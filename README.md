@@ -157,12 +157,18 @@ blender --background --factory-startup -t 2 --python-exit-code 1 \
 
 ### Reconstruct a source-guided control surface
 
-A wardrobe cell imports as a closed thick shell: outward cloth, an inner lining
-and sealed rims between them. Three commands turn it into one simulation/control
-surface using an explicit source-space guide. Every geometric decision lives in
-`sculpto_mesh::control`; the host adapter only runs native mesh operators.
+A source may be a thick sheet with lining and sealed rims, or a capped solid.
+The profile selects guide-facing extraction (`surface: "guide"`) or retention
+of an identified solid boundary (`surface: "boundary"`). The latter preserves
+concave folds and may need explicit opening cuts. Rust validates the profile
+and construction plans; the Blender adapter performs native cuts and mesh
+operations while preserving the original source.
+
+The full adapter command below applies optional cuts before extraction. These
+individual stage commands expect the appropriate prepared input:
 
 ```sh
+sculpto garment control-cuts --profile profile.json --report cut-plan.json
 sculpto garment control-exterior --source shell.obj --profile profile.json \
   --out selected.obj --plan exterior-plan.json
 sculpto garment control-repair --control decimated.obj --profile profile.json \
@@ -173,8 +179,10 @@ sculpto garment control-check --control reduced.obj --source shell.obj \
   --profile profile.json --report validation.json
 ```
 
-`control-exterior` keeps the shell's outward triangles (face normal agreeing with
-the direction away from the guide), keeps the largest connected shell, prunes
+`control-cuts` validates and reports planes; it does not itself modify geometry.
+Its `plane_frame` is always `source-local-z-up`, while `declared_frame` records
+the profile's input frame. The host rejects an unexpected plane frame.
+`control-exterior` applies the declared surface policy, keeps the largest connected shell, prunes
 corner-flare faces at pinch vertices, names the profile's apertures, and returns
 the source-stage closure actions *after* checking them against `source_repair`.
 Each fill includes a required `closure` kind: an existing interior edge between
@@ -195,6 +203,8 @@ The profile is data, not a search space:
 ```json
 {
   "frame": "source-local-z-up",
+  "surface": "guide",
+  "source_cuts": [],
   "guide_segments": [[[0.0, 0.0, -0.55], [0.0, 0.0, 0.5]]],
   "apertures": [
     {"role": "hem", "anchor": [0.0, 0.0, -0.5], "radius": 0.02},
@@ -241,10 +251,34 @@ are retained in the receipt but no displacement is attempted.
 
 `guide_segments` and every anchor share one declared frame: `source-local-z-up`
 (the extracted object's own coordinates) or `sculpto-display-y-up` (the Y-up OBJ
-frame, display `(x, y, z)` = source `(x, -z, y)`). Missing and unknown fields are
-errors. An aperture is a declared garment landmark: two boundary loops inside one
+frame). A declared display point `(x, y, z)` converts to source-local
+`(x, -z, y)`; the inverse source-to-display map is `(x, z, -y)`. Missing required
+fields and unknown fields are errors. Omitted `surface` means `guide`; omitted
+`source_cuts` means no cuts. An aperture is a declared garment landmark: two boundary loops inside one
 radius are ambiguous, and an opening with no loop is reported — never filled. No
 model name, asset path or vertex number is part of the algorithm.
+Opening centers use edge-length-weighted midpoints of the complete boundary,
+so subdividing the same curve does not change its identity. Role names are
+garment-local labels; anatomical sides and facing require separate actor
+registration.
+
+For a capped cylindrical source, replace the two policy fields in the example
+with explicit cuts that leave the intended passages open:
+
+```json
+{
+  "surface": "boundary",
+  "source_cuts": [
+    {"label": "lower opening", "plane_point": [0, 0, -0.5], "normal": [0, 0, 1], "retain": "positive"},
+    {"label": "upper opening", "plane_point": [0, 0, 0.5], "normal": [0, 0, 1], "retain": "negative"}
+  ]
+}
+```
+
+Each cut has a unique label, a finite plane point, a finite nonzero normal and
+an explicit retained half-space. Normals are normalized independently of their
+magnitude. Cuts act on a private derivative; the original source and its maps
+remain intact. Source coverage still includes deliberately removed cap areas.
 
 `control-check` writes its report and then fails when the declaration is not met;
 the report's `verdict` combines aperture/topology/winding/bounds qualification
@@ -268,8 +302,9 @@ blender --background --factory-startup -t 2 --python-exit-code 1 \
 }
 ```
 
-The adapter triangulates the source read-only, writes it for the CLI, applies the
-planned triangle fills, the declared decimation ratio, the planned collapses and
+The adapter triangulates the source read-only, validates and applies any declared
+opening cuts, writes the selected input for the CLI, applies the planned triangle
+fills, the declared decimation ratio, the planned collapses and
 fills, and re-runs `control-check` on the result. Output contains `high_control.{obj,npz}`,
 `reduced_control.{obj,npz}`, the two plan files, `separation.json`,
 `validation.json`, matched source/control renders and `receipt.json`. NPZ carries
@@ -284,6 +319,13 @@ UV and material identities, physical openings, bidirectional deviations, coverag
 timings and an optional `reference`/`reference_sha256` comparison. `receipt.status` is authoritative: a failed run keeps its
 artifacts for diagnosis and its control is not qualified. The source file,
 materials and UVs are never modified.
+
+With cuts, `derivative-lineage.json` stores every derivative vertex's known
+source triangle and barycentric coordinates, plus every derivative face's source
+triangle. Indices are zero-based. The adapter reads these relations back and
+composes selected geometry to the original source; complete-face removal and
+clipped area are reported separately. Freeze the digest-pinned executable before
+rebuilding it if the exact recipe must remain replayable.
 
 Run the focused native regression with:
 
