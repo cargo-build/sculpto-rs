@@ -4,6 +4,7 @@ mod animation;
 mod decode;
 mod geometry;
 mod packing;
+mod rig;
 
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
 
@@ -41,6 +42,53 @@ pub struct Sample {
     pub parts: Vec<Part>,
 }
 
+/// A retained rig node keeps its original identity and pose world transform.
+/// @req DECL0013
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RigNode {
+    pub node: usize,
+    pub name: Option<String>,
+    pub parent: Option<usize>,
+    pub world: [[f64; 4]; 4],
+    pub role: RigRole,
+}
+
+/// Connectors exist only to keep requested joints one connected graph.
+/// @req DECL0013
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RigRole {
+    Requested,
+    Connector,
+}
+
+/// One requested joint name bound to its retained rig position. @req DECL0013
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RequestedJoint {
+    pub name: String,
+    pub node: usize,
+    pub rig: usize,
+}
+
+/// Sparse retained-rig binding for one sampled vertex. @req DECL0013
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Influence {
+    pub rig: usize,
+    pub weight: f64,
+}
+
+/// Sampled geometry plus its reduced rig correspondence. @req DECL0013
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RigSample {
+    pub sample: Sample,
+    pub rig: Vec<RigNode>,
+    pub requested: Vec<RequestedJoint>,
+    pub influences: Vec<Vec<Influence>>,
+}
+
 /// Classified input failures retain their source location. @req DECL0013
 #[derive(Debug)]
 #[non_exhaustive]
@@ -50,6 +98,9 @@ pub enum ActorError {
     Unsupported { context: String, feature: String },
     Selection { name: String, matches: usize },
     DuplicatePart { name: String },
+    JointSelection { name: String, matches: usize },
+    DuplicateJoint { name: String },
+    DisconnectedRig,
     Clip { name: String, matches: usize },
     Time { time: f64, start: f64, end: f64 },
 }
@@ -69,6 +120,16 @@ impl fmt::Display for ActorError {
                 )
             }
             Self::DuplicatePart { name } => write!(f, "duplicate actor part {name:?}"),
+            Self::JointSelection { name, matches } => {
+                write!(
+                    f,
+                    "actor joint {name:?}: expected one node, found {matches}"
+                )
+            }
+            Self::DuplicateJoint { name } => write!(f, "duplicate actor joint {name:?}"),
+            Self::DisconnectedRig => {
+                write!(f, "requested joints share no common ancestor node")
+            }
             Self::Clip { name, matches } => {
                 write!(f, "actor clip {name:?}: expected one clip, found {matches}")
             }
@@ -149,6 +210,17 @@ impl Actor {
         let nodes = geometry::select(&self.document, parts)?;
         let worlds = animation::worlds(self, &nodes, pose)?;
         geometry::sample(self, &nodes, &worlds)
+    }
+
+    /// Reduced skin correspondence for the same explicit parts and pose.
+    /// @req DECL0013
+    pub fn rig_sample(
+        &self,
+        parts: &[&str],
+        pose: Pose<'_>,
+        joints: &[&str],
+    ) -> Result<RigSample, ActorError> {
+        rig::sample(self, parts, pose, joints)
     }
 
     fn buffer(&self, buffer: gltf::Buffer<'_>) -> Option<&[u8]> {

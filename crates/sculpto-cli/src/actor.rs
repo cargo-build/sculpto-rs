@@ -1,6 +1,7 @@
 //! File and serialization surface for the pure actor sampler. @req DECL0013
 
 mod pack;
+mod rig;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,6 +26,9 @@ struct Arguments<'arg> {
 pub(crate) fn run(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|command| command == "pack-cloth") {
         return pack::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "rig") {
+        return rig::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,

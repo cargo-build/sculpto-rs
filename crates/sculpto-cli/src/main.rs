@@ -27,6 +27,7 @@ usage: sculpto <command> [options]
 
 commands:
   actor sample [options] sample explicit GLB mesh nodes at REST or clip/time
+  actor rig [options]   sample parts plus reduced rig graph/influences JSON
   actor pack-cloth [options] pack baked cloth into an unchanged GLB actor
   inspect <path>        parse a document or morph container and print a summary
   bake [options]        resolve a preset, apply it to a body NIF, write an OBJ

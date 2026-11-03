@@ -174,6 +174,99 @@ fn joint_matrices(
         .collect()
 }
 
+/// One source influence row: skin-local joint indices and original weights.
+pub(super) struct SkinRow {
+    pub(super) joints: [u16; 4],
+    pub(super) weights: [f64; 4],
+}
+
+/// Decode and validate JOINTS_0/WEIGHTS_0 shared by sampling and rig output.
+/// @req DECL0013
+pub(super) fn skin_rows(
+    actor: &Actor,
+    primitive: &gltf::Primitive<'_>,
+    joint_count: usize,
+    vertex_count: usize,
+    context: &str,
+) -> Result<Vec<SkinRow>, ActorError> {
+    let joint_accessor = primitive
+        .get(&Semantic::Joints(0))
+        .ok_or_else(|| invalid(context, "missing JOINTS_0"))?;
+    let weight_accessor = primitive
+        .get(&Semantic::Weights(0))
+        .ok_or_else(|| invalid(context, "missing WEIGHTS_0"))?;
+    decode::accessor(
+        &joint_accessor,
+        Dimensions::Vec4,
+        &[DataType::U8, DataType::U16],
+        context,
+    )?;
+    decode::accessor(
+        &weight_accessor,
+        Dimensions::Vec4,
+        &[DataType::F32, DataType::U8, DataType::U16],
+        context,
+    )?;
+    match joint_accessor.count() == vertex_count
+        && weight_accessor.count() == vertex_count
+        && !joint_accessor.normalized()
+        && (weight_accessor.normalized() == (weight_accessor.data_type() != DataType::F32))
+    {
+        true => {}
+        false => {
+            return Err(invalid(
+                context,
+                "skin attribute count or normalization mismatch",
+            ));
+        }
+    }
+    let reader = primitive.reader(|buffer| actor.buffer(buffer));
+    let indices = reader
+        .read_joints(0)
+        .ok_or_else(|| invalid(context, "unreadable JOINTS_0"))?
+        .into_u16();
+    let weights: Vec<[f64; 4]> = match reader
+        .read_weights(0)
+        .ok_or_else(|| invalid(context, "unreadable WEIGHTS_0"))?
+    {
+        ReadWeights::F32(values) => values.map(|value| value.map(f64::from)).collect(),
+        ReadWeights::U8(values) => values
+            .map(|value| value.map(|v| f64::from(v) / 255.0))
+            .collect(),
+        ReadWeights::U16(values) => values
+            .map(|value| value.map(|v| f64::from(v) / 65535.0))
+            .collect(),
+    };
+    indices
+        .into_iter()
+        .zip(weights)
+        .enumerate()
+        .map(|(vertex, (joints, weights))| {
+            let location = format!("{context} vertex {vertex}");
+            match weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0)
+                && (weights.iter().sum::<f64>() - 1.0).abs() <= 2e-6
+            {
+                true => {}
+                false => {
+                    return Err(invalid(&location, "invalid skin weight total or value"));
+                }
+            }
+            match joints
+                .iter()
+                .find(|&&joint| usize::from(joint) >= joint_count)
+            {
+                Some(&joint) => Err(invalid(
+                    &location,
+                    format!("joint index {joint} exceeds skin"),
+                )),
+                None => Ok(SkinRow { joints, weights }),
+            }
+        })
+        .collect()
+}
+
 fn primitive_vertices(
     actor: &Actor,
     primitive: &gltf::Primitive<'_>,
@@ -206,81 +299,20 @@ fn primitive_vertices(
         .collect();
     let transformed: Vec<_> = match joints {
         Some(matrices) => {
-            let joint_accessor = primitive
-                .get(&Semantic::Joints(0))
-                .ok_or_else(|| invalid(context, "missing JOINTS_0"))?;
-            let weight_accessor = primitive
-                .get(&Semantic::Weights(0))
-                .ok_or_else(|| invalid(context, "missing WEIGHTS_0"))?;
-            decode::accessor(
-                &joint_accessor,
-                Dimensions::Vec4,
-                &[DataType::U8, DataType::U16],
-                context,
-            )?;
-            decode::accessor(
-                &weight_accessor,
-                Dimensions::Vec4,
-                &[DataType::F32, DataType::U8, DataType::U16],
-                context,
-            )?;
-            match joint_accessor.count() == points.len()
-                && weight_accessor.count() == points.len()
-                && !joint_accessor.normalized()
-                && (weight_accessor.normalized() == (weight_accessor.data_type() != DataType::F32))
-            {
-                true => {}
-                false => {
-                    return Err(invalid(
-                        context,
-                        "skin attribute count or normalization mismatch",
-                    ));
-                }
-            }
-            let indices = reader
-                .read_joints(0)
-                .ok_or_else(|| invalid(context, "unreadable JOINTS_0"))?
-                .into_u16();
-            let weights: Vec<[f64; 4]> = match reader
-                .read_weights(0)
-                .ok_or_else(|| invalid(context, "unreadable WEIGHTS_0"))?
-            {
-                ReadWeights::F32(values) => values.map(|value| value.map(f64::from)).collect(),
-                ReadWeights::U8(values) => values
-                    .map(|value| value.map(|v| f64::from(v) / 255.0))
-                    .collect(),
-                ReadWeights::U16(values) => values
-                    .map(|value| value.map(|v| f64::from(v) / 65535.0))
-                    .collect(),
-            };
+            let rows = skin_rows(actor, primitive, matrices.len(), points.len(), context)?;
             points
                 .into_iter()
-                .zip(indices)
-                .zip(weights)
-                .enumerate()
-                .map(|(vertex, ((point, indices), weights))| {
-                    let location = format!("{context} vertex {vertex}");
-                    match weights
-                        .iter()
-                        .all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0)
-                        && (weights.iter().sum::<f64>() - 1.0).abs() <= 2e-6
-                    {
-                        true => {}
-                        false => {
-                            return Err(invalid(&location, "invalid skin weight total or value"));
-                        }
-                    }
-                    indices.into_iter().zip(weights).try_fold(
+                .zip(rows)
+                .map(|(point, row)| {
+                    row.joints.into_iter().zip(row.weights).try_fold(
                         DVec4::ZERO,
                         |sum, (joint, weight)| {
-                            let matrix = matrices.get(usize::from(joint)).ok_or_else(|| {
-                                invalid(&location, format!("joint index {joint} exceeds skin"))
-                            })?;
-                            Ok(sum + (*matrix * point) * weight)
+                            // skin_rows validated each index against this skin.
+                            Ok(sum + (matrices[usize::from(joint)] * point) * weight)
                         },
                     )
                 })
-                .collect::<Result<_, _>>()?
+                .collect::<Result<_, ActorError>>()?
         }
         None => points.into_iter().map(|point| world * point).collect(),
     };

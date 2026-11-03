@@ -21,6 +21,8 @@ Examples with explicitly supplied local assets:
 
 ```sh
 target/debug/sculpto actor sample --input actor.glb --part BaseShape --rest --out body.obj
+target/debug/sculpto actor rig --input actor.glb --part BaseShape --part ArcherTrousers \
+  --joint "NPC COM [COM ]" --joint "NPC L Hand [LHnd]" --rest --out rig.json
 target/debug/sculpto actor pack-cloth --input actor.glb --targets targets.glb \
   --node TunicSimulationRender --clip Run --schedule schedule.json --out dressed.glb
 ```
@@ -30,6 +32,32 @@ preserves explicit part/primitive identity. Cloth packing preserves the
 actor's other geometry, materials and skeletal animation; it does not qualify
 fit, collisions or periodic motion. The current packing consumer supports
 2–256 targets. Base textures must be embedded or self-contained data URIs.
+
+`actor rig` samples the same explicit parts/pose and additionally reports the
+reduced skin correspondence used by fitting adapters:
+
+```text
+sculpto actor rig --input actor.glb --part NAME [--part NAME ...] \
+  --joint NAME [--joint NAME ...] (--rest | --clip NAME --time SECONDS) --out rig.json
+```
+
+The JSON output is one document in glTF Y-up world space with f64 values:
+`pose`, combined `vertices`/`triangles`, per-primitive `parts` ranges, the
+retained `rig` nodes (original glTF node id, name, rig-local `parent`,
+`requested`/`connector` role and column-major `world_column_major` transform
+from the same pose evaluation as the vertices), the caller-ordered
+`requested` name→node→rig mapping and sparse per-vertex `influences`
+(`bindings` with retained `rig` index and the original accumulated `weight`;
+zero-weight source influences are omitted and weights are never
+renormalized). Requested joints are exact unique node names, resolved in the
+real node graph; the retained rig keeps the hierarchy paths connecting them
+through their lowest common ancestor, ordered parent-before-child. Selections
+spanning different roots, influences without a retained ancestor, unskinned
+selected parts and ambiguous/repeated/missing joint names are explicit
+errors. The known subset matches `actor sample` (triangles, one
+JOINTS_0/WEIGHTS_0 influence set, embedded dense accessors); validation runs
+before any output file is created, and the output file is overwritten like
+`actor sample`'s OBJ/report (not an atomic transaction).
 
 Real-data tests are optional and read an explicitly supplied private fixture:
 
