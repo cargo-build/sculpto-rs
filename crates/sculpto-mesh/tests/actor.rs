@@ -26,7 +26,10 @@ fn custom_vertex_identity_does_not_change_sampling_or_admit_invalid_semantics() 
             let actor = Actor::from_glb(&fixture.bytes());
             match semantic {
                 "_SCULPTO_VERTEX" => {
-                    assert_eq!(actor.unwrap().sample(&["Body"], Pose::Rest).unwrap(), baseline)
+                    assert_eq!(
+                        actor.unwrap().sample(&["Body"], Pose::Rest).unwrap(),
+                        baseline
+                    )
                 }
                 _ => assert!(actor.is_err()),
             }
