@@ -8,5 +8,5 @@ license.workspace = true
 
 [dependencies]
 glam = "=0.33.12"
-gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names"] }
+gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }

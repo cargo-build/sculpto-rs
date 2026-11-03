@@ -108,6 +108,14 @@ fn replacement_preserves_actor_and_rebases_rest_geometry() {
         original["attributes"]["TEXCOORD_0"]
     );
     assert_eq!(
+        primitive["attributes"]["_SCULPTO_VERTEX"],
+        original["attributes"]["_SCULPTO_VERTEX"]
+    );
+    assert_eq!(
+        accessor(&result, &bin, &primitive["attributes"]["_SCULPTO_VERTEX"]),
+        accessor(&old, &old_bin, &original["attributes"]["_SCULPTO_VERTEX"])
+    );
+    assert_eq!(
         result["animations"][0]["channels"],
         old["animations"][0]["channels"]
     );

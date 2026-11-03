@@ -12,6 +12,28 @@ fn near(actual: [f64; 3], expected: [f64; 3]) {
 }
 
 #[test]
+fn custom_vertex_identity_does_not_change_sampling_or_admit_invalid_semantics() {
+    let baseline = Actor::from_glb(&Fixture::triangle().bytes())
+        .unwrap()
+        .sample(&["Body"], Pose::Rest)
+        .unwrap();
+    ["_SCULPTO_VERTEX", "UNKNOWN_SEMANTIC"]
+        .into_iter()
+        .for_each(|semantic| {
+            let mut fixture = Fixture::triangle();
+            let identity = fixture.floats(&[7., 11., 19.], "SCALAR", 3);
+            fixture.json["meshes"][0]["primitives"][0]["attributes"][semantic] = json!(identity);
+            let actor = Actor::from_glb(&fixture.bytes());
+            match semantic {
+                "_SCULPTO_VERTEX" => {
+                    assert_eq!(actor.unwrap().sample(&["Body"], Pose::Rest).unwrap(), baseline)
+                }
+                _ => assert!(actor.is_err()),
+            }
+        });
+}
+
+#[test]
 fn static_hierarchy_and_primitive_ranges_preserve_selection_order() {
     let mut fixture = Fixture::triangle();
     fixture.json["nodes"] = json!([

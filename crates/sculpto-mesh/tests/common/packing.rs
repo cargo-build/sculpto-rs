@@ -13,12 +13,13 @@ fn cloth() -> Fixture {
     let normals = fixture.floats(&[0., 1., 0.].repeat(3), "VEC3", 3);
     let tangents = fixture.floats(&[1., 0., 0., 1.].repeat(3), "VEC4", 3);
     let uv = fixture.floats(&[0., 0., 1., 0., 0., 1.], "VEC2", 3);
+    let identity = fixture.floats(&[7., 11., 19.], "SCALAR", 3);
     let indices = fixture.accessor(&[0, 1, 2], 5121, "SCALAR", 3);
     let morph = fixture.floats(&[0., 0., 0.25].repeat(3), "VEC3", 3);
     fixture.json["nodes"][0]["name"] = json!("Cloth");
     fixture.json["nodes"][0]["weights"] = json!([0.5, 0.5]);
     fixture.json["meshes"][0] = json!({
-        "primitives": [{"attributes": {"POSITION": 0, "NORMAL": normals, "TANGENT": tangents, "TEXCOORD_0": uv},
+        "primitives": [{"attributes": {"POSITION": 0, "NORMAL": normals, "TANGENT": tangents, "TEXCOORD_0": uv, "_SCULPTO_VERTEX": identity},
             "indices": indices, "targets": [{"POSITION": morph, "NORMAL": morph, "TANGENT": morph}, {"POSITION": morph}], "extras": {"primitive_custom": true}}],
         "weights": [0.5, 0.5], "extras": {"targetNames": ["old0", "old1"], "keep": "metadata"},
     });
