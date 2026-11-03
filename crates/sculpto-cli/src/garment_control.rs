@@ -402,10 +402,15 @@ fn actions_value(actions: &[RepairAction], loops: &[BoundaryLoop]) -> Value {
                     "length": length,
                     "vertices": loops[*loop_index].vertices,
                 }),
-                RepairAction::Fill { loop_index, edges } => json!({
+                RepairAction::Fill {
+                    loop_index,
+                    edges,
+                    closure,
+                } => json!({
                     "kind": "fill",
                     "loop": loop_index,
                     "edges": edges,
+                    "closure": closure.name(),
                     "vertices": loops[*loop_index].vertices,
                 }),
             })
@@ -583,8 +588,15 @@ fn print_repair(out: &Path, outcome: &RepairOutcome, plan: &Path) {
                 "collapse loop {loop_index}: {edges} edges, shortest {:?} at {length:.6}",
                 edge
             ),
-            RepairAction::Fill { loop_index, edges } => {
-                println!("fill loop {loop_index}: {edges} edges");
+            RepairAction::Fill {
+                loop_index,
+                edges,
+                closure,
+            } => {
+                println!(
+                    "fill loop {loop_index}: {edges} edges, {} patch",
+                    closure.name()
+                );
             }
         }
     }

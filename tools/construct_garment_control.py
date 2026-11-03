@@ -152,60 +152,227 @@ def edge_direction(face, edge):
 
 
 def orient_new_faces(new_faces):
-    """A generated patch must traverse shared edges opposite to the kept faces."""
+    """Propagate the kept surface's winding through the entire generated patch."""
     created = [face for face in new_faces if face.is_valid]
+    created_set = set(created)
+    pending = [
+        (face, other, edge)
+        for face in created
+        for edge in face.edges
+        for other in edge.link_faces
+        if other not in created_set
+    ]
+    visited = set()
     flipped = 0
-    for face in created:
+    while pending:
+        face, other, shared = pending.pop()
+        if face in visited:
+            continue
+        mine = edge_direction(face, shared)
+        theirs = edge_direction(other, shared)
+        if mine[0] is theirs[0] and mine[1] is theirs[1]:
+            face.normal_flip()
+            flipped += 1
+        visited.add(face)
         for edge in face.edges:
-            other = next(
-                (candidate for candidate in edge.link_faces if candidate is not face),
-                None,
+            pending.extend(
+                (neighbor, face, edge)
+                for neighbor in edge.link_faces
+                if neighbor in created_set and neighbor not in visited
             )
-            if other is None or any(other is candidate for candidate in created):
-                continue
-            mine = edge_direction(face, edge)
-            theirs = edge_direction(other, edge)
-            if mine[0] is theirs[0] and mine[1] is theirs[1]:
-                face.normal_flip()
-                flipped += 1
-                break
+    if len(visited) != len(created):
+        raise RuntimeError("generated patch has faces disconnected from the kept surface")
     return flipped
 
 
-def fill_loop(bm, vertices, report):
-    """Triangle fill, then hole fill; both failures are reported, never swallowed."""
+CLOSURES = ("triangulated", "boundary")
+
+
+def element_snapshot(bm):
+    """Identity sets of every live element, for exact rollback comparison."""
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    return {"verts": set(bm.verts), "edges": set(bm.edges), "faces": set(bm.faces)}
+
+
+def new_elements(bm, before):
+    """Elements that did not exist before the attempt, including partial mutation."""
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    return (
+        [face for face in bm.faces if face not in before["faces"]],
+        [edge for edge in bm.edges if edge not in before["edges"]],
+        [vertex for vertex in bm.verts if vertex not in before["verts"]],
+    )
+
+
+def rollback_patch(bm, before, loop_edges):
+    """Remove only what the attempt created; pre-existing geometry must survive."""
+    stale = [face for face in before["faces"] if not face.is_valid]
+    if stale:
+        raise RuntimeError(f"rollback would lose {len(stale)} pre-existing face(s)")
+    created, _, _ = new_elements(bm, before)
+    if created:
+        # FACES_ONLY leaves pre-existing boundary edges and vertices in place.
+        bmesh.ops.delete(bm, geom=created, context="FACES_ONLY")
+    bm.edges.ensure_lookup_table()
+    orphan_edges = [edge for edge in bm.edges if edge not in before["edges"] and not edge.link_faces]
+    if orphan_edges:
+        bmesh.ops.delete(bm, geom=orphan_edges, context="EDGES")
+    bm.verts.ensure_lookup_table()
+    orphan_verts = [vertex for vertex in bm.verts if vertex not in before["verts"] and not vertex.link_edges]
+    if orphan_verts:
+        bmesh.ops.delete(bm, geom=orphan_verts, context="VERTS")
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+    surviving = {
+        "faces": sum(1 for face in before["faces"] if face.is_valid),
+        "edges": sum(1 for edge in before["edges"] if edge.is_valid),
+        "verts": sum(1 for vertex in before["verts"] if vertex.is_valid),
+    }
+    expected = {
+        "faces": len(before["faces"]),
+        "edges": len(before["edges"]),
+        "verts": len(before["verts"]),
+    }
+    if surviving != expected:
+        raise RuntimeError(f"rollback lost pre-existing geometry: {surviving} != {expected}")
+    if (len(bm.faces), len(bm.edges), len(bm.verts)) != (
+        expected["faces"], expected["edges"], expected["verts"]
+    ):
+        raise RuntimeError(
+            "rollback left generated geometry: "
+            f"{len(bm.faces)} faces / {len(bm.edges)} edges / {len(bm.verts)} vertices, expected "
+            f"{expected['faces']} / {expected['edges']} / {expected['verts']}"
+        )
+    open_loop = [edge for edge in loop_edges if edge.is_valid and len(edge.link_faces) != 1]
+    if open_loop:
+        raise RuntimeError(f"rollback changed {len(open_loop)} loop edge(s)")
+
+
+def verify_patch(bm, loop_edges, created, loop_vertices):
+    """Complete patch topology: manifold, closed loop, consistent winding."""
+    loop_edges_set = set(loop_edges)
+    if not created:
+        raise RuntimeError("the operator created no face")
+    for face in created:
+        if not face.is_valid:
+            raise RuntimeError("the operator returned a face that is no longer valid")
+        if len(face.verts) != 3:
+            raise RuntimeError(f"generated face has {len(face.verts)} corners, not 3")
+        if face.calc_area() <= 0.0:
+            raise RuntimeError("generated face has no area")
+    bm.edges.ensure_lookup_table()
+    for edge in bm.edges:
+        faces = len(edge.link_faces)
+        if faces > 2:
+            raise RuntimeError(
+                "generated patch makes an edge non-manifold "
+                f"({faces} faces at {[round(value, 6) for value in (edge.verts[0].co + edge.verts[1].co) / 2]})"
+            )
+        if faces == 2:
+            directions = [edge_direction(face, edge) for face in edge.link_faces]
+            if directions[0][0] is directions[1][0] and directions[0][1] is directions[1][1]:
+                raise RuntimeError("generated patch reverses face winding")
+    open_loop = [edge for edge in loop_edges_set if edge.is_valid and len(edge.link_faces) != 2]
+    if open_loop:
+        raise RuntimeError(
+            f"generated patch left {len(open_loop)} of {len(loop_vertices)} loop edge(s) open"
+        )
+
+
+def boundary_patch(bm, edges):
+    """One n-gon over the loop edges only, then triangulate it."""
+    result = bmesh.ops.holes_fill(bm, edges=edges, sides=len(edges))
+    patch = [face for face in result.get("faces", []) if isinstance(face, bmesh.types.BMFace)]
+    if not patch:
+        raise RuntimeError("holes_fill created no face")
+    bmesh.ops.triangulate(bm, faces=[face for face in patch if face.is_valid])
+
+
+def chord_patch(bm, edges):
+    """Free-chord triangle fill over the loop edges."""
+    result = bmesh.ops.triangle_fill(bm, use_beauty=True, edges=edges)
+    patch = [face for face in result.get("geom", []) if isinstance(face, bmesh.types.BMFace)]
+    if not patch:
+        raise RuntimeError("triangle_fill created no face")
+
+
+def apply_patch(bm, kind, edges):
+    if kind == "boundary":
+        boundary_patch(bm, edges)
+    elif kind == "triangulated":
+        chord_patch(bm, edges)
+    else:
+        raise RuntimeError(f"unknown closure kind `{kind}`")
+
+
+def fill_loop(bm, vertices, report, closure):
+    """Close one loop as a native transaction: capture, verify, or roll back.
+
+    The core plans the patch kind from topology: a loop that straddles an existing
+    edge is closed with a boundary patch, because a free chord would reuse that
+    edge. Both operators are complementary in practice, so the other one is tried
+    once when verification rejects the planned patch. Every created face is captured
+    from the mesh itself (not from the operator return value), so a partial mutation
+    or a triangulated n-gon is owned completely; a rejected attempt is rolled back to
+    the exact pre-existing geometry, and a double failure is an explicit error.
+    """
+    if closure not in CLOSURES:
+        raise RuntimeError(
+            f"plan action has closure `{closure}`, expected one of {CLOSURES}"
+        )
     edges = loop_edges(bm, vertices)
-    try:
-        result = bmesh.ops.triangle_fill(bm, use_beauty=True, edges=edges)
-        created = [face for face in result.get("geom", []) if isinstance(face, bmesh.types.BMFace)]
+    order = ["boundary", "triangulated"] if closure == "boundary" else ["triangulated", "boundary"]
+    attempts = []
+    for kind in order:
+        before = element_snapshot(bm)
+        failure = None
+        try:
+            apply_patch(bm, kind, edges)
+        except Exception as error:  # noqa: BLE001 - partial mutation may exist
+            failure = f"{type(error).__name__}: {error}"
+        created, created_edges, created_verts = new_elements(bm, before)
+        flipped = 0
+        if failure is None:
+            try:
+                flipped = orient_new_faces(created)
+                verify_patch(bm, edges, created, vertices)
+            except Exception as error:  # noqa: BLE001
+                failure = f"{type(error).__name__}: {error}"
+        if failure is not None:
+            attempts.append(
+                {
+                    "closure": kind,
+                    "error": failure,
+                    "partial_faces": len(created),
+                    "partial_edges": len(created_edges),
+                }
+            )
+            rollback_patch(bm, before, edges)
+            continue
         report.append(
             {
-                "operator": "triangle_fill",
+                "operator": "holes_fill+triangulate" if kind == "boundary" else "triangle_fill",
+                "closure": kind,
+                "planned": closure,
+                "fallback": bool(attempts),
                 "edges": len(edges),
                 "faces": len(created),
-                "flipped": orient_new_faces(created),
+                "new_edges": len(created_edges),
+                "new_vertices": len(created_verts),
+                "flipped": flipped,
+                "rejected": attempts,
             }
         )
         return
-    except Exception as error:  # noqa: BLE001 - the message is the diagnostic
-        first = f"{type(error).__name__}: {error}"
-    try:
-        result = bmesh.ops.holes_fill(bm, edges=edges, sides=len(edges))
-        created = [face for face in result.get("faces", []) if isinstance(face, bmesh.types.BMFace)]
-        report.append(
-            {
-                "operator": "holes_fill",
-                "edges": len(edges),
-                "faces": len(created),
-                "flipped": orient_new_faces(created),
-                "triangle_fill": first,
-            }
-        )
-    except Exception as error:  # noqa: BLE001
-        raise RuntimeError(
-            f"loop closure failed for {len(edges)} edges; triangle_fill: {first}; "
-            f"holes_fill: {type(error).__name__}: {error}"
-        ) from error
+    raise RuntimeError(
+        f"loop closure failed for {len(edges)} edges after {len(attempts)} verified "
+        f"attempts: {attempts}"
+    )
 
 
 def tidy(bm):
@@ -502,7 +669,7 @@ def main(recipe_path, out_dir):
                     "the source stage may not collapse geometry; the plan asked for "
                     f"{action['kind']} on loop {action['loop']}"
                 )
-            fill_loop(bm, action["vertices"], fills)
+            fill_loop(bm, action["vertices"], fills, action["closure"])
         tidy(bm)
         high_positions, high_triangles = mesh_arrays(bm)
         high_edges, high_loops = boundary_loops(bm)
@@ -603,7 +770,7 @@ def main(recipe_path, out_dir):
             else:
                 indices = [vertex.index for vertex in element]
                 fills = []
-                fill_loop(bm, indices, fills)
+                fill_loop(bm, indices, fills, action["closure"])
                 actions.append({"operator": "fill", "loop": action["loop"], **fills[0]})
         tidy(bm)
         reduced_positions, reduced_triangles = mesh_arrays(bm)

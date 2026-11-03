@@ -177,6 +177,11 @@ sculpto garment control-check --control reduced.obj --source shell.obj \
 the direction away from the guide), keeps the largest connected shell, prunes
 corner-flare faces at pinch vertices, names the profile's apertures, and returns
 the source-stage closure actions *after* checking them against `source_repair`.
+Each fill includes a required `closure` kind: an existing interior edge between
+nonadjacent rim vertices selects a boundary patch instead of free chords.
+The native adapter captures all generated triangles, propagates source winding,
+and verifies the complete patch. A rejected attempt is rolled back before one
+recorded alternative operator; failure of both preserves diagnostics and stops.
 `control-repair` plans the post-decimation closure of corner flares and incidental
 boundary loops against `reduced_repair`. `control-separate` applies the profile's
 single bounded local contact separation, if one is declared. `control-check`

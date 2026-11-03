@@ -18,9 +18,10 @@ fn a_closed_boundary_perimeter_includes_its_closing_edge() {
 use sculpto_mesh::control::measure::{ControlDiagnostics, CoverageLimits};
 use sculpto_mesh::control::profile::{ControlFrame, ControlProfile};
 use sculpto_mesh::control::{
-    ApertureResolution, ApertureSpec, BoundaryLoop, ContactMode, ContactPolicy, ControlError,
-    Guide, GuideSegment, ReductionLimits, RepairAction, RepairLimits, boundary_loops,
-    exterior_control, largest_component, non_manifold_tips, repair_control, resolve_apertures,
+    ApertureResolution, ApertureSpec, BoundaryLoop, ClosureKind, ContactMode, ContactPolicy,
+    ControlError, Guide, GuideSegment, ReductionLimits, RepairAction, RepairLimits, boundary_loops,
+    exterior_control, largest_component, non_manifold_tips, repair_actions, repair_control,
+    resolve_apertures,
 };
 
 /// A closed thick shell plus the counts its construction is made of.
@@ -805,4 +806,72 @@ fn a_self_contact_rejects_the_control_and_keeps_the_measurement() {
         }),
         "a contact terminates qualification instead of being smoothed away"
     );
+}
+
+#[test]
+fn a_closure_loop_straddling_an_existing_edge_uses_a_boundary_patch() {
+    // Ring 0-1-2-3 with the interior edge 0-2 already carrying two faces: a
+    // free-chord patch would reuse it, so the closure must be a boundary patch.
+    let pinched_positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ];
+    let pinched_triangles = vec![[0, 1, 2], [0, 2, 3]];
+    // A ring fanned from a centre vertex that is not on the loop: no two
+    // non-adjacent loop vertices share an edge, so a free-chord patch is safe.
+    let plain_positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.5, 0.9, 0.0],
+        [1.0, 1.8, 0.0],
+        [0.0, 1.8, 0.0],
+        [-0.5, 0.9, 0.0],
+        [0.5, 0.9, 0.0],
+    ];
+    let plain_triangles = vec![
+        [0, 1, 6],
+        [1, 2, 6],
+        [2, 3, 6],
+        [3, 4, 6],
+        [4, 5, 6],
+        [5, 0, 6],
+    ];
+    let limits = RepairLimits {
+        max_incidental_loops: 4,
+        collapse_below_edges: 0,
+        max_fill_edges: 64,
+        max_tip_removal_share: 0.05,
+    };
+    for (positions, triangles, expected) in [
+        (
+            pinched_positions.clone(),
+            pinched_triangles,
+            ClosureKind::Boundary,
+        ),
+        (plain_positions, plain_triangles, ClosureKind::Triangulated),
+    ] {
+        let loops = boundary_loops(&positions, &triangles);
+        assert_eq!(loops.len(), 1, "fixture has one closure loop");
+        let resolution = ApertureResolution {
+            matched: Vec::new(),
+            incidental: vec![0],
+        };
+        let actions = repair_actions(&positions, &triangles, &loops, &resolution, &limits).unwrap();
+        match actions.as_slice() {
+            [
+                RepairAction::Fill {
+                    closure,
+                    edges,
+                    loop_index,
+                },
+            ] => {
+                assert_eq!(*closure, expected);
+                assert_eq!(*edges, loops[0].edges);
+                assert_eq!(*loop_index, 0);
+            }
+            other => panic!("expected one fill, got {other:?}"),
+        }
+    }
 }

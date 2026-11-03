@@ -571,6 +571,13 @@ pub struct TipPrune {
     pub vertices: Vec<u32>,
 }
 
+/// Number of face fans around one vertex; more than one is a pinched fan.
+///
+/// Qualification and outside diagnostics share this rule. @req DECL0013
+pub fn vertex_fan_count(triangles: &[[u32; 3]], vertex: u32, faces: &[u32]) -> usize {
+    fans(triangles, vertex, faces).len()
+}
+
 /// At a pinch vertex the incident faces form several fans; the smaller fans are
 /// corner flares, not cloth. Keeping the largest fan is the qualified repair.
 pub fn non_manifold_tips(triangles: &[[u32; 3]]) -> TipPrune {
@@ -943,6 +950,28 @@ impl Default for RepairLimits {
     }
 }
 
+/// How a closure loop may be patched without reusing existing surface.
+///
+/// A guide-facing slit that reaches a crease has two loop vertices that already
+/// share an interior edge. A free-chord triangulation reuses that edge and makes it
+/// non-manifold, so such a loop is closed with a single boundary patch instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureKind {
+    /// Free-chord triangle fill: the loop interior contains no existing edge.
+    Triangulated,
+    /// One boundary n-gon over the loop edges, then triangulate the patch.
+    Boundary,
+}
+
+impl ClosureKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Triangulated => "triangulated",
+            Self::Boundary => "boundary",
+        }
+    }
+}
+
 /// What the host must do to one incidental loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepairAction {
@@ -954,12 +983,17 @@ pub enum RepairAction {
         length: f32,
     },
     /// Fill the loop with a triangulated patch.
-    Fill { loop_index: usize, edges: usize },
+    Fill {
+        loop_index: usize,
+        edges: usize,
+        closure: ClosureKind,
+    },
 }
 
 /// Decide how each incidental loop closes; nothing is closed without a report.
 pub fn repair_actions(
     positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
     loops: &[BoundaryLoop],
     resolution: &ApertureResolution,
     limits: &RepairLimits,
@@ -999,9 +1033,42 @@ pub fn repair_actions(
             Ok(RepairAction::Fill {
                 loop_index: *loop_index,
                 edges: boundary.edges,
+                closure: match pinched_boundary(triangles, boundary) {
+                    true => ClosureKind::Boundary,
+                    false => ClosureKind::Triangulated,
+                },
             })
         })
         .collect()
+}
+
+/// Whether two non-adjacent loop vertices already share an interior edge.
+///
+/// Such a loop encloses existing surface: a free-chord patch would reuse that edge
+/// and make it non-manifold, so the closure must be a boundary patch.
+fn pinched_boundary(triangles: &[[u32; 3]], boundary: &BoundaryLoop) -> bool {
+    let mut faces: HashMap<u64, u32> = HashMap::new();
+    for [a, b, c] in triangles {
+        for (left, right) in [(*a, *b), (*b, *c), (*c, *a)] {
+            *faces.entry(edge_key(left, right)).or_default() += 1;
+        }
+    }
+    let vertices = &boundary.vertices;
+    for (index, first) in vertices.iter().enumerate() {
+        for (other_index, second) in vertices.iter().enumerate() {
+            let adjacent = other_index + 1 == index
+                || index + 1 == other_index
+                || (index == 0 && other_index + 1 == vertices.len())
+                || (other_index == 0 && index + 1 == vertices.len());
+            if index >= other_index || adjacent {
+                continue;
+            }
+            if faces.get(&edge_key(*first, *second)).copied().unwrap_or(0) > 1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The shortest boundary edge of a loop; ties keep the lowest vertex pair.
@@ -1275,7 +1342,13 @@ pub fn exterior_control(
         .collect::<Vec<_>>();
     let loops = boundary_loops(&positions, &triangles);
     let apertures = resolve_apertures(&loops, &profile.apertures)?;
-    let actions = repair_actions(&positions, &loops, &apertures, &profile.source_repair)?;
+    let actions = repair_actions(
+        &positions,
+        &triangles,
+        &loops,
+        &apertures,
+        &profile.source_repair,
+    )?;
     let reduction = ReductionPlan::plan(triangles.len(), &profile.reduction)?;
     Ok(ExteriorOutcome {
         positions,
@@ -1349,7 +1422,13 @@ pub fn repair_control(
     let (positions, triangles, _) = compact(&surface.positions, &kept);
     let loops = boundary_loops(&positions, &triangles);
     let apertures = resolve_apertures(&loops, &profile.apertures)?;
-    let actions = repair_actions(&positions, &loops, &apertures, &profile.reduced_repair)?;
+    let actions = repair_actions(
+        &positions,
+        &triangles,
+        &loops,
+        &apertures,
+        &profile.reduced_repair,
+    )?;
     let tip_removed = tips.removed.len();
     Ok(RepairOutcome {
         positions,

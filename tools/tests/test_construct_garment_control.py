@@ -7,14 +7,17 @@ Requires the CLI build (`cargo build -p sculpto-cli`) at target/debug/sculpto.
 """
 
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
 
+import bmesh
 import bpy
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import construct_garment_control as adapter  # noqa: E402
 from construct_garment_control import main, sha256  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -304,7 +307,9 @@ with tempfile.TemporaryDirectory(prefix="sculpto-control-native-") as temporary:
     assert len(holed_receipt["incidental"]) == 1
     assert len(holed_receipt["high_control"]["fills"]) == 1
     filled = holed_receipt["high_control"]["fills"][0]
-    assert filled["operator"] in {"triangle_fill", "holes_fill"}
+    assert filled["operator"] in {"triangle_fill", "holes_fill+triangulate"}
+    assert filled["closure"] in {"triangulated", "boundary"}
+    assert filled["faces"] >= 1
     assert filled["faces"] >= 1
     assert holed_receipt["validation"]["verdict"]["passed"] is True
 
@@ -338,3 +343,164 @@ with tempfile.TemporaryDirectory(prefix="sculpto-control-native-") as temporary:
     assert not (failed / "reduced_control.npz").exists()
 
 print("NATIVE_CONTROL_REGRESSION ok", flush=True)
+
+
+# --- native patch ownership -------------------------------------------------
+
+def hex_hole_mesh():
+    """A flat surface with a hexagonal hole: 6 boundary edges, one face each."""
+    bm = bmesh.new()
+    inner = [
+        bm.verts.new((0.1 * math.cos(math.tau * i / 6), 0.1 * math.sin(math.tau * i / 6), 0.0))
+        for i in range(6)
+    ]
+    outer = [
+        bm.verts.new((0.2 * math.cos(math.tau * i / 6), 0.2 * math.sin(math.tau * i / 6), -0.05))
+        for i in range(6)
+    ]
+    for i in range(6):
+        following = (i + 1) % 6
+        bm.faces.new([inner[i], inner[following], outer[following], outer[i]])
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    return bm, list(range(6))
+
+
+def mesh_state(bm):
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    return {
+        "vertices": len(bm.verts),
+        "edges": len(bm.edges),
+        "faces": len(bm.faces),
+        "idents": (set(bm.verts), set(bm.edges), set(bm.faces)),
+    }
+
+
+def boundary_loop_edges(bm, vertices):
+    bm.verts.ensure_lookup_table()
+    edges = []
+    for first, second in zip(vertices, vertices[1:] + vertices[:1]):
+        start, end = bm.verts[first], bm.verts[second]
+        edge = next(
+            (candidate for candidate in start.link_edges if candidate.other_vert(start) is end),
+            None,
+        )
+        assert edge is not None, f"no loop edge {first}-{second}"
+        edges.append(edge)
+    return edges
+
+
+def patch_tests():
+    # 1. Six-vertex ring ownership: the triangulated patch is fully captured.
+    bm, ring = hex_hole_mesh()
+    loop_edges = boundary_loop_edges(bm, ring)
+    assert all(len(edge.link_faces) == 1 for edge in loop_edges)
+    report = []
+    adapter.fill_loop(bm, ring, report, "boundary")
+    record = report[0]
+    assert record["closure"] == "boundary" and record["fallback"] is False
+    assert record["faces"] == 4, f"expected 4 triangles, got {record['faces']}"
+    assert all(len(edge.link_faces) == 2 for edge in loop_edges)
+    assert all(face.is_valid for face in bm.faces)
+    # Winding: every interior edge is traversed oppositely by its two faces.
+    bm.edges.ensure_lookup_table()
+    for edge in bm.edges:
+        if len(edge.link_faces) == 2:
+            first, second = (adapter.edge_direction(face, edge) for face in edge.link_faces)
+            assert not (first[0] is second[0] and first[1] is second[1]), "winding conflicts"
+    bm.free()
+
+    # Orientation repair happens before verification, including every new triangle.
+    bm, ring = hex_hole_mesh()
+    original_apply = adapter.apply_patch
+
+    def reversed_patch(bm_mesh, kind, edges):
+        before_faces = set(bm_mesh.faces)
+        original_apply(bm_mesh, kind, edges)
+        for face in bm_mesh.faces:
+            if face not in before_faces:
+                face.normal_flip()
+
+    adapter.apply_patch = reversed_patch
+    try:
+        oriented = []
+        adapter.fill_loop(bm, ring, oriented, "boundary")
+        assert oriented[0]["flipped"] == 4
+        assert not oriented[0]["fallback"]
+    finally:
+        adapter.apply_patch = original_apply
+        bm.free()
+
+    # 2. A rejected patch is rolled back to the exact pre-existing geometry.
+    bm, ring = hex_hole_mesh()
+    loop_edges = boundary_loop_edges(bm, ring)
+    before = mesh_state(bm)
+    original_verify = adapter.verify_patch
+
+    def rejecting(*_args, **_kwargs):
+        raise RuntimeError("injected verification rejection")
+
+    adapter.verify_patch = rejecting
+    try:
+        try:
+            adapter.fill_loop(bm, ring, [], "boundary")
+        except RuntimeError as error:
+            assert "verified attempts" in str(error), str(error)
+        else:
+            raise AssertionError("a rejected patch was accepted")
+    finally:
+        adapter.verify_patch = original_verify
+    after = mesh_state(bm)
+    assert after["faces"] == before["faces"], "rollback left generated faces"
+    assert after["edges"] == before["edges"], "rollback left generated edges"
+    assert after["vertices"] == before["vertices"], "rollback left generated vertices"
+    assert after["idents"][2] == before["idents"][2], "rollback replaced pre-existing faces"
+    assert all(edge.is_valid and len(edge.link_faces) == 1 for edge in loop_edges)
+    bm.free()
+
+    # 3. An exception raised after partial creation still owns and rolls back it.
+    bm, ring = hex_hole_mesh()
+    loop_edges = boundary_loop_edges(bm, ring)
+    before = mesh_state(bm)
+    original_apply = adapter.apply_patch
+
+    def failing(bm_mesh, kind, edges):
+        original_apply(bm_mesh, kind, edges)
+        raise RuntimeError("injected after partial creation")
+
+    adapter.apply_patch = failing
+    try:
+        try:
+            adapter.fill_loop(bm, ring, [], "triangulated")
+        except RuntimeError as error:
+            assert "verified attempts" in str(error), str(error)
+        else:
+            raise AssertionError("a partial patch was accepted")
+    finally:
+        adapter.apply_patch = original_apply
+    after = mesh_state(bm)
+    assert (after["faces"], after["edges"], after["vertices"]) == (
+        before["faces"],
+        before["edges"],
+        before["vertices"],
+    ), "partial mutation survived rollback"
+    assert after["idents"][2] == before["idents"][2]
+    assert all(edge.is_valid and len(edge.link_faces) == 1 for edge in loop_edges)
+    bm.free()
+
+    # 4. An unknown closure label is an explicit error, not a silent default.
+    bm, ring = hex_hole_mesh()
+    try:
+        adapter.fill_loop(bm, ring, [], "nonsense")
+    except RuntimeError as error:
+        assert "closure `nonsense`" in str(error), str(error)
+    else:
+        raise AssertionError("an unknown closure label was accepted")
+    bm.free()
+
+patch_tests()
+print("PATCH_OWNERSHIP ok", flush=True)
