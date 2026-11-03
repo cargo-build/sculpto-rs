@@ -132,7 +132,9 @@ impl fmt::Display for ContactError {
                 formatter,
                 "{pairs} contact pair(s) remain after the single proposed separation"
             ),
-            Self::NoSeparatingAxis => write!(formatter, "the contact has no usable separating axis"),
+            Self::NoSeparatingAxis => {
+                write!(formatter, "the contact has no usable separating axis")
+            }
             Self::InvalidInput => write!(
                 formatter,
                 "the control is empty, nonfinite, degenerate or has an invalid triangle index"
