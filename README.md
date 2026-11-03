@@ -225,7 +225,7 @@ The profile is data, not a search space:
 `source_repair` and `reduced_repair` are separate because the two stages work at
 different resolutions; each is checked *before* its native fills or collapses, so
 an out-of-limit stage is refused instead of silently expanded. `contact` is either
-`{"mode": "reject"}` (any rest contact fails) or `{"mode": "separate"}` with a
+`mode: "reject"` (any rest contact fails) or `mode: "separate"` with a
 finite clearance, a maximum vertex displacement and a maximum pair count, all in
 source units. A separation uses one geometry-derived minimum separating axis, moves
 the smaller face in full and its immediate neighbours at half strength, and is
