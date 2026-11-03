@@ -127,6 +127,137 @@ blender --background --factory-startup -t 2 --python-exit-code 1 \
   --python tools/tests/test_bake_garment_materials.py
 ```
 
+### Reconstruct a source-guided control surface
+
+A wardrobe cell imports as a closed thick shell: outward cloth, an inner lining
+and sealed rims between them. Three commands turn it into one simulation/control
+surface using an explicit source-space guide. Every geometric decision lives in
+`sculpto_mesh::control`; the host adapter only runs native mesh operators.
+
+```sh
+sculpto garment control-exterior --source shell.obj --profile profile.json \
+  --out selected.obj --plan exterior-plan.json
+sculpto garment control-repair --control decimated.obj --profile profile.json \
+  --out repaired.obj --plan repair-plan.json
+sculpto garment control-separate --control repaired.obj --profile profile.json \
+  --out reduced.obj --report separation.json
+sculpto garment control-check --control reduced.obj --source shell.obj \
+  --profile profile.json --report validation.json
+```
+
+`control-exterior` keeps the shell's outward triangles (face normal agreeing with
+the direction away from the guide), keeps the largest connected shell, prunes
+corner-flare faces at pinch vertices, names the profile's apertures, and returns
+the source-stage closure actions *after* checking them against `source_repair`.
+`control-repair` plans the post-decimation closure of corner flares and incidental
+boundary loops against `reduced_repair`. `control-separate` applies the profile's
+single bounded local contact separation, if one is declared. `control-check`
+measures the finished surface and enforces the acceptance conjunction: one
+manifold disk shell, consistent directed winding, exactly the declared apertures,
+the genus-0 Euler characteristic, zero coincident vertices, zero residual contacts,
+the declared triangle bounds and the declared bidirectional coverage.
+
+The profile is data, not a search space:
+
+```json
+{
+  "frame": "source-local-z-up",
+  "guide_segments": [[[0.0, 0.0, -0.55], [0.0, 0.0, 0.5]]],
+  "apertures": [
+    {"role": "hem", "anchor": [0.0, 0.0, -0.5], "radius": 0.02},
+    {"role": "collar", "anchor": [0.0, 0.0, 0.5], "radius": 0.02}
+  ],
+  "source_repair": {
+    "max_incidental_loops": 4,
+    "collapse_below_edges": 0,
+    "max_fill_edges": 16,
+    "max_tip_removal_share": 0.05
+  },
+  "reduced_repair": {
+    "max_incidental_loops": 4,
+    "collapse_below_edges": 10,
+    "max_fill_edges": 64,
+    "max_tip_removal_share": 0.05
+  },
+  "reduction": {
+    "target_triangles": 1800,
+    "minimum_triangles": 1200,
+    "maximum_triangles": 1890
+  },
+  "coverage": {"tolerance": 0.005, "minimum": 0.8},
+  "contact": {
+    "mode": "separate",
+    "clearance": 0.000002,
+    "max_displacement": 0.0001,
+    "max_pairs": 1
+  }
+}
+```
+
+`source_repair` and `reduced_repair` are separate because the two stages work at
+different resolutions; each is checked *before* its native fills or collapses, so
+an out-of-limit stage is refused instead of silently expanded. `contact` is either
+`{"mode": "reject"}` (any rest contact fails) or `{"mode": "separate"}` with a
+finite clearance, a maximum vertex displacement and a maximum pair count, all in
+source units. A separation uses one geometry-derived minimum separating axis, moves
+the smaller face in full and its immediate neighbours at half strength, and is
+refused when the required translation exceeds the bound, an incident face would
+invert or collapse, or any contact remains.
+
+`guide_segments` and every anchor share one declared frame: `source-local-z-up`
+(the extracted object's own coordinates) or `sculpto-display-y-up` (the Y-up OBJ
+frame, display `(x, y, z)` = source `(x, -z, y)`). Missing and unknown fields are
+errors. An aperture is a declared garment landmark: two boundary loops inside one
+radius are ambiguous, and an opening with no loop is reported — never filled. No
+model name, asset path or vertex number is part of the algorithm.
+
+`control-check` writes its report and then fails when the declaration is not met;
+the report's `verdict` combines aperture/topology/winding/bounds qualification
+with coverage. Diagnostics are always written before the failure is reported.
+
+The native adapter runs the whole stage list for one digest-pinned object:
+
+```sh
+blender --background --factory-startup -t 2 --python-exit-code 1 \
+  --python tools/construct_garment_control.py -- recipe.json /new/output-directory
+```
+
+```json
+{
+  "source": "/assets/extracted-parts.blend",
+  "source_sha256": "<SHA256>",
+  "profile": "/assets/profile.json",
+  "profile_sha256": "<SHA256>",
+  "object": "ExtractedGarment",
+  "sculpto": "/build/target/debug/sculpto"
+}
+```
+
+The adapter triangulates the source read-only, writes it for the CLI, applies the
+planned triangle fills, the declared decimation ratio, the planned collapses and
+fills, and re-runs `control-check` on the result. Output contains `high_control.{obj,npz}`,
+`reduced_control.{obj,npz}`, the two plan files, `separation.json`,
+`validation.json`, matched source/control renders and `receipt.json`. NPZ carries
+ordered `vertices` (Nx3, display frame) and `triangles` (Mx3). The exterior plan
+holds the full lineage the review asked for — every selected source face, every
+source vertex per selected vertex, and every removed source face grouped by reason
+— and the adapter records each native stage (file digest, counts), each generated
+patch (operator, edges, faces, orientation flips), and the QEM record (ratio,
+pre/post counts and digests) *without* labelling reduced triangles as original
+faces. The receipt also keeps the source object's matrix, source/profile digests,
+UV and material identities, physical openings, bidirectional deviations, coverage,
+timings and an optional `reference`/`reference_sha256` comparison. `receipt.status` is authoritative: a failed run keeps its
+artifacts for diagnosis and its control is not qualified. The source file,
+materials and UVs are never modified.
+
+Run the focused native regression with:
+
+```sh
+cargo build -p sculpto-cli
+blender --background --factory-startup -t 2 --python-exit-code 1 \
+  --python tools/tests/test_construct_garment_control.py
+```
+
 ## License and provenance
 
 First-party code is [GPL-3.0-only](LICENSE). Third-party source retains its

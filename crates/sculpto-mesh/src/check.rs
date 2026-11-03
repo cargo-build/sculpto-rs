@@ -650,12 +650,36 @@ pub fn intersection_pairs(
     pairs
 }
 
-/// Count physical self contacts; UV seams are adjacent, duplicate faces are not. @req DECL0013
-pub fn self_intersection_pairs(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> usize {
+/// What kind of physical self contact a pair is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessKind {
+    /// Nonadjacent triangles that intersect: a real crossing.
+    Crossing,
+    /// Coincident duplicate faces: zero enclosed volume, never a legal surface.
+    Duplicate,
+}
+
+/// One physical self contact at rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Witness {
+    pub left: usize,
+    pub right: usize,
+    pub kind: WitnessKind,
+}
+
+/// Every physical self contact at rest. The single authority for both the count
+/// and the witness list: `self_intersection_pairs` counts these.
+///
+/// UV seams are adjacent, duplicate faces are not. @req DECL0013
+pub fn self_intersection_witnesses(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> Vec<Witness> {
     if tris.len() < 2 {
-        return 0;
+        return Vec::new();
     }
-    let (positions, tris) = crate::topology::position_topology(positions, tris);
+    let crate::topology::Identical {
+        positions,
+        triangles: tris,
+        ..
+    } = crate::topology::position_topology(positions, tris);
     let face_keys: Vec<_> = tris
         .iter()
         .map(|triangle| {
@@ -666,7 +690,7 @@ pub fn self_intersection_pairs(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> usi
         .collect();
     let tries = triangles(&positions, &tris);
     let bvh = Bvh::build(tries.clone());
-    let mut pairs = 0usize;
+    let mut witnesses = Vec::new();
     for (index, probe) in tries.iter().enumerate() {
         let own = tris[index];
         let mut visit = |candidate: usize| {
@@ -677,17 +701,30 @@ pub fn self_intersection_pairs(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> usi
             let shares_vertex = own.iter().any(|v| other.contains(v));
             if shares_vertex {
                 if face_keys[index] == face_keys[candidate] {
-                    pairs += 1;
+                    witnesses.push(Witness {
+                        left: index,
+                        right: candidate,
+                        kind: WitnessKind::Duplicate,
+                    });
                 }
                 return;
             }
             if triangles_intersect(probe, &tries[candidate]) {
-                pairs += 1;
+                witnesses.push(Witness {
+                    left: index,
+                    right: candidate,
+                    kind: WitnessKind::Crossing,
+                });
             }
         };
         bvh.query(probe, 1e-6, &mut visit);
     }
-    pairs
+    witnesses
+}
+
+/// Count physical self contacts; UV seams are adjacent, duplicate faces are not.
+pub fn self_intersection_pairs(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> usize {
+    self_intersection_witnesses(positions, tris).len()
 }
 
 #[cfg(test)]

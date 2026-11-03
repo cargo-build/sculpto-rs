@@ -5,6 +5,7 @@
 //! same parser the adapters will use.
 
 mod actor;
+mod garment_control;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -41,6 +42,10 @@ commands:
   garment check [options] count garment/body triangle intersections (measured gate)
   garment trim [options]  cut away garment triangles that intersect the body
   garment cover [options] body coverage per height band (<=2/<=8/<=20 units)
+  garment control-exterior [options] keep the outward control surface of a thick shell
+  garment control-repair [options] plan corner-flare and incidental-loop repair
+  garment control-check [options] measure and gate a finished control surface
+  garment control-separate [options] apply the declared bounded local contact repair
   version               print the Sculpto implementation version
   help                  print this help
 
@@ -117,6 +122,30 @@ garment proxies options:
   --out <obj>         proxy polylines OBJ, one loop per body contour
   --slices <n>        body sections (96)
   --bins <n>          angular samples per contour (192)
+
+garment control-exterior options:
+  --source <obj>      thick source shell OBJ (display frame)
+  --profile <json>    control profile: guide, apertures, repair/reduction limits
+  --out <obj>         outward control surface OBJ (display frame)
+  --plan <json>       reconstruction decisions for the host adapter
+
+garment control-repair options:
+  --control <obj>     candidate control OBJ after native decimation
+  --profile <json>    the same control profile
+  --out <obj>         control OBJ after corner-flare pruning
+  --plan <json>       repair actions: collapse or fill each incidental loop
+
+garment control-check options:
+  --control <obj>     finished control OBJ
+  --source <obj>      thick source shell OBJ in the same frame
+  --profile <json>    the same control profile
+  --report <json>     measured topology, apertures, deviations and verdict
+
+garment control-separate options:
+  --control <obj>     finished control OBJ that still contacts itself
+  --profile <json>    the same control profile (contact policy and bounds)
+  --out <obj>         control OBJ after the bounded local separation
+  --report <json>     the chosen axis, moved vertices and bounds actually used
 ";
 
 fn main() -> ExitCode {
@@ -436,7 +465,11 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 }
 
 fn garment(args: &[String]) -> ExitCode {
-    let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj>\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]";
+    let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj>\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+       sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
+       sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
+       sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
+       sculpto garment control-separate --control <obj> --profile <json> --out <obj> --report <json>";
 
     let result = match args {
         [action, rest @ ..] if action == "fit" => garment_fit_inner(rest),
@@ -449,6 +482,14 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "check" => garment_check_inner(rest),
         [action, rest @ ..] if action == "trim" => garment_trim_inner(rest),
         [action, rest @ ..] if action == "cover" => garment_cover_inner(rest),
+        [action, rest @ ..] if action == "control-exterior" => {
+            garment_control::exterior_inner(rest)
+        }
+        [action, rest @ ..] if action == "control-repair" => garment_control::repair_inner(rest),
+        [action, rest @ ..] if action == "control-check" => garment_control::check_inner(rest),
+        [action, rest @ ..] if action == "control-separate" => {
+            garment_control::separate_inner(rest)
+        }
         _ => Err(usage.to_string()),
     };
     match result {

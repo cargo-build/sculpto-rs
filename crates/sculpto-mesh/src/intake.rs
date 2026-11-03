@@ -109,10 +109,9 @@ pub fn audit(
 
     let vertices = garment.len();
     let indexed_components = component_groups(garment, garment_triangles).len();
-    let (topology_positions, topology_triangles) =
-        crate::topology::position_topology(garment, garment_triangles);
-    let garment = topology_positions.as_slice();
-    let garment_triangles = topology_triangles.as_slice();
+    let topology = crate::topology::position_topology(garment, garment_triangles);
+    let garment = topology.positions.as_slice();
+    let garment_triangles = topology.triangles.as_slice();
     let parts = major_components(garment, garment_triangles);
     let component_total = component_groups(garment, garment_triangles).len();
     let referenced: usize = parts.iter().map(|(positions, _)| positions.len()).sum();
@@ -499,8 +498,7 @@ pub fn strip_interior(
     }
     let axis = up_axis(body);
     let (plane_u, plane_v) = plane_axes(axis);
-    let (topology_positions, topology_triangles) =
-        crate::topology::position_topology(garment, garment_triangles);
+    let topology = crate::topology::position_topology(garment, garment_triangles);
     let (gmin, gmax) = extent(garment, axis);
 
     let bands = SAMPLES * 4;
@@ -508,7 +506,7 @@ pub fn strip_interior(
     let band_layouts: Vec<Band> = (0..bands)
         .map(|band| {
             let cut = gmin + span * (band as f32 + 0.5) / bands as f32;
-            let chains = section_groups(&topology_positions, &topology_triangles, axis, cut);
+            let chains = section_groups(&topology.positions, &topology.triangles, axis, cut);
             let interior = interior_flags(&chains);
             Band { chains, interior }
         })
