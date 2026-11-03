@@ -359,7 +359,9 @@ def render_views(source, control, matrix, out_dir, label):
     scene.collection.objects.link(camera)
     scene.camera = camera
     camera.data.type = "ORTHO"
-    camera.data.ortho_scale = 1.3
+    camera.data.ortho_scale = 1.3 * max(
+        1.0, scene.render.resolution_x / scene.render.resolution_y
+    )
     written = []
     for view, position in (("front", (0.0, -3.0, 0.0)), ("side", (3.0, 0.0, 0.0))):
         camera.location = Vector(position)

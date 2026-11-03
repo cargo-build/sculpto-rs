@@ -1,5 +1,15 @@
 //! Characterization of the source-guided exterior rule on synthetic thick shells.
 
+#[test]
+fn a_closed_boundary_perimeter_includes_its_closing_edge() {
+    let positions = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+    let loops = boundary_loops(&positions, &[[0, 1, 2], [0, 2, 3]]);
+    assert_eq!(loops.len(), 1);
+    assert!(loops[0].closed);
+    assert_eq!(loops[0].edges, 4);
+    assert_eq!(loops[0].perimeter, 6.0);
+}
+
 use sculpto_mesh::control::measure::{ControlDiagnostics, CoverageLimits};
 use sculpto_mesh::control::profile::{ControlFrame, ControlProfile};
 use sculpto_mesh::control::{

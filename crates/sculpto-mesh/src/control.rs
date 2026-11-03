@@ -780,22 +780,24 @@ fn finish_loop(positions: &[[f32; 3]], vertices: Vec<u32>, closed: bool) -> Boun
         true => vertices.len(),
         false => vertices.len().saturating_sub(1),
     };
-    let perimeter = vertices
-        .windows(2)
-        .map(|window| {
-            length(subtract(
-                positions[window[1] as usize],
-                positions[window[0] as usize],
-            ))
-        })
-        .sum::<f32>();
-    BoundaryLoop {
+    let mut boundary = BoundaryLoop {
         edges,
         center: sum.map(|value| (value / f64::from(count)) as f32),
         closed,
-        perimeter,
+        perimeter: 0.0,
         vertices,
-    }
+    };
+    boundary.perimeter = boundary
+        .edge_pairs()
+        .into_iter()
+        .map(|edge| {
+            length(subtract(
+                positions[edge[1] as usize],
+                positions[edge[0] as usize],
+            ))
+        })
+        .sum::<f32>();
+    boundary
 }
 
 /// One expected physical opening and the geometry that identifies it.
