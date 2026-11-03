@@ -963,22 +963,27 @@ def recipe_inputs(recipe):
         raise ValueError(f"{profile} digest does not match the recipe")
     if not binary.is_file():
         raise ValueError(f"sculpto binary {binary} does not exist")
+    binary_digest = sha256(binary)
+    if "sculpto_sha256" in recipe and recipe["sculpto_sha256"] != binary_digest:
+        raise ValueError(f"sculpto binary {binary} digest does not match the recipe")
     declared = read_json(profile)
     if declared.get("frame") not in FRAMES:
         raise ValueError(f"profile frame must be one of {FRAMES}")
-    return source, profile, binary, declared
+    return source, profile, binary, declared, binary_digest
 
 
 def main(recipe_path, out_dir):
     started = time.monotonic()
     recipe = read_json(recipe_path)
-    source_path, profile_path, binary, declared = recipe_inputs(recipe)
+    source_path, profile_path, binary, declared, binary_digest = recipe_inputs(recipe)
     output = Path(out_dir)
     if output.exists():
         raise FileExistsError(f"{output} already exists; exclusive output only")
     output.mkdir(parents=True, exist_ok=False)
     receipt = {
         "recipe": str(Path(recipe_path).resolve()),
+        "sculpto": str(binary.resolve()),
+        "sculpto_sha256": binary_digest,
         "surface_policy": declared.get("surface", "guide"),
         "source": str(source_path.resolve()),
         "source_sha256": recipe["source_sha256"],

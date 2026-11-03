@@ -221,6 +221,8 @@ with tempfile.TemporaryDirectory(prefix="sculpto-control-native-") as temporary:
     main(recipe_path, output)
     receipt = json.loads((output / "receipt.json").read_text())
     assert receipt["status"] == "constructed", receipt.get("error")
+    assert receipt["sculpto_sha256"] == sha256(SCULPTO)
+    assert receipt["sculpto"] == str(SCULPTO.resolve())
     assert receipt["exterior"]["exterior_triangles"] == 4 * 10 * 2
     assert receipt["exterior"]["interior_removed"] == 4 * 10 * 2 + 40
     assert [match["role"] for match in receipt["apertures"]] == [
@@ -281,7 +283,9 @@ with tempfile.TemporaryDirectory(prefix="sculpto-control-native-") as temporary:
 
     # 3. Two runs of one recipe produce byte-identical control arrays.
     duplicate = root / "case-duplicate"
-    main(recipe_path, duplicate)
+    pinned_path = root / "pinned-executable-recipe.json"
+    pinned_path.write_text(json.dumps(dict(recipe, sculpto_sha256=sha256(SCULPTO))))
+    main(pinned_path, duplicate)
     assert (duplicate / "reduced_control.npz").read_bytes() == (
         output / "reduced_control.npz"
     ).read_bytes()
@@ -330,6 +334,9 @@ with tempfile.TemporaryDirectory(prefix="sculpto-control-native-") as temporary:
     # 5. A digest mismatch is refused.
     tampered = dict(recipe, profile_sha256="0" * 64)
     expect_failure(root, tampered, "case-digest", "digest does not match")
+    binary_mismatch = dict(recipe, sculpto_sha256="0" * 64)
+    refused = expect_failure(root, binary_mismatch, "case-binary-digest", "binary")
+    assert not refused.exists(), "executable mismatch must precede output creation"
 
     # 6. A wrong aperture anchor keeps the diagnostics and never claims a control.
     shifted_recipe, _ = write_recipe(

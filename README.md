@@ -320,6 +320,10 @@ timings and an optional `reference`/`reference_sha256` comparison. `receipt.stat
 artifacts for diagnosis and its control is not qualified. The source file,
 materials and UVs are never modified.
 
+An optional `sculpto_sha256` in the recipe pins the executable. A mismatch is
+rejected before output creation; the receipt always records the actual
+executable path and digest.
+
 With cuts, `derivative-lineage.json` stores every derivative vertex's known
 source triangle and barycentric coordinates, plus every derivative face's source
 triangle. Indices are zero-based. The adapter reads these relations back and
