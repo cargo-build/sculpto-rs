@@ -680,11 +680,16 @@ pub struct BoundaryLoop {
     pub edges: usize,
     /// Vertices in walk order.
     pub vertices: Vec<u32>,
-    /// Mean position of the loop's vertices.
+    /// Edge-length-weighted midpoint of the boundary curve.
+    ///
+    /// This is the centroid of the drawn boundary, so splitting an edge into collinear
+    /// pieces cannot move it: two tessellations of the same opening agree, which is what
+    /// aperture matching compares against a declared anchor. A loop whose every edge has
+    /// zero length is a single point, and that position is its center. @req DECL0013
     pub center: [f32; 3],
     /// Whether the walk returned to its first vertex.
     pub closed: bool,
-    /// Summed boundary edge length.
+    /// Summed boundary edge length, accumulated in f64.
     pub perimeter: f32,
 }
 
@@ -774,37 +779,66 @@ pub fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Bou
     loops
 }
 
-fn finish_loop(positions: &[[f32; 3]], vertices: Vec<u32>, closed: bool) -> BoundaryLoop {
-    let count = vertices.len().max(1) as f32;
-    let mut sum = [0.0f64; 3];
-    for vertex in &vertices {
-        let point = positions[*vertex as usize];
-        sum[0] += f64::from(point[0]);
-        sum[1] += f64::from(point[1]);
-        sum[2] += f64::from(point[2]);
+/// Length-weighted midpoint of one walked boundary curve plus its length.
+///
+/// The midpoint rule for the curve centroid: the result depends on the drawn boundary,
+/// not on how it was tessellated, so two tessellations of the same opening agree. Every
+/// edge is visited exactly once through the walk order; zero-length edges carry no curve
+/// and are skipped exactly. Accumulated in f64 and converted once, because an f32 sum of
+/// thousands of edges loses the differences an aperture radius is asked to resolve.
+/// A connected walk whose every edge has zero length is one point, and that point is the
+/// center. @req DECL0013
+pub(crate) fn curve_center(
+    positions: &[[f32; 3]],
+    vertices: &[u32],
+    closed: bool,
+) -> ([f32; 3], f32) {
+    let mut pairs = vertices
+        .windows(2)
+        .map(|window| [window[0], window[1]])
+        .collect::<Vec<_>>();
+    if closed && let (Some(first), Some(last)) = (vertices.first(), vertices.last()) {
+        pairs.push([*last, *first]);
     }
+    let mut weight = 0.0f64;
+    let mut sum = [0.0f64; 3];
+    for [first, second] in pairs {
+        let left = positions[first as usize];
+        let right = positions[second as usize];
+        let edge_length = f64::from(length(subtract(right, left)));
+        if edge_length == 0.0 {
+            continue;
+        }
+        weight += edge_length;
+        for (axis, slot) in sum.iter_mut().enumerate() {
+            *slot += 0.5 * (f64::from(left[axis]) + f64::from(right[axis])) * edge_length;
+        }
+    }
+    let center = match weight > 0.0 {
+        true => sum.map(|value| (value / weight) as f32),
+        false => {
+            let first = *vertices
+                .first()
+                .expect("a walked boundary loop holds at least one vertex");
+            positions[first as usize]
+        }
+    };
+    (center, weight as f32)
+}
+
+fn finish_loop(positions: &[[f32; 3]], vertices: Vec<u32>, closed: bool) -> BoundaryLoop {
     let edges = match closed {
         true => vertices.len(),
         false => vertices.len().saturating_sub(1),
     };
-    let mut boundary = BoundaryLoop {
+    let (center, perimeter) = curve_center(positions, &vertices, closed);
+    BoundaryLoop {
         edges,
-        center: sum.map(|value| (value / f64::from(count)) as f32),
+        center,
         closed,
-        perimeter: 0.0,
+        perimeter,
         vertices,
-    };
-    boundary.perimeter = boundary
-        .edge_pairs()
-        .into_iter()
-        .map(|edge| {
-            length(subtract(
-                positions[edge[1] as usize],
-                positions[edge[0] as usize],
-            ))
-        })
-        .sum::<f32>();
-    boundary
+    }
 }
 
 /// One expected physical opening and the geometry that identifies it.
@@ -1185,6 +1219,62 @@ pub struct Removal {
     pub reason: RemovalReason,
 }
 
+/// How a profile turns the identified source shell into the control surface.
+///
+/// A thick sheet is reconstructed from its outward faces only. A capped solid is
+/// reconstructed from its whole identified boundary, whose declared cuts are the
+/// openings: its concave folds are real surface, not lining. The choice is profile
+/// data and is never inferred from a name or switched after a failure. @req DECL0013
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfacePolicy {
+    /// Keep the faces that point away from the guide.
+    Guide,
+    /// Keep the whole identified boundary; declared cuts carry the openings.
+    Boundary,
+}
+
+impl SurfacePolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Guide => "guide",
+            Self::Boundary => "boundary",
+        }
+    }
+}
+
+/// Which half-space a source cut keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainSide {
+    /// Keep geometry on the positive side of the plane normal.
+    Positive,
+    /// Keep geometry on the negative side of the plane normal.
+    Negative,
+}
+
+impl RetainSide {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::Negative => "negative",
+        }
+    }
+}
+
+/// One explicit source-opening cut: a plane and the side that survives.
+///
+/// A capped solid sculpt has no passages; a declared half-plane cut removes the cap
+/// and leaves a real opening. The plane is validated in the shared core before the
+/// host mutates anything, and its normal is unit length. @req DECL0013
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlCut {
+    pub label: String,
+    /// Plane point in the mesh frame.
+    pub point: [f32; 3],
+    /// Unit plane normal in the mesh frame.
+    pub normal: [f32; 3],
+    pub retain: RetainSide,
+}
+
 /// What reconstruction removed, by stage.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Composition {
@@ -1201,13 +1291,14 @@ pub struct Composition {
 
 /// Classify the source shell's outward triangles without any other decision.
 ///
-/// Returns the identified surface and the indices (into [`SourceSurface::triangles`])
-/// that face away from the guide, so a caller can measure source coverage in the
-/// same frame. @req DECL0013
-pub fn source_exterior(
+/// Returns the identified surface and the kept triangle indices (into
+/// [`SourceSurface::triangles`]) for the declared [`SurfacePolicy`], so coverage and
+/// construction measure the same source surface. @req DECL0013
+pub fn source_surface(
     positions: &[[f32; 3]],
     triangles: &[[u32; 3]],
     guide: &Guide,
+    policy: SurfacePolicy,
 ) -> Result<(SourceSurface, Vec<u32>), ControlError> {
     let surface = SourceSurface::identify(positions, triangles)?;
     let degenerate = surface
@@ -1217,6 +1308,11 @@ pub fn source_exterior(
     let candidates = (0..surface.triangles.len() as u32)
         .filter(|index| !degenerate.contains(index))
         .collect::<Vec<_>>();
+    if policy == SurfacePolicy::Boundary {
+        // The identified shell is already the surface: its folds are geometry, and
+        // only the declared cuts (and the shared topology checks) may remove faces.
+        return Ok((surface, candidates));
+    }
     let candidate_triangles = candidates
         .iter()
         .map(|index| surface.triangles[*index as usize])
@@ -1260,7 +1356,8 @@ pub fn exterior_control(
     triangles: &[[u32; 3]],
     profile: &ControlProfile,
 ) -> Result<ExteriorOutcome, ControlError> {
-    let (surface, kept_indices) = source_exterior(positions, triangles, &profile.guide)?;
+    let (surface, kept_indices) =
+        source_surface(positions, triangles, &profile.guide, profile.surface)?;
     let degenerate = surface
         .welded_degenerate()
         .into_iter()
@@ -1512,5 +1609,96 @@ fn union(parent: &mut [usize], left: usize, right: usize) {
     let right = find(parent, right);
     if left != right {
         parent[left.max(right)] = left.min(right);
+    }
+}
+
+#[cfg(test)]
+mod curve_center_tests {
+    use super::{curve_center, finish_loop};
+
+    /// The same geometry as a closed square, optionally nonuniformly subdivided.
+    fn subdivided_square(subdivision: &[(u32, f32)]) -> (Vec<[f32; 3]>, Vec<u32>) {
+        let mut positions = vec![
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let mut outline = vec![0u32, 1, 2, 3];
+        if !subdivision.is_empty() {
+            let mut bottom = vec![0u32];
+            for (index, x) in subdivision {
+                let vertex = positions.len() as u32;
+                positions.push([*x, 0.0, 0.0]);
+                assert_eq!(vertex, *index);
+                bottom.push(vertex);
+            }
+            bottom.push(1);
+            outline = bottom.into_iter().chain([2u32, 3]).collect();
+        }
+        (positions, outline)
+    }
+
+    #[test]
+    fn a_closed_curve_center_ignores_how_its_edges_are_split() {
+        let (coarse_positions, coarse_outline) = subdivided_square(&[]);
+        let (fine_positions, fine_outline) = subdivided_square(&[(4, 0.5), (5, 1.7)]);
+        let coarse = finish_loop(&coarse_positions, coarse_outline, true);
+        let fine = finish_loop(&fine_positions, fine_outline, true);
+        assert_eq!(coarse.vertices.len(), 4);
+        assert_eq!(fine.vertices.len(), 6);
+        assert_eq!(coarse.perimeter, fine.perimeter);
+        assert_eq!(coarse.center, fine.center);
+        assert_eq!(coarse.center, [1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn an_open_chain_walks_every_edge_once_and_centers_on_its_own_curve() {
+        // An L-shaped open chain: two edges of different lengths, no closing edge.
+        let coarse_positions = vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 0.0]];
+        let coarse = finish_loop(&coarse_positions, vec![0, 1, 2], false);
+        assert_eq!(coarse.edges, 2);
+        assert_eq!(coarse.edge_pairs().len(), 2);
+        assert_eq!(coarse.perimeter, 3.0);
+        // Each edge contributes its midpoint once: ((1,0)*2 + (2,0.5)*1) / 3.
+        assert_eq!(coarse.center, [4.0 / 3.0, 1.0 / 6.0, 0.0]);
+
+        // The same drawn curve with the long edge split nonuniformly.
+        let fine_positions = vec![
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ];
+        let fine = finish_loop(&fine_positions, vec![0, 1, 2, 3], false);
+        assert_eq!(fine.edges, 3);
+        assert_eq!(fine.edge_pairs().len(), 3);
+        assert_eq!(fine.perimeter, coarse.perimeter);
+        assert_eq!(fine.center, coarse.center);
+
+        // Closing the chain is a different curve, so the centroid must move.
+        let closed = finish_loop(&coarse_positions, vec![0, 1, 2], true);
+        assert_eq!(closed.edges, 3);
+        assert_ne!(closed.center, coarse.center);
+    }
+
+    #[test]
+    fn curve_centers_remain_finite_across_coordinate_scales() {
+        [1e-30f32, 1e30f32].into_iter().for_each(|scale| {
+            let positions = [[0.0, 0.0, 0.0], [scale, 0.0, 0.0]];
+            let (center, perimeter) = curve_center(&positions, &[0, 1], false);
+            assert!(center.iter().all(|value| value.is_finite()), "{scale}");
+            assert_eq!(center, [scale / 2.0, 0.0, 0.0], "{scale}");
+            assert_eq!(perimeter, scale, "{scale}");
+        });
+    }
+
+    #[test]
+    fn a_zero_length_curve_reports_its_shared_point() {
+        let positions = vec![[0.25, 0.5, 0.75]; 3];
+        let center = curve_center(&positions, &[0, 1, 2], true);
+        assert_eq!(center, ([0.25, 0.5, 0.75], 0.0));
+        let open = curve_center(&positions, &[0, 1], false);
+        assert_eq!(open, ([0.25, 0.5, 0.75], 0.0));
     }
 }

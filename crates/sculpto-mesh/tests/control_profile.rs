@@ -1,7 +1,7 @@
 //! The control profile is data: it validates, converts frames and rejects typos.
 
 use sculpto_mesh::control::profile::ControlProfile;
-use sculpto_mesh::control::{ContactMode, ControlError, ControlFrame, GuideSegment};
+use sculpto_mesh::control::{ContactMode, ControlError, ControlFrame, GuideSegment, RetainSide};
 
 const VALID: &str = r#"{
   "frame": "source-local-z-up",
@@ -235,4 +235,205 @@ fn a_non_numeric_value_is_not_coerced() {
         malformed,
         Err(ControlError::InvalidProfile { field, .. }) if field == "document"
     ));
+}
+
+const CUTS: &str = r#"[
+    {"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 2.0], "retain": "negative"},
+    {"label": "left-cuff", "plane_point": [0.0, 0.0, 0.4], "normal": [0.0, 0.0, -1.0], "retain": "positive"}
+  ]"#;
+
+/// `VALID` with an optional `source_cuts` member appended.
+fn with_cuts(cuts: &str) -> String {
+    let body = VALID.trim_end().strip_suffix('}').unwrap();
+    format!("{body},\n  \"source_cuts\": {cuts}\n}}")
+}
+
+#[test]
+fn source_cuts_are_optional_and_absence_is_no_operation() {
+    assert!(profile(VALID).unwrap().source_cuts.is_empty());
+    assert!(profile(&with_cuts("[]")).unwrap().source_cuts.is_empty());
+}
+
+#[test]
+fn declared_source_cuts_keep_their_fields_and_unit_normal() {
+    let declared = profile(&with_cuts(CUTS)).unwrap();
+    assert_eq!(declared.source_cuts.len(), 2);
+    assert_eq!(declared.source_cuts[0].label, "waist");
+    assert_eq!(declared.source_cuts[0].point, [0.0, 0.0, 0.6]);
+    assert_eq!(declared.source_cuts[0].normal, [0.0, 0.0, 1.0]);
+    assert_eq!(declared.source_cuts[0].retain, RetainSide::Negative);
+    assert_eq!(declared.source_cuts[1].label, "left-cuff");
+    assert_eq!(declared.source_cuts[1].normal, [0.0, 0.0, -1.0]);
+    assert_eq!(declared.source_cuts[1].retain, RetainSide::Positive);
+}
+
+#[test]
+fn a_cut_plane_follows_the_declared_frame() {
+    // Display `(x, y, z)` is source `(x, -z, y)`, so this display cut is the same
+    // source plane as the `waist` entry above.
+    let display = with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.6, 0.0], "normal": [0.0, 4.0, 0.0], "retain": "negative"}]"#,
+    )
+    .replace("source-local-z-up", "sculpto-display-y-up");
+    let cut = profile(&display).unwrap().source_cuts.remove(0);
+    assert_eq!(cut.point, [0.0, 0.0, 0.6]);
+    assert_eq!(cut.normal, [0.0, 0.0, 1.0]);
+}
+
+#[test]
+fn a_malformed_source_cut_is_named_not_defaulted() {
+    let missing = profile(&with_cuts(
+        r#"[{"label": "waist", "normal": [0.0, 0.0, 1.0], "retain": "negative"}]"#,
+    ));
+    assert_eq!(
+        missing,
+        Err(ControlError::InvalidProfile {
+            field: "source_cuts[0]".to_string(),
+            reason: "missing `plane_point`".to_string(),
+        })
+    );
+    let unknown = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 1.0], "retain": "negative", "side": "keep"}]"#,
+    ));
+    assert_eq!(
+        unknown,
+        Err(ControlError::InvalidProfile {
+            field: "source_cuts[0]".to_string(),
+            reason: "unknown `side`".to_string(),
+        })
+    );
+    let short_point = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.6], "normal": [0.0, 0.0, 1.0], "retain": "negative"}]"#,
+    ));
+    let error = short_point.unwrap_err();
+    assert!(
+        error.to_string().contains("source_cuts[0].plane_point"),
+        "{error}"
+    );
+    let not_numbers = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, "0.6"], "normal": [0.0, 0.0, 1.0], "retain": "negative"}]"#,
+    ));
+    let error = not_numbers.unwrap_err();
+    assert!(
+        error.to_string().contains("source_cuts[0].plane_point[2]"),
+        "{error}"
+    );
+    let not_an_array = profile(&with_cuts("{}"));
+    assert_eq!(
+        not_an_array,
+        Err(ControlError::InvalidProfile {
+            field: "source_cuts".to_string(),
+            reason: "expected an array of cut objects".to_string(),
+        })
+    );
+}
+
+#[test]
+fn a_cut_without_a_usable_plane_normal_or_side_is_refused() {
+    let zero = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 0.0], "retain": "negative"}]"#,
+    ));
+    let error = zero.unwrap_err();
+    assert!(
+        error.to_string().contains("source_cuts[0].normal"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("nonzero finite normal"),
+        "{error}"
+    );
+    // A tiny but representable direction is a direction: 1e-45 is the smallest
+    // positive f32 value, and the f64 norm keeps it non-zero.
+    let subnormal = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [1e-45, 0.0, 0.0], "retain": "negative"}]"#,
+    ))
+    .unwrap();
+    assert_eq!(subnormal.source_cuts[0].normal, [1.0, 0.0, 0.0]);
+    let infinite = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [1e39, 0.0, 0.0], "retain": "negative"}]"#,
+    ));
+    let error = infinite.unwrap_err();
+    assert!(
+        error.to_string().contains("source_cuts[0].normal[0]"),
+        "{error}"
+    );
+    let side = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 1.0], "retain": "both"}]"#,
+    ));
+    let error = side.unwrap_err();
+    assert!(
+        error.to_string().contains("source_cuts[0].retain"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("positive or negative"),
+        "{error}"
+    );
+    let blank = profile(&with_cuts(
+        r#"[{"label": "  ", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 1.0], "retain": "negative"}]"#,
+    ));
+    assert!(
+        blank
+            .unwrap_err()
+            .to_string()
+            .contains("expected a non-blank label")
+    );
+    let duplicate = profile(&with_cuts(
+        r#"[{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 1.0], "retain": "negative"},
+            {"label": "waist", "plane_point": [0.0, 0.0, 0.4], "normal": [0.0, 0.0, -1.0], "retain": "positive"}]"#,
+    ));
+    assert!(
+        duplicate
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate cut label `waist`")
+    );
+}
+
+#[test]
+fn equivalent_normals_normalize_across_the_f32_range() {
+    // Three magnitudes, three axes: only the direction may survive.
+    for (declared, expected) in [
+        ("[1e-45, 0.0, 0.0]", [1.0, 0.0, 0.0]),
+        ("[1.0, 0.0, 0.0]", [1.0, 0.0, 0.0]),
+        ("[1e38, 0.0, 0.0]", [1.0, 0.0, 0.0]),
+        ("[0.0, 1e-30, 0.0]", [0.0, 1.0, 0.0]),
+        ("[0.0, 0.0, 3.0]", [0.0, 0.0, 1.0]),
+        ("[0.0, 0.0, -1e30]", [0.0, 0.0, -1.0]),
+        ("[1e-20, 1e-20, 0.0]", [0.70710677, 0.70710677, 0.0]),
+    ] {
+        let cut = with_cuts(&format!(
+            r#"[{{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": {declared}, "retain": "negative"}}]"#
+        ));
+        let declared = profile(&cut).unwrap().source_cuts.remove(0);
+        assert_eq!(
+            declared.normal, expected,
+            "magnitude must not change the normalized direction ({declared:?})"
+        );
+    }
+    // Only a truly zero or non-finite direction is left to refuse.
+    for declared in ["[0.0, 0.0, 0.0]", "[1e39, 0.0, 0.0]"] {
+        let cut = with_cuts(&format!(
+            r#"[{{"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": {declared}, "retain": "negative"}}]"#
+        ));
+        let error = profile(&cut).unwrap_err().to_string();
+        assert!(
+            error.contains("nonzero finite normal") || error.contains("must be finite"),
+            "{declared}: {error}"
+        );
+    }
+}
+
+#[test]
+fn cut_directions_convert_like_points_without_translation() {
+    let display = profile(&display_frame(VALID)).unwrap();
+    assert_eq!(display.frame.to_mesh([1.0, 2.0, 3.0]), [1.0, -3.0, 2.0]);
+    assert_eq!(
+        display.frame.to_mesh_direction([1.0, 2.0, 3.0]),
+        [1.0, -3.0, 2.0]
+    );
+    assert_eq!(
+        ControlFrame::SourceLocalZUp.to_mesh_direction([0.0, 0.0, -1.0]),
+        [0.0, 0.0, -1.0]
+    );
 }

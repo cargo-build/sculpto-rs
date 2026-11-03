@@ -12,7 +12,7 @@ use sculpto_mesh::control::measure::{ControlDiagnostics, Deviation, Deviations};
 use sculpto_mesh::control::profile::ControlProfile;
 use sculpto_mesh::control::{
     ApertureResolution, BoundaryLoop, ControlError, ExteriorOutcome, Qualification, RemovalReason,
-    RepairAction, RepairOutcome, exterior_control, repair_control, source_exterior,
+    RepairAction, RepairOutcome, exterior_control, repair_control, source_surface,
 };
 use serde_json::{Value, json};
 
@@ -149,6 +149,50 @@ pub fn separate_inner(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Validate the profile's declared source cuts and print the host plan.
+///
+/// The host must obtain this plan before it mutates any source derivative: the
+/// shared core validates labels, frame, finite plane values and the retained side.
+pub fn cuts_inner(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let profile_path = PathBuf::from(required(&flags, "profile")?);
+    let report_path = PathBuf::from(required(&flags, "report")?);
+    let profile = profile(&profile_path)?;
+    let cuts = profile
+        .source_cuts
+        .iter()
+        .map(|cut| {
+            json!({
+                "label": cut.label,
+                "plane_point": cut.point,
+                "normal": cut.normal,
+                "retain": cut.retain.name(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let plan = json!({
+        // The emitted planes are already converted; the declared profile frame is kept
+        // beside them so a reader never mistakes one for the other.
+        "plane_frame": "source-local-z-up",
+        "declared_frame": profile.frame.name(),
+        "cuts": cuts,
+        "note": "plane_point/normal are in plane_frame; declared_frame is the profile frame they were written in. The host applies the plane_frame values to a private derivative and leaves openings unfilled",
+    });
+    write_json(&report_path, &plan)?;
+    println!(
+        "{}: {} declared source cut(s) ({})",
+        report_path.display(),
+        profile.source_cuts.len(),
+        profile
+            .source_cuts
+            .iter()
+            .map(|cut| format!("{}:{}", cut.label, cut.retain.name()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
 /// Measure a finished control, resolve its apertures and gate it.
 pub fn check_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
@@ -165,7 +209,7 @@ pub fn check_inner(args: &[String]) -> Result<(), String> {
     let measured = ControlDiagnostics::measure(&control, &control_triangles);
     let diagnostics = measured.as_ref().ok();
     let qualification = diagnostics.map(|diagnostics| diagnostics.qualify(&profile));
-    let exterior = source_exterior(&source, &source_triangles, &profile.guide);
+    let exterior = source_surface(&source, &source_triangles, &profile.guide, profile.surface);
     let deviations = exterior.as_ref().ok().map(|(surface, kept)| {
         sculpto_mesh::control::measure::deviations(
             surface,

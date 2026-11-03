@@ -768,3 +768,74 @@ fn a_reversed_face_is_rejected_by_the_cli() {
     );
     fs::remove_dir_all(&directory).unwrap();
 }
+
+#[test]
+fn declared_and_plane_frames_report_the_same_planes() {
+    let directory = directory();
+    let shell = shell([0.0, 0.0, 0.0], 1.0);
+    let base = profile_json(&shell, 1.0);
+    let source_cut = r#""source_cuts": [
+    {"label": "top", "plane_point": [0.0, 0.0, 0.25], "normal": [0.0, 0.0, 1.0], "retain": "negative"}
+  ],
+  "#;
+    // Display `(x, y, z)` is source `(x, -z, y)`: this is the same plane as the source
+    // frame one, written in the other declared frame.
+    let display_cut = r#""source_cuts": [
+    {"label": "top", "plane_point": [0.0, 0.25, 0.0], "normal": [0.0, 1.0, 0.0], "retain": "negative"}
+  ],
+  "#;
+    let source_profile = directory.join("source-frame.json");
+    let display_profile = directory.join("display-frame.json");
+    let source_report = directory.join("source-frame-report.json");
+    let display_report = directory.join("display-frame-report.json");
+    fs::write(
+        &source_profile,
+        base.replace(
+            "\"source_repair\"",
+            &format!("{source_cut}\"source_repair\""),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &display_profile,
+        base.replace(
+            "\"source_repair\"",
+            &format!("{display_cut}\"source_repair\""),
+        )
+        .replace(
+            "\"frame\": \"source-local-z-up\"",
+            "\"frame\": \"sculpto-display-y-up\"",
+        ),
+    )
+    .unwrap();
+
+    for (profile, report) in [
+        (&source_profile, &source_report),
+        (&display_profile, &display_report),
+    ] {
+        let output = run(&[
+            "garment",
+            "control-cuts",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let source = read_json(&source_report);
+    let display = read_json(&display_report);
+    // The planes are always emitted in the mesh frame, whatever was declared.
+    assert_eq!(source["plane_frame"], "source-local-z-up");
+    assert_eq!(display["plane_frame"], "source-local-z-up");
+    assert_eq!(source["declared_frame"], "source-local-z-up");
+    assert_eq!(display["declared_frame"], "sculpto-display-y-up");
+    assert_eq!(
+        source["cuts"], display["cuts"],
+        "the same plane declared in two frames must emit identical mesh-frame planes"
+    );
+}

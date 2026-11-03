@@ -11,8 +11,8 @@ use serde_json::{Map, Value};
 use super::contact::{ContactMode, ContactPolicy};
 use super::measure::CoverageLimits;
 use super::{
-    ApertureSpec, ControlError, Guide, GuideSegment, ReductionLimits, RepairLimits,
-    validate_apertures,
+    ApertureSpec, ControlCut, ControlError, Guide, GuideSegment, ReductionLimits, RepairLimits,
+    RetainSide, SurfacePolicy, validate_apertures,
 };
 
 const FIELDS: &[&str] = &[
@@ -24,6 +24,8 @@ const FIELDS: &[&str] = &[
     "reduction",
     "coverage",
     "contact",
+    "source_cuts",
+    "surface",
 ];
 const REPAIR_FIELDS: &[&str] = &[
     "max_incidental_loops",
@@ -35,6 +37,7 @@ const REDUCTION_FIELDS: &[&str] = &["target_triangles", "minimum_triangles", "ma
 const COVERAGE_FIELDS: &[&str] = &["tolerance", "minimum"];
 const APERTURE_FIELDS: &[&str] = &["role", "anchor", "radius"];
 const CONTACT_FIELDS: &[&str] = &["mode", "clearance", "max_displacement", "max_pairs"];
+const CUT_FIELDS: &[&str] = &["label", "plane_point", "normal", "retain"];
 
 /// The frame the profile's guide and aperture anchors are written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +60,16 @@ impl ControlFrame {
     pub fn to_mesh(&self, point: [f32; 3]) -> [f32; 3] {
         match self {
             Self::SourceLocalZUp => point,
-            Self::SculptoDisplayYUp => [point[0], -point[2], point[1]],
+            Self::SculptoDisplayYUp => [point[0], -point[2], point[1]].map(signed_zero),
+        }
+    }
+
+    /// Convert a declared direction; the frame conversion is a rotation, so no
+    /// translation applies and the normal stays unit length after normalization.
+    pub fn to_mesh_direction(&self, direction: [f32; 3]) -> [f32; 3] {
+        match self {
+            Self::SourceLocalZUp => direction,
+            Self::SculptoDisplayYUp => [direction[0], -direction[2], direction[1]].map(signed_zero),
         }
     }
 
@@ -81,6 +93,8 @@ impl ControlFrame {
 pub struct ControlProfile {
     pub frame: ControlFrame,
     pub guide: Guide,
+    /// Which source faces become the control surface; absent means `guide`.
+    pub surface: SurfacePolicy,
     pub apertures: Vec<ApertureSpec>,
     /// Limits on the source-resolution stage, checked before its native fills.
     pub source_repair: RepairLimits,
@@ -89,10 +103,16 @@ pub struct ControlProfile {
     pub reduction: ReductionLimits,
     pub coverage: CoverageLimits,
     pub contact: ContactPolicy,
+    /// Explicit source-opening cuts; empty means the source keeps its closed shell.
+    pub source_cuts: Vec<ControlCut>,
 }
 
 impl ControlProfile {
-    /// Parse and validate a profile; nothing is defaulted.
+    /// Parse and validate a profile.
+    ///
+    /// Every required member must be present; only `source_cuts` (no cut is declared,
+    /// so no derivative is built) and `surface` (the published guide route) have a
+    /// documented absence. @req DECL0013
     pub fn from_json(bytes: &[u8]) -> Result<Self, ControlError> {
         let text = std::str::from_utf8(bytes).map_err(|error| ControlError::InvalidProfile {
             field: "document".to_string(),
@@ -120,17 +140,128 @@ impl ControlProfile {
         let reduction = reduction(require(object, "reduction", "document")?)?;
         let coverage = coverage(require(object, "coverage", "document")?)?;
         let contact = contact(require(object, "contact", "document")?)?;
+        let surface = match object.get("surface") {
+            Some(value) => surface_policy(value)?,
+            None => SurfacePolicy::Guide,
+        };
+        let source_cuts = match object.get("source_cuts") {
+            Some(value) => source_cuts(value, &frame)?,
+            None => Vec::new(),
+        };
         Ok(Self {
             frame,
             guide,
+            surface,
             apertures,
             source_repair,
             reduced_repair,
             reduction,
             coverage,
             contact,
+            source_cuts,
         })
     }
+}
+
+/// `-0.0` and `0.0` are the same coordinate; one spelling keeps a converted plane
+/// identical to its twin in another declared frame.
+fn signed_zero(value: f32) -> f32 {
+    match value == 0.0 {
+        true => 0.0,
+        false => value,
+    }
+}
+
+/// Parse the declared surface policy; only the two named routes exist.
+fn surface_policy(value: &Value) -> Result<SurfacePolicy, ControlError> {
+    let name = string(value, "surface")?;
+    match name {
+        "guide" => Ok(SurfacePolicy::Guide),
+        "boundary" => Ok(SurfacePolicy::Boundary),
+        other => Err(ControlError::InvalidProfile {
+            field: "surface".to_string(),
+            reason: format!(
+                "`{other}` is not a declared surface policy; expected guide or boundary"
+            ),
+        }),
+    }
+}
+
+/// Parse and validate the optional source-opening cuts.
+fn source_cuts(value: &Value, frame: &ControlFrame) -> Result<Vec<ControlCut>, ControlError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| ControlError::InvalidProfile {
+            field: "source_cuts".to_string(),
+            reason: "expected an array of cut objects".to_string(),
+        })?;
+    let mut labels = std::collections::HashSet::new();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let field = format!("source_cuts[{index}]");
+            let object = object(entry, &field)?;
+            only(object, CUT_FIELDS, &field)?;
+            let label =
+                string(require(object, "label", &field)?, &format!("{field}.label"))?.to_string();
+            if label.trim().is_empty() {
+                return Err(ControlError::InvalidProfile {
+                    field: format!("{field}.label"),
+                    reason: "expected a non-blank label".to_string(),
+                });
+            }
+            if !labels.insert(label.clone()) {
+                return Err(ControlError::InvalidProfile {
+                    field: format!("{field}.label"),
+                    reason: format!("duplicate cut label `{label}`"),
+                });
+            }
+            let plane_point = frame.to_mesh(point(
+                require(object, "plane_point", &field)?,
+                &format!("{field}.plane_point"),
+            )?);
+            let raw_normal = frame.to_mesh_direction(point(
+                require(object, "normal", &field)?,
+                &format!("{field}.normal"),
+            )?);
+            let length = (f64::from(raw_normal[0]).powi(2)
+                + f64::from(raw_normal[1]).powi(2)
+                + f64::from(raw_normal[2]).powi(2))
+            .sqrt();
+            // The norm is taken in f64, so any finite non-zero f32 direction has a
+            // representable non-zero length: the smallest subnormal squared is ~2e-90.
+            if !length.is_finite() || length == 0.0 {
+                return Err(ControlError::InvalidProfile {
+                    field: format!("{field}.normal"),
+                    reason: "expected a nonzero finite normal".to_string(),
+                });
+            }
+            let normal =
+                raw_normal.map(|component| signed_zero((f64::from(component) / length) as f32));
+            let retain = match string(
+                require(object, "retain", &field)?,
+                &format!("{field}.retain"),
+            )? {
+                "positive" => RetainSide::Positive,
+                "negative" => RetainSide::Negative,
+                other => {
+                    return Err(ControlError::InvalidProfile {
+                        field: format!("{field}.retain"),
+                        reason: format!(
+                            "`{other}` is not a declared side; expected positive or negative"
+                        ),
+                    });
+                }
+            };
+            Ok(ControlCut {
+                label,
+                point: plane_point,
+                normal,
+                retain,
+            })
+        })
+        .collect()
 }
 
 fn guide(value: &Value, frame: &ControlFrame) -> Result<Guide, ControlError> {

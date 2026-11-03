@@ -19,9 +19,9 @@ use sculpto_mesh::control::measure::{ControlDiagnostics, CoverageLimits};
 use sculpto_mesh::control::profile::{ControlFrame, ControlProfile};
 use sculpto_mesh::control::{
     ApertureResolution, ApertureSpec, BoundaryLoop, ClosureKind, ContactMode, ContactPolicy,
-    ControlError, Guide, GuideSegment, ReductionLimits, RepairAction, RepairLimits, boundary_loops,
-    exterior_control, largest_component, non_manifold_tips, repair_actions, repair_control,
-    resolve_apertures,
+    ControlError, Guide, GuideSegment, ReductionLimits, RepairAction, RepairLimits, SurfacePolicy,
+    boundary_loops, exterior_control, largest_component, non_manifold_tips, repair_actions,
+    repair_control, resolve_apertures, source_surface,
 };
 
 /// A closed thick shell plus the counts its construction is made of.
@@ -271,6 +271,8 @@ fn profile(shell: &Shell) -> ControlProfile {
             max_displacement: 1e-3,
             max_pairs: 1,
         },
+        source_cuts: Vec::new(),
+        surface: SurfacePolicy::Guide,
     }
 }
 
@@ -589,6 +591,8 @@ fn a_centroid_on_the_guide_has_no_outward_side() {
             max_displacement: 1e-3,
             max_pairs: 1,
         },
+        source_cuts: Vec::new(),
+        surface: SurfacePolicy::Guide,
     };
     assert_eq!(
         exterior_control(&positions, &[[0, 1, 2]], &profile),
@@ -874,4 +878,296 @@ fn a_closure_loop_straddling_an_existing_edge_uses_a_boundary_patch() {
             other => panic!("expected one fill, got {other:?}"),
         }
     }
+}
+
+/// A closed unit box: eight corners, twelve outward triangles.
+fn box_shell() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let corners = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0],
+    ];
+    let triangles = vec![
+        [0, 3, 2],
+        [0, 2, 1],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 3, 7],
+        [2, 7, 6],
+        [1, 2, 6],
+        [1, 6, 5],
+        [0, 4, 7],
+        [0, 7, 3],
+    ];
+    (corners.to_vec(), triangles)
+}
+
+#[test]
+fn a_boundary_policy_keeps_the_identified_shell_that_the_guide_drops() {
+    let (positions, triangles) = box_shell();
+    let guide = Guide::new([GuideSegment {
+        start: [0.5, 0.5, -1.0],
+        end: [0.5, 0.5, 2.0],
+    }])
+    .unwrap();
+    let (_, guided) = source_surface(&positions, &triangles, &guide, SurfacePolicy::Guide).unwrap();
+    let (_, retained) =
+        source_surface(&positions, &triangles, &guide, SurfacePolicy::Boundary).unwrap();
+    // The guide route drops both end caps; the boundary route keeps the whole shell.
+    assert_eq!(
+        guided.len(),
+        8,
+        "the four side walls survive the guide route"
+    );
+    assert_eq!(retained, (0..12).collect::<Vec<u32>>());
+    // Both routes identify one welded surface with no degeneracy.
+    let (surface, _) =
+        source_surface(&positions, &triangles, &guide, SurfacePolicy::Boundary).unwrap();
+    assert_eq!(surface.positions().len(), 8);
+    assert_eq!(surface.coincident_vertices(), 0);
+}
+
+#[test]
+fn a_retained_boundary_without_cuts_is_refused_at_the_opening_gate() {
+    let (positions, triangles) = box_shell();
+    let mut profile = profile_for_box();
+    profile.surface = SurfacePolicy::Boundary;
+    // The whole shell is kept, so no aperture can bind: a closed solid is not a
+    // control surface until its declared cuts exist.
+    assert_eq!(
+        exterior_control(&positions, &triangles, &profile),
+        Err(ControlError::UnknownAperture {
+            role: "waist".to_string(),
+            radius: 0.1,
+        })
+    );
+    profile.surface = SurfacePolicy::Guide;
+    let guided = exterior_control(&positions, &triangles, &profile).unwrap();
+    assert_eq!(guided.composition.interior_removed, 4);
+    assert_eq!(guided.composition.exterior_triangles, 8);
+}
+
+/// The box profile: one vertical guide and one declared end-cap opening.
+fn profile_for_box() -> ControlProfile {
+    ControlProfile {
+        frame: ControlFrame::SourceLocalZUp,
+        guide: Guide::new([GuideSegment {
+            start: [0.5, 0.5, -1.0],
+            end: [0.5, 0.5, 2.0],
+        }])
+        .unwrap(),
+        surface: SurfacePolicy::Guide,
+        apertures: vec![ApertureSpec {
+            role: "waist".to_string(),
+            anchor: [0.5, 0.5, 1.0],
+            radius: 0.1,
+        }],
+        source_repair: RepairLimits {
+            max_incidental_loops: 4,
+            collapse_below_edges: 0,
+            max_fill_edges: 16,
+            max_tip_removal_share: 0.05,
+        },
+        reduced_repair: RepairLimits {
+            max_incidental_loops: 4,
+            collapse_below_edges: 10,
+            max_fill_edges: 64,
+            max_tip_removal_share: 0.05,
+        },
+        reduction: ReductionLimits {
+            target_triangles: 8,
+            minimum_triangles: 4,
+            maximum_triangles: 12,
+        },
+        coverage: CoverageLimits {
+            tolerance: 0.01,
+            minimum: 0.5,
+        },
+        contact: ContactPolicy {
+            mode: ContactMode::Reject,
+            clearance: 1e-6,
+            max_displacement: 1e-3,
+            max_pairs: 1,
+        },
+        source_cuts: Vec::new(),
+    }
+}
+
+/// A square outline at z = 0, optionally subdivided on its bottom edge, as a fan.
+fn square_rim(subdivide: &[f32]) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let mut positions = vec![
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [2.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ];
+    let mut outline = vec![0u32, 1, 2, 3];
+    if !subdivide.is_empty() {
+        let mut bottom = vec![0u32];
+        for (index, x) in subdivide.iter().enumerate() {
+            positions.push([*x, 0.0, 0.0]);
+            bottom.push(4 + index as u32);
+        }
+        bottom.push(1);
+        outline = bottom.into_iter().chain([2u32, 3]).collect::<Vec<_>>();
+    }
+    let center = positions.len() as u32;
+    positions.push([1.0, 0.5, 0.0]);
+    let triangles = (0..outline.len())
+        .map(|index| [center, outline[index], outline[(index + 1) % outline.len()]])
+        .collect();
+    (positions, triangles)
+}
+
+/// The arithmetic vertex mean the resampling bug came from, for contrast.
+fn vertex_mean(positions: &[[f32; 3]], loop_: &BoundaryLoop) -> [f32; 3] {
+    let count = loop_.vertices.len() as f32;
+    let mut sum = [0.0f32; 3];
+    for vertex in &loop_.vertices {
+        for axis in 0..3 {
+            sum[axis] += positions[*vertex as usize][axis];
+        }
+    }
+    sum.map(|value| value / count)
+}
+
+#[test]
+fn a_boundary_center_survives_collinear_subdivision() {
+    let (coarse_positions, coarse_triangles) = square_rim(&[]);
+    // Deliberately nonuniform collinear splits of the same bottom edge.
+    let (fine_positions, fine_triangles) = square_rim(&[0.5, 1.7]);
+    let coarse = boundary_loops(&coarse_positions, &coarse_triangles);
+    let fine = boundary_loops(&fine_positions, &fine_triangles);
+    assert_eq!(coarse.len(), 1);
+    assert_eq!(fine.len(), 1);
+    let coarse = &coarse[0];
+    let fine = &fine[0];
+    // Different tessellation, same drawn boundary.
+    assert_eq!(coarse.vertices.len(), 4);
+    assert_eq!(fine.vertices.len(), 6);
+    assert_eq!(coarse.perimeter, fine.perimeter);
+    assert_eq!(coarse.center, fine.center);
+    assert_eq!(coarse.center, [1.0, 0.5, 0.0]);
+    // The vertex mean is *not* invariant, which is what the center must not be.
+    let shifted = vertex_mean(&fine_positions, fine);
+    assert!(
+        (shifted[0] - fine.center[0]).abs() > 0.02 && (shifted[1] - fine.center[1]).abs() > 0.1,
+        "the vertex mean should differ: {shifted:?} vs {:?}",
+        fine.center
+    );
+    // Both tessellations classify the same declared opening identically.
+    let spec = ApertureSpec {
+        role: "hem".to_string(),
+        anchor: [1.0, 0.5, 0.0],
+        radius: 0.05,
+    };
+    let coarse_resolution =
+        resolve_apertures(std::slice::from_ref(coarse), std::slice::from_ref(&spec)).unwrap();
+    let fine_resolution =
+        resolve_apertures(std::slice::from_ref(fine), std::slice::from_ref(&spec)).unwrap();
+    assert_eq!(coarse_resolution.matched.len(), 1);
+    assert_eq!(fine_resolution.matched.len(), 1);
+    assert_eq!(coarse_resolution.matched[0].role, "hem");
+    assert_eq!(fine_resolution.matched[0].role, "hem");
+    assert_eq!(coarse_resolution.matched[0].loop_index, 0);
+    assert_eq!(fine_resolution.matched[0].loop_index, 0);
+}
+
+#[test]
+fn a_boundary_actually_outside_the_radius_is_still_refused() {
+    let (positions, triangles) = square_rim(&[0.5, 1.7]);
+    let loops = boundary_loops(&positions, &triangles);
+    // The loop is unchanged in shape, and the declared anchor is far from its curve.
+    assert_eq!(
+        resolve_apertures(
+            &loops,
+            &[ApertureSpec {
+                role: "hem".to_string(),
+                anchor: [1.2, 0.5, 0.0],
+                radius: 0.05,
+            }]
+        ),
+        Err(ControlError::UnknownAperture {
+            role: "hem".to_string(),
+            radius: 0.05,
+        })
+    );
+    // A radius that reaches the curve still matches it, so the refusal is about distance.
+    assert!(
+        resolve_apertures(
+            &loops,
+            &[ApertureSpec {
+                role: "hem".to_string(),
+                anchor: [1.2, 0.5, 0.0],
+                radius: 0.25,
+            }]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn every_boundary_edge_is_walked_exactly_once() {
+    // A pinch: two triangles sharing one vertex, so one walk cannot close over both.
+    let positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ];
+    let triangles = vec![[0, 1, 2], [0, 3, 4]];
+    let mut expected = std::collections::BTreeSet::new();
+    for [a, b, c] in &triangles {
+        for (left, right) in [(*a, *b), (*b, *c), (*c, *a)] {
+            expected.insert((left.min(right), left.max(right)));
+        }
+    }
+    let loops = boundary_loops(&positions, &triangles);
+    let mut walked = Vec::new();
+    let mut total_edges = 0usize;
+    for boundary in &loops {
+        let pairs = boundary.edge_pairs();
+        assert_eq!(
+            pairs.len(),
+            boundary.edges,
+            "a loop must walk one pair per boundary edge"
+        );
+        total_edges += boundary.edges;
+        walked.extend(
+            pairs
+                .into_iter()
+                .map(|[left, right]| (left.min(right), left.max(right))),
+        );
+        // Every reported center is finite, including on an open walk.
+        assert!(boundary.center.iter().all(|value| value.is_finite()));
+    }
+    assert_eq!(
+        total_edges,
+        expected.len(),
+        "no boundary edge is walked twice"
+    );
+    let walked = walked
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(walked, expected, "every boundary edge is walked");
+}
+
+#[test]
+fn a_zero_length_loop_reports_its_shared_point() {
+    // Three indices at one position: every edge has zero length.
+    let positions = vec![[0.25, 0.5, 0.75]; 3];
+    let loops = boundary_loops(&positions, &[[0, 1, 2]]);
+    assert_eq!(loops.len(), 1);
+    let boundary = &loops[0];
+    assert_eq!(boundary.perimeter, 0.0);
+    assert_eq!(boundary.center, [0.25, 0.5, 0.75]);
+    assert!(boundary.center.iter().all(|value| value.is_finite()));
 }

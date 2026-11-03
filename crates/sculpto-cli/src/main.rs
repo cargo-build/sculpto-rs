@@ -47,6 +47,7 @@ commands:
   garment control-repair [options] plan corner-flare and incidental-loop repair
   garment control-check [options] measure and gate a finished control surface
   garment control-separate [options] apply the declared bounded local contact repair
+  garment control-cuts [options] validate declared source-opening cuts and print the plan
   version               print the Sculpto implementation version
   help                  print this help
 
@@ -141,6 +142,10 @@ garment control-check options:
   --source <obj>      thick source shell OBJ in the same frame
   --profile <json>    the same control profile
   --report <json>     measured topology, apertures, deviations and verdict
+
+garment control-cuts options:
+  --profile <json>    the same control profile (optional source_cuts)
+  --report <json>     validated cut planes in the mesh frame for the host
 
 garment control-separate options:
   --control <obj>     finished control OBJ that still contacts itself
@@ -470,7 +475,8 @@ fn garment(args: &[String]) -> ExitCode {
        sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
-       sculpto garment control-separate --control <obj> --profile <json> --out <obj> --report <json>";
+       sculpto garment control-separate --control <obj> --profile <json> --out <obj> --report <json>
+       sculpto garment control-cuts --profile <json> --report <json>";
 
     let result = match args {
         [action, rest @ ..] if action == "fit" => garment_fit_inner(rest),
@@ -491,6 +497,7 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "control-separate" => {
             garment_control::separate_inner(rest)
         }
+        [action, rest @ ..] if action == "control-cuts" => garment_control::cuts_inner(rest),
         _ => Err(usage.to_string()),
     };
     match result {

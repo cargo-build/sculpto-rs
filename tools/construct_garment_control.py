@@ -25,6 +25,7 @@ import time
 import bmesh
 import bpy
 from mathutils import Matrix, Vector
+from mathutils.kdtree import KDTree
 from mathutils.bvhtree import BVHTree
 import numpy as np
 
@@ -431,6 +432,416 @@ def boundary_loops(bm):
     return len(edges), loops
 
 
+def source_cut_plan(binary, profile_path, output):
+    """Ask the core for the validated cut plan before touching any derivative."""
+    plan_path = output / "cut-plan.json"
+    run_cli(
+        binary,
+        [
+            "garment",
+            "control-cuts",
+            "--profile",
+            str(profile_path),
+            "--report",
+            str(plan_path),
+        ],
+    )
+    return read_json(plan_path)
+
+
+PROVENANCE_TOLERANCE = 1e-6  # relative to the source extent: float32 round-trip
+AREA_RELATIVE_BOUND = 6e-8  # f32 relative precision, per measured triangle area
+
+
+def mesh_extent(positions):
+    """Largest bounding-box extent; the basis for a scale-relative tolerance."""
+    columns = list(zip(*positions))
+    return max(max(column) - min(column) for column in columns)
+
+
+def area_of_triangle(a, b, c):
+    first = Vector(a)
+    second = Vector(b)
+    third = Vector(c)
+    return 0.5 * ((second - first).cross(third - first)).length
+
+
+def barycentric(source, corners, point, tolerance):
+    """Convex weights of `point` inside one triangle given by its corner indices.
+
+    The point lies in the triangle's plane because the cut only subdivides that
+    triangle, so the two in-plane coordinates are exact up to float32 rounding.
+    """
+    origin = Vector(source[corners[0]])
+    first = Vector(source[corners[1]]) - origin
+    second = Vector(source[corners[2]]) - origin
+    delta = Vector(point) - origin
+    first_squared = first.length_squared
+    second_squared = second.length_squared
+    mixed = first.dot(second)
+    denominator = first_squared * second_squared - mixed * mixed
+    if denominator <= 0.0:
+        return None
+    first_dot = first.dot(delta)
+    second_dot = second.dot(delta)
+    u = (second_squared * first_dot - mixed * second_dot) / denominator
+    v = (first_squared * second_dot - mixed * first_dot) / denominator
+    weights = (1.0 - u - v, u, v)
+    rebuilt = origin + first * u + second * v
+    if (rebuilt - Vector(point)).length > tolerance:
+        return None
+    return weights
+
+
+def vertex_provenance(source, triangles, point, triangle_ids, tolerance, label):
+    """Attribute one derivative vertex to a known source triangle.
+
+    Every incident face carries its source triangle natively, so the candidate set is
+    topology, not a distance search. All candidates must reconstruct the position (a
+    vertex on a shared source edge belongs to both triangles); the lowest source
+    triangle id wins, which keeps the relation deterministic without guessing.
+    """
+    solved = []
+    for triangle in sorted(triangle_ids):
+        corners = triangles[triangle]
+        weights = barycentric(source, corners, point, tolerance)
+        if weights is None:
+            raise RuntimeError(
+                f"{label}: vertex {[round(value, 6) for value in point]} is not inside "
+                f"incident source triangle {triangle}; the native face relation is broken"
+            )
+        rebuilt = Vector((0.0, 0.0, 0.0))
+        for corner in range(3):
+            rebuilt += Vector(source[corners[corner]]) * weights[corner]
+        solved.append((triangle, weights, (rebuilt - Vector(point)).length))
+    if not solved:
+        raise RuntimeError(f"{label}: vertex with no source triangle relation")
+    triangle, weights, error = solved[0]
+    # A weight is a signed distance from the opposite edge divided by that edge's height,
+    # so the tolerated excursion converts per corner. A sliver triangle therefore allows a
+    # larger weight excursion for the same tolerated distance.
+    corners = triangles[triangle]
+    points = [Vector(source[index]) for index in corners]
+    doubled_area = (points[1] - points[0]).cross(points[2] - points[0]).length
+    if doubled_area <= 0.0:
+        raise RuntimeError(f"{label}: source triangle {triangle} has no area")
+    allowances = []
+    for corner in range(3):
+        first, second = (other for other in range(3) if other != corner)
+        edge = (points[second] - points[first]).length
+        height = doubled_area / edge if edge > 0.0 else 0.0
+        if height <= 0.0:
+            raise RuntimeError(f"{label}: source triangle {triangle} has a collapsed corner")
+        allowances.append(tolerance / height)
+    total = sum(weights)
+    if abs(total - 1.0) > 1e-9 or any(
+        weight < -allowances[corner] or weight > 1.0 + allowances[corner]
+        for corner, weight in enumerate(weights)
+    ):
+        raise RuntimeError(
+            f"{label}: weights {weights} are not convex within {allowances} "
+            f"on source triangle {triangle}"
+        )
+    # A unit-basis relation means the position is a source triangle corner; anything
+    # else was clipped into an edge or the interior by a declared cut.
+    kind = "source-corner" if max(weights) >= 1.0 - 1e-9 else "clipped"
+    return {
+        "source_triangle": triangle,
+        "weights": list(weights),
+        "kind": kind,
+        "candidates": len(solved),
+        "error": error,
+    }
+
+
+def write_json(path, document):
+    """Write one JSON stage file and return its identity."""
+    path = Path(path)
+    path.write_text(json.dumps(document, indent=1) + "\n")
+    return {"file": path.name, "sha256": sha256(path)}
+
+
+def apply_source_cuts(positions, triangles, cuts, output):
+    """Bisect a private derivative along declared half-planes; never fill.
+
+    Provenance is *known*, not searched: native operators keep every face's source
+    triangle id, so each generated vertex is attributed to a triangle it demonstrably
+    belongs to, with convex barycentric weights that reconstruct its position. The
+    complete ordered relation (per vertex and per face) is written beside the
+    derivative, and only a short preview stays in the receipt. Wholly removed source
+    faces, the actually removed area and the clipped remainder are recorded
+    separately so coverage against the original surface stays honest. The input
+    arrays are never mutated.
+    """
+    extent = mesh_extent(positions)
+    tolerance = max(PROVENANCE_TOLERANCE * extent, 1e-12)
+    source_count = len(positions)
+    source = [Vector(point) for point in positions]
+    original_area = sum(
+        area_of_triangle(positions[a], positions[b], positions[c]) for a, b, c in triangles
+    )
+    mesh = bpy.data.meshes.new("Derivative")
+    mesh.from_pydata(positions, [], triangles)
+    mesh.update()
+    obj = bpy.data.objects.new("Derivative", mesh)
+    bpy.context.collection.objects.link(obj)
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    face_layer = bm.faces.layers.int.new("orig_face")
+    bm.faces.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+    # The layer carries 1-based ids because 0 means "created by a cut"; the external
+    # ledger is 0-based like `face_source_triangles` and the source triangle list.
+    for index, face in enumerate(bm.faces):
+        face[face_layer] = index + 1
+    original_faces = sorted(face[face_layer] - 1 for face in bm.faces)
+    cut_records = []
+    for cut in cuts["cuts"]:
+        before_count = len(bm.faces)
+        geometry = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        result = bmesh.ops.bisect_plane(
+            bm,
+            geom=geometry,
+            dist=tolerance,
+            plane_co=Vector(cut["plane_point"]),
+            plane_no=Vector(cut["normal"]),
+            clear_outer=cut["retain"] == "negative",
+            clear_inner=cut["retain"] == "positive",
+        )
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        cut_vertices = sum(
+            1 for item in result.get("geom_cut", []) if isinstance(item, bmesh.types.BMVert)
+        )
+        deleted = before_count - len(bm.faces)
+        if deleted == 0 and cut_vertices == 0:
+            raise RuntimeError(
+                f"source cut `{cut['label']}` removed nothing; a declared opening must cut surface"
+            )
+        if not bm.faces:
+            raise RuntimeError(
+                f"source cut `{cut['label']}` removed the whole surface; the retained side is wrong"
+            )
+        # Bisect produces polygons; the core consumes triangles. The `orig_face` value is
+        # inherited by every split and triangulated face, so the face relation stays exact.
+        polygons = [face for face in bm.faces if len(face.verts) != 3]
+        if polygons:
+            bmesh.ops.triangulate(bm, faces=polygons, quad_method="BEAUTY", ngon_method="BEAUTY")
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        cut_records.append(
+            {
+                "label": cut["label"],
+                "retain": cut["retain"],
+                "plane_point": cut["plane_point"],
+                "normal": cut["normal"],
+                "operator": "bmesh.ops.bisect_plane+triangulate",
+                "faces_before": before_count,
+                "faces_after": len(bm.faces),
+                "operator_faces_deleted": deleted,
+                "cut_vertices": cut_vertices,
+                "polygons_triangulated": len(polygons),
+                "fill": "none",
+            }
+        )
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    corners = [len(face.verts) for face in bm.faces if len(face.verts) != 3]
+    if corners:
+        raise RuntimeError(
+            f"the derivative still holds {len(corners)} polygon(s) the core cannot consume: "
+            f"corner counts {sorted(set(corners))}"
+        )
+    # One ordered relation for the finished derivative: vertex -> source triangle and
+    # weights, face -> source triangle. Both indexes are 0-based in file order.
+    vertices = [
+        vertex_provenance(
+            positions,
+            triangles,
+            vertex.co,
+            {
+                face[face_layer] - 1
+                for face in vertex.link_faces
+                if face[face_layer] > 0
+            },
+            tolerance,
+            "derivative vertex",
+        )
+        for vertex in bm.verts
+    ]
+    face_sources = [face[face_layer] - 1 for face in bm.faces]
+    if any(source_triangle < 0 for source_triangle in face_sources):
+        raise RuntimeError("a derivative face lost its source triangle relation")
+    positions_out = [tuple(vertex.co) for vertex in bm.verts]
+    triangles_out = [[corner.index for corner in face.verts] for face in bm.faces]
+    derivative_area = sum(
+        area_of_triangle(positions_out[a], positions_out[b], positions_out[c])
+        for a, b, c in triangles_out
+    )
+    bm.free()
+    bpy.data.objects.remove(obj, do_unlink=True)
+    bpy.data.meshes.remove(mesh, do_unlink=True)
+    survivors = {source_triangle for source_triangle in face_sources}
+    removed_faces = [face for face in original_faces if face not in survivors]
+    removed_area = sum(
+        area_of_triangle(
+            positions[triangles[face][0]],
+            positions[triangles[face][1]],
+            positions[triangles[face][2]],
+        )
+        for face in removed_faces
+    )
+    total_removed = original_area - derivative_area
+    clipped_area = total_removed - removed_area
+    area_bound = AREA_RELATIVE_BOUND * (original_area + derivative_area)
+    if clipped_area < -area_bound:
+        raise RuntimeError(
+            f"removed area {total_removed} is less than the complete-face area {removed_area}; "
+            f"the geometric accounting is inconsistent beyond {area_bound}"
+        )
+    worst = max((record["error"] for record in vertices), default=0.0)
+    lineage = {
+        "domains": {
+            "derivative_vertex": "0-based index into derivative.obj vertex order",
+            "derivative_face": "0-based index into derivative.obj face order",
+            "source_vertex": "0-based index into original_source.obj vertex order",
+            "source_triangle": "0-based index into original_source.obj face order",
+            "weights": "convex weights over the source triangle's corners, in corner order, summing to 1",
+        },
+        "counts": {
+            "derivative_vertices": len(positions_out),
+            "derivative_faces": len(triangles_out),
+            "source_vertices": source_count,
+            "source_triangles": len(triangles),
+            "corner_vertices": sum(
+                1 for record in vertices if record["kind"] == "source-corner"
+            ),
+            "clipped_vertices": sum(1 for record in vertices if record["kind"] == "clipped"),
+            "cut_vertices_on_plane": sum(record["cut_vertices"] for record in cut_records),
+        },
+        "tolerance": tolerance,
+        "max_reconstruction_error": worst,
+        "verified": worst <= tolerance,
+        "vertices": vertices,
+        "face_source_triangles": face_sources,
+    }
+    lineage_file = write_json(Path(output) / "derivative-lineage.json", lineage)
+    return positions_out, triangles_out, {
+        "original": {
+            "vertices": source_count,
+            "triangles": len(triangles),
+            "faces": len(original_faces),
+            "area": original_area,
+        },
+        "derivative": {
+            "vertices": len(positions_out),
+            "triangles": len(triangles_out),
+            "faces": len(triangles_out),
+            "area": derivative_area,
+        },
+        "cuts": cut_records,
+        "lineage": {
+            "file": lineage_file["file"],
+            "sha256": lineage_file["sha256"],
+            "counts": lineage["counts"],
+            "corner_vertices": lineage["counts"]["corner_vertices"],
+            "clipped_vertices": lineage["counts"]["clipped_vertices"],
+            "tolerance": tolerance,
+            "max_reconstruction_error": worst,
+            "verified": lineage["verified"],
+            "sample": vertices[:8],
+            "removed_original_faces": removed_faces,
+            "removed_face_count": len(removed_faces),
+            "complete_face_removal_area": removed_area,
+            "clipped_area": clipped_area,
+            "total_area_removed": total_removed,
+            "area_error_bound": area_bound,
+            "fill": "none; declared openings stay open",
+            "note": (
+                "source face IDs are 0-based original triangle indices; generated cut "
+                "vertices carry source-triangle plus convex barycentric weights, never a "
+                "source-vertex claim; areas are in the raw source frame"
+            ),
+        },
+    }
+
+
+def compose_provenance(output, plan, report):
+    """Read the lineage back and compose selected vertices to the original source.
+
+    Reads `derivative-lineage.json`, the selected OBJ and the two source OBJs from disk,
+    then reconstructs every selected vertex from its recorded source triangle and
+    weights against the original positions. A relation that cannot be read back and
+    recomposed is a defect, not a report detail.
+    """
+    lineage = read_json(Path(output) / "derivative-lineage.json")
+    derivative = read_obj(Path(output) / "derivative.obj")
+    original = read_obj(Path(output) / "original_source.obj")
+    selected = read_obj(Path(output) / "selected.obj")
+    tolerance = float(lineage["tolerance"])
+    records = lineage["vertices"]
+    if len(records) != len(derivative[0]):
+        raise RuntimeError(
+            f"lineage holds {len(records)} vertices but derivative.obj holds {len(derivative[0])}"
+        )
+    sources = plan["vertex_sources"]
+    if len(sources) != len(selected[0]):
+        raise RuntimeError(
+            f"plan maps {len(sources)} vertices but selected.obj holds {len(selected[0])}"
+        )
+    worst = 0.0
+    generated = 0
+    for selected_vertex, derivative_vertex in enumerate(sources):
+        record = records[int(derivative_vertex)]
+        triangle = record["source_triangle"]
+        weights = record["weights"]
+        rebuilt = [0.0, 0.0, 0.0]
+        # The source triangle's corners are given by the original face list, not by
+        # consecutive `v` lines.
+        corners = original[1][int(triangle)]
+        for corner, weight in enumerate(weights):
+            point = original[0][corners[corner]]
+            for axis in range(3):
+                rebuilt[axis] += point[axis] * weight
+        target = selected[0][selected_vertex]
+        error = max(abs(rebuilt[axis] - target[axis]) for axis in range(3))
+        worst = max(worst, error)
+        total = sum(record["weights"])
+        if abs(total - 1.0) > tolerance:
+            raise RuntimeError(f"selected vertex {selected_vertex} weights sum to {total}")
+        if error > tolerance:
+            raise RuntimeError(
+                f"selected vertex {selected_vertex} reconstructs {rebuilt} but the OBJ has "
+                f"{list(target)}; error {error:.3g} > {tolerance:.3g}"
+            )
+        if record["kind"] == "clipped":
+            generated += 1
+    faces = plan["selected_faces"]
+    face_sources = lineage["face_source_triangles"]
+    composed_faces = [face_sources[int(index)] for index in faces]
+    if len(composed_faces) != len(selected[1]):
+        raise RuntimeError("selected face provenance does not match the saved control")
+    if any(value < 0 or value >= len(original[1]) for value in composed_faces):
+        raise RuntimeError("a selected face composes outside the original source faces")
+    report["stages"]["composed"] = {
+        "file": "derivative-lineage.json",
+        "sha256": sha256(Path(output) / "derivative-lineage.json"),
+        "lineage_vertices": len(records),
+        "selected_vertices": len(sources),
+        "clipped_vertices": generated,
+        "source_vertices": len(original[0]),
+        "source_triangles": len(original[1]),
+        "composed_faces": len(composed_faces),
+        "distinct_source_triangles": len(set(composed_faces)),
+        "tolerance": tolerance,
+        "max_reconstruction_error": worst,
+        "verified": True,
+    }
+
+
 def stage_record(path, vertices, triangles):
     """Identity of one native stage: file digest plus counts."""
     return {
@@ -568,6 +979,7 @@ def main(recipe_path, out_dir):
     output.mkdir(parents=True, exist_ok=False)
     receipt = {
         "recipe": str(Path(recipe_path).resolve()),
+        "surface_policy": declared.get("surface", "guide"),
         "source": str(source_path.resolve()),
         "source_sha256": recipe["source_sha256"],
         "profile": str(profile_path.resolve()),
@@ -613,8 +1025,76 @@ def main(recipe_path, out_dir):
             ],
             "unchanged": True,
         }
-        source_obj = output / "source.obj"
-        write_obj(source_obj, positions, triangles)
+        cut_plan = source_cut_plan(binary, profile_path, output)
+        plane_frame = cut_plan.get("plane_frame")
+        if plane_frame != "source-local-z-up":
+            raise RuntimeError(
+                f"cut plan planes are in frame {plane_frame!r}; the host applies "
+                "source-local-z-up planes only"
+            )
+        receipt["cut_plan"] = {
+            "plane_frame": plane_frame,
+            "declared_frame": cut_plan["declared_frame"],
+            "cuts": [cut["label"] for cut in cut_plan["cuts"]],
+            "note": "plane_frame names the coordinates of plane_point/normal; "
+            "declared_frame is the profile frame they were written in",
+        }
+        original_obj = output / "original_source.obj"
+        write_obj(original_obj, positions, triangles)
+        source_obj = original_obj
+        source_stage = {
+            "original": {
+                **stage_record(original_obj, len(positions), len(triangles)),
+                "note": "the displayed source surface; coverage and trimmed area refer to this stage",
+            },
+        }
+        if cut_plan["cuts"]:
+            cut_positions, cut_triangles, cut_report = apply_source_cuts(
+                positions, triangles, cut_plan, output
+            )
+            derivative_obj = output / "derivative.obj"
+            write_obj(derivative_obj, cut_positions, cut_triangles)
+            source_obj = derivative_obj
+            source_stage["derivative"] = {
+                **stage_record(derivative_obj, len(cut_positions), len(cut_triangles)),
+                "note": "private source-frame derivative; declared openings are left unfilled",
+            }
+            source_stage["cuts"] = cut_report["cuts"]
+            source_stage["lineage"] = cut_report["lineage"]
+            source_stage["areas"] = {
+                "original": cut_report["original"]["area"],
+                "derivative": cut_report["derivative"]["area"],
+                "total_removed": cut_report["lineage"]["total_area_removed"],
+                "complete_face_removal": cut_report["lineage"][
+                    "complete_face_removal_area"
+                ],
+                "clipped": cut_report["lineage"]["clipped_area"],
+                "error_bound": cut_report["lineage"]["area_error_bound"],
+                "units": "source-frame area units (raw Tripo frame, not actor scale)",
+            }
+            source_stage["derivative_counts"] = {
+                "original": cut_report["original"],
+                "derivative": cut_report["derivative"],
+            }
+        else:
+            source_stage["derivative"] = {
+                "note": "absent by contract: no source_cuts declared, so no derivative is written",
+            }
+            source_stage["cuts"] = []
+            source_stage["lineage"] = {
+                "file": "absent",
+                "corner_vertices": len(positions),
+                "clipped_vertices": 0,
+                "removed_face_count": 0,
+                "total_area_removed": 0.0,
+                "verified": True,
+                "fill": "not applicable",
+                "note": (
+                    "optional absence of source_cuts means no operation; the closed shell "
+                    "keeps its existing semantics"
+                ),
+            }
+        receipt["source_stage"] = source_stage
 
         exterior_plan_path = output / "exterior-plan.json"
         run_cli(
@@ -647,6 +1127,13 @@ def main(recipe_path, out_dir):
             },
             "note": "full arrays are in the plan file; QEM stages have no original faces",
         }
+        if cut_plan["cuts"]:
+            compose_provenance(output, plan, receipt)
+        else:
+            receipt["stages"]["composed"] = {
+                "note": "absent by contract: no source_cuts declared, no derivative exists",
+                "verified": True,
+            }
         receipt["exterior"] = plan["composition"]
         receipt["apertures"] = plan["apertures"]["matched"]
         receipt["incidental"] = plan["incidental"]
@@ -837,7 +1324,7 @@ def main(recipe_path, out_dir):
                     "--control",
                     str(output / "reduced_control.obj"),
                     "--source",
-                    str(source_obj),
+                    str(original_obj),
                     "--profile",
                     str(profile_path),
                     "--report",

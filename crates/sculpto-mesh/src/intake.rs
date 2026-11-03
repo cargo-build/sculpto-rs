@@ -40,7 +40,8 @@ impl Route {
 pub struct Opening {
     /// Boundary edges in the loop.
     pub edges: usize,
-    /// Mean position of the loop's vertices.
+    /// Edge-length-weighted midpoint of the boundary curve, so a differently tessellated
+    /// opening reports the same position. @req DECL0013
     pub center: [f32; 3],
 }
 
@@ -253,8 +254,8 @@ fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Opening
             continue;
         }
         let mut edges = 0usize;
-        let mut sum = [0.0f32; 3];
-        let mut count = 0usize;
+        let mut walked = Vec::new();
+        let mut closed = false;
         let mut current = start;
         let mut previous = u32::MAX;
         loop {
@@ -262,11 +263,7 @@ fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Opening
                 break;
             }
             visited.insert(current, true);
-            count += 1;
-            let position = positions[current as usize];
-            sum[0] += position[0];
-            sum[1] += position[1];
-            sum[2] += position[2];
+            walked.push(current);
             let neighbors = &adjacency[&current];
             let next = neighbors
                 .iter()
@@ -285,20 +282,15 @@ fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Opening
                 break;
             };
             if next == start {
+                closed = true;
                 break;
             }
             previous = current;
             current = next;
         }
-        if count > 0 {
-            loops.push(Opening {
-                edges,
-                center: [
-                    sum[0] / count as f32,
-                    sum[1] / count as f32,
-                    sum[2] / count as f32,
-                ],
-            });
+        if !walked.is_empty() {
+            let (center, _) = crate::control::curve_center(positions, &walked, closed);
+            loops.push(Opening { edges, center });
         }
     }
     loops.sort_by_key(|opening| std::cmp::Reverse(opening.edges));
