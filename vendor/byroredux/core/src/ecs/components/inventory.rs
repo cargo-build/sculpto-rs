@@ -1,0 +1,547 @@
+//! Inventory + equipment ECS components.
+//!
+//! Architectural model (settled 2026-05-07): base records live in the
+//! loaded `EsmIndex` (the Redux-native `DataStore` layer it was first
+//! sketched against has no production caller, #5609). Per-instance
+//! state, where it diverges from the base record, lives in
+//! [`ItemInstancePool`](crate::ecs::resources::ItemInstancePool). The
+//! `Inventory` Component on each container / actor / world ref carries
+//! the actual stack list.
+//!
+//! The vast majority of inventory rows are stack-count-only (e.g. "100
+//! stimpaks") and need no per-instance state — `ItemStack.instance` is
+//! `None`. Only stacks that pick up modlists, condition deltas, or
+//! charge state allocate from the instance pool.
+//!
+//! This is the runtime layer; the ESM-side parsed records are over in
+//! [`crates/plugin/src/esm/records/container.rs`] and `actor.rs`.
+//!
+//! See [issue #896](https://github.com/matiaszanolli/ByroRedux/issues/896)
+//! for the M41 equip slice that lights up these components.
+//!
+//! ## Why Component-on-container, not entity-per-item
+//!
+//! Bethesda's runtime spawns an entity per carried item, which leaks
+//! into save format (one change-form per modification, accumulating
+//! across the save's lifetime). ECS-as-truth + Component-on-container
+//! caps the data shape at "live entities × Vec of stacks per
+//! container" — bounded by current cell load, not playthrough length.
+//!
+//! Pickup + drop nets to zero on disk because the instance-pool
+//! free-list reclaims released slots.
+
+use crate::ecs::sparse_set::SparseSetStorage;
+use crate::ecs::storage::Component;
+use std::num::NonZeroU32;
+
+/// Index into the per-world [`ItemInstancePool`](crate::ecs::resources::ItemInstancePool).
+///
+/// `NonZeroU32` so `Option<ItemInstanceId>` is one `u32` wide. The
+/// pool's slot 0 is reserved as a sentinel; legal IDs start at 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ItemInstanceId(pub NonZeroU32);
+
+/// One row in an [`Inventory`].
+///
+/// The common case (`instance == None`) is a pure stack of identical
+/// items — e.g. 100 stimpaks. Stacks diverging from base (named items,
+/// modded weapons, partial-condition armor) point at an
+/// [`ItemInstance`](crate::ecs::resources::ItemInstance) in the
+/// per-world pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ItemStack {
+    /// Base record this stack is an instance of (ARMO / WEAP / MISC /
+    /// etc.). Raw plugin-scoped form ID — same shape the cell loader
+    /// and `EsmIndex` use throughout. Refactored to a stable
+    /// content-addressed identity (`FormId` interned through
+    /// `FormIdPool`) when M45 save lands and the rest of the engine
+    /// switches over in one pass; using `u32` here today avoids
+    /// threading `FormIdPool` through every spawn site for a slice
+    /// that doesn't yet need cross-load identity.
+    pub base_form_id: u32,
+    /// Stack count. Always non-negative at runtime — the parsed CNTO's
+    /// `i32` is normalised to `u32` at the spawn boundary (negative
+    /// counts on disk are remove-from-inventory deltas, never live
+    /// state).
+    pub count: u32,
+    /// Pool index for stacks with per-instance state. `None` for the
+    /// stack-only common case.
+    pub instance: Option<ItemInstanceId>,
+}
+
+impl ItemStack {
+    /// Build a stack of `count` items of `base_form_id` with no per-
+    /// instance state. Use this for any item that doesn't yet need an
+    /// instance pool slot — which is the overwhelming majority.
+    pub const fn new(base_form_id: u32, count: u32) -> Self {
+        Self {
+            base_form_id,
+            count,
+            instance: None,
+        }
+    }
+}
+
+/// What an actor / container / world ref currently holds.
+///
+/// `items` is a flat `Vec` rather than a map keyed by FormId so that
+/// duplicate entries with different per-instance state are
+/// representable (two distinct instances of the same base armor with
+/// different condition values).
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct Inventory {
+    pub items: Vec<ItemStack>,
+}
+
+impl Inventory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push a stack. Returns the new stack's index (the value that
+    /// goes into [`EquipmentSlots`]).
+    pub fn push(&mut self, stack: ItemStack) -> InventoryIndex {
+        let idx = self.items.len() as u32;
+        self.items.push(stack);
+        InventoryIndex(idx)
+    }
+
+    /// Add a stack, merging a plain one into the existing plain row of the
+    /// same form. Returns the row it landed in.
+    ///
+    /// #5871 — items without an instance used to be appended as a new row
+    /// per transfer (every `AddItem`, both legs of every barter click), so
+    /// gold and goods fragmented into a row per trade on both sides, were
+    /// saved that way and were each listed by the inventory menu. Rows are
+    /// never removed or reordered here, so [`EquipmentSlots`] indices stay
+    /// valid; a zeroed row (an emptied stack keeps its position) is reused
+    /// the same as a live one. A stack carrying an `instance` is its own
+    /// identity and is always appended unchanged.
+    pub fn add(&mut self, stack: ItemStack) -> InventoryIndex {
+        if stack.instance.is_none() {
+            if let Some(index) = self
+                .items
+                .iter()
+                .position(|row| row.base_form_id == stack.base_form_id && row.instance.is_none())
+            {
+                let row = &mut self.items[index];
+                row.count = row.count.saturating_add(stack.count);
+                return InventoryIndex(index as u32);
+            }
+        }
+        self.push(stack)
+    }
+
+    pub fn get(&self, idx: InventoryIndex) -> Option<&ItemStack> {
+        self.items.get(idx.0 as usize)
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl Component for Inventory {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Index into an [`Inventory::items`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct InventoryIndex(pub u32);
+
+/// The single weapon an actor currently presents to combat.
+///
+/// `inventory_index` keeps equip state anchored to the canonical Inventory
+/// row, while the copied base FormID and damage make the hot attack path
+/// independent of plugin-record storage. Weapon meshes/animation families
+/// can refine this component without changing damage ownership.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct EquippedWeapon {
+    pub inventory_index: InventoryIndex,
+    pub base_form_id: u32,
+    pub damage: f32,
+    /// Authored melee reach in Bethesda units, `0.0` when the source
+    /// game's weapon layout isn't decoded yet. See `ItemKind::Weapon::reach`.
+    ///
+    /// Required (no `#[serde(default)]`) per SAVE-D2-01 (#1714): a default
+    /// here would silently backfill pre-#3096 saves with fabricated `0.0`
+    /// reach/speed instead of rejecting them. `byroredux_save::FORMAT_MAJOR`
+    /// was bumped for this field addition instead.
+    pub reach: f32,
+    /// Authored attack speed multiplier, `0.0` when undecoded. See
+    /// `ItemKind::Weapon::speed`. Required for the same SAVE-D2-01 reason
+    /// as `reach`.
+    pub speed: f32,
+}
+
+impl Component for EquippedWeapon {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// The number of biped-slot bits an actor's equipment can occupy.
+///
+/// FO3 / FNV `BMDT.biped_flags` is the low 16 bits; Skyrim+ `BOD2`/`BODT`
+/// the full 32. Either fits in this array. The slot's *meaning* (head
+/// vs torso vs eyes etc.) is game-specific and lives near the parser
+/// (`crates/plugin/src/esm/records/items.rs`), not here — this layer
+/// just tracks "which inventory entry occupies bit N."
+pub const MAX_BIPED_SLOTS: usize = 32;
+
+/// Per-actor map: biped-slot bit → which `Inventory` entry currently
+/// fills it.
+///
+/// Multiple bits can point at the same inventory entry (one armor
+/// piece covering UpperBody + Arms). Equipping a new item that
+/// overlaps an existing item's slot mask supersedes the old occupant
+/// in the overlapping bits — visualisation responsibility, not save-
+/// state churn.
+///
+/// The wielded weapon lives in its own [`weapon`](Self::weapon) field
+/// rather than a biped bit — see that field's docs (#3112).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct EquipmentSlots {
+    pub occupants: [Option<InventoryIndex>; MAX_BIPED_SLOTS],
+    /// The currently wielded weapon's `Inventory` entry.
+    ///
+    /// #3112 — deliberately **not** a bit in `occupants`. Every index in
+    /// `0..MAX_BIPED_SLOTS` is addressable by an authored armor mask:
+    /// FO3/FNV `BMDT.biped_flags` reaches the low 16, and Skyrim+ `BOD2`/`BODT`
+    /// reaches all 32 (bit 0 = body-part 30, so bit 31 = body-part 61 /
+    /// `FX01`, a real `BSDismemberBodyPartType`). Carving a "spare" bit
+    /// out of that array — as the first pass at #3032 did with bit 31 —
+    /// lets an authored ARMO and the weapon displace each other, silently
+    /// dropping the player's `EquippedWeapon` back to unarmed damage.
+    /// A separate field is unreachable from any record mask by
+    /// construction.
+    ///
+    /// Deliberately no `serde(default)`: per SAVE-D2-01 (#1714) a
+    /// compatibility default would mask this intra-type change, so
+    /// `byroredux_save::FORMAT_MAJOR` is bumped instead.
+    pub weapon: Option<InventoryIndex>,
+}
+
+impl Default for EquipmentSlots {
+    fn default() -> Self {
+        Self {
+            occupants: [None; MAX_BIPED_SLOTS],
+            weapon: None,
+        }
+    }
+}
+
+impl EquipmentSlots {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark every set bit in `slot_mask` as occupied by `idx`. Returns
+    /// the set of inventory indices that were displaced (an empty
+    /// `Vec` if the slots were free). Callers can use the return
+    /// value to drive "remove the displaced item from the visible
+    /// mesh set" follow-up logic in spawn paths.
+    pub fn equip(&mut self, slot_mask: u32, idx: InventoryIndex) -> Vec<InventoryIndex> {
+        let mut displaced = Vec::new();
+        for bit in 0..MAX_BIPED_SLOTS {
+            if slot_mask & (1u32 << bit) == 0 {
+                continue;
+            }
+            if let Some(prev) = self.occupants[bit].replace(idx) {
+                if prev != idx && !displaced.contains(&prev) {
+                    displaced.push(prev);
+                }
+            }
+        }
+        displaced
+    }
+
+    /// Clear every set bit in `slot_mask`. Returns the (deduplicated)
+    /// set of inventory indices that were occupying those bits.
+    pub fn unequip(&mut self, slot_mask: u32) -> Vec<InventoryIndex> {
+        let mut released = Vec::new();
+        for bit in 0..MAX_BIPED_SLOTS {
+            if slot_mask & (1u32 << bit) == 0 {
+                continue;
+            }
+            if let Some(prev) = self.occupants[bit].take() {
+                if !released.contains(&prev) {
+                    released.push(prev);
+                }
+            }
+        }
+        released
+    }
+
+    /// What occupies the given biped bit, if anything. Returns `None`
+    /// for bits beyond [`MAX_BIPED_SLOTS`] rather than panicking.
+    pub fn at(&self, bit: u8) -> Option<InventoryIndex> {
+        self.occupants.get(usize::from(bit)).copied().flatten()
+    }
+
+    /// Wield `idx`, returning the inventory entry it displaced (if any).
+    /// Never touches [`occupants`](Self::occupants), so no authored armor
+    /// mask can collide with it (#3112).
+    pub fn equip_weapon(&mut self, idx: InventoryIndex) -> Option<InventoryIndex> {
+        self.weapon.replace(idx).filter(|&prev| prev != idx)
+    }
+
+    /// Stop wielding whatever is in the weapon slot, returning it.
+    pub fn unequip_weapon(&mut self) -> Option<InventoryIndex> {
+        self.weapon.take()
+    }
+
+    /// Every inventory entry this actor currently has equipped — biped
+    /// occupants and the wielded weapon. Yields duplicates when one item
+    /// covers several biped bits; callers that need uniqueness dedup.
+    ///
+    /// Use this (not a bare `occupants` scan) for any "is this item
+    /// equipped?" question, or the weapon reads as unequipped (#3112).
+    pub fn equipped_indices(&self) -> impl Iterator<Item = InventoryIndex> + '_ {
+        self.occupants.iter().flatten().copied().chain(self.weapon)
+    }
+
+    /// Whether `idx` is equipped in any biped slot or the weapon slot.
+    pub fn is_equipped(&self, idx: InventoryIndex) -> bool {
+        self.equipped_indices().any(|equipped| equipped == idx)
+    }
+
+    /// Release `idx` from every biped slot it occupies and from the weapon
+    /// slot. Returns whether anything was actually released.
+    pub fn release(&mut self, idx: InventoryIndex) -> bool {
+        let mut released = false;
+        for occupant in &mut self.occupants {
+            if *occupant == Some(idx) {
+                *occupant = None;
+                released = true;
+            }
+        }
+        if self.weapon == Some(idx) {
+            self.weapon = None;
+            released = true;
+        }
+        released
+    }
+}
+
+impl Component for EquipmentSlots {
+    type Storage = SparseSetStorage<Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_stack_defaults_to_no_instance() {
+        let s = ItemStack::new(0x0001_F4A0, 5);
+        assert_eq!(s.count, 5);
+        assert!(s.instance.is_none());
+    }
+
+    #[test]
+    fn inventory_push_returns_sequential_indices() {
+        let mut inv = Inventory::new();
+        let a = inv.push(ItemStack::new(0x0001_F4A0, 1));
+        let b = inv.push(ItemStack::new(0x0001_F4A1, 2));
+        assert_eq!(a, InventoryIndex(0));
+        assert_eq!(b, InventoryIndex(1));
+        assert_eq!(inv.get(a).unwrap().count, 1);
+        assert_eq!(inv.get(b).unwrap().count, 2);
+    }
+
+    #[test]
+    fn equipped_weapon_points_at_inventory_and_carries_base_damage() {
+        let weapon = EquippedWeapon {
+            inventory_index: InventoryIndex(2),
+            base_form_id: 0x0001_CB64,
+            damage: 18.0,
+            reach: 140.0,
+            speed: 0.9,
+        };
+        assert_eq!(weapon.inventory_index, InventoryIndex(2));
+        assert_eq!(weapon.base_form_id, 0x0001_CB64);
+        assert_eq!(weapon.damage, 18.0);
+        assert_eq!(weapon.reach, 140.0);
+        assert_eq!(weapon.speed, 0.9);
+    }
+
+    #[test]
+    fn equipment_slots_default_is_all_unoccupied() {
+        let slots = EquipmentSlots::new();
+        for o in slots.occupants.iter() {
+            assert!(o.is_none());
+        }
+    }
+
+    #[test]
+    fn equip_marks_every_set_bit_in_mask() {
+        let mut slots = EquipmentSlots::new();
+        // Bits 2 + 3 + 5 set.
+        let mask = 0b00101100u32;
+        let displaced = slots.equip(mask, InventoryIndex(7));
+        assert!(displaced.is_empty());
+        assert_eq!(slots.occupants[2], Some(InventoryIndex(7)));
+        assert_eq!(slots.occupants[3], Some(InventoryIndex(7)));
+        assert_eq!(slots.occupants[5], Some(InventoryIndex(7)));
+        assert!(slots.occupants[4].is_none());
+    }
+
+    #[test]
+    fn equip_returns_deduplicated_displaced_indices() {
+        let mut slots = EquipmentSlots::new();
+        // Existing armor covers bits 2 + 3.
+        slots.equip(0b00001100, InventoryIndex(1));
+        // New armor covers bits 3 + 4 — overlaps on bit 3.
+        let displaced = slots.equip(0b00011000, InventoryIndex(2));
+        assert_eq!(displaced, vec![InventoryIndex(1)]);
+        assert_eq!(slots.occupants[2], Some(InventoryIndex(1)));
+        assert_eq!(slots.occupants[3], Some(InventoryIndex(2)));
+        assert_eq!(slots.occupants[4], Some(InventoryIndex(2)));
+    }
+
+    #[test]
+    fn unequip_clears_and_returns_released() {
+        let mut slots = EquipmentSlots::new();
+        slots.equip(0b00001100, InventoryIndex(1));
+        slots.equip(0b00010000, InventoryIndex(2));
+        let released = slots.unequip(0b00011100);
+        assert!(released.contains(&InventoryIndex(1)));
+        assert!(released.contains(&InventoryIndex(2)));
+        assert_eq!(released.len(), 2);
+        for o in slots.occupants.iter() {
+            assert!(o.is_none());
+        }
+    }
+
+    // ── weapon slot lives outside the biped array (#3112) ───────────────
+
+    #[test]
+    fn no_armor_mask_can_reach_the_weapon_slot() {
+        // The invariant #3112 exists to pin: NO value an authored BOD2 /
+        // BMDT mask can take — including the all-ones u32, which sets the
+        // former WEAPON_EQUIP_SLOT bit 31 (Skyrim+ body-part 61 / FX01) —
+        // may touch the wielded weapon. Pre-fix the weapon lived at
+        // occupants[31], so equipping such an armor silently unequipped it.
+        let mut slots = EquipmentSlots::new();
+        slots.equip_weapon(InventoryIndex(9));
+
+        let displaced = slots.equip(u32::MAX, InventoryIndex(4));
+        assert!(
+            !displaced.contains(&InventoryIndex(9)),
+            "an armor mask must never displace the weapon"
+        );
+        assert_eq!(
+            slots.weapon,
+            Some(InventoryIndex(9)),
+            "the weapon survives an armor covering every addressable biped bit"
+        );
+
+        // And the reverse direction: wielding a weapon must not evict armor.
+        slots.equip_weapon(InventoryIndex(5));
+        for bit in 0..MAX_BIPED_SLOTS {
+            assert_eq!(slots.occupants[bit], Some(InventoryIndex(4)));
+        }
+    }
+
+    #[test]
+    fn unequip_mask_cannot_clear_the_weapon_slot() {
+        let mut slots = EquipmentSlots::new();
+        slots.equip_weapon(InventoryIndex(9));
+        let released = slots.unequip(u32::MAX);
+        assert!(released.is_empty());
+        assert_eq!(slots.weapon, Some(InventoryIndex(9)));
+    }
+
+    #[test]
+    fn equip_weapon_reports_the_displaced_weapon_only_on_a_real_swap() {
+        let mut slots = EquipmentSlots::new();
+        assert_eq!(slots.equip_weapon(InventoryIndex(1)), None);
+        // Re-wielding the same entry is not a swap.
+        assert_eq!(slots.equip_weapon(InventoryIndex(1)), None);
+        assert_eq!(
+            slots.equip_weapon(InventoryIndex(2)),
+            Some(InventoryIndex(1))
+        );
+        assert_eq!(slots.unequip_weapon(), Some(InventoryIndex(2)));
+        assert_eq!(slots.unequip_weapon(), None);
+    }
+
+    #[test]
+    fn equipped_indices_covers_both_biped_slots_and_the_weapon() {
+        let mut slots = EquipmentSlots::new();
+        slots.equip(0b0110, InventoryIndex(3));
+        slots.equip_weapon(InventoryIndex(9));
+
+        assert!(slots.is_equipped(InventoryIndex(3)));
+        assert!(
+            slots.is_equipped(InventoryIndex(9)),
+            "a bare `occupants` scan would report the weapon as unequipped"
+        );
+        assert!(!slots.is_equipped(InventoryIndex(4)));
+
+        let mut seen: Vec<_> = slots.equipped_indices().collect();
+        seen.sort_by_key(|i| i.0);
+        seen.dedup();
+        assert_eq!(seen, vec![InventoryIndex(3), InventoryIndex(9)]);
+    }
+
+    #[test]
+    fn release_clears_an_entry_from_biped_slots_and_the_weapon() {
+        let mut slots = EquipmentSlots::new();
+        slots.equip(0b0110, InventoryIndex(3));
+        slots.equip_weapon(InventoryIndex(9));
+
+        assert!(slots.release(InventoryIndex(3)));
+        assert!(!slots.is_equipped(InventoryIndex(3)));
+        assert_eq!(slots.weapon, Some(InventoryIndex(9)));
+
+        assert!(slots.release(InventoryIndex(9)));
+        assert_eq!(slots.weapon, None);
+
+        assert!(!slots.release(InventoryIndex(9)), "already released");
+    }
+
+    /// #5871 — plain stacks of one form share a row (a zeroed row is reused);
+    /// an instanced stack is its own row; rows never move or disappear.
+    #[test]
+    fn add_folds_plain_stacks_into_one_row_per_form() {
+        let mut inv = Inventory::new();
+        let gold = inv.add(ItemStack::new(0xF, 5));
+        assert_eq!(inv.add(ItemStack::new(0xF, 7)), gold);
+        let other = inv.add(ItemStack::new(0x1, 1));
+        assert_eq!(
+            inv.items,
+            vec![ItemStack::new(0xF, 12), ItemStack::new(0x1, 1)]
+        );
+
+        let instanced = ItemStack {
+            instance: Some(ItemInstanceId(NonZeroU32::new(3).unwrap())),
+            ..ItemStack::new(0xF, 1)
+        };
+        let row = inv.add(instanced);
+        assert_ne!(row, gold, "an instance is its own identity");
+        assert_eq!(
+            inv.add(ItemStack::new(0xF, 1)),
+            gold,
+            "…and never absorbs a plain stack"
+        );
+        assert_eq!(inv.len(), 3);
+
+        inv.items[other.0 as usize].count = 0;
+        assert_eq!(
+            inv.add(ItemStack::new(0x1, 4)),
+            other,
+            "a zeroed row is reused in place"
+        );
+        assert_eq!(inv.len(), 3);
+    }
+}

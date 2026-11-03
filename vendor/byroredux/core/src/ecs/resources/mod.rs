@@ -1,0 +1,2366 @@
+//! Built-in engine resources.
+
+use super::components::ItemInstanceId;
+use super::resource::Resource;
+use std::num::NonZeroU32;
+
+mod hardcore;
+pub use hardcore::HardcoreMode;
+
+/// System names stored as a resource for debug and console queries.
+pub struct SystemList(pub Vec<String>);
+impl Resource for SystemList {}
+
+/// Snapshot of [`crate::ecs::scheduler::AccessReport`] captured at
+/// scheduler-build time and stored as a resource so console commands
+/// (`sys.accesses`) can read the per-stage declared-access map without
+/// a live `Scheduler` reference. R7.
+pub struct SchedulerAccessReport(pub crate::ecs::scheduler::AccessReport);
+impl Resource for SchedulerAccessReport {}
+
+/// Bridge for requesting screenshots from the renderer.
+/// Atomically claim ownership via [`ScreenshotBridge::try_claim`]; the
+/// renderer captures the next frame and places PNG bytes in `result`.
+/// [`ScreenshotBridge::take_result_for`] consumes the bytes only when
+/// the calling consumer matches the in-flight owner.
+///
+/// Two consumers exist by design: the CLI `--screenshot path.png`
+/// deadline loop and the debug-server `DebugRequest::Screenshot`
+/// handler. Pre-#1006 both could fire concurrently and race on the
+/// single result slot — last drainer won the PNG, the other reported
+/// "timed out" and the user's path argument was silently ignored.
+/// The owner-tagged API rejects the second caller with `false` from
+/// `try_claim`; the rejected consumer surfaces a "screenshot in
+/// progress (claimed by ...)" error to its user.
+pub struct ScreenshotBridge {
+    pub requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub result: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// Atomic owner tag — `SCREENSHOT_OWNER_NONE` / `_CLI` / `_DEBUG_SERVER`.
+    /// CAS'd from NONE → owner by `try_claim`, reset to NONE by
+    /// successful `take_result_for` or by `cancel`.
+    pub owner: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Monotonic capture generation, shared with the renderer (#1603).
+    ///
+    /// `owner` cannot distinguish a *cancelled* in-flight capture from a
+    /// fresh claim that reuses the same owner tag, so it can't gate the
+    /// renderer's private `screenshot_pending_readback` latch: a copy
+    /// recorded under owner X, cancelled mid-flight, then a new claim by
+    /// the same owner X, would let the straggler readback publish into
+    /// the new claimant's slot. This generation does: the renderer
+    /// captures it when it records the copy and only publishes the PNG if
+    /// it still matches at readback time. [`cancel`](Self::cancel) bumps
+    /// it, invalidating any capture recorded before the cancel.
+    pub generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Renderer-side depth-capture request/result channel (#3308).
+///
+/// Sibling of [`ScreenshotBridge`], deliberately thinner: the depth capture
+/// has exactly one consumer (the `depth.stats` console command), so there is
+/// no second claimant for a straggler result to be served to and neither an
+/// owner tag nor a capture generation is needed. A stale result is simply an
+/// older frame's depth, which for a diagnostic is a meaningful answer rather
+/// than a correctness hazard — the opposite of the golden-frame comparison
+/// `ScreenshotBridge` feeds, where #1006 and #1603 both mattered.
+///
+/// `samples` are raw `D32_SFLOAT` values; hand them to
+/// [`crate::ecs::components::Camera::analyze_depth_field`] rather than
+/// interpreting them at the call site.
+pub struct DepthCaptureBridge {
+    pub requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The most recent completed capture, or `None` if none has landed since
+    /// the last [`take_result`](Self::take_result).
+    pub result: std::sync::Arc<std::sync::Mutex<Option<DepthCapture>>>,
+    /// `Some(format_name)` when this device cannot be captured at all, naming
+    /// the depth format it selected instead. `None` when capture is
+    /// supported.
+    ///
+    /// #4003 — the renderer refuses to capture unless `find_depth_format`
+    /// selected `D32_SFLOAT`, because the staging sizing and the
+    /// f32-per-sample readback decode both hardcode that layout and a
+    /// confidently-wrong capture is worse than none (#3570). Vulkan mandates
+    /// `D16_UNORM` depth-attachment support but not `D32_SFLOAT`, so the
+    /// refusal is reachable on real hardware. It had no path back to the
+    /// caller: [`take_result`](Self::take_result) simply stayed `None`
+    /// forever, and `depth.stats` answered every invocation with "armed —
+    /// come back in a frame or two". The only trace was a `log::warn!` in
+    /// the renderer's log stream, which a `byro-dbg` console session does
+    /// not see.
+    ///
+    /// Filled in at init rather than on refusal, which is what lets the
+    /// console report it on the *first* invocation instead of arming a
+    /// request that can never complete. The format is a display name rather
+    /// than a `vk::Format`, since this crate does not depend on `ash` — and
+    /// the renderer owns the "which formats are capturable" rule anyway, so
+    /// the decision belongs on its side of the boundary, not this one's.
+    pub unsupported_format: Option<String>,
+}
+
+/// One captured depth attachment, as raw `D32_SFLOAT` samples.
+///
+/// Lives here rather than in the renderer so the renderer's result slot and
+/// this resource can be the *same* `Arc` — a translation step between two
+/// shapes would be one more place for the extent and the sample buffer to
+/// disagree, which is exactly the class of bug the capture exists to detect.
+#[derive(Debug, Clone)]
+pub struct DepthCapture {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major, `width * height` encoded depth values in `[0, 1]`.
+    pub samples: Vec<f32>,
+}
+
+impl Resource for DepthCaptureBridge {}
+
+impl DepthCaptureBridge {
+    /// Ask the renderer to copy the next frame's depth attachment. The
+    /// result lands one frame later, once the fence proves the GPU is done.
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Take the most recent capture, leaving the slot empty.
+    pub fn take_result(&self) -> Option<DepthCapture> {
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// The depth format this device selected, when it is one the capture
+    /// path cannot decode. `None` means capture is supported — see
+    /// [`unsupported_format`](Self::unsupported_format).
+    ///
+    /// Callers should consult this **before** [`request`](Self::request):
+    /// arming a request the renderer will refuse produces no result and no
+    /// console-visible reason (#4003).
+    pub fn unsupported_reason(&self) -> Option<&str> {
+        self.unsupported_format.as_deref()
+    }
+}
+
+/// `ScreenshotBridge` is idle — neither CLI nor debug-server holds it.
+pub const SCREENSHOT_OWNER_NONE: u8 = 0;
+/// CLI `--screenshot` deadline loop owns the in-flight request.
+pub const SCREENSHOT_OWNER_CLI: u8 = 1;
+/// Debug-server `DebugRequest::Screenshot` owns the in-flight request.
+pub const SCREENSHOT_OWNER_DEBUG_SERVER: u8 = 2;
+
+impl ScreenshotBridge {
+    /// Set `requested = true` without owner-gating. Kept for
+    /// renderer-internal use (the staging-copy poll loop on the
+    /// device side which doesn't care about consumer identity).
+    /// **New CLI / debug-server code should use [`try_claim`]
+    /// instead** so the two consumers can't collide. See #1006.
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Atomically claim the bridge for `owner` and set `requested = true`.
+    /// Returns `true` on successful claim, `false` when another owner
+    /// (or the same owner re-claiming a still-in-flight request)
+    /// already holds the bridge.
+    ///
+    /// `owner` must be `SCREENSHOT_OWNER_CLI` or
+    /// `SCREENSHOT_OWNER_DEBUG_SERVER` — passing `_NONE` is a logic
+    /// error.
+    pub fn try_claim(&self, owner: u8) -> bool {
+        debug_assert!(
+            owner == SCREENSHOT_OWNER_CLI || owner == SCREENSHOT_OWNER_DEBUG_SERVER,
+            "ScreenshotBridge::try_claim must be called with CLI or DEBUG_SERVER, not NONE"
+        );
+        if self
+            .owner
+            .compare_exchange(
+                SCREENSHOT_OWNER_NONE,
+                owner,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+
+    /// Read the current in-flight owner (CLI / DebugServer / None).
+    /// Useful for surfacing a precise rejection message when
+    /// `try_claim` fails.
+    pub fn current_owner(&self) -> u8 {
+        self.owner.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn take_result(&self) -> Option<Vec<u8>> {
+        // #1174 — recover from poison. The state inside the mutex
+        // (`Option<Vec<u8>>`) is a plain value with no invariants that
+        // a panicking writer could have left half-formed; treating a
+        // poisoned bridge as "PNG-encode failed → result empty" is the
+        // correct contract.
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Owner-gated result drain. Returns `Some(bytes)` only when the
+    /// in-flight owner matches `owner` AND a result is available.
+    /// On a successful take, atomically resets the owner to
+    /// `SCREENSHOT_OWNER_NONE` so the next request can claim a fresh
+    /// bridge. Mismatched owners get `None` even if bytes exist —
+    /// the bytes stay queued for their rightful claimant. See #1006.
+    pub fn take_result_for(&self, owner: u8) -> Option<Vec<u8>> {
+        if self.owner.load(std::sync::atomic::Ordering::Acquire) != owner {
+            return None;
+        }
+        // #1174 — see `take_result` for poison-recovery rationale.
+        let bytes = self
+            .result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        // Release the bridge for the next consumer.
+        self.owner
+            .store(SCREENSHOT_OWNER_NONE, std::sync::atomic::Ordering::Release);
+        Some(bytes)
+    }
+
+    /// Cancel a pending request and discard any straggler result bytes.
+    ///
+    /// Pre-#1011, a `DebugDrainSystem` timeout cleared
+    /// `pending_screenshot = None` but left `requested = true` if the
+    /// renderer hadn't yet observed it (renderer paused, swapchain
+    /// recreate). The renderer would later drain the request and write
+    /// a result that nobody was waiting for — the bytes sat in
+    /// `result.lock()` until the *next* screenshot request claimed
+    /// them, leaking a stale PNG into the wrong response.
+    ///
+    /// Returns `true` when state was actually mutated (request was in
+    /// flight or result was buffered). The boolean is informational —
+    /// callers don't need to branch on it.
+    pub fn cancel(&self) -> bool {
+        let had_request = self
+            .requested
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        // #1174 — see `take_result` for poison-recovery rationale.
+        let had_result = self
+            .result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        // #1006 — release ownership so the next consumer can claim.
+        self.owner
+            .store(SCREENSHOT_OWNER_NONE, std::sync::atomic::Ordering::Release);
+        // #1603 — bump the capture generation so a copy already recorded
+        // into the renderer's staging buffer (but not yet read back) is
+        // rejected when its delayed readback completes, instead of
+        // publishing a stale PNG into the next claimant's result slot.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        had_request || had_result
+    }
+
+    /// Current capture generation (#1603). The renderer captures this
+    /// when it records a screenshot copy and passes it back to
+    /// [`readback_is_current`](Self::readback_is_current) before
+    /// publishing the encoded PNG.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a readback captured at `captured_generation` is still the
+    /// live capture — i.e. no [`cancel`](Self::cancel) has intervened
+    /// since the copy was recorded. The renderer gates its
+    /// `screenshot_result` write on this so a cancelled-then-resumed
+    /// straggler is discarded rather than served to a later claimant.
+    /// #1603.
+    pub fn readback_is_current(&self, captured_generation: u64) -> bool {
+        self.generation() == captured_generation
+    }
+}
+
+impl Resource for ScreenshotBridge {}
+
+/// Per-frame delta time in seconds.
+pub struct DeltaTime(pub f32);
+impl Resource for DeltaTime {}
+
+/// Accumulated wall-clock time since engine start, in seconds.
+pub struct TotalTime(pub f32);
+impl Resource for TotalTime {}
+
+/// Global engine configuration.
+pub struct EngineConfig {
+    pub vsync: bool,
+    pub target_fps: Option<u32>,
+    pub debug_logging: bool,
+}
+
+impl Resource for EngineConfig {}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            vsync: true,
+            target_fps: None,
+            debug_logging: cfg!(debug_assertions),
+        }
+    }
+}
+
+const FRAME_HISTORY_SIZE: usize = 128;
+
+/// Per-frame engine diagnostics, updated by the main loop.
+///
+/// Contains a rolling window of frame times for FPS calculation,
+/// plus counts of entities, meshes, textures, and draw calls.
+pub struct DebugStats {
+    /// Current instantaneous FPS (1.0 / last dt).
+    pub fps: f32,
+    /// Current frame time in milliseconds.
+    pub frame_time_ms: f32,
+    /// Rolling buffer of frame times in seconds.
+    frame_times: [f32; FRAME_HISTORY_SIZE],
+    /// Write cursor into frame_times.
+    frame_index: usize,
+    /// Number of frames recorded (saturates at FRAME_HISTORY_SIZE).
+    frame_count: usize,
+    /// Total entities in the world.
+    pub entity_count: u32,
+    /// GPU meshes in the MeshRegistry. **Registry-wide** — never
+    /// drops on cell unload, so a leak that holds the last reference
+    /// to a mesh keeps this counter inflated. Pair with
+    /// [`Self::meshes_in_use`] to spot the leak: `mesh_count >
+    /// meshes_in_use` is the count of meshes the registry is retaining
+    /// for no active consumer.
+    pub mesh_count: u32,
+    /// GPU textures in the TextureRegistry. **Registry-wide** — same
+    /// caveats as [`Self::mesh_count`]. Pair with
+    /// [`Self::textures_in_use`]. See #637 / FNV-D5-02.
+    pub texture_count: u32,
+    /// Distinct non-zero `MeshHandle` values reachable from live ECS
+    /// entities at the last `stats_system` tick. Scene-scoped: drops
+    /// the moment a cell unload removes the last entity holding the
+    /// handle, so a regression that keeps a mesh in the registry
+    /// after unload shows up as `mesh_count > meshes_in_use`. See
+    /// #637 / FNV-D5-02.
+    pub meshes_in_use: u32,
+    /// Distinct non-zero `TextureHandle` values reachable from live
+    /// ECS entities at the last `stats_system` tick. Same scene-scoped
+    /// semantics as [`Self::meshes_in_use`]. See #637 / FNV-D5-02.
+    pub textures_in_use: u32,
+    /// `DrawCommand` count input to the batch merger last frame
+    /// (== `app.draw_commands.len()`). The pre-batch input — NOT the
+    /// GPU call count. Renamed from `draw_call_count` in #1258 /
+    /// PERF-D3-NEW-03 to fix a longstanding mislabel: the field was
+    /// surfaced as "Draws" by the `stats` command and the bench
+    /// summary, but stored the input-to-batcher count, which led
+    /// every perf audit's "~N µs/draw" arithmetic to use the wrong
+    /// denominator. Paired with `batch_count` + `indirect_call_count`
+    /// below for full pipeline visibility.
+    pub draw_command_count: u32,
+    /// Number of commands in the sorted raster-visible prefix last frame.
+    /// This is the population used by the parallel sort gate; the full
+    /// `draw_command_count` also includes RT-only occluders.
+    pub raster_draw_command_count: u32,
+    /// Post-merge `DrawBatch` count from the main raster pass last
+    /// frame (== `VulkanContext::last_draw_call_stats.batch_count`).
+    /// Upper bound on the actual GPU draw call count;
+    /// `cmd_draw_indexed_indirect` further compresses runs of
+    /// compatible batches into a single call (see
+    /// `indirect_call_count`). Dedup ratio = `draw_command_count /
+    /// batch_count` is what tells you whether the batcher is
+    /// collapsing repeated meshes. #1258 / PERF-D3-NEW-03.
+    pub batch_count: u32,
+    /// Actual number of `cmd_draw_indexed` + `cmd_draw_indexed_indirect`
+    /// invocations recorded into last frame's main raster pass
+    /// (== `VulkanContext::last_draw_call_stats.indirect_call_count`).
+    /// Includes the two-sided alpha-blend split (which emits 2 direct
+    /// draws per batch) and excludes the water / sky / UI / composite
+    /// passes (O(1) per frame each). Indirect grouping ratio =
+    /// `batch_count / indirect_call_count`. This is the "Draws" number
+    /// the user actually wants when asking "how expensive is the
+    /// frame?" — the real GPU call count. #1258 / PERF-D3-NEW-03.
+    pub indirect_call_count: u32,
+    /// `SkinSlotPool` live-slot count last frame (== entities currently
+    /// allocated a bone-palette slot, excluding the reserved slot 0).
+    /// Mirrored from `App::skin_slot_pool` each frame because the pool
+    /// itself lives on the App struct rather than the ECS world.
+    /// #1284.
+    pub skin_pool_live: u32,
+    /// `SkinSlotPool` capacity ceiling
+    /// (`(MAX_TOTAL_BONES / MAX_BONES_PER_MESH) - 1`). Pinned via
+    /// `SKIN_MAX_SLOTS` to the bone-palette architectural ceiling so
+    /// the descriptor pool never silently becomes the dominant cap.
+    /// #1284.
+    pub skin_pool_max: u32,
+    /// `SkinSlotPool` cumulative spill count — how many `allocate()`
+    /// calls returned `None` since engine start. `0` is the healthy
+    /// state; any non-zero value means at least one entity is rendering
+    /// in bind pose for lack of a slot. Drives the cap-sizing feedback
+    /// loop on #1284: capture this from the `audit-runtime` baseline to
+    /// know how far the next bump needs to go.
+    pub skin_pool_overflow_attempts: u32,
+    /// `AnimationClipRegistry::len()` last frame — total clip slots,
+    /// including ones `release` has stranded as empty stubs (see
+    /// `anim_clip_stub_count`). Same "registry-wide, never drops"
+    /// caveat as `mesh_count` / `texture_count`.
+    pub anim_clip_count: u32,
+    /// `AnimationClipRegistry::stub_slot_count()` last frame — clip
+    /// slots permanently stranded empty by `release` (the cell-loader's
+    /// LRU eviction path). #2689 (SAFE-D8-01): the registry never
+    /// reuses a released slot (reuse would risk aliasing a still-live
+    /// stale handle to unrelated new content), so this grows by one per
+    /// evict/reload cycle on a churned clip and never shrinks.
+    /// `anim_clip_stub_count == anim_clip_count` means every resident
+    /// slot is dead weight — the actionable signal for finally
+    /// implementing a generational-handle scheme.
+    pub anim_clip_stub_count: u32,
+    /// Ground-cover authored-model tier (#4920): the most recent frame's
+    /// placement counts, read back one pipelined frame late. `demanded >
+    /// emitted` means placement was truncated — every record keeps the same
+    /// share of whole plants. #5220: the tier zeroes these on any frame that
+    /// places nothing (interior, cover off, upload failure), so a reader
+    /// sees this frame's truth rather than a latched exterior count; 0/0
+    /// with no tier resident. Surfaced by the `stats` console command.
+    pub groundcover_model_demanded: u32,
+    pub groundcover_model_emitted: u32,
+}
+
+impl Resource for DebugStats {}
+
+impl Default for DebugStats {
+    fn default() -> Self {
+        Self {
+            fps: 0.0,
+            frame_time_ms: 0.0,
+            frame_times: [0.0; FRAME_HISTORY_SIZE],
+            frame_index: 0,
+            frame_count: 0,
+            entity_count: 0,
+            mesh_count: 0,
+            texture_count: 0,
+            meshes_in_use: 0,
+            textures_in_use: 0,
+            draw_command_count: 0,
+            raster_draw_command_count: 0,
+            batch_count: 0,
+            indirect_call_count: 0,
+            skin_pool_live: 0,
+            skin_pool_max: 0,
+            skin_pool_overflow_attempts: 0,
+            anim_clip_count: 0,
+            anim_clip_stub_count: 0,
+            groundcover_model_demanded: 0,
+            groundcover_model_emitted: 0,
+        }
+    }
+}
+
+impl DebugStats {
+    /// Record a frame's delta time and update FPS.
+    pub fn push_frame_time(&mut self, dt: f32) {
+        self.frame_times[self.frame_index] = dt;
+        self.frame_index = (self.frame_index + 1) % FRAME_HISTORY_SIZE;
+        if self.frame_count < FRAME_HISTORY_SIZE {
+            self.frame_count += 1;
+        }
+        self.frame_time_ms = dt * 1000.0;
+        self.fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+    }
+
+    /// Average FPS over the rolling window.
+    pub fn avg_fps(&self) -> f32 {
+        if self.frame_count == 0 {
+            return 0.0;
+        }
+        let sum: f32 = self.frame_times[..self.frame_count].iter().sum();
+        let avg_dt = sum / self.frame_count as f32;
+        if avg_dt > 0.0 {
+            1.0 / avg_dt
+        } else {
+            0.0
+        }
+    }
+
+    /// Min and max frame times (seconds) over the rolling window.
+    pub fn min_max_frame_time(&self) -> (f32, f32) {
+        if self.frame_count == 0 {
+            return (0.0, 0.0);
+        }
+        let slice = &self.frame_times[..self.frame_count];
+        let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = slice.iter().cloned().fold(0.0f32, f32::max);
+        (min, max)
+    }
+
+    /// Current write index (useful for throttling title bar updates).
+    pub fn frame_index(&self) -> usize {
+        self.frame_index
+    }
+
+    /// Frames recorded so far, saturating at the rolling window's size.
+    /// Unlike [`Self::frame_index`] (the window's wrapping write cursor) it
+    /// never returns to 0, so it can tell startup frames from later ones.
+    pub fn frames_recorded(&self) -> usize {
+        self.frame_count
+    }
+}
+
+/// One row of renderer-side scratch-buffer telemetry: name, current
+/// `len`, current `capacity`, and the size in bytes of one element so
+/// consumers can compute the heap footprint without knowing the
+/// renderer's element types.
+///
+/// Used by R6 (ROADMAP) to catch unbounded `Vec` growth in the
+/// renderer's per-frame scratch buffers, particularly across M40 cell
+/// streaming where the high-water mark would otherwise grow silently.
+#[derive(Debug, Clone, Copy)]
+pub struct ScratchRow {
+    pub name: &'static str,
+    pub len: usize,
+    pub capacity: usize,
+    pub elem_size_bytes: usize,
+}
+
+impl ScratchRow {
+    /// Heap footprint of the buffer at its current `capacity` (not `len`).
+    pub fn bytes_used(&self) -> usize {
+        self.capacity.saturating_mul(self.elem_size_bytes)
+    }
+
+    /// Bytes of headroom — `capacity - len` × element size. Sustained
+    /// non-zero values across many frames mean the high-water mark
+    /// drifted up at some point and never came back down.
+    pub fn wasted_bytes(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.len)
+            .saturating_mul(self.elem_size_bytes)
+    }
+}
+
+/// Snapshot of every renderer-side persistent `Vec` scratch's capacity.
+///
+/// Refreshed each frame by the engine binary (after `Scheduler::run`,
+/// alongside `mesh_count` / `texture_count` on `DebugStats`). Read by
+/// the `ctx.scratch` console command.
+///
+/// `rows` is a reused `Vec` — stabilises at one row per registered
+/// scratch after the first frame (see `VulkanContext::
+/// fill_scratch_telemetry` for the current, authoritative row count and
+/// list — it has grown since this was last counted, don't recount it
+/// here), and is the *only* per-frame heap allocation in the telemetry
+/// path. Bounded by the number of declared scratches at that call site,
+/// so it cannot itself exhibit the unbounded-growth pattern this
+/// resource is designed to catch.
+#[derive(Debug, Default)]
+pub struct ScratchTelemetry {
+    pub rows: Vec<ScratchRow>,
+    /// R1 / #780 — unique materials at end of last `build_render_data`.
+    ///
+    /// `== MaterialTable::unique_user_count()`, i.e. `len()` minus the
+    /// seeded neutral default at slot 0 (#1032). The producer in
+    /// `byroredux::main` assigns exactly that, deliberately: counting the
+    /// seed would put a floor of 1 under the denominator and skew the
+    /// dedup ratio on frames with no user materials. This doc previously
+    /// said `len()`, contradicting `unique_user_count`'s own doc in
+    /// `crates/renderer/src/vulkan/material.rs` (#2711).
+    ///
+    /// Pairs with `materials_interned` to compute the dedup ratio.
+    pub materials_unique: usize,
+    /// R1 / #780 — total `intern()` calls during last
+    /// `build_render_data` (== `MaterialTable::interned_count()`,
+    /// one tick per emitted `DrawCommand`). Dedup ratio =
+    /// `materials_interned / materials_unique` — how many intern calls
+    /// each unique material absorbs (higher = better dedup). Displayed by
+    /// the `ctx.scratch` console command — there is no `mat.stats`
+    /// (#2711); `ctx.scratch`'s handler is what prints the
+    /// `materials: N unique / M interned (R× dedup)` line and the
+    /// overflow tail. A drop here flags a regression
+    /// (alignment hole, non-deterministic float in the producer) that
+    /// breaks byte-equality dedup before VRAM pressure shows it.
+    /// (#1066 / REN-D14-NEW-06 — corrected from the prior inverted formula)
+    pub materials_interned: usize,
+    /// Number of `intern()` calls routed to id 0 (the neutral-default
+    /// fallback) because the table hit `MAX_MATERIALS`. Mirrors
+    /// `MaterialTable::overflow_count()`. Zero in the common case;
+    /// non-zero is the signal that the cap should be raised — see
+    /// `MAX_MATERIALS` in `crates/renderer/src/vulkan/scene_buffer/
+    /// constants.rs`. Surfaced by the `mem` console command.
+    pub materials_overflow: usize,
+    /// #3694 — split point in `rows`: `rows[..renderer_row_count]` came
+    /// from `VulkanContext::fill_scratch_telemetry` (renderer-owned
+    /// scratches); `rows[renderer_row_count..]` are the engine binary's
+    /// own `build_render_data` scratches, appended right after by the
+    /// producer in `byroredux::app_events`. Lets `ctx.scratch` label the
+    /// two groups without threading a per-row tag through all 24+
+    /// `ScratchRow` construction sites — the producer already knows the
+    /// boundary at push time, for free.
+    pub renderer_row_count: usize,
+}
+
+impl Resource for ScratchTelemetry {}
+
+/// One-line description of the active render-to-output reconstruction path,
+/// refreshed by the renderer each frame and printed by `ctx.upscaler`.
+///
+/// Carries the FSR provider version and the SDK's own GPU memory reservation,
+/// neither of which appears in `gpu-allocator`'s accounting because the
+/// official backend allocates them itself. Empty until the renderer's first
+/// frame.
+#[derive(Debug, Default)]
+pub struct UpscalerTelemetry {
+    pub summary: String,
+    /// Milliseconds the upscale bracket measured on the last snapshot frame.
+    /// Mirrors `SkinCoverageStats::gpu_upscale_ms`, repeated here so the
+    /// upscaler command is a single stop.
+    pub gpu_ms: f32,
+    /// Whether the upscale bracket actually ran on that snapshot frame
+    /// (#2821). Mirrors `SkinCoverageStats::gpu_upscale_active`; without it
+    /// `ctx.upscaler` could not tell a genuinely free upscale from a bracket
+    /// that never fired (no upscaler, or GPU timestamps unavailable), which is
+    /// the ambiguity the `_active` plumbing exists to close.
+    pub gpu_ms_active: bool,
+}
+
+impl Resource for UpscalerTelemetry {}
+
+impl ScratchTelemetry {
+    pub fn total_bytes(&self) -> usize {
+        self.rows.iter().map(ScratchRow::bytes_used).sum()
+    }
+
+    pub fn total_wasted(&self) -> usize {
+        self.rows.iter().map(ScratchRow::wasted_bytes).sum()
+    }
+}
+
+/// Volumetric dispatch inputs retained alongside the same frame's GPU timers.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VolumetricsFrameState {
+    pub rt_tier: u32,
+    pub light_cap: u32,
+    pub froxel_extent: [u32; 3],
+    pub transport_armed: bool,
+    pub fog_volume_count: u32,
+    pub max_density_count: u32,
+    pub max_portal_count: u32,
+}
+
+/// Per-frame skinned-mesh BLAS coverage telemetry.
+///
+/// Refreshed each frame by the engine binary via
+/// `VulkanContext::fill_skin_coverage_stats`, alongside
+/// [`ScratchTelemetry`]. Surfaced by the `skin.coverage` console
+/// command.
+///
+/// Closes the M29.3 / "skinned BLAS coverage" observability gap: the
+/// per-skinned-entity pre-skin + BLAS refit path is wired, but several
+/// silent skips can drop a visible skinned entity from this frame's
+/// refit — slot-pool exhaustion (`failed_skin_slots`), first-sight
+/// prime/BUILD failure, missing `MeshHandle`. This resource is the
+/// falsifiable signal that "every visible skinned entity refit this
+/// frame": `refits_succeeded == dispatches_total` is the green-bar.
+#[derive(Debug, Default)]
+pub struct SkinCoverageStats {
+    /// State from the same submitted frame as the GPU timing snapshot.
+    pub volumetrics_state: VolumetricsFrameState,
+    /// Unique skinned entities in this frame's draw_commands (those with
+    /// `bone_offset > 0`). Denominator for everything below.
+    pub dispatches_total: u32,
+    /// Entities whose compute dispatch was elided this frame because the
+    /// bone palette hadn't changed since the previous dispatch. Counter
+    /// landed in #1194 / PERF-DIM7-INSTR; incremented by the dispatch-
+    /// dirty gate (#1195 / PERF-DIM7-01). `dispatches_total -
+    /// dispatches_skipped` gives the GPU dispatch count actually issued.
+    pub dispatches_skipped: u32,
+    /// Entities currently holding a `SkinSlot` (gauge — not per-frame).
+    pub slots_active: u32,
+    /// Slot-pool capacity (`SKIN_MAX_SLOTS`). Constant after init.
+    /// `slots_active` approaching this is the pressure signal.
+    pub slot_pool_capacity: u32,
+    /// Entities whose `create_slot` call returned an error and are
+    /// suppressed until LRU eviction frees a slot. Gauge — cleared on
+    /// any eviction.
+    pub slots_failed: u32,
+    /// #4049 — cumulative count of failed `upload_pending_bind_inverses`
+    /// calls (the host-visible map/flush for first-sight `bind_inverses`).
+    /// Unlike `slots_failed`, this is a running total with no reset point —
+    /// the #3569 requeue retries the same upload every frame until it
+    /// succeeds, so the log for it is one-shot (`bind_inverse_upload_warned`)
+    /// and this counter is the only place the magnitude survives.
+    pub bind_inverse_upload_failures: u32,
+    /// Active per-entity morph slots. Their immutable delta buffers may be
+    /// shared by mesh; the count here is still one entry per entity weight
+    /// buffer.
+    pub morph_slots: u32,
+    /// Resident bytes for unique mesh morph deltas plus per-entity weight
+    /// buffers. This is a logical buffer-size total, excluding allocator
+    /// page/granularity overhead.
+    pub morph_bytes: u64,
+    /// First-sight entities entering the sync prime + BUILD path this
+    /// frame (slot newly created OR BLAS missing/rebuild-requested).
+    pub first_sight_attempted: u32,
+    /// First-sight entities for which both prime and BUILD succeeded.
+    pub first_sight_succeeded: u32,
+    /// Per-frame compute dispatch + refit attempts (entities with a
+    /// `SkinSlot` AND with an existing BLAS — i.e. past first-sight).
+    pub refits_attempted: u32,
+    /// Refits that returned `Ok` this frame.
+    pub refits_succeeded: u32,
+    /// Sample of entity IDs currently in `failed_skin_slots`. Bounded
+    /// snapshot (first ~16 entries) so the resource stays cheap to copy
+    /// out of the renderer each frame; the full count is in
+    /// `slots_failed`.
+    pub failed_entity_ids: Vec<super::storage::EntityId>,
+    /// **CPU** wall-clock milliseconds the renderer spent driving the
+    /// skinned chain this frame — dispatch loop, first-sight BLAS
+    /// builds, refit loop, and the slot eviction drain/sweep.
+    ///
+    /// Unlike every `gpu_*_ms` field below this is same-frame, not one
+    /// `MAX_FRAMES_IN_FLIGHT` cycle behind: it is a host `Instant`
+    /// measurement taken inside the frame being reported. It is also
+    /// the only host-side cost of the chain that is measured at all —
+    /// the GPU brackets time the work this recording *submits*, and the
+    /// two diverge whenever per-entity map lookups and command
+    /// recording, rather than the device, are the bottleneck. Measured
+    /// since M29, given a consumer by #2803.
+    pub cpu_skin_chain_ms: f32,
+    /// Per-pass GPU elapsed time in milliseconds (#1194 /
+    /// PERF-DIM7-INSTR). One `MAX_FRAMES_IN_FLIGHT` cycle behind the
+    /// frame the stats were filled on — that's the pipeline lag
+    /// between writing TIMESTAMPs and reading them after the
+    /// frame's fence signals. Zero when the driver lacks
+    /// `timestampComputeAndGraphics` OR before the first complete
+    /// pipelined cycle OR when the corresponding bracket didn't run
+    /// (skin section skipped, TAA disabled, etc.).
+    pub gpu_skin_dispatch_ms: f32,
+    /// GPU bone-buffer transfers plus `skin_palette.comp`. The staging
+    /// memcpys are host work and are not included in this timestamp bracket.
+    pub gpu_skin_palette_ms: f32,
+    pub gpu_skin_blas_refit_ms: f32,
+    pub gpu_taa_ms: f32,
+    /// Main render pass (G-buffer + per-fragment RT loop) wall-clock
+    /// in milliseconds. Added in debug-UI Phase 6 to surface the
+    /// 540 ms / 1 FPS Sleeping-Giant-Inn pathology that hid behind
+    /// the unprofiled main pass. Names stay on `SkinCoverageStats`
+    /// for historical compatibility; the resource is the canonical
+    /// landing pad for every per-pass GPU timer.
+    pub gpu_main_render_ms: f32,
+    pub gpu_tlas_build_ms: f32,
+    pub gpu_cluster_cull_ms: f32,
+    pub gpu_svgf_ms: f32,
+    /// Phase-7 brackets — added to close the "438 ms unaccounted"
+    /// gap that Phase 6's instrumentation exposed (main_render
+    /// itself reads only ~35 ms on a Skyrim interior, so the
+    /// bottleneck has to live in one of these five). Naming
+    /// retained on `SkinCoverageStats` for historical
+    /// compatibility; the resource is the canonical landing pad
+    /// for every per-pass GPU timer now, not just skin-related.
+    pub gpu_composite_ms: f32,
+    pub gpu_ssao_ms: f32,
+    pub gpu_bloom_ms: f32,
+    pub gpu_caustic_splat_ms: f32,
+    pub gpu_volumetrics_ms: f32,
+    /// Render-to-output reconstruction (FSR 3.1 dispatch, or the native
+    /// blit that stands in for it). The upscaler's own cost, which the
+    /// bench report subtracts from the render-resolution savings.
+    pub gpu_upscale_ms: f32,
+    /// Output-resolution presentation (exposure + ACES → swapchain). The part
+    /// of the frame an FSR preset does *not* shrink.
+    pub gpu_presentation_ms: f32,
+    /// Full-render-resolution opaque-depth copy into the soft-particle
+    /// history image. This is inactive when no loaded material source carries
+    /// `MAT_FLAG_EFFECT_SOFT`.
+    pub gpu_depth_history_copy_ms: f32,
+    /// SKYAL sky-cubemap bake (analytic sky + volumetric cloud march for
+    /// every texel of all six faces). Inactive when the bake failed to
+    /// initialise and the ray-traced sky fell back to the flat blend.
+    pub gpu_sky_cube_ms: f32,
+    /// EXAL ground-cover interaction + scatter compute (#4315) — the §12.4
+    /// field update, the counter clears and the TLAS-ray-query scatter that
+    /// feeds the blade draw. Inactive on interiors and on any frame with no
+    /// resident ground-cover chunks. The blade draw itself is inside
+    /// `gpu_main_render_ms`, not here.
+    pub gpu_groundcover_scatter_ms: f32,
+    /// Exposure meter (#4618) — the luminance reduction of the post-bloom
+    /// scene and the write of the exposure texel FSR and presentation both
+    /// read, both barriers included. Inactive on a raw-debug-view frame and
+    /// after the meter latches a failure.
+    pub gpu_exposure_meter_ms: f32,
+    pub gpu_groundcover_models_ms: f32,
+    pub gpu_volumetrics_inject_ms: f32,
+    pub gpu_volumetrics_integrate_ms: f32,
+    /// #5959 — the direct-shadow filter, nested inside `gpu_svgf_ms` when
+    /// SVGF runs (never sum the two).
+    pub gpu_shadow_filter_ms: f32,
+    /// #6316 — the cloud-shadow bake, nested inside `gpu_sky_cube_ms`
+    /// (never sum the two).
+    pub gpu_cloud_shadow_ms: f32,
+
+    // ── Per-bracket "ran this frame" flags (#2513 / REN-D20-NEW-03) ───
+    //
+    // One bool per `gpu_*_ms` field above, in the same order — mirrors
+    // `GpuTimerSnapshot`'s own `*_active` fields (#2278 / PERF-D9-01),
+    // which `fill_skin_coverage_stats` copies straight through. `false`
+    // means the bracket's `_ms` field reads `0.0` because the pass didn't
+    // run this snapshot cycle (or GPU timestamps are unavailable at all),
+    // not because it measured zero — the ambiguity #2278 fixed at the
+    // producer but that had no consumer until now.
+    pub gpu_skin_dispatch_active: bool,
+    pub gpu_skin_palette_active: bool,
+    pub gpu_skin_blas_refit_active: bool,
+    pub gpu_taa_active: bool,
+    pub gpu_main_render_active: bool,
+    pub gpu_tlas_build_active: bool,
+    pub gpu_cluster_cull_active: bool,
+    pub gpu_svgf_active: bool,
+    pub gpu_composite_active: bool,
+    pub gpu_ssao_active: bool,
+    pub gpu_bloom_active: bool,
+    pub gpu_caustic_splat_active: bool,
+    pub gpu_volumetrics_active: bool,
+    pub gpu_upscale_active: bool,
+    pub gpu_presentation_active: bool,
+    pub gpu_depth_history_copy_active: bool,
+    pub gpu_sky_cube_active: bool,
+    pub gpu_groundcover_scatter_active: bool,
+    pub gpu_exposure_meter_active: bool,
+    pub gpu_groundcover_models_active: bool,
+    pub gpu_volumetrics_inject_active: bool,
+    pub gpu_volumetrics_integrate_active: bool,
+    pub gpu_shadow_filter_active: bool,
+    pub gpu_cloud_shadow_active: bool,
+}
+
+/// CPU-side per-frame wall-clock breakdown — populated by the
+/// binary's main loop using the `byroredux_renderer::FrameTimings`
+/// struct `draw_frame` fills.
+///
+/// **Why this resource exists**: the GPU TIMESTAMP brackets in
+/// `SkinCoverageStats` measure only work bracketed inside the main
+/// command buffer. Operations that happen OUTSIDE that bracket —
+/// the fence wait at the top of `draw_frame`, the
+/// `vkQueueSubmit` + `vkQueuePresentKHR` block at the end, the egui set_textures
+/// transfer-queue submit-and-wait — are invisible to those
+/// brackets. A pathology surfaced by Phase 7 instrumentation
+/// (sum of 12 GPU brackets = 78 ms vs 389 ms wall frame time = 311 ms
+/// "missing") drove the addition of this resource: if `fence_wait_ms`
+/// or `submit_present_ms` is large, the bottleneck is a GPU stall
+/// or a present-mode block that GPU timestamps can't see.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CpuFrameTimings {
+    /// `vkWaitForFences` at the top of `draw_frame` — CPU stall
+    /// waiting for the previous frame's GPU work to complete. If
+    /// this is large, the GPU is genuinely the bottleneck even
+    /// when the per-pass GPU TIMESTAMPs sum to less.
+    pub fence_wait_ms: f32,
+    /// CPU work for the TLAS build path (instance map gather +
+    /// command record). The GPU AS build runs async; this is
+    /// the host-side overhead.
+    pub tlas_build_ms: f32,
+    /// Instance SSBO fill + upload (memcpy + indirect draws).
+    /// Dominant CPU-side work per frame on dense cells.
+    pub ssbo_build_ms: f32,
+    /// Blend variant discovery, compilation and pipeline-cache persistence.
+    pub pipeline_compile_ms: f32,
+    /// Post-instance parameter construction/uploads and pre-render barriers.
+    pub parameter_upload_ms: f32,
+    /// Fog cluster construction and mapped uploads. This is excluded from
+    /// `cmd_record_ms`, although it runs during the recording interval.
+    pub fog_cluster_ms: f32,
+    /// Scratch and acceleration-buffer maintenance after presentation.
+    pub post_present_ms: f32,
+    /// The resumable global-geometry SSBO rebuild (#3298), including
+    /// its per-frame chunk. Its own constant is documented as
+    /// "chosen conservatively pending live tuning"; this is the
+    /// number that tuning needs, and nothing else isolates it —
+    /// it otherwise hides inside `rof_pre_draw` alongside
+    /// `build_render_data`, material interning and the UI tick
+    /// (#3467). Zero on frames with no rebuild in flight.
+    pub geometry_rebuild_ms: f32,
+    /// Main geometry recording through `end_command_buffer`, including
+    /// geometry and post passes, excluding separately measured fog preparation.
+    pub cmd_record_ms: f32,
+    /// `vkQueueSubmit` + `vkQueuePresentKHR` — driver overhead
+    /// plus any vsync / present-mode-FIFO stall. The other place
+    /// "missing" GPU work hides.
+    pub submit_present_ms: f32,
+    /// `vkAcquireNextImageKHR` CPU stall. Falls in the gap
+    /// between `fence_wait` and `cmd_record`. With FIFO present
+    /// mode + a low swapchain image count this is where the
+    /// compositor / vsync block lands. Phase 9 of the debug-UI
+    /// plan added the bracket after a reading showed
+    /// fence_wait + submit_present both trivial yet a 390 ms
+    /// per-frame gap.
+    pub acquire_ms: f32,
+    /// Wall time between the END of one frame and the START of
+    /// the next. Captures the period winit hands the thread back
+    /// to the OS — Wayland frame-callback wait, compositor
+    /// throttling, the ECS scheduler tick in `about_to_wait`,
+    /// any event-loop sleep. If `acquire_ms` is small but this
+    /// is large, the bottleneck is *outside* the engine's render
+    /// path (compositor, OS, ECS systems running between
+    /// frames). Phase 9.
+    pub between_frames_ms: f32,
+    /// Wall time in the `about_to_wait`'s pre-scheduler phase:
+    /// dt update, entity-walk handle dedup (`meshes_in_use` /
+    /// `textures_in_use`), DebugStats refresh, scratch +
+    /// skin-coverage fill from the renderer. The entity walk
+    /// alone is O(entity_count); on dense cells this can grow.
+    /// Phase 10.
+    pub atw_pre_ms: f32,
+    /// Wall time of `Scheduler::run` — runs every registered ECS
+    /// system in stage order. The biggest single block of work
+    /// in `about_to_wait`; any pathology that holds the host
+    /// (kira mutex, physics island fence, audio queue flush)
+    /// lands here. Phase 10.
+    pub atw_scheduler_ms: f32,
+    /// Wall time from the start of `about_to_wait`'s post-scheduler phase
+    /// through its tail. This includes post-scheduler steps such as
+    /// `step_streaming`, debug loads, cell transitions, and window-title
+    /// updates, plus the nested `render_one_frame` call. In steady state it
+    /// therefore contains `rof_pre_draw_ms + rof_draw_call_ms +
+    /// rof_post_draw_ms`. It is sequential with `atw_pre_ms` and
+    /// `atw_scheduler_ms`; those three `about_to_wait` phases are siblings.
+    /// Phase 10.
+    pub atw_post_ms: f32,
+    /// `render_one_frame`'s pre-draw_frame phase: egui run,
+    /// build_render_data (ECS walk producing draw_commands),
+    /// material table refresh, ScratchTelemetry update, UI
+    /// manager (Ruffle SWF) tick + texture upload, geometry SSBO
+    /// rebuild check. Phase 15.
+    pub rof_pre_draw_ms: f32,
+    /// Wall time of the `draw_frame` CPU call itself. Its sub-buckets are
+    /// acquire, fence wait, SSBO build, pipeline compile, parameter upload,
+    /// TLAS build, fog cluster, command recording, submit/present and
+    /// post-present maintenance. The residual also includes other host work
+    /// (for example egui texture setup); it is not proof of a driver wait.
+    pub rof_draw_call_ms: f32,
+    /// `render_one_frame`'s post-draw_frame phase: FrameTimings
+    /// fold into `CpuFrameTimings`, bench accumulator update,
+    /// swapchain recreate, `last_redraw_end` stamp. Phase 15.
+    pub rof_post_draw_ms: f32,
+}
+
+impl Resource for CpuFrameTimings {}
+
+impl Resource for SkinCoverageStats {}
+
+pub mod skin_slot_pool;
+pub use skin_slot_pool::SkinSlotPool;
+
+/// Pre-tonemap image-health counters (EX-05 / #2736).
+///
+/// Refreshed from the renderer each frame. `last` is the most recently
+/// completed frame; `total` accumulates since process start, because a NaN is
+/// usually transient — it appears only while a bad material or degenerate
+/// light is on screen. A gate sampling just the current frame would miss it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ImageHealth {
+    pub last_non_finite_rgb: u32,
+    pub last_non_finite_alpha: u32,
+    pub total_non_finite_rgb: u64,
+    pub total_non_finite_alpha: u64,
+}
+
+impl ImageHealth {
+    /// True when nothing non-finite has ever reached the tone mapper.
+    pub fn is_clean(&self) -> bool {
+        self.total_non_finite_rgb == 0 && self.total_non_finite_alpha == 0
+    }
+}
+
+impl Resource for ImageHealth {}
+
+/// Last completed renderer integrity snapshot for RT lighting.
+///
+/// This joins the five conditions that must all hold before a shadow-ray
+/// result is meaningful: the camera UBO published RT, the current TLAS build
+/// succeeded, every eligible draw became an instance, submitted lights were
+/// retained, and clustered-light assignment stayed within its capacity.
+/// The renderer fills the resource once per frame; `rt.integrity` and finite
+/// benchmark summaries expose the same stable line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RtIntegrityStats {
+    /// Monotonic renderer frame associated with the CPU/TLAS sample.
+    pub frame: u64,
+    /// At least one renderer frame has populated this resource.
+    pub sampled: bool,
+    /// The selected Vulkan device exposes the required ray-query path.
+    pub rt_supported: bool,
+    /// `GpuCamera.flags[0]` was successfully uploaded/patched to `1.0` for
+    /// the most recently recorded frame.
+    pub rt_flag: bool,
+    /// The most recent TLAS build completed and produced a live handle.
+    pub tlas_build_succeeded: bool,
+    /// Draws which passed the renderer's TLAS eligibility predicate.
+    pub tlas_eligible: u32,
+    /// Acceleration-structure instances emitted for those draws.
+    pub tlas_emitted: u32,
+    /// Eligible skinned draws missing their per-entity BLAS.
+    pub missing_skinned_blas: u32,
+    /// Eligible rigid draws missing their mesh BLAS (the LRU-eviction signal).
+    pub missing_rigid_blas: u32,
+    /// Eligible draws missing the matching compacted instance-SSBO entry.
+    pub missing_ssbo_instance: u32,
+    /// Eligible draws whose model matrix carried a non-finite cell, so the
+    /// TLAS gather dropped them instead of feeding a garbage
+    /// `VkTransformMatrixKHR` to the AS build (#4633). #5200 — without this
+    /// field a frame whose only drops are non-finite reports `emitted <
+    /// eligible` with every cause counter at zero, the "FAIL, no cause"
+    /// shape the #1228/#3999 integrity chain exists to prevent.
+    pub non_finite_transform: u32,
+    /// Lights submitted by render-data collection before the global SSBO cap.
+    pub lights_submitted: u32,
+    /// Lights retained in the GPU SSBO after applying the global cap.
+    pub lights_uploaded: u32,
+    /// Submitted lights discarded before cluster assignment.
+    pub lights_dropped: u32,
+    /// A completed cluster-cull readback has populated the fields below.
+    pub cluster_sampled: bool,
+    /// Number of clusters whose candidate count exceeded the hard cap.
+    pub cluster_overflowed: u32,
+    /// Total candidate references discarded across overflowing clusters.
+    pub cluster_dropped: u32,
+    /// Largest unclamped candidate count observed in any cluster.
+    pub cluster_max_lights: u32,
+    /// Total BLAS device memory in bytes — static (mesh-keyed) plus skinned
+    /// (per-entity).
+    ///
+    /// #3999 — the acceleration manager computed all five of the figures
+    /// below and exposed each behind a `pub` accessor, three of whose
+    /// docstrings named a consumer that did not exist (a `tex.stats` command
+    /// that was never registered, and two unit tests that were never
+    /// written). BLAS device residency and the deferred-destroy backlog were
+    /// therefore not readable from a running engine at all — which is
+    /// precisely the accounting the #3840 work computed and
+    /// `REN-2026-09-06-D1-01` describes going wrong. `rt.integrity` already
+    /// crosses renderer → resource → console every frame, so these ride it
+    /// rather than growing a second telemetry channel.
+    ///
+    /// Deliberately absent from [`Self::verdict`]: residency is a magnitude,
+    /// not a correctness predicate, and there is no threshold here that
+    /// should turn a PASS into a FAIL.
+    pub blas_total_bytes: u64,
+    /// Static (mesh-keyed) BLAS bytes — the LRU-evictable subset of
+    /// [`Self::blas_total_bytes`], and the figure residency-budget decisions
+    /// are made against.
+    pub blas_static_bytes: u64,
+    /// Static-BLAS bytes already deducted from [`Self::blas_static_bytes`]
+    /// but not yet freed, because their entries are waiting out the
+    /// deferred-destroy countdown. The gap between the paper figure and true
+    /// residency; the number a batch can overshoot its budget by.
+    pub blas_pending_destroy_bytes: u64,
+    /// Entries waiting in the deferred-destroy BLAS queue.
+    pub blas_pending_destroy_count: u32,
+    /// Retired scratch buffers waiting in the deferred-destroy scratch queue.
+    pub scratch_pending_destroy_count: u32,
+    /// Textures waiting in `TextureRegistry`'s deferred-destroy queues.
+    ///
+    /// #4117 — the texture-side twin of the two BLAS/scratch backlogs above:
+    /// the registry computed it behind a `pub` accessor whose doc named a
+    /// telemetry consumer that did not exist, so a stalled
+    /// `tick_deferred_destroy` would only have surfaced later as VRAM
+    /// pressure. Telemetry like its siblings; not part of the verdict.
+    pub texture_pending_destroy_count: u32,
+}
+
+impl RtIntegrityStats {
+    /// Stable four-state verdict for automation and operator diagnostics.
+    pub fn verdict(&self) -> &'static str {
+        if !self.sampled || !self.cluster_sampled {
+            "PENDING"
+        } else if !self.rt_supported {
+            "UNSUPPORTED"
+        } else if self.rt_flag
+            && self.tlas_build_succeeded
+            && self.tlas_emitted == self.tlas_eligible
+            && self.missing_skinned_blas == 0
+            && self.missing_rigid_blas == 0
+            && self.missing_ssbo_instance == 0
+            && self.non_finite_transform == 0
+            && self.lights_dropped == 0
+            && self.cluster_overflowed == 0
+            && self.cluster_dropped == 0
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    }
+
+    /// Machine-readable line shared by the console and benchmark harness.
+    pub fn machine_line(&self) -> String {
+        format!(
+            "rt-integrity: frame={} sampled={} rt_supported={} rt_flag={} \
+             tlas_build={} tlas_eligible={} tlas_emitted={} \
+             missing_skinned={} missing_rigid={} missing_ssbo={} \
+             non_finite_transform={} \
+             lights_submitted={} lights_uploaded={} lights_dropped={} \
+             cluster_sampled={} cluster_overflowed={} cluster_dropped={} \
+             cluster_max={} \
+             blas_total_bytes={} blas_static_bytes={} \
+             blas_pending_destroy_bytes={} blas_pending_destroy_count={} \
+             scratch_pending_destroy_count={} texture_pending_destroy_count={} \
+             verdict={}",
+            self.frame,
+            u8::from(self.sampled),
+            u8::from(self.rt_supported),
+            u8::from(self.rt_flag),
+            u8::from(self.tlas_build_succeeded),
+            self.tlas_eligible,
+            self.tlas_emitted,
+            self.missing_skinned_blas,
+            self.missing_rigid_blas,
+            self.missing_ssbo_instance,
+            self.non_finite_transform,
+            self.lights_submitted,
+            self.lights_uploaded,
+            self.lights_dropped,
+            u8::from(self.cluster_sampled),
+            self.cluster_overflowed,
+            self.cluster_dropped,
+            self.cluster_max_lights,
+            self.blas_total_bytes,
+            self.blas_static_bytes,
+            self.blas_pending_destroy_bytes,
+            self.blas_pending_destroy_count,
+            self.scratch_pending_destroy_count,
+            self.texture_pending_destroy_count,
+            self.verdict(),
+        )
+    }
+}
+
+impl Resource for RtIntegrityStats {}
+
+/// Live-residency LOD coverage audit (EX-10/11 / #2371).
+///
+/// Distinct from [`RtIntegrityStats`] (renderer-side, TLAS/light budget) —
+/// this covers the exterior LOD streaming ring's own state-consistency
+/// invariants: no two resident quads (or a quad and a resident full-detail
+/// cell) claim the same ground, every quad the current band ladder wants is
+/// either resident or a confirmed permanent miss, and no quad key is
+/// flapping in and out of residency across a traversal. The pure geometry
+/// and churn-tracking logic lives in `byroredux::cell_loader::lod_coverage`
+/// (binary-crate-only, no `crates/core` dependency); this resource is just
+/// the stable snapshot `lod.coverage` and smoke-test gates read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LodCoverageStats {
+    /// At least one reconcile has populated this resource.
+    pub sampled: bool,
+    /// The most recent reconcile reported every desired quad coordinate
+    /// resident or a confirmed miss — no outstanding streaming work.
+    pub settled: bool,
+    /// Resident quad pairs (terrain-vs-terrain, object-vs-object) whose
+    /// cell footprints intersect. Always 0 unless state has drifted away
+    /// from the quadtree-descent invariant `lod_bands` proves by
+    /// construction.
+    pub overlaps: u32,
+    /// Resident LOD quads (terrain or object) whose footprint intersects a
+    /// still-resident full-detail cell — the cross-scheme boundary #1866 /
+    /// #1871 keep conservative specifically to hold this at 0.
+    pub full_detail_overlaps: u32,
+    /// Resident object-LOD `.bto` quads whose footprint intersects the cell
+    /// of a resident `VisibleWhenDistant`-flagged full REFR — the runtime
+    /// half of the VWD culling rule (EXAL §5.2): a full model and its own
+    /// `.bto` proxy must never both be resident over the same ground.
+    /// Always 0 today because full REFRs and object-LOD quads are gated on
+    /// disjoint rings (#1866); this is the live audit that would catch a
+    /// regression the day anything decouples that radius, in place of an
+    /// active per-record cull (still deliberately unbuilt — see
+    /// `byroredux::components::VisibleWhenDistant`'s own doc for why).
+    pub vwd_full_model_overlaps: u32,
+    /// Terrain LOD quad keys that left residency and later returned —
+    /// real thrash, not merely an in-flight load superseded by the next
+    /// boundary crossing (see `streaming::StreamingTelemetry::superseded_lod`
+    /// for that narrower signal).
+    pub terrain_churn: u32,
+    /// Same as `terrain_churn`, for the baked object-LOD `.bto` scheme.
+    pub object_churn: u32,
+    /// Resident terrain LOD quad count at the last sample.
+    pub terrain_resident: u32,
+    /// Resident object LOD quad count at the last sample.
+    pub object_resident: u32,
+    /// #6093 — distant-LOD quads the last reconcile held back because the
+    /// geometry pool was closed to uploads (#6092). The ring has nothing left
+    /// it can try, so it reads as complete, but the horizon lost these quads:
+    /// a non-zero count is a failing verdict, not a settled ring.
+    pub held_back: u32,
+}
+
+impl LodCoverageStats {
+    /// Stable three-state verdict for the console command and smoke-test
+    /// gates. Unlike [`RtIntegrityStats::verdict`], this has no separate
+    /// `UNSUPPORTED` state.
+    pub fn verdict(&self) -> &'static str {
+        if !self.sampled {
+            "PENDING"
+        } else if self.overlaps == 0
+            && self.full_detail_overlaps == 0
+            && self.vwd_full_model_overlaps == 0
+            && self.settled
+            && self.held_back == 0
+            && self.terrain_churn == 0
+            && self.object_churn == 0
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    }
+
+    /// Machine-readable line shared by the console command and (future)
+    /// benchmark harness — same convention as
+    /// [`RtIntegrityStats::machine_line`].
+    pub fn machine_line(&self) -> String {
+        format!(
+            "lod-coverage: sampled={} settled={} overlaps={} full_detail_overlaps={} \
+             vwd_full_model_overlaps={} terrain_churn={} object_churn={} terrain_resident={} \
+             object_resident={} held_back={} verdict={}",
+            u8::from(self.sampled),
+            u8::from(self.settled),
+            self.overlaps,
+            self.full_detail_overlaps,
+            self.vwd_full_model_overlaps,
+            self.terrain_churn,
+            self.object_churn,
+            self.terrain_resident,
+            self.object_resident,
+            self.held_back,
+            self.verdict(),
+        )
+    }
+}
+
+impl Resource for LodCoverageStats {}
+
+/// Shadow-ray visibility-mask census over the instances the most recent
+/// TLAS build emitted (#3305).
+///
+/// `acceleration::predicates::shadow_mask_for_instance` assigns each
+/// instance one visibility bucket, and the exterior sun's shadow rays cull
+/// on `VISIBILITY_MASK_ALL_OPAQUE` (bits 0–3). `VISIBILITY_LAYER_EFFECT` is
+/// bit 5, so an instance routed there casts no shadow — deliberately, since
+/// #2224/#2227 established that blended proxies must not become structural
+/// occluders.
+///
+/// The routing is by *precedence*, not by render layer: refractive glass
+/// wins first, then `alpha_blend` or an effect/fire-refraction material
+/// kind, and only then does `RenderLayer` decide. So an actor draw carrying
+/// any of those never reaches `VISIBILITY_LAYER_DYNAMIC_ACTOR` at all.
+///
+/// That is the hypothesis #3305 needs to test against a live scene, and it
+/// was previously only readable from a RenderDoc capture of one instance's
+/// mask byte. The `actor_diverted_*` counters make it readable from
+/// `byro-dbg` instead: with a creature on screen and no ground-contact
+/// shadow, a non-zero divert count names the cause, and an all-zero one
+/// clears the mask system and sends the search back to the BLAS/refit
+/// candidates.
+///
+/// Counted at the point the mask is assigned, so these describe instances
+/// that actually reached the TLAS. A draw that lost its BLAS never appears
+/// here — [`RtIntegrityStats`]'s `missing_*` counters own that case, and the
+/// two commands are meant to be read together.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowMaskCensus {
+    /// Monotonic renderer frame this census was gathered on.
+    pub frame: u64,
+    /// At least one TLAS build has populated this resource.
+    pub sampled: bool,
+
+    // ── emitted instances by assigned visibility bucket ──
+    /// `VISIBILITY_LAYER_ARCHITECTURE` (bit 0).
+    pub architecture: u32,
+    /// `VISIBILITY_LAYER_STATIC_PROP` (bit 1).
+    pub static_prop: u32,
+    /// `VISIBILITY_LAYER_DYNAMIC_ACTOR` (bit 2).
+    pub dynamic_actor: u32,
+    /// `VISIBILITY_LAYER_FOLIAGE` (bit 3).
+    pub foliage: u32,
+    /// `VISIBILITY_LAYER_EFFECT` (bit 5) — outside `ALL_OPAQUE`, so these
+    /// cast no shadow.
+    pub effect: u32,
+    /// `VISIBILITY_LAYER_GLASS` (bit 4) — also outside `ALL_OPAQUE`.
+    pub glass: u32,
+
+    // ── the #3305 question ──
+    /// Emitted instances whose draw declared `RenderLayer::Actor`.
+    pub actor_layer_total: u32,
+    /// ...of those, diverted to `GLASS` by the refractive-glass test.
+    pub actor_diverted_glass: u32,
+    /// ...diverted to `EFFECT` by `MATERIAL_KIND_EFFECT_SHADER`.
+    pub actor_diverted_effect_shader: u32,
+    /// ...diverted to `EFFECT` by `MATERIAL_KIND_FIRE_REFRACTION`.
+    pub actor_diverted_fire_refraction: u32,
+}
+
+impl ShadowMaskCensus {
+    /// Actor-layer instances that did not reach
+    /// `VISIBILITY_LAYER_DYNAMIC_ACTOR`, and therefore cast no shadow.
+    ///
+    /// The three causes partition this total: they are attributed in the
+    /// same precedence order `shadow_mask_for_instance` tests them, so an
+    /// instance that is both refractive glass and `alpha_blend` is counted
+    /// once, under glass. There is deliberately no `alpha_blend` cause:
+    /// since 84bbc44ed blended Actor draws keep the opaque bucket, so the
+    /// alpha test in the divert chain can never fire for an actor (#4518).
+    pub fn actor_diverted(&self) -> u32 {
+        self.actor_diverted_glass
+            + self.actor_diverted_effect_shader
+            + self.actor_diverted_fire_refraction
+    }
+
+    /// Total emitted instances the census accounted for.
+    pub fn total(&self) -> u32 {
+        self.architecture
+            + self.static_prop
+            + self.dynamic_actor
+            + self.foliage
+            + self.effect
+            + self.glass
+    }
+
+    /// Instances in a bucket the sun's `ALL_OPAQUE` shadow rays cannot see.
+    pub fn shadow_invisible(&self) -> u32 {
+        self.effect + self.glass
+    }
+
+    /// `PENDING` before the first build; `CLEAR` when no actor-layer
+    /// instance was diverted (the mask system is not the cause of a missing
+    /// actor shadow); `DIVERTED` when at least one was.
+    ///
+    /// `DIVERTED` is not by itself a defect — a blended fur or effect
+    /// sub-mesh on an otherwise opaque actor is normal and still leaves the
+    /// body casting a shadow. It is a defect only when it accounts for
+    /// *every* draw of an actor that visibly has no shadow, which is why
+    /// `actor_layer_total` is reported next to it.
+    pub fn verdict(&self) -> &'static str {
+        if !self.sampled {
+            "PENDING"
+        } else if self.actor_diverted() == 0 {
+            "CLEAR"
+        } else {
+            "DIVERTED"
+        }
+    }
+
+    /// Machine-readable line shared by the console command and any harness
+    /// — same convention as [`RtIntegrityStats::machine_line`].
+    pub fn machine_line(&self) -> String {
+        format!(
+            "shadow-masks: frame={} sampled={} total={} architecture={} static_prop={} \
+             dynamic_actor={} foliage={} effect={} glass={} shadow_invisible={} \
+             actor_layer_total={} actor_diverted={} actor_diverted_glass={} \
+             actor_diverted_effect_shader={} \
+             actor_diverted_fire_refraction={} verdict={}",
+            self.frame,
+            u8::from(self.sampled),
+            self.total(),
+            self.architecture,
+            self.static_prop,
+            self.dynamic_actor,
+            self.foliage,
+            self.effect,
+            self.glass,
+            self.shadow_invisible(),
+            self.actor_layer_total,
+            self.actor_diverted(),
+            self.actor_diverted_glass,
+            self.actor_diverted_effect_shader,
+            self.actor_diverted_fire_refraction,
+            self.verdict(),
+        )
+    }
+}
+
+impl Resource for ShadowMaskCensus {}
+
+/// Adjacent-loaded-cell terrain-seam agreement audit (EX-10/11 item 7,
+/// #2371) — the live consumer of
+/// `byroredux::cell_loader::terrain_seam::check_seam`. Sampled from
+/// `state.loaded`'s currently-resident grid tiles on every streaming
+/// reconcile, same cadence as [`LodCoverageStats`]; the accounting logic
+/// itself lives in the binary crate (`streaming_helpers::
+/// update_terrain_seam_stats`) for the same reason `LodCoverageStats`'s
+/// does — this resource is just the stable snapshot the console command
+/// and smoke-test gate read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainSeamStats {
+    /// At least one reconcile has populated this resource.
+    pub sampled: bool,
+    /// Adjacent resident-cell pairs actually compared (both sides had a
+    /// parsed LAND heightmap — pairs where one or both lack LAND, or one
+    /// side isn't loaded at all, aren't counted).
+    pub pairs_checked: u32,
+    /// Of `pairs_checked`, how many disagreed on at least one shared-edge
+    /// **height** vertex — the real geometric-crack signal, and what
+    /// [`Self::verdict`] fails on. Deliberately height-only, not
+    /// `!SeamReport::is_clean()` (which also counts `normal_mismatch_pairs`
+    /// below): a live FO4 Commonwealth run (2026-08-26) measured
+    /// near-perfect height agreement (3 mismatched vertices across 17
+    /// pairs) alongside pervasive VNML raw-byte disagreement (15/17 pairs)
+    /// — a pattern consistent with each cell computing its own boundary
+    /// normal one-sidedly at authoring time (a plausible per-game
+    /// convention, matching the already-documented FO4 `_msn`-vs-Skyrim-`_n`
+    /// LOD-normal precedent), not a shared-edge geometric crack. Folding
+    /// normal disagreement into this field would make every FO4 boundary
+    /// smoke run hard-fail on an unconfirmed signal.
+    pub pairs_dirty: u32,
+    /// Sum of disagreeing edge-vertex counts across every height-dirty pair
+    /// — severity, not just incident count (one pair off by one vertex vs.
+    /// a whole edge disagreeing are both "1 dirty pair" but very
+    /// different problems).
+    pub height_mismatch_vertices: u32,
+    /// Pairs whose `VNML` raw bytes disagree at the shared edge.
+    /// Informational only — does **not** affect [`Self::pairs_dirty`] or
+    /// [`Self::verdict`] (see `pairs_dirty`'s doc for why). A future
+    /// session with visual-inspection or RenderDoc time to confirm whether
+    /// this produces an actual visible lighting seam can fold it back into
+    /// the hard-fail criterion if warranted.
+    pub normal_mismatch_pairs: u32,
+}
+
+impl TerrainSeamStats {
+    /// Stable three-state verdict, same shape as
+    /// [`LodCoverageStats::verdict`] (no `UNSUPPORTED` state, unlike the
+    /// four-state [`RtIntegrityStats::verdict`]). Height-only
+    /// — see [`Self::pairs_dirty`]'s doc for why `normal_mismatch_pairs`
+    /// doesn't factor in.
+    pub fn verdict(&self) -> &'static str {
+        if !self.sampled {
+            "PENDING"
+        } else if self.pairs_dirty == 0 {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    }
+
+    /// Machine-readable line, same convention as
+    /// [`LodCoverageStats::machine_line`].
+    pub fn machine_line(&self) -> String {
+        format!(
+            "terrain-seams: sampled={} pairs_checked={} pairs_dirty={} \
+             height_mismatch_vertices={} normal_mismatch_pairs={} verdict={}",
+            u8::from(self.sampled),
+            self.pairs_checked,
+            self.pairs_dirty,
+            self.height_mismatch_vertices,
+            self.normal_mismatch_pairs,
+            self.verdict(),
+        )
+    }
+}
+
+impl Resource for TerrainSeamStats {}
+
+pub mod ownership;
+pub use ownership::{
+    FindingKind, OwnerClass, OwnershipFinding, OwnershipSnapshot, OwnershipTelemetry,
+    OwnershipTracker, ReclaimPolicy,
+};
+
+impl SkinCoverageStats {
+    /// True when every visible skinned entity got a refit this frame.
+    /// Reads correct only after `fill_skin_coverage_stats` populates
+    /// the snapshot; before that all counters are 0 and this returns
+    /// `true` trivially.
+    pub fn fully_covered(&self) -> bool {
+        self.refits_succeeded == self.dispatches_total && self.slots_failed == 0
+    }
+}
+
+/// Format one GPU bracket's elapsed time for a text surface, honouring the
+/// bracket's `_active` flag (#2821).
+///
+/// The `gpu_*_active` mirrors exist so `0.000 ms` can be told apart from "this
+/// bracket did not run this snapshot cycle" — the whole point of the #2278
+/// plumbing. Every text consumer of a `gpu_*_ms` field must route through this
+/// so the console log line, `skin.coverage` and `ctx.upscaler` agree with the
+/// egui panel's `n/a` rather than each re-inventing (or losing) the
+/// distinction. `precision` is the caller's `{:.N}` — the once-a-second log
+/// line uses 1, the diagnostic commands 3.
+pub fn format_gpu_bracket_ms(ms: f32, active: bool, precision: usize) -> String {
+    if active {
+        format!("{ms:.precision$}")
+    } else {
+        "n/a".to_string()
+    }
+}
+
+/// The currently-selected entity reference for debugger operations.
+///
+/// Bethesda-console heritage — `prid <FormID>` picks a reference, then
+/// follow-up commands (`getpos`, `inspect`, `cam.tp` w/o args, …)
+/// operate on the picked ref by default. byro-dbg uses `EntityId`
+/// rather than `FormID` because the renderer-side debugger talks
+/// directly to the ECS; an M47-era in-game console would resolve
+/// FormID → EntityId through `byroredux_plugin` and set this same
+/// resource.
+///
+/// World-scoped state (not per-TCP-client). Single-developer-at-a-time
+/// is the dev-tool reality; two clients would fight, but the simpler
+/// state model is worth the tradeoff for now.
+#[derive(Debug, Default)]
+pub struct SelectedRef(pub Option<super::storage::EntityId>);
+
+impl Resource for SelectedRef {}
+
+/// Per-stack divergent state.
+///
+/// Allocated only when an [`ItemStack`](super::components::ItemStack)
+/// can't be represented by `(base_form_id, count)` alone — modlists,
+/// condition deltas, charge state, named items. Most inventory rows
+/// don't need one; the stack-only common case keeps `instance` at
+/// `None`.
+///
+/// Fields are open-ended: future equip mechanics (FO4 OMOD, weapon
+/// charge, food spoilage) extend this struct rather than parallel
+/// inventory types. Phase A of #896 ships it minimal; Phase B/C and
+/// M45 fill in real fields.
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ItemInstance {
+    /// Reserved for now. Real fields land alongside the consuming
+    /// gameplay system (M45 save round-trip; FO4 OMOD wiring).
+    _reserved: (),
+}
+
+/// Sparse arena for [`ItemInstance`]s with a free-list for slot reuse.
+///
+/// The free-list is what prevents Bethesda's pickup-drop-pickup save-
+/// bloat tail. When an `ItemInstance` is released, its slot returns
+/// to `free` and the next allocation reuses it. Save format dumps
+/// `instances` + `free` verbatim — bounded, not log-shaped.
+///
+/// Slot 0 is reserved as a sentinel so [`ItemInstanceId`] (which
+/// wraps `NonZeroU32`) can encode "no instance" as the absence of
+/// the option without burning a u32 niche.
+#[derive(Debug)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ItemInstancePool {
+    instances: Vec<Option<ItemInstance>>,
+    free: Vec<u32>,
+}
+
+impl Resource for ItemInstancePool {}
+
+impl Default for ItemInstancePool {
+    fn default() -> Self {
+        // Pre-fill slot 0 as the reserved sentinel.
+        Self {
+            instances: vec![None],
+            free: Vec::new(),
+        }
+    }
+}
+
+impl ItemInstancePool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate an instance, reusing a freed slot if available.
+    pub fn allocate(&mut self, inst: ItemInstance) -> ItemInstanceId {
+        if let Some(slot) = self.free.pop() {
+            self.instances[slot as usize] = Some(inst);
+            ItemInstanceId(NonZeroU32::new(slot).expect("free-list never holds slot 0"))
+        } else {
+            let slot = self.instances.len();
+            // `usize::MAX` would wrap; in practice the cap is u32::MAX
+            // entries, far above any realistic save's instance count.
+            assert!(slot <= u32::MAX as usize, "ItemInstancePool overflow");
+            self.instances.push(Some(inst));
+            ItemInstanceId(
+                NonZeroU32::new(slot as u32).expect("slot >= 1 since slot 0 is reserved"),
+            )
+        }
+    }
+
+    /// Release a slot back to the free-list. Returns the freed
+    /// instance if it was live, `None` if the slot was already free
+    /// or out of bounds (defensive — duplicate-free is a logic bug
+    /// elsewhere but we don't want to corrupt the arena over it).
+    pub fn release(&mut self, id: ItemInstanceId) -> Option<ItemInstance> {
+        let slot = id.0.get();
+        let cell = self.instances.get_mut(slot as usize)?;
+        let taken = cell.take()?;
+        // Avoid double-pushing onto `free` if release is called twice
+        // for the same id (the `cell.take` above guards the live state
+        // but the free-list contract still needs deduping).
+        if !self.free.contains(&slot) {
+            self.free.push(slot);
+        }
+        Some(taken)
+    }
+
+    pub fn get(&self, id: ItemInstanceId) -> Option<&ItemInstance> {
+        self.instances
+            .get(id.0.get() as usize)
+            .and_then(|cell| cell.as_ref())
+    }
+
+    /// Number of live instances (excludes free slots and the sentinel).
+    pub fn live_count(&self) -> usize {
+        self.instances
+            .iter()
+            .skip(1) // skip the sentinel
+            .filter(|c| c.is_some())
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_stats_default_is_zero() {
+        let stats = DebugStats::default();
+        assert_eq!(stats.fps, 0.0);
+        assert_eq!(stats.avg_fps(), 0.0);
+        assert_eq!(stats.min_max_frame_time(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn push_frame_time_updates_fps() {
+        let mut stats = DebugStats::default();
+        stats.push_frame_time(1.0 / 60.0); // 60 FPS
+        assert!((stats.fps - 60.0).abs() < 0.5);
+        assert!((stats.frame_time_ms - 16.67).abs() < 0.1);
+    }
+
+    #[test]
+    fn avg_fps_over_multiple_frames() {
+        let mut stats = DebugStats::default();
+        for _ in 0..10 {
+            stats.push_frame_time(1.0 / 30.0); // 30 FPS
+        }
+        assert!((stats.avg_fps() - 30.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn min_max_frame_time_correct() {
+        let mut stats = DebugStats::default();
+        stats.push_frame_time(0.010); // 10ms
+        stats.push_frame_time(0.020); // 20ms
+        stats.push_frame_time(0.005); // 5ms
+        let (min, max) = stats.min_max_frame_time();
+        assert!((min - 0.005).abs() < 1e-6);
+        assert!((max - 0.020).abs() < 1e-6);
+    }
+
+    #[test]
+    fn circular_buffer_wraps() {
+        let mut stats = DebugStats::default();
+        // Fill more than 128 frames
+        for i in 0..200 {
+            stats.push_frame_time(0.016);
+            assert!(stats.frame_count <= FRAME_HISTORY_SIZE);
+            if i >= FRAME_HISTORY_SIZE {
+                assert_eq!(stats.frame_count, FRAME_HISTORY_SIZE);
+            }
+        }
+        assert_eq!(stats.frame_index, 200 % FRAME_HISTORY_SIZE);
+        assert!((stats.avg_fps() - 62.5).abs() < 1.0);
+    }
+
+    /// `frames_recorded` must not follow `frame_index` back to 0 when the
+    /// window wraps: the SLOW FRAME warning reads it to skip only the
+    /// startup frames, and the wrapping cursor muted 4 of every 128.
+    #[test]
+    fn frames_recorded_does_not_wrap_with_the_cursor() {
+        let mut stats = DebugStats::default();
+        for _ in 0..FRAME_HISTORY_SIZE {
+            stats.push_frame_time(0.016);
+        }
+        assert_eq!(stats.frame_index(), 0, "cursor wrapped");
+        assert_eq!(stats.frames_recorded(), FRAME_HISTORY_SIZE);
+    }
+
+    #[test]
+    fn scratch_row_bytes_used_is_capacity_times_elem_size() {
+        let row = ScratchRow {
+            name: "x",
+            len: 10,
+            capacity: 100,
+            elem_size_bytes: 32,
+        };
+        assert_eq!(row.bytes_used(), 100 * 32);
+        assert_eq!(row.wasted_bytes(), (100 - 10) * 32);
+    }
+
+    #[test]
+    fn scratch_row_wasted_is_zero_when_full() {
+        let row = ScratchRow {
+            name: "full",
+            len: 50,
+            capacity: 50,
+            elem_size_bytes: 8,
+        };
+        assert_eq!(row.wasted_bytes(), 0);
+    }
+
+    #[test]
+    fn skin_coverage_default_is_trivially_covered() {
+        // Default reports zero dispatches → no work missed; this is
+        // the no-skinned-content-this-frame baseline that `skin.
+        // coverage` should print as "n/a".
+        let cov = SkinCoverageStats::default();
+        assert!(cov.fully_covered());
+        assert_eq!(cov.dispatches_total, 0);
+        assert_eq!(cov.refits_succeeded, 0);
+    }
+
+    #[test]
+    fn skin_coverage_full_when_refits_match_dispatches() {
+        let cov = SkinCoverageStats {
+            dispatches_total: 23,
+            refits_succeeded: 23,
+            ..Default::default()
+        };
+        assert!(cov.fully_covered());
+    }
+
+    #[test]
+    fn skin_coverage_partial_when_refits_lag() {
+        // 23 visible skinned entities but only 22 refit — one was
+        // dropped somewhere between dispatches collection and the refit
+        // loop. This is exactly the regression mode the instrumentation
+        // exists to surface.
+        let cov = SkinCoverageStats {
+            dispatches_total: 23,
+            refits_succeeded: 22,
+            ..Default::default()
+        };
+        assert!(!cov.fully_covered());
+    }
+
+    /// #1194 / PERF-DIM7-INSTR — `dispatches_skipped` + GPU timer
+    /// fields. Pin: they default to zero and don't affect
+    /// `fully_covered` (the green-bar only reads dispatch/refit
+    /// counters). PERF-DIM7-01 / -02 / -03 (#1195 / #1196 / #1197)
+    /// landed the consumers that increment `dispatches_skipped` and
+    /// populate the GPU timer values; this test guards the fields
+    /// against accidental removal from the struct.
+    #[test]
+    fn skin_coverage_dim7_instr_fields_default_to_zero_and_dont_break_green_bar() {
+        let cov = SkinCoverageStats {
+            dispatches_total: 10,
+            refits_succeeded: 10,
+            dispatches_skipped: 4, // some entities elided this frame
+            gpu_skin_dispatch_ms: 1.234,
+            gpu_skin_palette_ms: 0.789,
+            gpu_skin_blas_refit_ms: 2.345,
+            gpu_taa_ms: 0.456,
+            ..Default::default()
+        };
+        assert!(
+            cov.fully_covered(),
+            "instrumentation fields must not gate the green-bar — \
+             dispatches_skipped is a positive signal (work elided), \
+             not a regression",
+        );
+        assert_eq!(cov.dispatches_skipped, 4);
+        assert!((cov.gpu_skin_dispatch_ms - 1.234).abs() < 1e-6);
+        assert!((cov.gpu_skin_palette_ms - 0.789).abs() < 1e-6);
+        assert!((cov.gpu_skin_blas_refit_ms - 2.345).abs() < 1e-6);
+        assert!((cov.gpu_taa_ms - 0.456).abs() < 1e-6);
+    }
+
+    #[test]
+    fn skin_coverage_partial_when_slots_failed_nonzero() {
+        // Even if refits == dispatches arithmetically, a non-zero
+        // failed-slot count means visible entities were silently
+        // skipped from the dispatches stream (they never reached
+        // first-sight). The green-bar must fail.
+        let cov = SkinCoverageStats {
+            dispatches_total: 10,
+            refits_succeeded: 10,
+            slots_failed: 2,
+            ..Default::default()
+        };
+        assert!(!cov.fully_covered());
+    }
+
+    #[test]
+    fn rt_integrity_requires_a_complete_cross_layer_sample() {
+        let pending = RtIntegrityStats::default();
+        assert_eq!(pending.verdict(), "PENDING");
+
+        let unsupported = RtIntegrityStats {
+            sampled: true,
+            cluster_sampled: true,
+            ..Default::default()
+        };
+        assert_eq!(unsupported.verdict(), "UNSUPPORTED");
+
+        let clean = RtIntegrityStats {
+            frame: 42,
+            sampled: true,
+            rt_supported: true,
+            rt_flag: true,
+            tlas_build_succeeded: true,
+            tlas_eligible: 17,
+            tlas_emitted: 17,
+            cluster_sampled: true,
+            cluster_max_lights: 23,
+            ..Default::default()
+        };
+        assert_eq!(clean.verdict(), "PASS");
+        assert_eq!(
+            clean.machine_line(),
+            "rt-integrity: frame=42 sampled=1 rt_supported=1 rt_flag=1 \
+             tlas_build=1 tlas_eligible=17 tlas_emitted=17 missing_skinned=0 \
+             missing_rigid=0 missing_ssbo=0 non_finite_transform=0 \
+             lights_submitted=0 \
+             lights_uploaded=0 lights_dropped=0 cluster_sampled=1 \
+             cluster_overflowed=0 cluster_dropped=0 cluster_max=23 \
+             blas_total_bytes=0 blas_static_bytes=0 \
+             blas_pending_destroy_bytes=0 blas_pending_destroy_count=0 \
+             scratch_pending_destroy_count=0 texture_pending_destroy_count=0 \
+             verdict=PASS"
+        );
+
+        // #3999 — BLAS residency is telemetry, not a correctness predicate.
+        // A large deferred-destroy backlog is exactly the state
+        // `REN-2026-09-06-D1-01` needs an operator to be able to *see*, so it
+        // must reach `machine_line` while leaving the verdict alone; folding
+        // it into `verdict()` would turn an ordinary eviction burst into a
+        // FAIL.
+        let backlogged = RtIntegrityStats {
+            blas_total_bytes: 89_128_960,
+            blas_static_bytes: 67_108_864,
+            blas_pending_destroy_bytes: 4_194_304,
+            blas_pending_destroy_count: 3,
+            scratch_pending_destroy_count: 1,
+            texture_pending_destroy_count: 5,
+            ..clean
+        };
+        assert_eq!(backlogged.verdict(), "PASS");
+        let line = backlogged.machine_line();
+        assert!(
+            line.contains("blas_total_bytes=89128960 blas_static_bytes=67108864"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "blas_pending_destroy_bytes=4194304 blas_pending_destroy_count=3 \
+                 scratch_pending_destroy_count=1 texture_pending_destroy_count=5"
+            ),
+            "{line}"
+        );
+
+        // #5200 — non-finite-transform drops are the fourth cause. Pre-fix
+        // this state reported FAIL with every cause counter at zero (the
+        // "FAIL, no cause" shape), because only `tlas_emitted !=
+        // tlas_eligible` saw the gap.
+        let non_finite_only = RtIntegrityStats {
+            tlas_eligible: 17,
+            tlas_emitted: 16,
+            non_finite_transform: 1,
+            ..clean
+        };
+        assert_eq!(non_finite_only.verdict(), "FAIL");
+        let line = non_finite_only.machine_line();
+        assert!(
+            line.contains("missing_ssbo=0 non_finite_transform=1 "),
+            "the non-finite count must name the FAIL cause: {line}"
+        );
+    }
+
+    #[test]
+    fn terrain_seam_stats_pending_before_first_sample() {
+        assert_eq!(TerrainSeamStats::default().verdict(), "PENDING");
+    }
+
+    #[test]
+    fn terrain_seam_stats_clean_run_passes() {
+        let clean = TerrainSeamStats {
+            sampled: true,
+            pairs_checked: 12,
+            pairs_dirty: 0,
+            height_mismatch_vertices: 0,
+            normal_mismatch_pairs: 0,
+        };
+        assert_eq!(clean.verdict(), "PASS");
+        assert_eq!(
+            clean.machine_line(),
+            "terrain-seams: sampled=1 pairs_checked=12 pairs_dirty=0 \
+             height_mismatch_vertices=0 normal_mismatch_pairs=0 verdict=PASS"
+        );
+    }
+
+    #[test]
+    fn terrain_seam_stats_any_dirty_pair_fails() {
+        // Zero-tolerance on HEIGHT by design (see `pairs_dirty`'s doc):
+        // authored terrain shares byte-identical LAND height payloads at
+        // seams, so any height disagreement at all is a real
+        // authoring/merge defect, not a magnitude judgement call for this
+        // resource to make.
+        let dirty = TerrainSeamStats {
+            sampled: true,
+            pairs_checked: 12,
+            pairs_dirty: 1,
+            height_mismatch_vertices: 3,
+            normal_mismatch_pairs: 0,
+        };
+        assert_eq!(dirty.verdict(), "FAIL");
+    }
+
+    /// #2371 live-data finding (2026-08-26) — normal-byte disagreement
+    /// alone (no height disagreement) must NOT fail the verdict. See
+    /// `pairs_dirty`'s doc: a live FO4 Commonwealth run measured pervasive
+    /// VNML raw-byte disagreement (15/17 pairs) alongside near-perfect
+    /// height agreement, consistent with a benign per-game boundary-normal
+    /// authoring convention rather than a geometric crack. Without this
+    /// guard, every FO4 boundary smoke run would hard-fail on an
+    /// unconfirmed signal.
+    #[test]
+    fn terrain_seam_stats_normal_only_mismatch_still_passes() {
+        let normal_only = TerrainSeamStats {
+            sampled: true,
+            pairs_checked: 17,
+            pairs_dirty: 0,
+            height_mismatch_vertices: 0,
+            normal_mismatch_pairs: 15,
+        };
+        assert_eq!(
+            normal_only.verdict(),
+            "PASS",
+            "normal-byte disagreement alone must not fail the height-only verdict"
+        );
+    }
+
+    #[test]
+    fn rt_integrity_fails_each_silent_drop_class() {
+        let clean = RtIntegrityStats {
+            sampled: true,
+            rt_supported: true,
+            rt_flag: true,
+            tlas_build_succeeded: true,
+            tlas_eligible: 3,
+            tlas_emitted: 3,
+            cluster_sampled: true,
+            ..Default::default()
+        };
+
+        for broken in [
+            RtIntegrityStats {
+                rt_flag: false,
+                ..clean
+            },
+            RtIntegrityStats {
+                tlas_build_succeeded: false,
+                ..clean
+            },
+            RtIntegrityStats {
+                tlas_emitted: 2,
+                missing_rigid_blas: 1,
+                ..clean
+            },
+            RtIntegrityStats {
+                missing_skinned_blas: 1,
+                ..clean
+            },
+            RtIntegrityStats {
+                missing_ssbo_instance: 1,
+                ..clean
+            },
+            RtIntegrityStats {
+                lights_submitted: 513,
+                lights_uploaded: 512,
+                lights_dropped: 1,
+                ..clean
+            },
+            RtIntegrityStats {
+                cluster_overflowed: 1,
+                cluster_dropped: 9,
+                cluster_max_lights: 137,
+                ..clean
+            },
+        ] {
+            assert_eq!(broken.verdict(), "FAIL", "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn item_instance_pool_allocate_starts_at_one() {
+        let mut pool = ItemInstancePool::new();
+        let id = pool.allocate(ItemInstance::default());
+        // Slot 0 is reserved; first allocation must land at 1.
+        assert_eq!(id.0.get(), 1);
+        assert_eq!(pool.live_count(), 1);
+    }
+
+    #[test]
+    fn item_instance_pool_release_reclaims_slot() {
+        let mut pool = ItemInstancePool::new();
+        let a = pool.allocate(ItemInstance::default());
+        let b = pool.allocate(ItemInstance::default());
+        assert_eq!(pool.live_count(), 2);
+        let released = pool.release(a);
+        assert!(released.is_some());
+        assert_eq!(pool.live_count(), 1);
+        // Next allocation reuses `a`'s slot (LIFO from free-list).
+        let c = pool.allocate(ItemInstance::default());
+        assert_eq!(c, a);
+        assert_eq!(pool.live_count(), 2);
+        // `b` stays valid throughout.
+        assert!(pool.get(b).is_some());
+    }
+
+    #[test]
+    fn item_instance_pool_double_release_does_not_corrupt_free_list() {
+        let mut pool = ItemInstancePool::new();
+        let a = pool.allocate(ItemInstance::default());
+        let _ = pool.allocate(ItemInstance::default());
+        assert!(pool.release(a).is_some());
+        // Second release of the same id is a no-op rather than a
+        // duplicate free-list entry.
+        assert!(pool.release(a).is_none());
+        let c = pool.allocate(ItemInstance::default());
+        // Should reuse `a`'s slot exactly once.
+        assert_eq!(c, a);
+        let d = pool.allocate(ItemInstance::default());
+        // `d` lands at a fresh slot — would be slot 1's reuse if the
+        // free-list were corrupted with a duplicate entry.
+        assert_ne!(d, a);
+    }
+
+    #[test]
+    fn scratch_telemetry_aggregates_rows() {
+        let mut tlm = ScratchTelemetry::default();
+        tlm.rows.push(ScratchRow {
+            name: "a",
+            len: 1,
+            capacity: 10,
+            elem_size_bytes: 4,
+        });
+        tlm.rows.push(ScratchRow {
+            name: "b",
+            len: 5,
+            capacity: 5,
+            elem_size_bytes: 16,
+        });
+        assert_eq!(tlm.total_bytes(), 10 * 4 + 5 * 16);
+        assert_eq!(tlm.total_wasted(), ((10 - 1) * 4));
+    }
+
+    /// Test fixture — fresh idle bridge.
+    fn idle_bridge() -> ScreenshotBridge {
+        ScreenshotBridge {
+            requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            owner: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(SCREENSHOT_OWNER_NONE)),
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// #1603 — a screenshot copy recorded into the renderer staging
+    /// buffer, then cancelled (client `recv_timeout` during an engine
+    /// stall), must NOT be published when its delayed readback finally
+    /// completes — even if a new request has since claimed the bridge
+    /// under the same owner tag. The renderer gates the
+    /// `screenshot_result` write on the capture generation; this pins
+    /// the generation discipline that makes that gate correct.
+    #[test]
+    fn screenshot_cancelled_readback_not_served_to_later_claimant() {
+        let bridge = idle_bridge();
+
+        // Claim A records a copy; the renderer captures the generation.
+        assert!(bridge.try_claim(SCREENSHOT_OWNER_DEBUG_SERVER));
+        let captured_gen = bridge.generation();
+        assert!(
+            bridge.readback_is_current(captured_gen),
+            "uncancelled in-flight capture is current"
+        );
+
+        // Client A times out → drain cancels.
+        bridge.cancel();
+
+        // A new request (claim B) reuses the same owner tag.
+        assert!(bridge.try_claim(SCREENSHOT_OWNER_DEBUG_SERVER));
+
+        // A's straggler readback finally completes. Despite owner being
+        // DEBUG_SERVER again (B's claim), the captured generation is
+        // stale → the renderer must NOT publish A's pixels.
+        assert!(
+            !bridge.readback_is_current(captured_gen),
+            "cancel() must invalidate the pre-cancel capture generation"
+        );
+
+        // B's own capture, recorded after the claim, IS current.
+        let b_gen = bridge.generation();
+        assert!(
+            bridge.readback_is_current(b_gen),
+            "B's fresh capture is current"
+        );
+    }
+
+    /// #1011 — `cancel()` must clear both the AtomicBool `requested`
+    /// flag AND any buffered result bytes. Either alone would leak
+    /// state into the next request.
+    #[test]
+    fn screenshot_bridge_cancel_clears_request_and_result() {
+        use std::sync::atomic::Ordering;
+
+        let bridge = idle_bridge();
+
+        // Simulate a renderer that has finished a capture (result
+        // present) but a still-pending follow-up request (flag set).
+        bridge.request();
+        *bridge.result.lock().unwrap() = Some(vec![0xDE, 0xAD]);
+
+        assert!(bridge.cancel(), "cancel reports state mutated");
+        assert!(!bridge.requested.load(Ordering::Acquire), "flag cleared");
+        assert!(
+            bridge.result.lock().unwrap().is_none(),
+            "buffered result discarded"
+        );
+    }
+
+    #[test]
+    fn screenshot_bridge_cancel_is_idempotent_on_clean_state() {
+        let bridge = idle_bridge();
+        assert!(
+            !bridge.cancel(),
+            "cancel on clean state reports no mutation"
+        );
+    }
+
+    #[test]
+    fn screenshot_bridge_cancel_handles_request_only() {
+        let bridge = idle_bridge();
+        bridge.request();
+        assert!(bridge.cancel());
+        assert!(!bridge.requested.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn screenshot_bridge_cancel_handles_result_only() {
+        let bridge = idle_bridge();
+        *bridge.result.lock().unwrap() = Some(vec![0xCA, 0xFE]);
+        assert!(bridge.cancel());
+        assert!(bridge.result.lock().unwrap().is_none());
+    }
+
+    /// #1006 — `try_claim` succeeds on an idle bridge and atomically
+    /// sets both owner + requested.
+    #[test]
+    fn screenshot_bridge_try_claim_succeeds_when_idle() {
+        let bridge = idle_bridge();
+        assert!(bridge.try_claim(SCREENSHOT_OWNER_CLI));
+        assert_eq!(bridge.current_owner(), SCREENSHOT_OWNER_CLI);
+        assert!(bridge.requested.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// #1006 — second `try_claim` rejects when another owner holds
+    /// the bridge; no mutation occurs.
+    #[test]
+    fn screenshot_bridge_try_claim_rejects_when_owned() {
+        let bridge = idle_bridge();
+        assert!(bridge.try_claim(SCREENSHOT_OWNER_CLI));
+        // Different owner — must reject.
+        assert!(!bridge.try_claim(SCREENSHOT_OWNER_DEBUG_SERVER));
+        // Same owner — also rejects (a still-in-flight request must
+        // complete its result drain before re-claiming).
+        assert!(!bridge.try_claim(SCREENSHOT_OWNER_CLI));
+        // Owner unchanged.
+        assert_eq!(bridge.current_owner(), SCREENSHOT_OWNER_CLI);
+    }
+
+    /// #1006 — `take_result_for` only returns bytes when owner matches.
+    /// On a successful take, owner resets to NONE so the next consumer
+    /// can claim.
+    #[test]
+    fn screenshot_bridge_take_result_for_owner_gated() {
+        let bridge = idle_bridge();
+        bridge.try_claim(SCREENSHOT_OWNER_DEBUG_SERVER);
+        *bridge.result.lock().unwrap() = Some(vec![0xBE, 0xEF]);
+
+        // Wrong owner — bytes stay queued.
+        assert!(bridge.take_result_for(SCREENSHOT_OWNER_CLI).is_none());
+        assert!(
+            bridge.result.lock().unwrap().is_some(),
+            "bytes not consumed by wrong owner"
+        );
+        assert_eq!(bridge.current_owner(), SCREENSHOT_OWNER_DEBUG_SERVER);
+
+        // Correct owner — bytes drain AND owner resets.
+        let bytes = bridge.take_result_for(SCREENSHOT_OWNER_DEBUG_SERVER);
+        assert_eq!(bytes, Some(vec![0xBE, 0xEF]));
+        assert_eq!(
+            bridge.current_owner(),
+            SCREENSHOT_OWNER_NONE,
+            "successful take releases ownership"
+        );
+    }
+
+    /// #1006 — after a successful drain, the bridge is idle and the
+    /// other consumer can claim it.
+    #[test]
+    fn screenshot_bridge_handoff_cli_to_debug_server() {
+        let bridge = idle_bridge();
+        bridge.try_claim(SCREENSHOT_OWNER_CLI);
+        *bridge.result.lock().unwrap() = Some(vec![0x01]);
+        assert!(bridge.take_result_for(SCREENSHOT_OWNER_CLI).is_some());
+        // Debug-server can now claim.
+        assert!(bridge.try_claim(SCREENSHOT_OWNER_DEBUG_SERVER));
+    }
+
+    /// #1006 — `cancel()` also resets ownership so the bridge is fully
+    /// reusable after a timeout cleanup.
+    #[test]
+    fn screenshot_bridge_cancel_resets_owner() {
+        let bridge = idle_bridge();
+        bridge.try_claim(SCREENSHOT_OWNER_DEBUG_SERVER);
+        bridge.cancel();
+        assert_eq!(bridge.current_owner(), SCREENSHOT_OWNER_NONE);
+        // Either consumer can claim a fresh bridge.
+        assert!(bridge.try_claim(SCREENSHOT_OWNER_CLI));
+    }
+
+    /// #1174 — a panic in the encode path (or any other writer) leaves
+    /// the `result` mutex poisoned. Public API must recover transparently
+    /// so the bridge isn't a one-shot process-killer.
+    #[test]
+    fn screenshot_bridge_recovers_from_poisoned_mutex() {
+        use std::sync::Arc;
+
+        let bridge = Arc::new(idle_bridge());
+        // Seed a result so `take_result` has something to find.
+        *bridge.result.lock().unwrap() = Some(vec![0x42]);
+
+        // Poison the mutex by panicking inside a lock guard on a
+        // helper thread, then joining the resulting Err.
+        let poisoner = Arc::clone(&bridge);
+        let res = std::thread::spawn(move || {
+            let _guard = poisoner.result.lock().unwrap();
+            panic!("synthetic encode failure");
+        })
+        .join();
+        assert!(res.is_err(), "helper thread should have panicked");
+        assert!(
+            bridge.result.is_poisoned(),
+            "mutex should be poisoned after the panic"
+        );
+
+        // Every public accessor must succeed despite the poison.
+        let bytes = bridge.take_result();
+        assert_eq!(bytes, Some(vec![0x42]), "take_result recovers state");
+
+        // `cancel()` and `take_result_for` also recover; exercise both.
+        *bridge.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![0x99]);
+        bridge.try_claim(SCREENSHOT_OWNER_CLI);
+        let claimed = bridge.take_result_for(SCREENSHOT_OWNER_CLI);
+        assert_eq!(claimed, Some(vec![0x99]));
+
+        *bridge.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![0xAA]);
+        bridge.request();
+        assert!(bridge.cancel(), "cancel recovers + reports mutated state");
+    }
+
+    // ---- #3305 shadow-mask census ----
+
+    /// `actor_layer_total` is an exact partition: every actor-layer
+    /// instance either reached the actor bucket or was diverted by one
+    /// cause. `rt.masks` reports both halves next to each other, so a
+    /// residual would read as unexplained instances and undermine the one
+    /// question the command exists to answer.
+    #[test]
+    fn the_actor_census_partitions_into_bucketed_plus_diverted() {
+        // Every cause distinct and non-zero: a zero in any of them would let
+        // that term be dropped from the sum without the assertion noticing.
+        let census = ShadowMaskCensus {
+            sampled: true,
+            dynamic_actor: 9,
+            actor_layer_total: 21,
+            actor_diverted_glass: 1,
+            actor_diverted_effect_shader: 4,
+            actor_diverted_fire_refraction: 7,
+            ..Default::default()
+        };
+        assert_eq!(census.actor_diverted(), 12);
+        assert_eq!(
+            census.dynamic_actor + census.actor_diverted(),
+            census.actor_layer_total
+        );
+    }
+
+    /// The verdict is the triage signal: `CLEAR` acquits the mask system
+    /// and sends a missing-shadow investigation back to the BLAS/refit
+    /// candidates; `DIVERTED` names it as a live suspect.
+    #[test]
+    fn the_census_verdict_distinguishes_pending_clear_and_diverted() {
+        assert_eq!(ShadowMaskCensus::default().verdict(), "PENDING");
+
+        let clear = ShadowMaskCensus {
+            sampled: true,
+            dynamic_actor: 4,
+            actor_layer_total: 4,
+            ..Default::default()
+        };
+        assert_eq!(clear.verdict(), "CLEAR");
+
+        let diverted = ShadowMaskCensus {
+            sampled: true,
+            actor_layer_total: 4,
+            actor_diverted_effect_shader: 4,
+            ..Default::default()
+        };
+        assert_eq!(diverted.verdict(), "DIVERTED");
+    }
+
+    /// `shadow_invisible` is the pair of buckets outside the sun's
+    /// `ALL_OPAQUE` cull mask, and `total` covers every bucket — so a
+    /// census whose `total` disagrees with the TLAS's emitted count means
+    /// an unaccounted bucket, not a quiet miscount.
+    #[test]
+    fn the_census_totals_cover_every_bucket() {
+        let census = ShadowMaskCensus {
+            sampled: true,
+            architecture: 100,
+            static_prop: 50,
+            dynamic_actor: 7,
+            foliage: 20,
+            effect: 6,
+            glass: 3,
+            ..Default::default()
+        };
+        assert_eq!(census.total(), 186);
+        assert_eq!(census.shadow_invisible(), 9);
+    }
+
+    /// The machine line is what `byro-dbg` prints and what a harness would
+    /// parse, so the fields the #3305 triage reads must actually be in it.
+    #[test]
+    fn the_census_machine_line_carries_the_triage_fields() {
+        let census = ShadowMaskCensus {
+            frame: 42,
+            sampled: true,
+            dynamic_actor: 2,
+            effect: 5,
+            actor_layer_total: 7,
+            actor_diverted_effect_shader: 5,
+            ..Default::default()
+        };
+        let line = census.machine_line();
+        for needle in [
+            "shadow-masks:",
+            "frame=42",
+            "sampled=1",
+            "dynamic_actor=2",
+            "effect=5",
+            "actor_layer_total=7",
+            "actor_diverted=5",
+            "verdict=DIVERTED",
+        ] {
+            assert!(
+                line.contains(needle),
+                "machine_line missing `{needle}`: {line}"
+            );
+        }
+    }
+}

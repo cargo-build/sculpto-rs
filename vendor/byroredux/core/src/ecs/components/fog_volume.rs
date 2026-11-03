@@ -1,0 +1,364 @@
+//! Engine-native participating-medium volume.
+//!
+//! Legacy cell/weather depth ramps are converted once into the canonical
+//! `FogMedium` resource used by the global froxel medium. `FogVolume` is the
+//! complementary ECS representation for spatially bounded authored content:
+//! particle smoke, fog billboards, and explicit volume meshes. Render code
+//! transforms these local primitives to world space and injects their
+//! extinction/scattering into the same froxel V-buffer as atmospheric fog.
+
+use crate::ecs::sparse_set::SparseSetStorage;
+use crate::ecs::storage::Component;
+use crate::math::{Quat, Vec3};
+
+/// One coherent local participating-medium region.
+///
+/// `bounds == None` is reserved for cell-scope sources. Runtime XCLL/WTHR fog
+/// currently bypasses that form and reaches the renderer through the canonical
+/// medium resource, so the froxel primitive collector consumes bounded volumes
+/// only.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct FogVolume {
+    /// Local-space primitive bounds. `None` means cell scope.
+    pub bounds: Option<FogBounds>,
+    /// Extinction coefficient sigma_t in inverse metres.
+    pub extinction_per_meter: f32,
+    /// RGB single-scatter albedo. This permits authored smoke tint while
+    /// preserving the physical `sigma_s = sigma_t * albedo` relationship.
+    pub single_scatter_albedo: [f32; 3],
+    /// Fraction of the normalized primitive radius occupied by the soft edge.
+    /// `0` is a hard boundary; `1` fades from the primitive center outward.
+    pub edge_softness: f32,
+    /// Canonical density/evolution behavior selected at the authoring -> ECS
+    /// translation boundary.
+    ///
+    /// Runtime systems consume this directly. They must not reconstruct it
+    /// from [`Self::source`], authored game identity, blend modes, or optical
+    /// coefficients: those inputs can be ambiguous, and doing so would spread
+    /// legacy schema policy through otherwise game-independent logic.
+    pub profile: FogProfile,
+    /// Emitted radiance `L_e` in linear RGB (Rec. 709 primaries) — the
+    /// emission source term of the radiative transfer equation.
+    ///
+    /// The shader multiplies this by the *locally evaluated* absorption
+    /// coefficient `sigma_a = sigma_t * (1 - albedo)` rather than by a
+    /// constant, so emission follows the same procedural density profile as
+    /// extinction. That is both physically correct (hotter, denser soot
+    /// radiates more) and what makes a flame's interior structure visible
+    /// instead of reading as a uniform glowing blob.
+    ///
+    /// `[0.0; 3]` for passive media — fog, mist, and cooled smoke.
+    ///
+    /// The fire/smoke distinction is entirely a matter of these coefficients:
+    /// a flame is a **high** `sigma_t`, **low** albedo, high `L_e` medium
+    /// (soot hot enough to incandesce absorbs and emits, it barely scatters),
+    /// while smoke is the same soot after cooling — moderate `sigma_t`,
+    /// **high** albedo, zero `L_e`. There is no separate "fire system"; there
+    /// is one medium whose coefficients follow its temperature.
+    pub emissive_radiance: [f32; 3],
+    /// Blackbody temperature in kelvin that produced [`Self::emissive_radiance`].
+    ///
+    /// Retained rather than discarded after the colour conversion because the
+    /// cooling curve — not the colour — is the thing a fire simulation
+    /// integrates. `0.0` means either a passive medium or authored
+    /// non-thermal emission (magical fire, plasma) whose colour did not come
+    /// from a blackbody spectrum.
+    pub emission_temperature_k: f32,
+    /// Provenance for diagnostics and future per-source tuning.
+    pub source: FogSource,
+}
+
+impl FogVolume {
+    /// Whether this volume carries finite, positive medium data suitable for
+    /// GPU injection.
+    pub fn is_renderable(self) -> bool {
+        self.bounds.is_some()
+            && self.extinction_per_meter.is_finite()
+            && self.extinction_per_meter > 0.0
+            && self
+                .single_scatter_albedo
+                .iter()
+                .all(|component| component.is_finite())
+            && self.emissive_radiance.iter().all(|c| c.is_finite())
+    }
+
+    /// Whether this volume contributes an emission source term.
+    ///
+    /// Passive media skip the emission path entirely, so ordinary fog and
+    /// smoke cost nothing extra for the fire feature existing.
+    pub fn is_emissive(self) -> bool {
+        self.emissive_radiance
+            .iter()
+            .any(|component| component.is_finite() && *component > 0.0)
+    }
+}
+
+/// Local-space extent for a bounded fog primitive.
+///
+/// The owning entity's `GlobalTransform` supplies the outer transform.
+/// `center` and `rotation` allow an emitter-derived volume to follow the
+/// particle plume rather than remaining centered on the emitter origin.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct FogBounds {
+    pub center: Vec3,
+    pub rotation: Quat,
+    pub half_extents: Vec3,
+    pub shape: FogShape,
+}
+
+impl FogBounds {
+    /// Conservative local-space sphere radius used for CPU frustum culling.
+    pub fn bounding_radius(self) -> f32 {
+        match self.shape {
+            FogShape::Sphere => self.half_extents.x.abs(),
+            FogShape::Ellipsoid | FogShape::Box | FogShape::Cone => {
+                self.half_extents.abs().length()
+            }
+        }
+    }
+}
+
+/// Analytic density primitive evaluated by the froxel inject shader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u32)]
+pub enum FogShape {
+    Sphere,
+    Ellipsoid,
+    Box,
+    /// Axis-aligned taper in local +Y: `half_extents.x` is bottom radius,
+    /// `.y` is half height, and `.z` is top radius. The owning transform
+    /// rotates the cone; this encoding stays within the existing GPU ABI.
+    Cone,
+}
+
+/// Canonical local-medium behavior.
+///
+/// These variants describe simulation/render intent, not which game or file
+/// format produced the entity. Importers translate legacy authoring into one
+/// of these profiles exactly once; downstream ECS and renderer code remain
+/// game-independent and exhaustively match the canonical domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u32)]
+pub enum FogProfile {
+    /// Preserve the authored primitive with only low-contrast heterogeneity.
+    Homogeneous = 0,
+    /// A passive, buoyant plume of cooled particulates.
+    Smoke = 1,
+    /// A persistent hot, tapered, emissive plume.
+    Flame = 2,
+    /// A transient hot impulse that expands and cools into smoke.
+    Explosion = 3,
+    /// A conventional fuel/propellant blast: compact hot fireball followed by
+    /// a dense, fast-cooling soot cloud. This is the default for legacy
+    /// explosion emitters whose authoring does not identify a special yield.
+    OilExplosion = 4,
+    /// A high-yield nuclear blast: an intense flash, fast radial impulse, and
+    /// a broad buoyant cap over a persistent rising stem.
+    NuclearExplosion = 5,
+    /// Passive authored shaft. A cone's narrow source end is a candidate
+    /// sky aperture only when the ray beyond it is clear. Ordinary local
+    /// lights also scatter through the same medium.
+    LightShaft = 6,
+    /// Explicit, bounded source plane at an interior opening. It scatters
+    /// like a light shaft and additionally permits sky and sunlight through
+    /// the plane when a legacy opaque shell lies immediately behind it.
+    SkyAperture = 7,
+}
+
+impl FogProfile {
+    /// Whether this profile owns a finite combustion timeline.
+    pub const fn is_explosion(self) -> bool {
+        matches!(
+            self,
+            Self::Explosion | Self::OilExplosion | Self::NuclearExplosion
+        )
+    }
+
+    /// Whether the blast should use high-yield mushroom-cloud dynamics.
+    pub const fn is_nuclear_explosion(self) -> bool {
+        matches!(self, Self::NuclearExplosion)
+    }
+
+    /// Whether the blast should use conventional fuel-fireball dynamics.
+    pub const fn is_oil_explosion(self) -> bool {
+        matches!(self, Self::Explosion | Self::OilExplosion)
+    }
+}
+
+/// Provenance of a fog volume, retained for diagnostics only.
+///
+/// Runtime behavior belongs to [`FogProfile`]. Consumers must not branch on
+/// provenance to recover behavior that the translation boundary already knew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub enum FogSource {
+    /// Cell-wide medium converted from XCLL/LGTM.
+    Xcll,
+    /// Per-node `NiFogProperty`.
+    NiFog,
+    /// Per-region medium.
+    Regn,
+    /// Weather-driven medium.
+    Wthr,
+    /// Alpha-blended fog plane or explicit authored volume mesh.
+    AuthoredMesh,
+    /// A legacy fog/smoke particle emitter replaced by a local volume.
+    ParticleEmitter,
+    /// A synthetic or gameplay-spawned effect with no legacy authoring record.
+    RuntimeEffect,
+}
+
+/// Timeline attached to a transient combustion volume.
+///
+/// Persistent fire and smoke need no per-entity clock. Explosions do: their
+/// density, temperature, scattering, and emission all evolve from the same
+/// normalized age, and the renderer must stop collecting them after the
+/// authored lifetime instead of looping a fireball forever.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct CombustionState {
+    /// Absolute engine time at which the impulse begins.
+    pub start_time_seconds: f32,
+    /// Duration of the fireball-to-smoke evolution.
+    pub lifetime_seconds: f32,
+}
+
+impl CombustionState {
+    pub fn one_shot(start_time_seconds: f32, lifetime_seconds: f32) -> Self {
+        Self {
+            start_time_seconds: if start_time_seconds.is_finite() {
+                start_time_seconds
+            } else {
+                0.0
+            },
+            lifetime_seconds: if lifetime_seconds.is_finite() {
+                lifetime_seconds.max(0.05)
+            } else {
+                0.05
+            },
+        }
+    }
+
+    /// Active normalized age in `[0, 1)`, or `None` after the impulse ends.
+    pub fn normalized_age(self, now_seconds: f32) -> Option<f32> {
+        if !now_seconds.is_finite() {
+            return None;
+        }
+        let elapsed = now_seconds - self.start_time_seconds;
+        if elapsed < 0.0 {
+            return None;
+        }
+        let age = (elapsed / self.lifetime_seconds).max(0.0);
+        (age < 1.0 - 4.0 * f32::EPSILON).then_some(age)
+    }
+}
+
+impl Component for FogVolume {
+    type Storage = SparseSetStorage<Self>;
+}
+
+impl Component for CombustionState {
+    type Storage = SparseSetStorage<Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_physical_medium_is_renderable() {
+        let fog = FogVolume {
+            bounds: Some(FogBounds {
+                center: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
+                half_extents: Vec3::new(10.0, 20.0, 10.0),
+                shape: FogShape::Ellipsoid,
+            }),
+            extinction_per_meter: 0.4,
+            single_scatter_albedo: [0.8, 0.75, 0.7],
+            edge_softness: 0.35,
+            profile: FogProfile::Smoke,
+            emissive_radiance: [0.0; 3],
+            emission_temperature_k: 0.0,
+            source: FogSource::ParticleEmitter,
+        };
+        assert!(fog.is_renderable());
+        assert_eq!(fog.source, FogSource::ParticleEmitter);
+    }
+
+    #[test]
+    fn canonical_profiles_have_a_stable_cross_backend_index() {
+        assert_eq!(FogProfile::Homogeneous as u32, 0);
+        assert_eq!(FogProfile::Smoke as u32, 1);
+        assert_eq!(FogProfile::Flame as u32, 2);
+        assert_eq!(FogProfile::Explosion as u32, 3);
+        assert_eq!(FogProfile::OilExplosion as u32, 4);
+        assert_eq!(FogProfile::NuclearExplosion as u32, 5);
+        assert_eq!(FogProfile::LightShaft as u32, 6);
+        assert!(FogProfile::OilExplosion.is_explosion());
+        assert!(FogProfile::NuclearExplosion.is_explosion());
+        assert!(FogProfile::NuclearExplosion.is_nuclear_explosion());
+        assert!(FogProfile::OilExplosion.is_oil_explosion());
+        assert!(!FogProfile::Flame.is_explosion());
+        assert!(!FogProfile::LightShaft.is_explosion());
+    }
+
+    #[test]
+    fn cell_scope_and_invalid_density_are_not_gpu_primitives() {
+        let cell_scope = FogVolume {
+            bounds: None,
+            extinction_per_meter: 0.1,
+            single_scatter_albedo: [0.9; 3],
+            edge_softness: 0.0,
+            profile: FogProfile::Homogeneous,
+            emissive_radiance: [0.0; 3],
+            emission_temperature_k: 0.0,
+            source: FogSource::Xcll,
+        };
+        assert!(!cell_scope.is_renderable());
+
+        let invalid = FogVolume {
+            bounds: Some(FogBounds {
+                center: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
+                half_extents: Vec3::ONE,
+                shape: FogShape::Sphere,
+            }),
+            extinction_per_meter: f32::NAN,
+            ..cell_scope
+        };
+        assert!(!invalid.is_renderable());
+    }
+
+    #[test]
+    fn primitive_bound_radius_is_conservative() {
+        let ellipsoid = FogBounds {
+            center: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            half_extents: Vec3::new(3.0, 4.0, 12.0),
+            shape: FogShape::Ellipsoid,
+        };
+        assert_eq!(ellipsoid.bounding_radius(), 13.0);
+
+        let sphere = FogBounds {
+            half_extents: Vec3::splat(7.0),
+            shape: FogShape::Sphere,
+            ..ellipsoid
+        };
+        assert_eq!(sphere.bounding_radius(), 7.0);
+    }
+
+    #[test]
+    fn combustion_timeline_is_monotonic_and_expires() {
+        let state = CombustionState::one_shot(10.0, 2.0);
+        assert_eq!(state.normalized_age(9.0), None);
+        assert_eq!(state.normalized_age(10.0), Some(0.0));
+        assert_eq!(state.normalized_age(11.0), Some(0.5));
+        assert_eq!(state.normalized_age(12.0), None);
+        assert_eq!(state.normalized_age(f32::NAN), None);
+    }
+}

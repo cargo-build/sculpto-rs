@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SliderSetInfo version="1">
+    <SliderSet name="Reference Body">
+        <DataFolder>RefBody</DataFolder>
+        <SourceFile>RefBody.nif</SourceFile>
+        <OutputPath>meshes\actors\character\character assets</OutputPath>
+        <OutputFile GenWeights="true">refbody</OutputFile>
+        <Shape target="RefBody" DataFolder="RefBody">RefBody</Shape>
+        <Slider name="Weight 0 to 1" invert="false" small="0" big="100" hidden="true">
+            <Data name="RefBodyWeight" target="RefBody" local="true">RefBody.osd\RefBodyWeight</Data>
+        </Slider>
+        <Slider name="ChestUV" small="0" big="0" uv="true">
+            <Data name="RefBodyChestUV" target="RefBody" local="true">RefBody.osd\RefBodyChestUV</Data>
+        </Slider>
+        <Slider name="Trim" zap="true" small="0" big="0">
+            <Data name="RefBodyTrim" target="RefBody" local="false">RefBodyTrim.bsd</Data>
+            <Data name="RefBodyTrimAlt" target="RefBodyAlt" local="false">RefBodyTrim.bsd</Data>
+            <Data name="RefBodyTrimNote" target="RefBodyAlt"/>
+        </Slider>
+    </SliderSet>
+</SliderSetInfo>

@@ -1,0 +1,483 @@
+//! Render-layer classification for depth-bias ladder.
+//!
+//! Bethesda content carries three implicit content layers — *Architecture*
+//! (large fixtures: walls, floors, fireplaces), *Clutter* (small items
+//! resting on architecture: papers, books, ammo), *Actors* (NPCs / creatures
+//! standing on floors). Gamebryo's renderer enforced layer priority via
+//! render-order tricks the unified RT pipeline doesn't replicate, so
+//! coplanar-stacked content z-fights against the surfaces underneath
+//! (rugs zebra-striped on hardwood, papers clipping desks, NPC feet
+//! sinking into floors).
+//!
+//! [`RenderLayer`] is the explicit classification, attached as a sparse
+//! component to every renderable entity at cell-load time. The renderer
+//! reads it and applies the per-layer depth-bias ladder via
+//! `vkCmdSetDepthBias`, replacing the ad-hoc `is_decal || alpha_test_func != 0`
+//! heuristic from commits `0f13ff5` / `ee3cb13`. Single source of truth,
+//! game-invariant (Oblivion through Starfield use the same record-type →
+//! layer mapping; per-game record availability differs but the mapping
+//! itself doesn't).
+//!
+//! See `crates/plugin/src/record.rs::RecordType::render_layer` for the
+//! base-record classifier, and `byroredux/src/cell_loader.rs` for the
+//! spawn-site escalation rule (alpha-tested or NIF-decal-flagged meshes
+//! escalate to [`RenderLayer::Decal`] regardless of base record).
+
+use crate::ecs::sparse_set::SparseSetStorage;
+use crate::ecs::storage::Component;
+
+/// Content-layer classification for depth-bias purposes. Lower numeric
+/// value = lower priority (drawn deeper); higher value = wins more
+/// z-fights. Default [`RenderLayer::Architecture`] yields zero bias —
+/// identical to pre-#renderlayer behaviour for any entity that never
+/// gets the component attached.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+#[derive(Default)]
+pub enum RenderLayer {
+    /// Walls, floors, fireplaces, doors, plants rooted in ground,
+    /// terrain, vending machines, wall-mounted lamps, terminals,
+    /// containers/footlockers built into the level. The base layer that
+    /// owns the depth buffer; zero bias.
+    #[default]
+    Architecture = 0,
+    /// Player-pickup-able items: weapons, armor, ammo, misc clutter,
+    /// keys, alchemy, ingredients, books, notes. Small things that
+    /// rest on top of architecture and need a tiny depth bias to win
+    /// the coplanar z-fight against the surface beneath.
+    Clutter = 1,
+    /// NPCs and creatures. Their feet plant on floors at exactly the
+    /// floor's Y; without bias every standing NPC z-fights the floor at
+    /// the foot-plant patch.
+    Actor = 2,
+    /// True decals — NIF-flagged blood splats, scorch marks, bullet holes.
+    /// Strongest bias. Reached only via `mesh.is_decal`, applied at the
+    /// spawn sites through [`render_layer_with_decal_escalation`], which
+    /// overrides whatever the base record type mapped to.
+    ///
+    /// #2446 (MAT-D3-04) — this doc used to say alpha-tested overlays
+    /// (rugs, posters, fences, cutout foliage) land here too, escalated by
+    /// `mesh.alpha_test_func != 0`. Both halves were wrong: the gate is the
+    /// `alpha_test` **bool** (see the escalation fn's own doc for why the
+    /// func value cannot be used), and cutout architecture escalates to
+    /// [`RenderLayer::Clutter`], not here — a gentle bias rather than the
+    /// depth-inverting Decal anchor.
+    Decal = 3,
+}
+
+impl RenderLayer {
+    /// The Vulkan `vkCmdSetDepthBias` triple `(constant_factor, clamp,
+    /// slope_factor)` per layer.
+    ///
+    /// **Slope factors are zero for every layer except `Decal`.** The
+    /// slope term `slope_factor × max_dz/dxy` is NOT scaled by the depth
+    /// format's `r` the way the constant term is — it shifts normalized
+    /// depth by the raw per-pixel depth gradient, which grows without
+    /// bound at grazing view angles. A nonzero slope on world-scale
+    /// layers therefore *inverts depth ordering against unrelated
+    /// occluders*: observed live in Markarth SilverBloodInn, where
+    /// `Actor = -1.5` let an NPC's grazing cloak fragments depth-test
+    /// through a stone staircase and `Clutter = -1.0` let a
+    /// wall-mounted lantern's embedded rear half render through its
+    /// host wall. (The same failure mode was already documented for the
+    /// Decal `-2.0` slope on the FNV vault door; this applies that
+    /// lesson to the intermediate layers.)
+    ///
+    /// Coplanar z-fight resolution is carried by the constant terms
+    /// alone: `bias = constant × r + slope × |max_dz/dxy|` with
+    /// `r ≈ 2⁻²⁴ ≈ 6e-8` for D32_SFLOAT, so `Decal = (-64, 0, -2)`
+    /// offsets by roughly `4e-6` of normalised depth plus the slope
+    /// term — same scale Bethesda's D3D engines use for decal polygon
+    /// offset, big enough to win every coplanar tie, and the slope term
+    /// there is intentional: a decal that did not invert against its
+    /// own host surface would z-fight it.
+    pub const fn depth_bias(self) -> (f32, f32, f32) {
+        match self {
+            RenderLayer::Architecture => (0.0, 0.0, 0.0),
+            RenderLayer::Clutter => (-16.0, 0.0, 0.0),
+            RenderLayer::Actor => (-32.0, 0.0, 0.0),
+            RenderLayer::Decal => (-64.0, 0.0, -2.0),
+        }
+    }
+}
+
+/// Apply the spawn-site decal / cutout bias escalation. Two distinct
+/// signals, two distinct outcomes (they used to be conflated — see below):
+///
+/// 1. **`mesh_is_decal`** — the authoritative NIF `SF1_DECAL` shader flag.
+///    These meshes genuinely lie flat against another surface (posters,
+///    blood splatter, painted signs). They get the strong
+///    [`RenderLayer::Decal`] bias `(-64, -2)` so they always win the
+///    coplanar z-fight, regardless of base classification.
+///
+/// 2. **`mesh_alpha_test_enabled`** — a *cutout* signal, NOT a decal
+///    signal. Alpha-test is used by flat decals (rugs) AND by large
+///    standalone architecture with cutout detail (vault doors with window
+///    holes + stencil text, grates, fences, holed steel beams). Promote
+///    these only to the **gentle** [`RenderLayer::Clutter`] bias
+///    `(-16, slope 0)` — enough for a coplanar rug to win its floor
+///    z-fight via the constant term, but NOT the aggressive Decal
+///    `(-64, -2)` bias whose `-2.0` slope
+///    term scales with polygon depth-gradient and **inverts the depth
+///    ordering on large cutout meshes at grazing view angles** — the
+///    "broken polygons that change with motion" z-fighting bug (the
+///    `0x40` render-layer viz showed the entire FNV vault door wrongly
+///    tinted Decal-yellow). Only Architecture is promoted; Clutter /
+///    Actor / Decal pass through (they already carry adequate bias).
+///
+/// Single rule used at every cell-loader / scene spawn site. The FNV-rug
+/// fix intent from commit `ee3cb13` (alpha-test rug wins floor z-fight)
+/// is preserved via the gentler Clutter bias; what's removed is the
+/// over-escalation of cutout architecture to the depth-inverting Decal bias.
+///
+/// Important — this gate uses the `alpha_test: bool` from
+/// [`crate::ecs::components::Material`] (or `ImportedMesh::alpha_test`
+/// at spawn time), NOT `alpha_test_func: u8`. The Gamebryo default
+/// for `alpha_test_func` is `6` (GREATEREQUAL) and lands on every
+/// imported material regardless of whether alpha-testing is actually
+/// enabled — using the func value as the gate would escalate every
+/// architectural mesh in the cell. The `alpha_test` bool is the
+/// authoritative "is testing actually on" signal.
+pub const fn render_layer_with_decal_escalation(
+    base: RenderLayer,
+    mesh_is_decal: bool,
+    mesh_alpha_test_enabled: bool,
+) -> RenderLayer {
+    if mesh_is_decal {
+        RenderLayer::Decal
+    } else if mesh_alpha_test_enabled && matches!(base, RenderLayer::Architecture) {
+        // Cutout architecture → gentle Clutter bias, never the
+        // depth-inverting Decal bias. See doc above.
+        RenderLayer::Clutter
+    } else {
+        base
+    }
+}
+
+/// World-space bounding-sphere radius (in Bethesda units) under which a
+/// [`RenderLayer::Architecture`] mesh is reclassified as
+/// [`RenderLayer::Clutter`]. See [`escalate_small_static_to_clutter`].
+///
+/// Calibrated against vanilla FNV content. 1 Bethesda unit ≈ 1.43 cm
+/// (1 yard = 64 units), so 50 units ≈ 71 cm — a sphere that comfortably
+/// encloses every desktop-clutter STAT (paper piles, folders, clipboards,
+/// books, photo frames, ashtrays, lamps; bounding-sphere radii observed
+/// in the 5-25-unit range) while staying below the smallest architectural
+/// pieces (door panels ≈ 48 units, wall sections ≥ 128, railing posts
+/// ≈ 35 are the only borderline candidates and tolerate a -16 / -1.0
+/// nudge against the floor without visual impact).
+pub const SMALL_STATIC_RADIUS_UNITS: f32 = 50.0;
+
+/// Reclassify small STAT meshes from Architecture to Clutter so they win
+/// the coplanar z-fight against the surface they rest on. In vanilla
+/// content, decorative props authored as `STAT` records (papers, folders,
+/// clipboards, ashtrays, photo frames, etc.) inherit
+/// [`RenderLayer::Architecture`] from the [`RecordType`] classifier — but
+/// they sit on top of desks / shelves / floors at exactly that surface's
+/// Y, so they z-fight the way pickup-clutter MISC items used to before
+/// the layer ladder. The base-record classifier can't tell pickup-clutter
+/// (`MISC`) from decorative-clutter (`STAT`) because Bethesda authored
+/// both forms — only the spatial extent does.
+///
+/// Threshold lives in [`SMALL_STATIC_RADIUS_UNITS`] so the calibration
+/// is one tweakable constant.
+///
+/// Only escalates Architecture; Clutter / Actor / Decal pass through
+/// unchanged (we never want to demote, and a small Actor — child NPC,
+/// small creature — should keep its Actor bias against the floor).
+///
+/// `world_bound_radius` should already include the REFR's `ref_scale`
+/// applied to `ImportedMesh::local_bound_radius`. The call site doing
+/// `mesh.local_bound_radius * ref_scale` is the contract.
+///
+/// # NOT a collision / physics gate
+///
+/// The output of this helper is **render-side only**: it drives
+/// [`RenderLayer::depth_bias`] for the z-fight ladder. Do NOT branch
+/// collision-generation or physics-actor decisions off the
+/// post-escalation layer — the escalation operates on per-sub-mesh
+/// `local_bound_radius`, which for Starfield content (heavily
+/// decomposed per-LOD per-material sub-meshes per BSGeometry block)
+/// under-counts the REFR's true spatial extent. #1294 (Cydonia
+/// render attempt 2026-05-28) surfaced exactly this trap: the
+/// cell-loader's static-trimesh fallback was keying off the
+/// post-escalation layer and rejected every Cydonia wall / floor /
+/// ramp because each sub-mesh was < 50 units even though the
+/// composite architecture extended thousands of units. Collision
+/// sites must read the **pre-escalation** `base_layer` (the
+/// [`RecordType`]-derived classification) — the trimesh fallback at
+/// `byroredux/src/cell_loader/spawn.rs::spawn_placed_instances` is
+/// the canonical example post-#1294.
+///
+/// [`RecordType`]: crate::ecs::components::RenderLayer
+pub fn escalate_small_static_to_clutter(base: RenderLayer, world_bound_radius: f32) -> RenderLayer {
+    if matches!(base, RenderLayer::Architecture)
+        && world_bound_radius > 0.0
+        && world_bound_radius < SMALL_STATIC_RADIUS_UNITS
+    {
+        RenderLayer::Clutter
+    } else {
+        base
+    }
+}
+
+impl Component for RenderLayer {
+    type Storage = SparseSetStorage<Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bias-table monotonicity guard. Any future reordering that puts
+    /// (e.g.) Actor's constant factor below Decal's would break the
+    /// "stronger layer wins more z-fights" invariant the rest of the
+    /// system depends on.
+    #[test]
+    fn depth_bias_constants_monotone() {
+        let arch = RenderLayer::Architecture.depth_bias().0;
+        let clutter = RenderLayer::Clutter.depth_bias().0;
+        let actor = RenderLayer::Actor.depth_bias().0;
+        let decal = RenderLayer::Decal.depth_bias().0;
+        assert!(
+            arch > clutter && clutter > actor && actor > decal,
+            "bias ladder must descend Architecture > Clutter > Actor > Decal: \
+             got {arch} > {clutter} > {actor} > {decal}"
+        );
+    }
+
+    /// Slope factors should also descend (or at least not invert) so
+    /// angled surfaces honour the same priority order.
+    #[test]
+    fn depth_bias_slopes_monotone() {
+        let s_arch = RenderLayer::Architecture.depth_bias().2;
+        let s_clutter = RenderLayer::Clutter.depth_bias().2;
+        let s_actor = RenderLayer::Actor.depth_bias().2;
+        let s_decal = RenderLayer::Decal.depth_bias().2;
+        assert!(s_arch >= s_clutter && s_clutter >= s_actor && s_actor >= s_decal);
+    }
+
+    /// World-scale layers must carry **zero** slope bias. The slope term
+    /// of Vulkan's depth-bias formula is not scaled by the depth format's
+    /// `r`, so any nonzero factor grows without bound at grazing view
+    /// angles and inverts depth ordering against unrelated occluders —
+    /// observed live in Markarth SilverBloodInn (NPC cloak fragments
+    /// depth-testing through a stone staircase at `Actor = -1.5`, a
+    /// wall-mounted lantern's rear half through its host wall at
+    /// `Clutter = -1.0`). Only `Decal` keeps a slope, and deliberately:
+    /// a decal that did not invert against its own host surface would
+    /// z-fight it. Pin the zeros so the intermediate ladder can never
+    /// quietly grow slope terms again.
+    #[test]
+    fn non_decal_layers_carry_zero_slope_bias() {
+        assert_eq!(RenderLayer::Architecture.depth_bias().2, 0.0);
+        assert_eq!(RenderLayer::Clutter.depth_bias().2, 0.0);
+        assert_eq!(RenderLayer::Actor.depth_bias().2, 0.0);
+        assert_eq!(RenderLayer::Decal.depth_bias().2, -2.0);
+    }
+
+    /// `Architecture` is zero so absent-component fallback (via
+    /// `unwrap_or_default()` in the renderer) is identical to pre-#renderlayer
+    /// behaviour for any entity that never gets the component.
+    #[test]
+    fn architecture_is_zero_bias() {
+        assert_eq!(RenderLayer::Architecture.depth_bias(), (0.0, 0.0, 0.0));
+    }
+
+    /// `Decal` matches the proven-working `(-64, 0, -2)` anchor from
+    /// commit `0f13ff5` so the rug-z-fight fix is preserved byte-for-byte.
+    #[test]
+    fn decal_matches_proven_anchor() {
+        assert_eq!(RenderLayer::Decal.depth_bias(), (-64.0, 0.0, -2.0));
+    }
+
+    #[test]
+    fn default_is_architecture() {
+        assert_eq!(RenderLayer::default(), RenderLayer::Architecture);
+    }
+
+    /// `repr(u8)` so the variant can be packed into shader-side flag
+    /// words for the debug-viz bit `0x40`. Locks the layout.
+    #[test]
+    fn repr_is_u8() {
+        assert_eq!(std::mem::size_of::<RenderLayer>(), 1);
+        assert_eq!(RenderLayer::Architecture as u8, 0);
+        assert_eq!(RenderLayer::Clutter as u8, 1);
+        assert_eq!(RenderLayer::Actor as u8, 2);
+        assert_eq!(RenderLayer::Decal as u8, 3);
+    }
+
+    // ── Spawn-site escalation rule (#renderlayer) ─────────────────────
+    //
+    // Single rule called at every cell-loader / scene spawn site so
+    // the alpha-test-on-clutter case (the FNV rug regression that
+    // motivated commit `ee3cb13`) is preserved without having to
+    // re-derive it per-spawn-site.
+
+    #[test]
+    fn nif_decal_flag_escalates_clutter_to_decal() {
+        let r = render_layer_with_decal_escalation(RenderLayer::Clutter, true, false);
+        assert_eq!(r, RenderLayer::Decal);
+    }
+
+    #[test]
+    fn alpha_test_escalates_architecture_to_clutter_not_decal() {
+        // Alpha-test is a CUTOUT signal, not a decal signal. An
+        // Architecture-base alpha-test mesh (FNV `rugsmall01.nif` rug,
+        // but ALSO the Ulysses' Temple vault door with its cutout window
+        // holes + stencil text) gets the gentle Clutter bias so the
+        // coplanar rug still wins its floor z-fight — but NOT the
+        // aggressive Decal `(-64,-2)` bias, whose slope term inverts the
+        // depth ordering on large cutout architecture at grazing angles
+        // (the "broken polygons that change with motion" bug). See the
+        // function doc + the `0x40` render-layer viz diagnosis.
+        let r = render_layer_with_decal_escalation(RenderLayer::Architecture, false, true);
+        assert_eq!(r, RenderLayer::Clutter);
+    }
+
+    #[test]
+    fn alpha_test_does_not_demote_higher_layers() {
+        // Already-Clutter / Actor / Decal alpha-test meshes keep their
+        // band (the cutout promotion only lifts Architecture).
+        assert_eq!(
+            render_layer_with_decal_escalation(RenderLayer::Clutter, false, true),
+            RenderLayer::Clutter
+        );
+        assert_eq!(
+            render_layer_with_decal_escalation(RenderLayer::Actor, false, true),
+            RenderLayer::Actor
+        );
+        assert_eq!(
+            render_layer_with_decal_escalation(RenderLayer::Decal, false, true),
+            RenderLayer::Decal
+        );
+    }
+
+    #[test]
+    fn no_decal_no_alpha_test_passes_base_through() {
+        // Plain MISC clutter on a desk — no NIF decal, no alpha-test.
+        // Stays at Clutter (small bias for the desktop z-fight).
+        let r = render_layer_with_decal_escalation(RenderLayer::Clutter, false, false);
+        assert_eq!(r, RenderLayer::Clutter);
+        // Plain wall — Architecture.
+        let r = render_layer_with_decal_escalation(RenderLayer::Architecture, false, false);
+        assert_eq!(r, RenderLayer::Architecture);
+        // Plain NPC body part — Actor.
+        let r = render_layer_with_decal_escalation(RenderLayer::Actor, false, false);
+        assert_eq!(r, RenderLayer::Actor);
+    }
+
+    /// Critical regression guard — the early implementation gated on
+    /// `alpha_test_func != 0` instead of the bool, but the
+    /// Gamebryo default for `alpha_test_func` is `6` (GREATEREQUAL)
+    /// regardless of whether alpha-testing is actually enabled. That
+    /// bug escalated every mesh in the cell to Decal at spawn time,
+    /// caught by the live FNV viz screenshot showing all-yellow.
+    /// Pin the correct gate: only the `alpha_test_enabled` bool
+    /// triggers escalation; `alpha_test_func` is irrelevant here.
+    #[test]
+    fn alpha_test_disabled_does_not_escalate_regardless_of_default_func() {
+        // FNV importer ships `MaterialInfo::default().alpha_test_func = 6`
+        // (GREATEREQUAL — Gamebryo default). That default value rides
+        // through to every mesh whose source NIF lacks a
+        // `NiAlphaProperty`. Those meshes must NOT escalate to Decal —
+        // they're plain opaque architecture.
+        let r = render_layer_with_decal_escalation(RenderLayer::Architecture, false, false);
+        assert_eq!(r, RenderLayer::Architecture);
+    }
+
+    // ── Small-STAT escalation rule (#renderlayer follow-up) ────────────
+    //
+    // Bethesda authors decorative desk-clutter (paper piles, folders,
+    // clipboards) as STAT records — the base classifier puts them in
+    // Architecture (zero bias) and they z-fight the desk surface
+    // beneath. Spatial extent is the only signal that distinguishes
+    // them from real architecture; `escalate_small_static_to_clutter`
+    // moves Architecture meshes whose world-space bounding-sphere
+    // radius is below `SMALL_STATIC_RADIUS_UNITS` into the Clutter
+    // bias band.
+
+    #[test]
+    fn small_static_escalates_to_clutter() {
+        // 12-unit radius — ~17 cm in real-world terms; matches a folder
+        // / clipboard / paper-pile bounding sphere observed in vanilla
+        // FNV STAT meshes.
+        let r = escalate_small_static_to_clutter(RenderLayer::Architecture, 12.0);
+        assert_eq!(r, RenderLayer::Clutter);
+    }
+
+    #[test]
+    fn large_static_stays_architecture() {
+        // 200-unit radius — comfortably bigger than any clutter prop;
+        // matches a wall section or floor tile.
+        let r = escalate_small_static_to_clutter(RenderLayer::Architecture, 200.0);
+        assert_eq!(r, RenderLayer::Architecture);
+    }
+
+    #[test]
+    fn small_static_threshold_is_strict_lower_bound() {
+        // Exactly at the threshold must NOT escalate (strictly less).
+        // Pinning the comparator so a future `>=` slip doesn't let
+        // borderline architecture leak into Clutter.
+        let r =
+            escalate_small_static_to_clutter(RenderLayer::Architecture, SMALL_STATIC_RADIUS_UNITS);
+        assert_eq!(r, RenderLayer::Architecture);
+    }
+
+    #[test]
+    fn small_static_zero_radius_does_not_escalate() {
+        // A zero radius means the mesh has no extracted bounds (NIF
+        // bound was zero AND the vertex-position fallback produced
+        // nothing). Don't pretend that's "small" — leave it as
+        // Architecture so a real STAT with missing bounds doesn't
+        // start drawing in front of its neighbors.
+        let r = escalate_small_static_to_clutter(RenderLayer::Architecture, 0.0);
+        assert_eq!(r, RenderLayer::Architecture);
+    }
+
+    #[test]
+    fn small_radius_does_not_demote_higher_layers() {
+        // Idempotent for non-Architecture bases: a small Actor
+        // (child NPC, small creature) keeps its Actor bias; small
+        // Decal stays Decal; already-Clutter stays Clutter.
+        let r = escalate_small_static_to_clutter(RenderLayer::Clutter, 5.0);
+        assert_eq!(r, RenderLayer::Clutter);
+        let r = escalate_small_static_to_clutter(RenderLayer::Actor, 5.0);
+        assert_eq!(r, RenderLayer::Actor);
+        let r = escalate_small_static_to_clutter(RenderLayer::Decal, 5.0);
+        assert_eq!(r, RenderLayer::Decal);
+    }
+
+    /// Composition order at the spawn site: small-STAT escalation runs
+    /// first, decal/cutout escalation second. Alpha-test (cutout) now
+    /// lands on Clutter, not Decal — both orderings converge on the
+    /// gentle Clutter bias:
+    ///   small + alpha-test STAT → Architecture → Clutter (size) → Clutter
+    ///   large + alpha-test STAT (rug / vault door) → Architecture → Clutter (cutout)
+    #[test]
+    fn size_then_cutout_composition_order() {
+        // Small alpha-tested STAT → Clutter (size), stays Clutter (cutout
+        // doesn't demote an already-Clutter base).
+        let l = escalate_small_static_to_clutter(RenderLayer::Architecture, 10.0);
+        let l = render_layer_with_decal_escalation(l, false, true);
+        assert_eq!(l, RenderLayer::Clutter);
+
+        // Large alpha-tested STAT (rug / vault door) → size leaves it
+        // Architecture, cutout promotes it to the gentle Clutter bias
+        // (NOT the depth-inverting Decal bias).
+        let l = escalate_small_static_to_clutter(RenderLayer::Architecture, 200.0);
+        let l = render_layer_with_decal_escalation(l, false, true);
+        assert_eq!(l, RenderLayer::Clutter);
+    }
+
+    #[test]
+    fn already_decal_stays_decal() {
+        // Idempotent: passing `RenderLayer::Decal` as the base with
+        // any escalation flag still returns Decal.
+        let r = render_layer_with_decal_escalation(RenderLayer::Decal, true, true);
+        assert_eq!(r, RenderLayer::Decal);
+        let r = render_layer_with_decal_escalation(RenderLayer::Decal, false, false);
+        assert_eq!(r, RenderLayer::Decal);
+    }
+}

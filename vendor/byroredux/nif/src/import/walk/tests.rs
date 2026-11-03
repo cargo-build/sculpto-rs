@@ -1,0 +1,2497 @@
+//! Tests for `walk_node_hierarchical`, `walk_node_flat`, and the
+//! various flat satellite walkers (lights, particle emitters,
+//! texture effects). Lifted out of the pre-#1118 monolithic
+//! `walk.rs` (TD9-004). Inner-module `use super::*;` statements
+//! were updated to `use super::super::*;` so they still resolve
+//! to the `walk` module after the directory promotion.
+
+#[cfg(test)]
+mod affected_nodes_tests {
+    //! Regression tests for issue #335 — `NiDynamicEffect.Affected
+    //! Nodes` Ptr list must surface on `ImportedLight` so the
+    //! renderer's per-light filter can later restrict the light's
+    //! effect to the named subtrees.
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::node::NiNode;
+    use crate::types::BlockRef;
+    use std::sync::Arc;
+
+    fn node_with_name(name: &str) -> NiNode {
+        NiNode {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: Some(Arc::from(name)),
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: crate::types::NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            children: Vec::new(),
+            effects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_skips_null_pointer() {
+        let scene = NifScene::default();
+        let names = resolve_affected_node_names(&scene, &[u32::MAX]);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn resolve_skips_out_of_range_pointer() {
+        // Empty scene — index 0 is out of range. Must be silently
+        // dropped rather than panic.
+        let scene = NifScene::default();
+        let names = resolve_affected_node_names(&scene, &[0u32]);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn resolve_extracts_node_name() {
+        // Regression: pre-#335 the `affected_nodes` Vec was parsed
+        // (light.rs:48) but never read. Now the importer surfaces the
+        // names on `ImportedLight` for the renderer's per-light filter.
+        let mut scene = NifScene::default();
+        scene
+            .blocks
+            .push(Box::new(node_with_name("HandLanternBone")));
+        scene.blocks.push(Box::new(node_with_name("BipedHead")));
+        let names = resolve_affected_node_names(&scene, &[0u32, 1u32]);
+        assert_eq!(names.len(), 2);
+        assert_eq!(&*names[0], "HandLanternBone");
+        assert_eq!(&*names[1], "BipedHead");
+    }
+
+    #[test]
+    fn resolve_drops_unnamed_target() {
+        // Sibling check — a target block that exists but has no name
+        // (`net.name == None`) must drop out of the result rather
+        // than emitting an empty string. Empty names break consumer
+        // hash-set lookups silently.
+        let mut scene = NifScene::default();
+        let mut anon = node_with_name("");
+        anon.av.net.name = None;
+        scene.blocks.push(Box::new(anon));
+        scene.blocks.push(Box::new(node_with_name("Named")));
+        let names = resolve_affected_node_names(&scene, &[0u32, 1u32]);
+        assert_eq!(names.len(), 1);
+        assert_eq!(&*names[0], "Named");
+    }
+
+    #[test]
+    fn resolve_partial_failure_keeps_recoverable_entries() {
+        // A mix of [valid, null, out-of-range] must yield exactly the
+        // one valid entry — the null-as-no-restriction convention
+        // means we'd lose meaning if a single bad pointer collapsed
+        // the whole list to empty.
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(node_with_name("OnlyValid")));
+        let names = resolve_affected_node_names(&scene, &[0u32, u32::MAX, 99u32]);
+        assert_eq!(names.len(), 1);
+        assert_eq!(&*names[0], "OnlyValid");
+    }
+
+    /// Regression for #872 / NIF-PERF-08. Both resolvers must take the
+    /// `name_arc()` fast path (`Arc::clone` ⇒ refcount bump) instead of
+    /// `Arc::from(&str)` (fresh heap alloc + byte copy). On cell-load
+    /// critical paths — many lights' affected_nodes, every BSTreeNode's
+    /// trunk + branch bone lists — that's the difference between
+    /// `O(refs)` allocations and zero. We pin the contract via
+    /// `Arc::ptr_eq`: the returned Arc must alias the source Arc on
+    /// the underlying NiObjectNET, not a freshly minted copy.
+    #[test]
+    fn resolvers_refcount_bump_instead_of_realloc() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(node_with_name("TrunkBone")));
+        scene.blocks.push(Box::new(node_with_name("BranchBoneA")));
+
+        let original_trunk_arc = scene
+            .get(0)
+            .and_then(|b| b.as_object_net())
+            .and_then(|n| n.name_arc())
+            .expect("seed Arc must exist on the NiObjectNET")
+            .clone();
+        let original_branch_arc = scene
+            .get(1)
+            .and_then(|b| b.as_object_net())
+            .and_then(|n| n.name_arc())
+            .expect("seed Arc must exist")
+            .clone();
+
+        // Path 1: BSTreeNode bone-list resolution (the SpeedTree case
+        // called out in #872). BlockRef-typed.
+        let bone_refs = [BlockRef(0), BlockRef(1)];
+        let bone_names = resolve_block_ref_names(&scene, &bone_refs);
+        assert_eq!(bone_names.len(), 2);
+        assert!(
+            std::sync::Arc::ptr_eq(&bone_names[0], &original_trunk_arc),
+            "BSTreeNode bone-list resolver must Arc::clone, not Arc::from(&str)"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&bone_names[1], &original_branch_arc),
+            "all entries take the refcount-bump fast path"
+        );
+
+        // Path 2: NiDynamicEffect.affected_nodes resolution (the lights
+        // case bundled in the same fix). Ptr-typed (u32).
+        let affected = [0u32, 1u32];
+        let lit_names = resolve_affected_node_names(&scene, &affected);
+        assert_eq!(lit_names.len(), 2);
+        assert!(
+            std::sync::Arc::ptr_eq(&lit_names[0], &original_trunk_arc),
+            "affected_nodes resolver shares the same fast path"
+        );
+        assert!(std::sync::Arc::ptr_eq(&lit_names[1], &original_branch_arc));
+
+        // Strong-count sanity: the seed clone above + 2 entries each
+        // from the two resolvers ⇒ ≥ 4 references to the trunk Arc.
+        // Pre-fix the resolvers minted fresh allocations, leaving
+        // strong_count == 2 (block storage + our seed clone) and the
+        // returned Arcs would each be strong_count == 1.
+        assert!(
+            std::sync::Arc::strong_count(&original_trunk_arc) >= 4,
+            "post-fix every resolved entry shares the seed Arc — \
+             strong_count must reflect the refcount bump (was {})",
+            std::sync::Arc::strong_count(&original_trunk_arc)
+        );
+    }
+}
+
+#[cfg(test)]
+mod texture_effect_import_tests {
+    //! Regression tests for #891 / LC-D2-NEW-01 — `NiTextureEffect`
+    //! blocks must surface as `ImportedTextureEffect` after the import
+    //! walk, with world-space pose, interned texture path, and
+    //! resolved affected-node names. Pre-fix the parser captured all
+    //! 12 wire fields but no consumer read them, so vanilla Oblivion
+    //! sun gobos / FO3 / FNV light cookies parsed and were silently
+    //! discarded.
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::node::NiNode;
+    use crate::blocks::texture::{NiSourceTexture, NiTextureEffect};
+    use crate::import::ImportedTextureEffect;
+    use crate::types::{BlockRef, NiMatrix3, NiTransform};
+    use byroredux_core::string::StringPool;
+    use std::sync::Arc;
+
+    fn node_named(name: &str, children: Vec<BlockRef>) -> NiNode {
+        NiNode {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: Some(Arc::from(name)),
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            children,
+            effects: Vec::new(),
+        }
+    }
+
+    fn make_texture_effect(
+        affected: Vec<u32>,
+        source_ref: BlockRef,
+        texture_type: u32,
+        coord_gen: u32,
+    ) -> NiTextureEffect {
+        NiTextureEffect {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: Some(Arc::from("SunGobo")),
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            switch_state: true,
+            affected_nodes: affected,
+            model_projection_matrix: NiMatrix3::default(),
+            model_projection_translation: [0.0; 3],
+            texture_filtering: 0,
+            max_anisotropy: 1,
+            texture_clamping: 0,
+            texture_type,
+            coordinate_generation_type: coord_gen,
+            source_texture_ref: source_ref,
+            enable_plane: false,
+            plane: [0.0; 4],
+            ps2_l: 0,
+            ps2_k: 0,
+        }
+    }
+
+    fn make_source_texture(filename: &str) -> NiSourceTexture {
+        NiSourceTexture {
+            net: NiObjectNETData {
+                name: None,
+                extra_data_refs: Vec::new(),
+                controller_ref: BlockRef::NULL,
+            },
+            use_external: true,
+            filename: Some(Arc::from(filename)),
+            pixel_data_ref: BlockRef::NULL,
+            pixel_layout: 0,
+            use_mipmaps: 1,
+            alpha_format: 0,
+            is_static: true,
+        }
+    }
+
+    /// Happy path: a NIF with one NiNode root + one NiTextureEffect
+    /// child that references a NiSourceTexture and lists two affected
+    /// nodes. The walker must produce one `ImportedTextureEffect`
+    /// with: interned texture path, both texture-type and
+    /// coord-gen-type fields preserved, and both affected-node names
+    /// resolved through the same `resolve_affected_node_names` path
+    /// `ImportedLight` uses.
+    #[test]
+    fn import_texture_effect_round_trips_path_and_affected_nodes() {
+        // Build the scene blocks:
+        //   0 = root NiNode (has child #1)
+        //   1 = NiTextureEffect (refs source #2, affects nodes #3, #4)
+        //   2 = NiSourceTexture (filename = "textures\\sun_gobo.dds")
+        //   3 = NiNode "SunDiscBone"
+        //   4 = NiNode "CloudsBone"
+        let mut scene = NifScene::default();
+        scene
+            .blocks
+            .push(Box::new(node_named("Scene Root", vec![BlockRef(1)])));
+        scene.blocks.push(Box::new(make_texture_effect(
+            vec![3, 4],
+            BlockRef(2),
+            0, // ProjectedLight
+            1, // WorldPerspective
+        )));
+        scene
+            .blocks
+            .push(Box::new(make_source_texture("textures\\sun_gobo.dds")));
+        scene
+            .blocks
+            .push(Box::new(node_named("SunDiscBone", Vec::new())));
+        scene
+            .blocks
+            .push(Box::new(node_named("CloudsBone", Vec::new())));
+        scene.root_index = Some(0);
+
+        let mut pool = StringPool::new();
+        let effects = crate::import::import_nif_texture_effects(&scene, &mut pool);
+        assert_eq!(
+            effects.len(),
+            1,
+            "one NiTextureEffect → one ImportedTextureEffect"
+        );
+        let eff = &effects[0];
+
+        // Texture path interned through the pool — resolve back for
+        // the comparison; the pool lower-cases on intern.
+        let path = eff
+            .texture_path
+            .and_then(|fs| pool.resolve(fs).map(str::to_owned));
+        assert_eq!(path.as_deref(), Some("textures\\sun_gobo.dds"));
+
+        assert_eq!(eff.texture_type, 0, "ProjectedLight roundtrip");
+        assert_eq!(
+            eff.coordinate_generation_type, 1,
+            "WorldPerspective roundtrip"
+        );
+
+        assert_eq!(eff.affected_node_names.len(), 2);
+        assert_eq!(&*eff.affected_node_names[0], "SunDiscBone");
+        assert_eq!(&*eff.affected_node_names[1], "CloudsBone");
+    }
+
+    /// A NiTextureEffect whose `source_texture_ref` is null leaves
+    /// `texture_path` as `None` — empty paths must drop rather than
+    /// intern an empty string into the pool. Same convention the
+    /// material walker uses for empty texture slots (#609).
+    #[test]
+    fn texture_effect_with_null_source_ref_leaves_path_none() {
+        let mut scene = NifScene::default();
+        scene
+            .blocks
+            .push(Box::new(node_named("Scene Root", vec![BlockRef(1)])));
+        scene.blocks.push(Box::new(make_texture_effect(
+            Vec::new(),
+            BlockRef::NULL,
+            2, // Environment
+            2, // SphereMap
+        )));
+        scene.root_index = Some(0);
+
+        let mut pool = StringPool::new();
+        let effects: Vec<ImportedTextureEffect> =
+            crate::import::import_nif_texture_effects(&scene, &mut pool);
+        assert_eq!(effects.len(), 1);
+        assert!(
+            effects[0].texture_path.is_none(),
+            "null source_texture_ref must produce no path"
+        );
+        assert_eq!(effects[0].texture_type, 2);
+        assert_eq!(effects[0].coordinate_generation_type, 2);
+    }
+
+    /// A NIF without any `NiTextureEffect` blocks must produce an
+    /// empty result. NO_REGRESSION check from the issue's
+    /// completeness checklist — non-texture-effect scenes must not
+    /// be perturbed by the new walker.
+    #[test]
+    fn scene_without_texture_effects_returns_empty() {
+        let mut scene = NifScene::default();
+        scene
+            .blocks
+            .push(Box::new(node_named("Scene Root", Vec::new())));
+        scene.root_index = Some(0);
+
+        let mut pool = StringPool::new();
+        let effects = crate::import::import_nif_texture_effects(&scene, &mut pool);
+        assert!(effects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod editor_marker_tests {
+    //! Regression tests for `is_editor_marker` (#165 / audit N26-4-06).
+    //! Exhaustive list of the prefixes the walker must filter across
+    //! Gamebryo-lineage games. Missed patterns render as untextured
+    //! debug geometry in the live scene (map pins, quest targets,
+    //! patrol route markers, editor bounding pyramids).
+    use super::super::is_editor_marker;
+
+    #[test]
+    fn matches_known_editor_marker_prefixes() {
+        // Gamebryo editor / quest / patrol markers — every game.
+        assert!(is_editor_marker(Some("EditorMarker")));
+        assert!(is_editor_marker(Some("EDITORMARKER")));
+        assert!(is_editor_marker(Some("EditorMarker_QuestNode")));
+        assert!(is_editor_marker(Some("Marker_01")));
+        assert!(is_editor_marker(Some("marker:patrol")));
+        assert!(is_editor_marker(Some("MarkerX")));
+        assert!(is_editor_marker(Some("markerx")));
+    }
+
+    /// Regression: #165 — Skyrim+ exterior-cell world map pins
+    /// ("MapMarker") were rendering as untextured pyramids in the
+    /// overworld. The match now catches the prefix (case-insensitive).
+    #[test]
+    fn matches_skyrim_map_marker() {
+        assert!(is_editor_marker(Some("MapMarker")));
+        assert!(is_editor_marker(Some("mapmarker")));
+        assert!(is_editor_marker(Some("MapMarker_Whiterun")));
+        assert!(is_editor_marker(Some("MAPMARKER")));
+    }
+
+    #[test]
+    fn does_not_match_legitimate_names() {
+        // False-positive regression guards — these are real NIF node
+        // names that must NOT be filtered.
+        assert!(!is_editor_marker(None));
+        assert!(!is_editor_marker(Some("")));
+        assert!(!is_editor_marker(Some("Bip01 Head")));
+        assert!(!is_editor_marker(Some("NPC Torso [Tors]")));
+        // "MapMarkerMesh" does get filtered — that's correct, any
+        // prefix match is intentional (vanilla doesn't author non-
+        // marker nodes starting with these prefixes).
+        assert!(is_editor_marker(Some("MapMarkerMesh")));
+    }
+}
+
+#[cfg(test)]
+mod switch_node_walker_tests {
+    //! Regression tests for #718 / NIF-D4-02: `walk_node_lights` and
+    //! `walk_node_particle_emitters_flat` must walk through
+    //! `NiSwitchNode` subtrees (previously they only called
+    //! `as_ni_node`, which returns `None` for NiSwitchNode/NiLODNode,
+    //! silently dropping any lights/emitters inside them).
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::light::{NiDirectionalLight, NiLightBase, NiPointLight, NiSpotLight};
+    use crate::blocks::node::{NiLODNode, NiNode, NiSwitchNode};
+    use crate::import::{ImportedLight, LightKind};
+    use crate::types::{BlockRef, NiColor, NiMatrix3, NiTransform};
+    use std::sync::Arc;
+
+    fn blank_av(name: Option<&str>) -> NiAVObjectData {
+        NiAVObjectData {
+            net: NiObjectNETData {
+                name: name.map(Arc::from),
+                extra_data_refs: Vec::new(),
+                controller_ref: BlockRef::NULL,
+            },
+            flags: 0,
+            transform: NiTransform::default(),
+            properties: Vec::new(),
+            collision_ref: BlockRef::NULL,
+        }
+    }
+
+    fn blank_node(name: Option<&str>, children: Vec<BlockRef>) -> NiNode {
+        NiNode {
+            av: blank_av(name),
+            children,
+            effects: Vec::new(),
+        }
+    }
+
+    fn point_light_block() -> Box<dyn NiObject> {
+        Box::new(NiPointLight {
+            base: NiLightBase {
+                av: blank_av(Some("TestLight")),
+                switch_state: true,
+                affected_nodes: Vec::new(),
+                dimmer: 1.0,
+                ambient_color: NiColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                },
+                diffuse_color: NiColor {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                },
+                specular_color: NiColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                },
+            },
+            constant_attenuation: 0.0,
+            linear_attenuation: 0.0,
+            quadratic_attenuation: 1.0,
+        })
+    }
+
+    /// Regression for #718: a NiSwitchNode wrapping a NiPointLight child
+    /// must yield the light from `walk_node_lights`.  Pre-fix the walker
+    /// went straight to `as_ni_node`, which returns `None` for
+    /// NiSwitchNode, silently dropping the light.
+    #[test]
+    fn walk_node_lights_traverses_ni_switch_node() {
+        // Scene layout:
+        //   [0] NiSwitchNode  { active_index=0, children=[1] }
+        //   [1] NiPointLight  { diffuse=(1,0,0) }
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiSwitchNode {
+            base: blank_node(None, vec![BlockRef(1)]),
+            switch_flags: 0,
+            index: 0,
+        }));
+        scene.blocks.push(point_light_block());
+        scene.root_index = Some(0);
+
+        let mut lights = Vec::new();
+        walk_node_lights(
+            &scene,
+            0,
+            &NiTransform::default(),
+            &mut new_visited(&scene),
+            0,
+            &mut lights,
+        );
+
+        assert_eq!(
+            lights.len(),
+            1,
+            "pre-#718: NiSwitchNode was invisible to walk_node_lights — light lost"
+        );
+        assert_eq!(lights[0].color, [1.0, 0.0, 0.0]);
+    }
+
+    /// Regression for #718: a NiLODNode wrapping a NiPointLight child
+    /// must also yield the light (LOD 0 = highest detail is always walked).
+    #[test]
+    fn walk_node_lights_traverses_ni_lod_node() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiLODNode {
+            base: NiSwitchNode {
+                base: blank_node(None, vec![BlockRef(1), BlockRef::NULL]),
+                switch_flags: 0,
+                index: 0,
+            },
+            lod_level_data: BlockRef::NULL,
+        }));
+        scene.blocks.push(point_light_block());
+        scene.root_index = Some(0);
+
+        let mut lights = Vec::new();
+        walk_node_lights(
+            &scene,
+            0,
+            &NiTransform::default(),
+            &mut new_visited(&scene),
+            0,
+            &mut lights,
+        );
+
+        assert_eq!(lights.len(), 1, "NiLODNode must expose its LOD-0 light");
+    }
+
+    /// Light base whose world rotation is 90° about Gamebryo +Z, so the
+    /// first column (the Gamebryo model direction (1,0,0) in world space)
+    /// is Z-up (0,1,0) while the third column is Z-up (0,0,1) — the two
+    /// axes the old and fixed derivations read are distinguishable.
+    fn rotated_light_base() -> NiLightBase {
+        let mut av = blank_av(Some("RotatedLight"));
+        av.transform.rotation = NiMatrix3 {
+            rows: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        NiLightBase {
+            av,
+            switch_state: true,
+            affected_nodes: Vec::new(),
+            dimmer: 1.0,
+            ambient_color: NiColor {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+            },
+            diffuse_color: NiColor {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+            },
+            specular_color: NiColor {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+            },
+        }
+    }
+
+    fn imported_single_light(block: Box<dyn NiObject>) -> ImportedLight {
+        let mut scene = NifScene::default();
+        scene.blocks.push(block);
+        scene.root_index = Some(0);
+        let mut lights = Vec::new();
+        walk_node_lights(
+            &scene,
+            0,
+            &NiTransform::default(),
+            &mut new_visited(&scene),
+            0,
+            &mut lights,
+        );
+        assert_eq!(lights.len(), 1);
+        lights.remove(0)
+    }
+
+    /// Regression for #4395 / #4859 — the angle fixture is in Gamebryo
+    /// degrees, converted to canonical radians at import. A `NiSpotLight`
+    /// emits along the FIRST column of its world rotation (model direction
+    /// (1,0,0), `NiSpotLight.h`), and a spot's direction points outward.
+    /// Z-up (0,1,0) → Y-up (0,0,-1). The pre-fix "-Z" derivation gave
+    /// Y-up (0,-1,0).
+    #[test]
+    fn spot_light_direction_is_the_first_rotation_column() {
+        let light = imported_single_light(Box::new(NiSpotLight {
+            point: NiPointLight {
+                base: rotated_light_base(),
+                constant_attenuation: 0.0,
+                linear_attenuation: 0.0,
+                quadratic_attenuation: 1.0,
+            },
+            outer_spot_angle: 45.0,
+            inner_spot_angle: 15.0,
+            exponent: 1.0,
+        }));
+        assert_eq!(light.kind, LightKind::Spot);
+        assert_eq!(light.direction, [0.0, 0.0, -1.0]);
+        assert!((light.outer_angle - 45.0_f32.to_radians()).abs() < 1.0e-6);
+    }
+
+    /// Regression for #4395 — `NiDirectionalLight` shares the (1,0,0) model
+    /// direction (`NiDirectionalLight.h`), but the canonical directional
+    /// `Emitter.direction` points TOWARD the light, so it is the negated
+    /// first column: Z-up (0,-1,0) → Y-up (0,0,1).
+    #[test]
+    fn directional_light_direction_points_toward_the_light() {
+        let light = imported_single_light(Box::new(NiDirectionalLight {
+            base: rotated_light_base(),
+        }));
+        assert_eq!(light.kind, LightKind::Directional);
+        assert_eq!(light.direction, [0.0, 0.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod recursion_depth_tests {
+    //! Regression for #1269 / SAFE-DIM3-NEW-01: the hierarchical and
+    //! flat walkers must bail at `MAX_NIF_NODE_DEPTH` rather than
+    //! overflow the stack on a pathologically deep scene graph.
+    //!
+    //! The tests build a chain of `NiNode`s each pointing to a single
+    //! child at the next index. Without the depth cap the recursive
+    //! walkers would unwind the entire chain on the stack; with the cap
+    //! they log a warning and return, importing only the prefix up to
+    //! the cap.
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::node::NiNode;
+    use crate::types::{BlockRef, NiTransform};
+    use byroredux_core::string::StringPool;
+
+    fn chain_node(child_idx: Option<u32>) -> Box<dyn NiObject> {
+        Box::new(NiNode {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: None,
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            children: match child_idx {
+                Some(c) => vec![BlockRef(c)],
+                None => Vec::new(),
+            },
+            effects: Vec::new(),
+        })
+    }
+
+    fn build_chain_scene(depth: u32) -> NifScene {
+        let mut scene = NifScene::default();
+        for i in 0..depth {
+            let next = if i + 1 < depth { Some(i + 1) } else { None };
+            scene.blocks.push(chain_node(next));
+        }
+        scene.root_index = Some(0);
+        scene
+    }
+
+    fn empty_imported_scene() -> ImportedScene {
+        ImportedScene {
+            nodes: Vec::new(),
+            meshes: Vec::new(),
+            particle_emitters: Vec::new(),
+            bsx_flags: None,
+            bs_bound: None,
+            phantom_bounds: None,
+            attach_points: None,
+            child_attach_connections: None,
+            furniture_markers: Vec::new(),
+            embedded_clip: None,
+            ragdoll: None,
+            lights: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hierarchical_walker_caps_at_max_depth() {
+        // Build a chain longer than MAX_NIF_NODE_DEPTH so the walker
+        // must bail. Pre-#1269 this would unbounded-recurse.
+        let chain_len = MAX_NIF_NODE_DEPTH + 64;
+        let scene = build_chain_scene(chain_len);
+        let mut imported = empty_imported_scene();
+        let mut pool = StringPool::new();
+        let mut props_stack: Vec<BlockRef> = Vec::new();
+        let mut ctx = HierWalkCtx {
+            scene: &scene,
+            inherited_props: &mut props_stack,
+            out: &mut imported,
+            pool: &mut pool,
+            resolver: None,
+            inherited_billboard: None,
+            visited: &mut new_visited(&scene),
+        };
+        walk_node_hierarchical(&mut ctx, 0, None, 0);
+        // We imported some prefix of the chain but not the whole thing —
+        // the cap fires somewhere on the way down.
+        assert!(
+            (imported.nodes.len() as u32) <= MAX_NIF_NODE_DEPTH + 1,
+            "expected ≤ {} nodes (cap + root), got {}",
+            MAX_NIF_NODE_DEPTH + 1,
+            imported.nodes.len(),
+        );
+        assert!(
+            (imported.nodes.len() as u32) < chain_len,
+            "walker should have stopped before exhausting the chain"
+        );
+    }
+
+    #[test]
+    fn flat_walker_caps_at_max_depth() {
+        let chain_len = MAX_NIF_NODE_DEPTH + 64;
+        let scene = build_chain_scene(chain_len);
+        let mut meshes = Vec::new();
+        let mut pool = StringPool::new();
+        let mut props_stack: Vec<BlockRef> = Vec::new();
+        // Pre-#1269 this would stack-overflow on a long-enough chain.
+        let mut ctx = FlatWalkCtx {
+            scene: &scene,
+            inherited_props: &mut props_stack,
+            out: &mut meshes,
+            collisions: None,
+            pool: &mut pool,
+            resolver: None,
+            inherited_billboard: None,
+            visited: &mut new_visited(&scene),
+        };
+        walk_node_flat(&mut ctx, 0, &NiTransform::default(), 0);
+        // Nothing to assert on the mesh side (chain has no geometry);
+        // success is "returned without overflowing the stack".
+    }
+
+    #[test]
+    fn hierarchical_walker_accepts_shallow_chain() {
+        // A chain well under the cap must import every node — the cap
+        // does not bail prematurely on legitimate depth.
+        let chain_len: u32 = 32;
+        let scene = build_chain_scene(chain_len);
+        let mut imported = empty_imported_scene();
+        let mut pool = StringPool::new();
+        let mut props_stack: Vec<BlockRef> = Vec::new();
+        let mut ctx = HierWalkCtx {
+            scene: &scene,
+            inherited_props: &mut props_stack,
+            out: &mut imported,
+            pool: &mut pool,
+            resolver: None,
+            inherited_billboard: None,
+            visited: &mut new_visited(&scene),
+        };
+        walk_node_hierarchical(&mut ctx, 0, None, 0);
+        assert_eq!(imported.nodes.len() as u32, chain_len);
+    }
+}
+
+/// #5485 — self-referencing and diamond scene graphs. `NiNode.children`
+/// is raw on-disk `BlockRef`s, so a child can name its own node (or an
+/// ancestor, or a sibling twice). Pre-fix the three satellite walkers
+/// had no bound at all (one self-child = stack overflow abort), and
+/// the two #1269 depth-capped walkers fanned out as 2^depth on a
+/// two-self-child node. Vanilla content is a strict tree (0
+/// multi-parent / 0 self-referenced children in the 128,377-file
+/// census), so "each block at most once" is purely defensive.
+#[cfg(test)]
+mod revisit_tests {
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::node::NiNode;
+    use crate::types::{BlockRef, NiTransform};
+    use byroredux_core::string::StringPool;
+
+    fn node(children: &[u32]) -> Box<dyn NiObject> {
+        Box::new(NiNode {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: None,
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            children: children.iter().map(|c| BlockRef(*c)).collect(),
+            effects: Vec::new(),
+        })
+    }
+
+    /// Root listing itself `fan` times as its own children.
+    fn self_referencing_scene(fan: usize) -> NifScene {
+        let mut scene = NifScene::default();
+        scene.blocks.push(node(&vec![0u32; fan]));
+        scene.root_index = Some(0);
+        scene
+    }
+
+    fn empty_imported_scene() -> crate::import::ImportedScene {
+        crate::import::ImportedScene {
+            nodes: Vec::new(),
+            meshes: Vec::new(),
+            particle_emitters: Vec::new(),
+            bsx_flags: None,
+            bs_bound: None,
+            phantom_bounds: None,
+            attach_points: None,
+            child_attach_connections: None,
+            furniture_markers: Vec::new(),
+            embedded_clip: None,
+            ragdoll: None,
+            lights: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hierarchical_walker_survives_a_self_reference() {
+        for fan in [1usize, 2] {
+            let scene = self_referencing_scene(fan);
+            let mut imported = empty_imported_scene();
+            let mut pool = StringPool::new();
+            let mut props_stack: Vec<BlockRef> = Vec::new();
+            let mut ctx = HierWalkCtx {
+                scene: &scene,
+                inherited_props: &mut props_stack,
+                out: &mut imported,
+                pool: &mut pool,
+                resolver: None,
+                inherited_billboard: None,
+                visited: &mut new_visited(&scene),
+            };
+            walk_node_hierarchical(&mut ctx, 0, None, 0);
+            // Pre-fix: fan=1 recursed to the 128 cap (129 nodes);
+            // fan=2 pushed 2^128 ImportedNodes — an OOM abort.
+            assert_eq!(
+                imported.nodes.len(),
+                1,
+                "fan={fan}: the root must import exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_walker_survives_a_self_reference() {
+        for fan in [1usize, 2] {
+            let scene = self_referencing_scene(fan);
+            let mut meshes = Vec::new();
+            let mut pool = StringPool::new();
+            let mut props_stack: Vec<BlockRef> = Vec::new();
+            let mut ctx = FlatWalkCtx {
+                scene: &scene,
+                inherited_props: &mut props_stack,
+                out: &mut meshes,
+                collisions: None,
+                pool: &mut pool,
+                resolver: None,
+                inherited_billboard: None,
+                visited: &mut new_visited(&scene),
+            };
+            // Pre-fix: fan=2 was still walking at the 30 s timeout
+            // (2^129 visits). Success = returns promptly.
+            walk_node_flat(&mut ctx, 0, &NiTransform::default(), 0);
+        }
+    }
+
+    #[test]
+    fn lights_walker_survives_a_self_reference() {
+        for fan in [1usize, 2] {
+            let scene = self_referencing_scene(fan);
+            let mut lights = Vec::new();
+            // Pre-fix: stack-overflow abort on the 2 MiB rayon worker.
+            walk_node_lights(
+                &scene,
+                0,
+                &NiTransform::default(),
+                &mut new_visited(&scene),
+                0,
+                &mut lights,
+            );
+            assert!(lights.is_empty());
+        }
+    }
+
+    #[test]
+    fn texture_effects_walker_survives_a_self_reference() {
+        for fan in [1usize, 2] {
+            let scene = self_referencing_scene(fan);
+            let mut effects = Vec::new();
+            let mut pool = StringPool::new();
+            // Pre-fix: stack-overflow abort on the 2 MiB rayon worker.
+            walk_node_texture_effects(
+                &scene,
+                0,
+                &NiTransform::default(),
+                &mut new_visited(&scene),
+                0,
+                &mut pool,
+                &mut effects,
+            );
+            assert!(effects.is_empty());
+        }
+    }
+
+    #[test]
+    fn particle_emitters_walker_survives_a_self_reference() {
+        for fan in [1usize, 2] {
+            let scene = self_referencing_scene(fan);
+            let mut out = Vec::new();
+            let mut inherited_props = Vec::new();
+            let mut pool = StringPool::new();
+            // Pre-fix: stack-overflow abort on the 2 MiB rayon worker.
+            walk_node_particle_emitters_flat(
+                &scene,
+                0,
+                &NiTransform::default(),
+                None,
+                &mut inherited_props,
+                &mut pool,
+                &mut new_visited(&scene),
+                0,
+                &mut out,
+            );
+            assert!(out.is_empty());
+        }
+    }
+
+    /// A diamond (shared child, no cycle) must also visit each block
+    /// once — the fan-out shape that defeated the depth-only cap.
+    #[test]
+    fn hierarchical_walker_visits_a_diamond_child_once() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(node(&[1, 2])); // root
+        scene.blocks.push(node(&[3])); // left
+        scene.blocks.push(node(&[3])); // right
+        scene.blocks.push(node(&[])); // shared leaf
+        scene.root_index = Some(0);
+        let mut imported = empty_imported_scene();
+        let mut pool = StringPool::new();
+        let mut props_stack: Vec<BlockRef> = Vec::new();
+        let mut ctx = HierWalkCtx {
+            scene: &scene,
+            inherited_props: &mut props_stack,
+            out: &mut imported,
+            pool: &mut pool,
+            resolver: None,
+            inherited_billboard: None,
+            visited: &mut new_visited(&scene),
+        };
+        walk_node_hierarchical(&mut ctx, 0, None, 0);
+        assert_eq!(
+            imported.nodes.len(),
+            4,
+            "each of the 4 blocks imports exactly once (pre-fix: the \
+             shared leaf imported once per path)"
+        );
+    }
+
+    /// A two-node cycle (A → B → A) — the ancestor-cycle shape.
+    #[test]
+    fn walkers_survive_a_mutual_cycle() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(node(&[1])); // A
+        scene.blocks.push(node(&[0])); // B → A
+        scene.root_index = Some(0);
+        let mut imported = empty_imported_scene();
+        let mut pool = StringPool::new();
+        let mut props_stack: Vec<BlockRef> = Vec::new();
+        let mut ctx = HierWalkCtx {
+            scene: &scene,
+            inherited_props: &mut props_stack,
+            out: &mut imported,
+            pool: &mut pool,
+            resolver: None,
+            inherited_billboard: None,
+            visited: &mut new_visited(&scene),
+        };
+        walk_node_hierarchical(&mut ctx, 0, None, 0);
+        assert_eq!(imported.nodes.len(), 2, "A and B each import once");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)] // The fixture starts from identity then authors one offset.
+mod particle_local_transform_tests {
+    //! Regression for #1333: both particle-emitter walkers must compose
+    //! the `NiParticleSystem`'s own local TRS (from its `NiAVObjectData`
+    //! base) onto the host node, not just use the host's world transform.
+    //! Pre-fix the block's transform was parsed into `_av` and dropped, so
+    //! an emitter authored with a non-zero offset (campfire smoke above the
+    //! fire, FO4 steam stacks) spawned at the host node origin.
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::node::NiNode;
+    use crate::blocks::particle::NiParticleSystem;
+    use crate::types::{BlockRef, NiPoint3, NiTransform};
+    use byroredux_core::string::StringPool;
+    use std::sync::Arc;
+
+    /// Host `NiNode` at identity world transform with one child.
+    fn host_node(child: u32) -> Box<dyn NiObject> {
+        Box::new(NiNode {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: Some(Arc::from("FireNode")),
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            children: vec![BlockRef(child)],
+            effects: Vec::new(),
+        })
+    }
+
+    /// `NiParticleSystem` carrying a Z-up local translation offset.
+    fn particle_system(zup_translation: [f32; 3]) -> Box<dyn NiObject> {
+        let mut transform = NiTransform::default();
+        transform.translation = NiPoint3 {
+            x: zup_translation[0],
+            y: zup_translation[1],
+            z: zup_translation[2],
+        };
+        Box::new(NiParticleSystem {
+            original_type: "NiParticleSystem".to_string(),
+            transform,
+            properties: Vec::new(),
+            shader_property_ref: BlockRef::NULL,
+            alpha_property_ref: BlockRef::NULL,
+            modifier_refs: Vec::new(),
+            controller_ref: BlockRef::NULL,
+            data_ref: BlockRef::NULL,
+            flags: 0,
+            name: None,
+        })
+    }
+
+    /// Scene: `[0]` host NiNode (identity) → child `[1]` NiParticleSystem
+    /// with a Z-up local offset of (10, 20, 30).
+    fn scene_with_offset_emitter() -> NifScene {
+        let mut scene = NifScene::default();
+        scene.blocks.push(host_node(1));
+        scene.blocks.push(particle_system([10.0, 20.0, 30.0]));
+        scene.root_index = Some(0);
+        scene
+    }
+
+    /// Flat walker (cell-loader path): `local_position` must include the
+    /// block's own offset, converted Z-up (10,20,30) → Y-up (10,30,-20).
+    /// Pre-#1333 this read (0,0,0) — the bare host node origin.
+    #[test]
+    fn flat_walker_composes_block_local_offset() {
+        let scene = scene_with_offset_emitter();
+        let mut out = Vec::new();
+        let mut inherited_props = Vec::new();
+        let mut pool = StringPool::new();
+        walk_node_particle_emitters_flat(
+            &scene,
+            0,
+            &NiTransform::default(),
+            None,
+            &mut inherited_props,
+            &mut pool,
+            &mut new_visited(&scene),
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "the NiParticleSystem child must surface one emitter"
+        );
+        assert_eq!(out[0].local_position, [10.0, 30.0, -20.0]);
+    }
+
+    /// Z-up yaw by +90° about the up axis: x_new = y_old.
+    fn yaw90_zup() -> crate::types::NiMatrix3 {
+        crate::types::NiMatrix3 {
+            rows: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    /// #4398 — the flat walker must carry the composed NIF rotation, not
+    /// just the translation (#1333). A rotated host node with an
+    /// identity-local particle block, an identity host with a rotated
+    /// block, and both rotated (composing to a Z-up 180° yaw) must each
+    /// surface the converted composed rotation; pre-#4398 there was no
+    /// field at all and every cell-path emitter spawned world-axis
+    /// aligned.
+    #[test]
+    fn flat_walker_composes_the_emitter_rotation() {
+        use super::super::super::coord::zup_matrix_to_yup_quat;
+
+        let yaw180_zup = crate::types::NiMatrix3 {
+            rows: [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let cases = [
+            // (host rotation, block rotation, expected composed)
+            (yaw90_zup(), crate::types::NiMatrix3::default(), yaw90_zup()),
+            (crate::types::NiMatrix3::default(), yaw90_zup(), yaw90_zup()),
+            (yaw90_zup(), yaw90_zup(), yaw180_zup),
+        ];
+        for (host_rot, block_rot, expected_composed) in cases {
+            // Local builders (not `host_node`/`particle_system`): the
+            // boxed `dyn NiObject` those return can't be downcast mutably,
+            // and this test needs per-case rotations on both blocks.
+            let host = NiNode {
+                av: NiAVObjectData {
+                    net: NiObjectNETData {
+                        name: Some(Arc::from("FireNode")),
+                        extra_data_refs: Vec::new(),
+                        controller_ref: BlockRef::NULL,
+                    },
+                    flags: 0,
+                    transform: NiTransform {
+                        rotation: host_rot,
+                        translation: NiPoint3 {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        scale: 1.0,
+                    },
+                    properties: Vec::new(),
+                    collision_ref: BlockRef::NULL,
+                },
+                children: vec![BlockRef(1)],
+                effects: Vec::new(),
+            };
+            let ps = NiParticleSystem {
+                original_type: "NiParticleSystem".to_string(),
+                transform: NiTransform {
+                    rotation: block_rot,
+                    translation: NiPoint3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    scale: 1.0,
+                },
+                properties: Vec::new(),
+                shader_property_ref: BlockRef::NULL,
+                alpha_property_ref: BlockRef::NULL,
+                modifier_refs: Vec::new(),
+                controller_ref: BlockRef::NULL,
+                data_ref: BlockRef::NULL,
+                flags: 0,
+                name: None,
+            };
+            let scene = NifScene {
+                blocks: vec![Box::new(host), Box::new(ps)],
+                ..NifScene::default()
+            };
+
+            let mut out = Vec::new();
+            let mut inherited_props = Vec::new();
+            let mut pool = StringPool::new();
+            walk_node_particle_emitters_flat(
+                &scene,
+                0,
+                &NiTransform::default(),
+                None,
+                &mut inherited_props,
+                &mut pool,
+                &mut new_visited(&scene),
+                0,
+                &mut out,
+            );
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0].local_rotation,
+                zup_matrix_to_yup_quat(&expected_composed),
+                "host {host_rot:?} × block {block_rot:?} must surface as the \
+                 composed, Y-up-converted rotation (#4398)"
+            );
+        }
+
+        // Control: an all-identity chain surfaces identity, so spawn-time
+        // behaviour on unrotated content is unchanged.
+        let scene = scene_with_offset_emitter();
+        let mut out = Vec::new();
+        let mut inherited_props = Vec::new();
+        let mut pool = StringPool::new();
+        walk_node_particle_emitters_flat(
+            &scene,
+            0,
+            &NiTransform::default(),
+            None,
+            &mut inherited_props,
+            &mut pool,
+            &mut new_visited(&scene),
+            0,
+            &mut out,
+        );
+        assert_eq!(out[0].local_rotation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// Hierarchical walker (loose-NIF path): `local_translation` must carry
+    /// the block's own offset (Z-up → Y-up) so the scene builder anchors at
+    /// host-world × block-local. Pre-#1333 the field did not exist.
+    #[test]
+    fn hierarchical_walker_retains_block_local_offset() {
+        let scene = scene_with_offset_emitter();
+        let mut imported = ImportedScene {
+            nodes: Vec::new(),
+            meshes: Vec::new(),
+            particle_emitters: Vec::new(),
+            bsx_flags: None,
+            bs_bound: None,
+            phantom_bounds: None,
+            attach_points: None,
+            child_attach_connections: None,
+            furniture_markers: Vec::new(),
+            embedded_clip: None,
+            ragdoll: None,
+            lights: Vec::new(),
+        };
+        let mut pool = StringPool::new();
+        let mut props_stack: Vec<BlockRef> = Vec::new();
+        let mut ctx = HierWalkCtx {
+            scene: &scene,
+            inherited_props: &mut props_stack,
+            out: &mut imported,
+            pool: &mut pool,
+            resolver: None,
+            inherited_billboard: None,
+            visited: &mut new_visited(&scene),
+        };
+        walk_node_hierarchical(&mut ctx, 0, None, 0);
+        assert_eq!(
+            imported.particle_emitters.len(),
+            1,
+            "the NiParticleSystem child must surface one emitter"
+        );
+        let em = &imported.particle_emitters[0];
+        assert_eq!(em.parent_node, Some(0), "emitter must tag its host node");
+        assert_eq!(em.local_translation, [10.0, 30.0, -20.0]);
+        assert_eq!(em.local_rotation, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(em.local_scale, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod emitter_rate_tests {
+    //! Regression for #1364: `extract_emitter_rate`'s `sane()` gate must
+    //! reject the `FLT_MAX` sentinel (`>= 3.0e38`). A
+    //! `NiPSysEmitterCtlr` whose interpolator carries `value == FLT_MAX` with
+    //! a NULL `data_ref` previously fell through the keyed-data branch and
+    //! returned ~3.4e38 from the constant-value branch — a cap-spawn-every-
+    //! frame rate.
+    use super::super::extract_emitter_rate;
+    use crate::blocks::controller::NiTimeControllerBase;
+    use crate::blocks::interpolator::NiFloatInterpolator;
+    use crate::blocks::particle::NiPSysEmitterCtlr;
+    use crate::scene::NifScene;
+    use crate::types::BlockRef;
+
+    /// #4261 — `extract_emitter_rate` now takes the specific particle
+    /// system's `controller_ref` (chain head) instead of scanning the
+    /// whole scene, so every fixture below constructs a full
+    /// `NiPSysEmitterCtlr` (base + interpolator_ref) via this helper and
+    /// threads its own `BlockRef` back to the caller.
+    fn emitter_ctlr(interpolator_ref: BlockRef) -> NiPSysEmitterCtlr {
+        NiPSysEmitterCtlr {
+            base: NiTimeControllerBase {
+                next_controller_ref: BlockRef::NULL,
+                flags: 0,
+                frequency: 1.0,
+                phase: 0.0,
+                start_time: 0.0,
+                stop_time: 0.0,
+                target_ref: BlockRef::NULL,
+            },
+            interpolator_ref,
+            data_ref: BlockRef::NULL,
+        }
+    }
+
+    fn scene_with_constant_rate(value: f32) -> (NifScene, BlockRef) {
+        let mut scene = NifScene::default();
+        // [0] interpolator with a constant value and no keyed data.
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value,
+            data_ref: BlockRef::NULL,
+        }));
+        // [1] controller pointing at it.
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(0u32))));
+        (scene, BlockRef(1u32))
+    }
+
+    #[test]
+    fn flt_max_sentinel_is_rejected() {
+        // FLT_MAX on the constant value + NULL data_ref → no usable rate.
+        let (scene, ctlr_ref) = scene_with_constant_rate(f32::MAX);
+        assert_eq!(
+            extract_emitter_rate(&scene, ctlr_ref),
+            None,
+            "FLT_MAX sentinel must not leak through as a ~3.4e38 spawn rate (#1364)"
+        );
+    }
+
+    #[test]
+    fn sane_constant_rate_passes() {
+        // A legitimate authored constant still resolves through the same
+        // branch the FLT_MAX guard tightened.
+        let (scene, ctlr_ref) = scene_with_constant_rate(5.0);
+        assert_eq!(extract_emitter_rate(&scene, ctlr_ref), Some(5.0));
+    }
+
+    #[test]
+    fn negative_and_nonfinite_rates_rejected() {
+        let (scene, ctlr_ref) = scene_with_constant_rate(-1.0);
+        assert_eq!(extract_emitter_rate(&scene, ctlr_ref), None);
+        let (scene, ctlr_ref) = scene_with_constant_rate(f32::INFINITY);
+        assert_eq!(extract_emitter_rate(&scene, ctlr_ref), None);
+    }
+
+    /// #1771 — an authored rate of exactly `0.0` is a ramp-up emitter's t=0
+    /// key, not "never emit". `sane()` must reject it to `None` so the caller
+    /// keeps the preset's spawn rate; returning `Some(0.0)` made the spawn
+    /// guard (`em.rate > 0.0`) kill the emitter for the whole clip. The `sane`
+    /// gate is shared by the keyed-first-key and constant-value branches, so
+    /// the constant-value scaffold exercises the exact same path.
+    #[test]
+    fn zero_rate_falls_back_to_preset() {
+        let (scene, ctlr_ref) = scene_with_constant_rate(0.0);
+        assert_eq!(
+            extract_emitter_rate(&scene, ctlr_ref),
+            None,
+            "a 0.0 first-key/constant rate must fall back to the preset, not zero the emitter",
+        );
+    }
+
+    // ── #4467 — hop-≥2 chains behind opaque `NiPSysBlock` siblings ──
+    //
+    // On real content the emitter ctlr usually sits behind sibling
+    // `NiPSys*` controllers (`NiPSysModifierActiveCtlr`,
+    // `BSPSysMultiTargetEmitterCtlr`, …) that parse to the opaque
+    // `NiPSysBlock` marker, which discards `next_controller_ref` — so
+    // `walk_controller_chain` stops at hop 1 and #4261's own-chain
+    // scoping lost the ctlr entirely (FO3 rate coverage 94.3%→70.8%).
+    // The fallback resolves the scene's ctlrs by `base.target_ref`
+    // pointing at the system whose `controller_ref` equals the chain
+    // head — per-instance exact (census: 100% of FO3/SSE ctlrs target
+    // their system directly).
+
+    use crate::blocks::particle::{NiPSysBlock, NiParticleSystem};
+
+    fn particle_system(controller_ref: BlockRef) -> NiParticleSystem {
+        NiParticleSystem {
+            original_type: "NiParticleSystem".to_string(),
+            transform: Default::default(),
+            properties: Vec::new(),
+            shader_property_ref: BlockRef::NULL,
+            alpha_property_ref: BlockRef::NULL,
+            modifier_refs: Vec::new(),
+            controller_ref,
+            data_ref: BlockRef::NULL,
+            flags: 0,
+            name: None,
+        }
+    }
+
+    /// The measured corpus shape: system `[2]`'s chain head `[3]` is an
+    /// opaque sibling-controller marker (`NiPSysModifierActiveCtlr`
+    /// parses to `NiPSysBlock`, discarding `next_controller_ref`), and
+    /// the real `NiPSysEmitterCtlr` `[1]` sits BEHIND it, reachable only
+    /// via its `base.target_ref` → `[2]`. Pre-fix this resolved to
+    /// `None` (walk stops at hop 1); post-fix the target-ref fallback
+    /// finds `[1]` and its rate.
+    #[test]
+    fn emitter_ctlr_behind_an_opaque_sibling_is_found_by_target_ref() {
+        let mut scene = NifScene::default();
+        // [0] the rate source.
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 25.0,
+            data_ref: BlockRef::NULL,
+        }));
+        // [1] the emitter ctlr — target_ref → the system at [2], NOT in
+        // any chain the walk can traverse from [3].
+        let mut ctlr = emitter_ctlr(BlockRef(0u32));
+        ctlr.base.target_ref = BlockRef(2u32);
+        scene.blocks.push(Box::new(ctlr));
+        // [2] the particle system; its chain head is [3].
+        scene.blocks.push(Box::new(particle_system(BlockRef(3u32))));
+        // [3] the sibling controller the chain actually starts with —
+        // parses to the opaque marker, so the walk cannot advance past it.
+        scene
+            .blocks
+            .push(Box::new(NiPSysBlock::marker("NiPSysModifierActiveCtlr")));
+
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(3u32)),
+            Some(25.0),
+            "the ctlr behind an opaque sibling head must be found via its \
+             base.target_ref (#4467)"
+        );
+    }
+
+    /// #4560 — the legacy (pre-10.1.0.104) tier follows each system's OWN
+    /// controller `Data` link. Two legacy emitters in one file used to both
+    /// take the first `NiPSysEmitterCtlrData` in block order; each now gets
+    /// its own rate, and a data block no controller links is attributed to
+    /// nobody.
+    #[test]
+    fn legacy_emitter_ctlr_data_resolves_per_instance() {
+        use crate::blocks::particle::NiPSysEmitterCtlrData;
+        let mut scene = NifScene::default();
+        // [0] / [1] the two systems' legacy birth-rate data.
+        scene.blocks.push(Box::new(NiPSysEmitterCtlrData {
+            birth_rate_first: Some(7.0),
+        }));
+        scene.blocks.push(Box::new(NiPSysEmitterCtlrData {
+            birth_rate_first: Some(40.0),
+        }));
+        // [2] system A's legacy ctlr (no interpolator), data at [0].
+        let mut ctlr_a = emitter_ctlr(BlockRef::NULL);
+        ctlr_a.data_ref = BlockRef(0u32);
+        scene.blocks.push(Box::new(ctlr_a));
+        // [3] system B's legacy ctlr, data at [1].
+        let mut ctlr_b = emitter_ctlr(BlockRef::NULL);
+        ctlr_b.data_ref = BlockRef(1u32);
+        scene.blocks.push(Box::new(ctlr_b));
+
+        assert_eq!(extract_emitter_rate(&scene, BlockRef(2u32)), Some(7.0));
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(3u32)),
+            Some(40.0),
+            "system B must read its own data, not the first in block order"
+        );
+
+        // [4] a legacy ctlr with no Data link: the unlinked data blocks
+        // above belong to other controllers and must not be borrowed.
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef::NULL)));
+        assert_eq!(extract_emitter_rate(&scene, BlockRef(4u32)), None);
+    }
+
+    /// The fallback is per-instance, not a scene-wide first-match: a
+    /// second system's ctlr must not be claimed by the first system's
+    /// lookup, and a ctlr targeting a non-system block must be ignored.
+    #[test]
+    fn target_ref_fallback_stays_per_instance() {
+        let mut scene = NifScene::default();
+        // [0] rate source for system A's ctlr.
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 11.0,
+            data_ref: BlockRef::NULL,
+        }));
+        // [1] system A's ctlr — targets system A at [2].
+        let mut ctlr_a = emitter_ctlr(BlockRef(0u32));
+        ctlr_a.base.target_ref = BlockRef(2u32);
+        scene.blocks.push(Box::new(ctlr_a));
+        // [2] system A, chain head [3] (opaque marker).
+        scene.blocks.push(Box::new(particle_system(BlockRef(3u32))));
+        // [3] system A's opaque sibling head.
+        scene
+            .blocks
+            .push(Box::new(NiPSysBlock::marker("NiPSysModifierActiveCtlr")));
+        // [4] system B, chain head [5] (also an opaque marker) — a
+        // different system whose ctlr does not exist in this scene.
+        scene.blocks.push(Box::new(particle_system(BlockRef(5u32))));
+        // [5] system B's opaque sibling head.
+        scene.blocks.push(Box::new(NiPSysBlock::marker(
+            "BSPSysMultiTargetEmitterCtlr",
+        )));
+
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(3u32)),
+            Some(11.0),
+            "system A resolves its own ctlr through the fallback"
+        );
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(5u32)),
+            None,
+            "system B must not claim system A's ctlr — the fallback is \
+             target-keyed, not a whole-scene first-match"
+        );
+        // A NULL chain head authors no chain; the fallback must not
+        // match ctlrs of other chainless systems.
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef::NULL),
+            None,
+            "a NULL controller_ref must not claim any ctlr via the fallback"
+        );
+    }
+
+    // ── #2548 — NiBlendFloatInterpolator wrapper ────────────────────
+    //
+    // 78% of real FO3 NiPSysEmitterCtlr.interpolator_ref targets are this
+    // weighted-array wrapper, not a bare NiFloatInterpolator — the Modern
+    // branch never followed it at all, silently falling through to the
+    // Legacy branch / heuristic preset for most of FO3's fire/explosion/
+    // dust/blood/gore VFX library.
+
+    use crate::blocks::interpolator::{FloatKey, InterpBlendItem, KeyGroup, KeyType};
+    use crate::blocks::interpolator::{NiBlendFloatInterpolator, NiBlendInterpolator, NiFloatData};
+
+    fn blend_item(interpolator_index: u32, normalized_weight: f32) -> InterpBlendItem {
+        InterpBlendItem {
+            interpolator_ref: BlockRef(interpolator_index),
+            weight: normalized_weight,
+            normalized_weight,
+            priority: 0,
+            ease_spinner: 0.0,
+        }
+    }
+
+    /// The blend wrapper itself must be followed to its dominant
+    /// (highest-`normalized_weight`) item's sub-interpolator — not
+    /// treated as an opaque, unrecognised interpolator type.
+    #[test]
+    fn resolves_the_highest_weight_sub_interpolators_constant_value() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 1.0, // [0] low-weight — must lose
+            data_ref: BlockRef::NULL,
+        }));
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 7.0, // [1] high-weight — must win
+            data_ref: BlockRef::NULL,
+        }));
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 0,
+                array_size: 2,
+                weight_threshold: 0.0,
+                manager_controlled: false,
+                interp_count: 2,
+                single_index: 0,
+                items: vec![blend_item(0, 0.25), blend_item(1, 0.75)],
+            },
+            value: 0.0,
+        })); // [2]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(2u32)))); // [3]
+
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(3u32)),
+            Some(7.0),
+            "must follow the highest-normalized_weight item's sub-interpolator"
+        );
+    }
+
+    /// The sub-interpolator resolved through the blend wrapper runs the
+    /// same keyed-data-first chain as the direct case — its keyed first
+    /// value wins over its own constant `value`.
+    #[test]
+    fn resolved_sub_interpolators_keyed_data_wins_over_its_constant() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiFloatData {
+            keys: KeyGroup {
+                key_type: KeyType::Linear,
+                keys: vec![FloatKey {
+                    time: 0.0,
+                    value: 12.0,
+                    tangent_forward: 0.0,
+                    tangent_backward: 0.0,
+                    tbc: None,
+                }],
+            },
+        })); // [0]
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 999.0, // must lose to the keyed first value
+            data_ref: BlockRef(0u32),
+        })); // [1]
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 0,
+                array_size: 1,
+                weight_threshold: 0.0,
+                manager_controlled: false,
+                interp_count: 1,
+                single_index: 0,
+                items: vec![blend_item(1, 1.0)],
+            },
+            value: 0.0,
+        })); // [2]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(2u32)))); // [3]
+
+        assert_eq!(extract_emitter_rate(&scene, BlockRef(3u32)), Some(12.0));
+    }
+
+    /// The manager-controlled case carries an empty `items` array (the
+    /// sub-interpolator is supplied externally by the controller
+    /// manager, not reachable from the blend block itself) —
+    /// `resolve_blend_interpolator_target` returns `None` for it, and
+    /// `extract_emitter_rate` must fall back to the blend interpolator's
+    /// own constant `value` rather than failing outright.
+    #[test]
+    fn manager_controlled_blend_falls_back_to_its_own_constant_value() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 1, // Manager Controlled bit set
+                array_size: 0,
+                weight_threshold: 0.0,
+                manager_controlled: true,
+                interp_count: 0,
+                single_index: 0,
+                items: Vec::new(),
+            },
+            value: 4.5,
+        })); // [0]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(0u32)))); // [1]
+
+        assert_eq!(extract_emitter_rate(&scene, BlockRef(1u32)), Some(4.5));
+    }
+
+    /// #3329 — the residual #2548 left behind. A manager-controlled blend has
+    /// an EMPTY `items` array, so tier (b) can't resolve a sub-interpolator,
+    /// and on real content its own `value` is non-positive too, so tier (c)
+    /// also fails. On vanilla FNV that is 168 of the 307 emitter-bearing
+    /// meshes — every affected file's blend has `items.len() == 0` — and the
+    /// rate then silently falls back to `fog.rs::particle_preset`'s
+    /// name-heuristic guess.
+    ///
+    /// The authored rate is still in the file, on the sibling
+    /// `NiControllerSequence`'s controlled block for the same emitter
+    /// controller. Measured on `Fallout - Meshes.bsa`: 100 -> 255 of 307
+    /// emitter meshes now surface an authored rate.
+    #[test]
+    fn manager_controlled_blend_recovers_rate_from_a_controller_sequence() {
+        let mut scene = NifScene::default();
+        // [0] the empty-items manager blend the controller points at, with a
+        //     non-positive `value` so tier (c) fails too — the real shape.
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 1,
+                array_size: 0,
+                weight_threshold: 0.0,
+                manager_controlled: true,
+                interp_count: 0,
+                single_index: 0,
+                items: Vec::new(),
+            },
+            value: 0.0,
+        }));
+        // [1] the controller.
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(0u32))));
+        // [2] a transient sequence's rate, and [3] the steady-state loop's.
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 300.0,
+            data_ref: BlockRef::NULL,
+        }));
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 25.0,
+            data_ref: BlockRef::NULL,
+        }));
+        // [4] transient first in block order, so a naive first-match would
+        //     take the ignition ramp instead of the idle density.
+        scene.blocks.push(Box::new(emitter_sequence("Forward", 2)));
+        // [5] the steady-state loop.
+        scene.blocks.push(Box::new(emitter_sequence("Idle", 3)));
+
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(1u32)),
+            Some(25.0),
+            "the steady-state `Idle` sequence must win over the transient one (#3329)"
+        );
+    }
+
+    fn emitter_sequence(
+        name: &str,
+        interp_block: u32,
+    ) -> crate::blocks::controller::NiControllerSequence {
+        use crate::blocks::controller::{ControlledBlock, NiControllerSequence};
+        use std::sync::Arc;
+        NiControllerSequence {
+            name: Some(Arc::from(name)),
+            controlled_blocks: vec![ControlledBlock {
+                interpolator_ref: BlockRef(interp_block),
+                controller_ref: BlockRef(1u32),
+                priority: 0,
+                node_name: None,
+                property_type: None,
+                controller_type: Some(Arc::from("NiPSysEmitterCtlr")),
+                controller_id: None,
+                interpolator_id: None,
+                string_palette_ref: BlockRef::NULL,
+                node_name_offset: 0,
+                property_type_offset: 0,
+                controller_type_offset: 0,
+                controller_id_offset: 0,
+                interpolator_id_offset: 0,
+            }],
+            array_grow_by: 0,
+            weight: 1.0,
+            text_keys_ref: BlockRef::NULL,
+            cycle_type: 0,
+            frequency: 1.0,
+            phase: 0.0,
+            start_time: 0.0,
+            stop_time: 1.0,
+            manager_ref: BlockRef::NULL,
+            accum_root_name: None,
+            anim_note_refs: Vec::new(),
+        }
+    }
+
+    /// With no `Idle`-ish sequence present, a transient one is still far
+    /// better than the name-heuristic preset — the fallback must not require
+    /// a steady-state loop to exist.
+    #[test]
+    fn sequence_rate_recovery_accepts_a_transient_when_no_idle_exists() {
+        use crate::blocks::controller::{ControlledBlock, NiControllerSequence};
+        use std::sync::Arc;
+
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 1,
+                array_size: 0,
+                weight_threshold: 0.0,
+                manager_controlled: true,
+                interp_count: 0,
+                single_index: 0,
+                items: Vec::new(),
+            },
+            value: 0.0,
+        })); // [0]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(0u32)))); // [1]
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 510.0,
+            data_ref: BlockRef::NULL,
+        })); // [2]
+        scene.blocks.push(Box::new(NiControllerSequence {
+            name: Some(Arc::from("Forward")),
+            controlled_blocks: vec![ControlledBlock {
+                interpolator_ref: BlockRef(2u32),
+                controller_ref: BlockRef(1u32),
+                priority: 0,
+                node_name: None,
+                property_type: None,
+                controller_type: Some(Arc::from("NiPSysEmitterCtlr")),
+                controller_id: None,
+                interpolator_id: None,
+                string_palette_ref: BlockRef::NULL,
+                node_name_offset: 0,
+                property_type_offset: 0,
+                controller_type_offset: 0,
+                controller_id_offset: 0,
+                interpolator_id_offset: 0,
+            }],
+            array_grow_by: 0,
+            weight: 1.0,
+            text_keys_ref: BlockRef::NULL,
+            cycle_type: 0,
+            frequency: 1.0,
+            phase: 0.0,
+            start_time: 0.0,
+            stop_time: 1.0,
+            manager_ref: BlockRef::NULL,
+            accum_root_name: None,
+            anim_note_refs: Vec::new(),
+        })); // [3]
+
+        // `dlc04fxcrashthroughfloor`'s real shape and its real rate.
+        assert_eq!(extract_emitter_rate(&scene, BlockRef(1u32)), Some(510.0));
+    }
+
+    /// A sequence carrying no emitter controller must not be mined for a
+    /// rate — the fallback keys off `controller_type`, not "any float
+    /// interpolator in the file".
+    #[test]
+    fn sequence_rate_recovery_ignores_non_emitter_controllers() {
+        use crate::blocks::controller::{ControlledBlock, NiControllerSequence};
+        use std::sync::Arc;
+
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 1,
+                array_size: 0,
+                weight_threshold: 0.0,
+                manager_controlled: true,
+                interp_count: 0,
+                single_index: 0,
+                items: Vec::new(),
+            },
+            value: 0.0,
+        })); // [0]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(0u32)))); // [1]
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 77.0,
+            data_ref: BlockRef::NULL,
+        })); // [2]
+        scene.blocks.push(Box::new(NiControllerSequence {
+            name: Some(Arc::from("Idle")),
+            controlled_blocks: vec![ControlledBlock {
+                interpolator_ref: BlockRef(2u32),
+                controller_ref: BlockRef(1u32),
+                priority: 0,
+                node_name: None,
+                property_type: None,
+                // An alpha controller, not an emitter one.
+                controller_type: Some(Arc::from("NiAlphaController")),
+                controller_id: None,
+                interpolator_id: None,
+                string_palette_ref: BlockRef::NULL,
+                node_name_offset: 0,
+                property_type_offset: 0,
+                controller_type_offset: 0,
+                controller_id_offset: 0,
+                interpolator_id_offset: 0,
+            }],
+            array_grow_by: 0,
+            weight: 1.0,
+            text_keys_ref: BlockRef::NULL,
+            cycle_type: 0,
+            frequency: 1.0,
+            phase: 0.0,
+            start_time: 0.0,
+            stop_time: 1.0,
+            manager_ref: BlockRef::NULL,
+            accum_root_name: None,
+            anim_note_refs: Vec::new(),
+        })); // [3]
+
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(1u32)),
+            None,
+            "an alpha channel is not a birth rate (#3329)"
+        );
+    }
+
+    #[test]
+    fn sequence_rates_belong_to_each_system_in_both_curve_passes() {
+        for names_only in [false, true] {
+            for curves in [false, true] {
+                let mut scene = NifScene::default();
+                scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+                    base: NiBlendInterpolator {
+                        flags: 1,
+                        array_size: 0,
+                        weight_threshold: 0.0,
+                        manager_controlled: true,
+                        interp_count: 0,
+                        single_index: 0,
+                        items: Vec::new(),
+                    },
+                    value: 0.0,
+                })); // 0 shared empty blend
+                for (target, head, name) in [(2, 1, "Smoke"), (4, 8, "Sparks")] {
+                    let mut ctlr = emitter_ctlr(BlockRef(0));
+                    ctlr.base.target_ref = BlockRef(target);
+                    scene.blocks.push(Box::new(ctlr)); // 1 / 3
+                    let mut system = particle_system(BlockRef(head));
+                    system.name = Some(name.into());
+                    scene.blocks.push(Box::new(system)); // 2 / 4
+                }
+                for (rate, data) in [(30.0, 9), (150.0, 10)] {
+                    scene.blocks.push(Box::new(NiFloatInterpolator {
+                        value: if curves { -f32::MAX } else { rate },
+                        data_ref: if curves {
+                            BlockRef(data)
+                        } else {
+                            BlockRef::NULL
+                        },
+                    })); // 5 / 6
+                }
+                let mut sequence = emitter_sequence("Idle", 5);
+                sequence.controlled_blocks[0].node_name = Some("Smoke".into());
+                if names_only {
+                    sequence.controlled_blocks[0].controller_ref = BlockRef::NULL;
+                }
+                let mut second = emitter_sequence("Idle", 6).controlled_blocks.pop().unwrap();
+                second.interpolator_ref = BlockRef(6);
+                second.controller_ref = if names_only {
+                    BlockRef::NULL
+                } else {
+                    BlockRef(3)
+                };
+                second.node_name = Some("Sparks".into());
+                sequence.controlled_blocks.push(second);
+                scene.blocks.push(Box::new(sequence)); // 7
+                scene
+                    .blocks
+                    .push(Box::new(NiPSysBlock::marker("NiPSysModifierActiveCtlr"))); // 8 opaque chain head
+                for peak in [60.0, 300.0] {
+                    scene.blocks.push(Box::new(NiFloatData {
+                        keys: KeyGroup {
+                            key_type: KeyType::Linear,
+                            keys: vec![key(0.0, 0.0), key(1.0, peak)],
+                        },
+                    })); // 9 / 10, means 30 / 150
+                }
+                assert_eq!(extract_emitter_rate(&scene, BlockRef(1)), Some(30.0));
+                assert_eq!(extract_emitter_rate(&scene, BlockRef(8)), Some(150.0));
+
+                // An unlinked system cannot borrow a sibling's sequence.
+                scene.blocks.push(Box::new(emitter_ctlr(BlockRef(0)))); // 11, no named target
+                assert_eq!(extract_emitter_rate(&scene, BlockRef(11)), None);
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_controller_ref_overrides_a_conflicting_node_name() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 1,
+                array_size: 0,
+                weight_threshold: 0.0,
+                manager_controlled: true,
+                interp_count: 0,
+                single_index: 0,
+                items: Vec::new(),
+            },
+            value: 0.0,
+        }));
+        let mut ctlr = emitter_ctlr(BlockRef(0));
+        ctlr.base.target_ref = BlockRef(2);
+        scene.blocks.push(Box::new(ctlr));
+        let mut system = particle_system(BlockRef(1));
+        system.name = Some("Smoke".into());
+        scene.blocks.push(Box::new(system));
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: 90.0,
+            data_ref: BlockRef::NULL,
+        }));
+        let mut seq = emitter_sequence("Idle", 3);
+        seq.controlled_blocks[0].controller_ref = BlockRef(99);
+        seq.controlled_blocks[0].node_name = Some("Smoke".into());
+        scene.blocks.push(Box::new(seq));
+        assert_eq!(extract_emitter_rate(&scene, BlockRef(1)), None);
+    }
+
+    // ── #3754 — authored ramp-up / burst curves ──────────────────────
+    //
+    // `sane()` rejects a `0.0` first key by design (#1771), and on this
+    // shape the interpolator's own `value` is the `-FLT_MAX` "use the keyed
+    // data" sentinel, which it also rejects — so the authored curve, already
+    // in hand, was discarded whole and the emitter ran on
+    // `fog.rs::particle_preset`'s name guess (35 /s by default). 10 of the
+    // 162 emitter-bearing meshes in `Fallout - Meshes.bsa` are this shape
+    // (20 of 294 across all six FO3 archives).
+    //
+    // The curves below are transcribed from the real files, dumped through
+    // `NiFloatInterpolator -> NiFloatData` on 2026-08-30.
+
+    fn key(time: f32, value: f32) -> FloatKey {
+        FloatKey {
+            time,
+            value,
+            tangent_forward: 0.0,
+            tangent_backward: 0.0,
+            tbc: None,
+        }
+    }
+
+    /// Emitter controller → `NiFloatInterpolator` carrying the `-FLT_MAX`
+    /// sentinel and `keys` as its authored curve. Returns the scene plus
+    /// the `BlockRef` of the `NiPSysEmitterCtlr` at [2].
+    fn scene_with_rate_curve(keys: Vec<FloatKey>) -> (NifScene, BlockRef) {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiFloatData {
+            keys: KeyGroup {
+                key_type: KeyType::Linear,
+                keys,
+            },
+        })); // [0]
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            // The real value on every affected file: "read the keys".
+            value: -f32::MAX,
+            data_ref: BlockRef(0u32),
+        })); // [1]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(1u32)))); // [2]
+        (scene, BlockRef(2u32))
+    }
+
+    fn approx(actual: Option<f32>, expected: f32, what: &str) {
+        let got = actual.unwrap_or_else(|| panic!("{what}: expected ~{expected}, got None"));
+        assert!(
+            (got - expected).abs() < 0.05,
+            "{what}: expected ~{expected}, got {got}"
+        );
+    }
+
+    /// `meshes\\effects\\ambient\\fxbubblestall01.nif`, sequence `Idle` —
+    /// the ramp-to-plateau shape. Zero for 2.8 s, ramps to 30 /s, holds it
+    /// for the remaining 11.8 s of a 16.7 s clip.
+    #[test]
+    fn ramp_to_plateau_curve_resolves_near_its_plateau() {
+        let (scene, ctlr_ref) = scene_with_rate_curve(vec![
+            key(0.0, 0.0),
+            key(2.7666667, 0.0),
+            key(4.8333335, 30.0),
+            key(16.666666, 30.0),
+        ]);
+        approx(
+            extract_emitter_rate(&scene, ctlr_ref),
+            23.16,
+            "fxbubblestall01 Idle",
+        );
+    }
+
+    /// `meshes\\architecture\\urban\\tenpengate01.nif` — the shape the
+    /// report assumed was also a plateau. It is not: 600 /s for 0.13 s of a
+    /// 2 s clip. Taking the curve's *peak* would run Tenpenny's gate at
+    /// 600 /s forever, 30× the authored average and further from the file
+    /// than the 35 /s preset it replaces — which is why this resolves to the
+    /// time-weighted mean instead.
+    #[test]
+    fn burst_curve_resolves_to_its_mean_not_its_peak() {
+        let (scene, ctlr_ref) = scene_with_rate_curve(vec![
+            key(0.0, 0.0),
+            key(1.7, 0.0),
+            key(1.7333333, 600.0),
+            key(1.8333333, 0.0),
+            key(2.0, 0.0),
+        ]);
+        let rate = extract_emitter_rate(&scene, ctlr_ref);
+        approx(rate, 20.0, "tenpengate01 Close");
+        assert_ne!(rate, Some(600.0), "the peak is not a steady-state rate");
+        assert_ne!(rate, None, "…and the curve must not be discarded (#3754)");
+    }
+
+    /// The curve tier is a **last resort**: it runs as a whole second pass
+    /// over the tier chain, only after the first pass finds nothing. Here
+    /// tier (c) — the blend interpolator's own constant — resolves, so the
+    /// dominant item's ramp curve must not pre-empt it.
+    ///
+    /// Measured reason: run inline instead, and 5 meshes in
+    /// `Fallout - Meshes.bsa` that already had a rate change one
+    /// (`ppurityfxtankfog01` 7.5 → 86.5 /s) because an earlier controller
+    /// starts resolving. Re-ranking a mesh's emitters is #1402's business.
+    #[test]
+    fn curve_tier_cannot_outrank_an_already_resolvable_tier() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiFloatData {
+            keys: KeyGroup {
+                key_type: KeyType::Linear,
+                keys: vec![key(0.0, 0.0), key(1.0, 90.0), key(2.0, 90.0)],
+            },
+        })); // [0]
+        scene.blocks.push(Box::new(NiFloatInterpolator {
+            value: -f32::MAX,
+            data_ref: BlockRef(0u32),
+        })); // [1]
+        scene.blocks.push(Box::new(NiBlendFloatInterpolator {
+            base: NiBlendInterpolator {
+                flags: 0,
+                array_size: 1,
+                weight_threshold: 0.0,
+                manager_controlled: false,
+                interp_count: 1,
+                single_index: 0,
+                items: vec![blend_item(1, 1.0)],
+            },
+            value: 12.0,
+        })); // [2]
+        scene.blocks.push(Box::new(emitter_ctlr(BlockRef(2u32)))); // [3]
+
+        assert_eq!(
+            extract_emitter_rate(&scene, BlockRef(3u32)),
+            Some(12.0),
+            "the blend's own constant resolves on the first pass; the curve \
+             mean is a second-pass fallback, not a competitor (#3754)"
+        );
+    }
+
+    /// A sentinel inside the curve poisons the average, so the pass bails to
+    /// the existing fallbacks rather than averaging garbage in.
+    #[test]
+    fn sentinel_key_inside_a_curve_is_not_averaged() {
+        let (scene, ctlr_ref) =
+            scene_with_rate_curve(vec![key(0.0, 0.0), key(1.0, f32::MAX), key(2.0, 0.0)]);
+        assert_eq!(extract_emitter_rate(&scene, ctlr_ref), None);
+    }
+
+    /// A curve that spans no time has no average to take. (The two keys at
+    /// an identical timestamp are real — `fxbubblestall01` ends on a pair
+    /// 2 µs apart — so this is the degenerate form of a shape that occurs.)
+    #[test]
+    fn zero_span_curve_is_rejected() {
+        let (scene, ctlr_ref) = scene_with_rate_curve(vec![key(1.0, 0.0), key(1.0, 30.0)]);
+        assert_eq!(extract_emitter_rate(&scene, ctlr_ref), None);
+    }
+
+    /// An all-zero curve is a genuinely silent emitter, not a ramp — it must
+    /// still fall through to the preset rather than resolving to `0.0` and
+    /// tripping the spawn guard (#1771's invariant, re-pinned for the new
+    /// tier).
+    #[test]
+    fn all_zero_curve_still_falls_back_to_the_preset() {
+        let (scene, ctlr_ref) =
+            scene_with_rate_curve(vec![key(0.0, 0.0), key(1.0, 0.0), key(2.0, 0.0)]);
+        assert_eq!(extract_emitter_rate(&scene, ctlr_ref), None);
+    }
+
+    /// Negative key values are clamped to zero rather than subtracting area:
+    /// a negative spawn rate is meaningless, and letting one cancel real
+    /// emission would silently mute the emitter.
+    #[test]
+    fn negative_keys_clamp_rather_than_cancel_emission() {
+        let (scene, ctlr_ref) = scene_with_rate_curve(vec![
+            key(0.0, 0.0),
+            key(1.0, -100.0),
+            key(2.0, 60.0),
+            key(3.0, 60.0),
+        ]);
+        // Clamped: segments are 0, 0, 30, 60 → area 90 over 3 s.
+        approx(
+            extract_emitter_rate(&scene, ctlr_ref),
+            30.0,
+            "clamped negative",
+        );
+    }
+}
+
+#[cfg(test)]
+mod emitter_max_particles_tests {
+    //! #4261 (OB-D4-02) — `extract_emitter_max_particles` now resolves a
+    //! `NiParticleSystem`'s own `data_ref` directly instead of scanning
+    //! the whole scene for the first budget-bearing block, so two systems
+    //! in one NIF get their own distinct particle budgets.
+    use super::super::extract_emitter_max_particles;
+    use crate::blocks::particle::NiPSysBlock;
+    use crate::scene::NifScene;
+    use crate::types::BlockRef;
+
+    fn budget_block(max_particles: Option<u32>) -> NiPSysBlock {
+        let mut b = NiPSysBlock::marker("NiPSysData");
+        b.max_particles = max_particles;
+        b
+    }
+
+    #[test]
+    fn resolves_the_specific_data_ref_directly() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(budget_block(Some(200)))); // [0]
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(0u32)),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn two_systems_get_their_own_distinct_budgets() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(budget_block(Some(50)))); // [0] system A's data
+        scene.blocks.push(Box::new(budget_block(Some(500)))); // [1] system B's data
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(0u32)),
+            Some(50)
+        );
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(1u32)),
+            Some(500),
+            "system B must not inherit system A's first-match budget (#4261)"
+        );
+    }
+
+    /// #4550 — a resolved own-ref hit is DECISIVE, whatever it carries:
+    /// the own block's budget returns as-is (a synthetic `Some(0)` rides
+    /// through; `apply_emitter_overlays`' `> 0` filter keeps the preset
+    /// downstream). Pre-fix the `> 0` filter made a non-positive own
+    /// budget fall through to the sibling-stealing whole-scene scan.
+    #[test]
+    fn own_ref_hit_is_decisive_even_when_the_budget_is_zero() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(budget_block(Some(0)))); // [0]
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(0u32)),
+            Some(0),
+            "the own block is authoritative; the downstream > 0 filter \
+             keeps the preset (#4550)"
+        );
+        // The real authored-0 shape parses to None: same decisiveness.
+        scene.blocks[0] = Box::new(budget_block(None));
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(0u32)),
+            None,
+            "None must stay None — NOT fall through to a sibling's budget (#4550)"
+        );
+    }
+
+    /// #4550 (NIFAL-D5-2026-09-21-01) — the actual hazard shape: system A
+    /// authors budget 0 (None) while sibling B authors 5000. Pre-fix the
+    /// whole-scene scan handed A B's budget (block order = first
+    /// budget-bearing block); A must keep its preset.
+    #[test]
+    fn zero_own_budget_does_not_inherit_a_siblings_budget() {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(budget_block(None))); // [0] system A: authored 0
+        scene.blocks.push(Box::new(budget_block(Some(5000)))); // [1] system B
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(0u32)),
+            None,
+            "A's authored-zero budget must keep the preset, not inherit B's (#4550)"
+        );
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef(1u32)),
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn null_data_ref_falls_back_to_the_whole_scene_scan() {
+        // Defensive residual: a data_ref that doesn't resolve (NULL, or a
+        // version/shape this pass didn't measure) must still find a budget
+        // via the old whole-scene scan rather than losing it outright.
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(budget_block(Some(75)))); // [0]
+        assert_eq!(
+            extract_emitter_max_particles(&scene, BlockRef::NULL),
+            Some(75)
+        );
+    }
+}
+
+#[cfg(test)]
+mod emitter_param_tests {
+    //! Regression for NIFAL-S3 (#1411): `extract_emitter_params` must reject
+    //! non-finite / non-positive base spawn scalars so a corrupt NIF can't
+    //! poison the particle sim — `apply_emitter_params` copies every scalar
+    //! straight into the `ParticleEmitter` preset.
+    use super::super::extract_emitter_params;
+    use crate::blocks::particle::{EmitterBaseParams, NiPSysEmitter, NiPSysGrowFadeModifier};
+    use crate::scene::NifScene;
+    use crate::types::BlockRef;
+
+    /// #4261 — `extract_emitter_params` now scopes to a `NiParticleSystem`'s
+    /// own `modifier_refs` rather than the whole scene, so fixtures must
+    /// wire the emitter block in via that list, not just push it into
+    /// `scene.blocks`. Returns the refs alongside the scene.
+    fn scene_with_emitter(params: EmitterBaseParams) -> (NifScene, Vec<BlockRef>) {
+        let mut scene = NifScene::default();
+        scene.blocks.push(Box::new(NiPSysEmitter {
+            params,
+            original_type: "NiPSysBoxEmitter".to_string(),
+        }));
+        (scene, vec![BlockRef(0)])
+    }
+
+    fn scene_with_emitter_and_scale(
+        params: EmitterBaseParams,
+        base_scale: Option<f32>,
+    ) -> (NifScene, Vec<BlockRef>) {
+        let (mut scene, mut modifier_refs) = scene_with_emitter(params);
+        let idx = scene.blocks.len();
+        scene
+            .blocks
+            .push(Box::new(NiPSysGrowFadeModifier { base_scale }));
+        modifier_refs.push(BlockRef(idx as u32));
+        (scene, modifier_refs)
+    }
+
+    fn sane_params() -> EmitterBaseParams {
+        EmitterBaseParams {
+            speed: 10.0,
+            initial_radius: 2.0,
+            life_span: 3.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sane_emitter_params_pass() {
+        let (scene, refs) = scene_with_emitter(sane_params());
+        let got =
+            extract_emitter_params(&scene, &refs).expect("sane emitter params must translate");
+        assert_eq!(got.speed, 10.0);
+        assert_eq!(got.life_span, 3.0);
+        assert_eq!(got.initial_radius, 2.0);
+    }
+
+    /// #4240 — the planar angle pair was finite-swept (#1445) and then
+    /// dropped before `ImportedEmitterParams` was built, so the spawn cone
+    /// could never see an authored azimuth.
+    #[test]
+    fn planar_angle_is_forwarded() {
+        let (scene, refs) = scene_with_emitter(EmitterBaseParams {
+            planar_angle: 1.571,
+            planar_angle_variation: 0.188,
+            ..sane_params()
+        });
+        let got =
+            extract_emitter_params(&scene, &refs).expect("sane emitter params must translate");
+        assert_eq!(got.planar_angle, 1.571);
+        assert_eq!(got.planar_angle_variation, 0.188);
+    }
+
+    #[test]
+    fn non_finite_scalars_rejected() {
+        // Every scalar `apply_emitter_params` consumes — a NaN/Inf in any
+        // one of them must block the whole emitter (→ heuristic preset).
+        let cases = [
+            EmitterBaseParams {
+                speed: f32::NAN,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                speed: f32::INFINITY,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                speed_variation: f32::NAN,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                declination: f32::INFINITY,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                declination_variation: f32::NAN,
+                ..sane_params()
+            },
+            // #1445 — the two planar-angle fields were omitted from the sweep.
+            EmitterBaseParams {
+                planar_angle: f32::NAN,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                planar_angle_variation: f32::INFINITY,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                initial_radius: f32::INFINITY,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                life_span: f32::NAN,
+                ..sane_params()
+            },
+            EmitterBaseParams {
+                life_span_variation: f32::INFINITY,
+                ..sane_params()
+            },
+        ];
+        for bad in cases {
+            let (scene, refs) = scene_with_emitter(bad);
+            assert!(
+                extract_emitter_params(&scene, &refs).is_none(),
+                "non-finite emitter scalar must block apply_emitter_params (#1411)"
+            );
+        }
+    }
+
+    #[test]
+    fn non_positive_life_and_negative_radius_rejected() {
+        // life_span == 0 spawns already-dead particles; negative radius is
+        // physically meaningless. Both fall back to the preset.
+        let (scene, refs) = scene_with_emitter(EmitterBaseParams {
+            life_span: 0.0,
+            ..sane_params()
+        });
+        assert!(extract_emitter_params(&scene, &refs).is_none());
+        let (scene, refs) = scene_with_emitter(EmitterBaseParams {
+            life_span: -1.0,
+            ..sane_params()
+        });
+        assert!(extract_emitter_params(&scene, &refs).is_none());
+        let (scene, refs) = scene_with_emitter(EmitterBaseParams {
+            initial_radius: -1.0,
+            ..sane_params()
+        });
+        assert!(extract_emitter_params(&scene, &refs).is_none());
+    }
+
+    #[test]
+    fn valid_base_scale_passes_through() {
+        let (scene, refs) = scene_with_emitter_and_scale(sane_params(), Some(0.15));
+        let got = extract_emitter_params(&scene, &refs)
+            .expect("emitter with a valid positive base_scale must translate");
+        assert_eq!(got.base_scale, Some(0.15));
+    }
+
+    #[test]
+    fn bad_base_scale_drops_to_none_but_keeps_emitter() {
+        // NIFAL-S5 (#1434): a non-finite or non-positive grow/fade base_scale
+        // feeds `initial_radius × base_scale`. Drop just the modifier to
+        // `None` (→ ×1.0 default in systems/particle.rs) without rejecting an
+        // otherwise-valid emitter.
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (scene, refs) = scene_with_emitter_and_scale(sane_params(), Some(bad));
+            let got = extract_emitter_params(&scene, &refs)
+                .unwrap_or_else(|| panic!("emitter must survive bad base_scale {bad}"));
+            assert_eq!(
+                got.base_scale, None,
+                "bad base_scale {bad} must drop to None (×1.0 default), not poison particle size"
+            );
+            // The emitter's own scalars stay intact.
+            assert_eq!(got.speed, 10.0);
+            assert_eq!(got.initial_radius, 2.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod attenuation_radius_tests {
+    //! #2210 (NIFAL-D3-02) — the no-attenuation fallback must resolve to
+    //! `EXTERIOR_CELL_UNITS`, a cited Bethesda spec constant, not a bare
+    //! uncited literal. This is also the OPERATIVE case on real content:
+    //! FNV/FO3 ship a zero-only attenuation triple on 82/82 measured
+    //! spawnable point lights (range control deferred to the ESM LIGH
+    //! record instead), so this is the value that matters, not an edge case.
+    use super::super::*;
+
+    #[test]
+    fn no_attenuation_falls_back_to_cited_exterior_cell_units() {
+        assert_eq!(
+            attenuation_radius(0.0, 0.0, 0.0),
+            byroredux_core::math::coord::EXTERIOR_CELL_UNITS,
+            "the no-attenuation fallback must be the cited EXTERIOR_CELL_UNITS \
+             constant, not an independent uncited magic number"
+        );
+    }
+
+    #[test]
+    fn quadratic_coefficient_solves_analytically_instead_of_falling_back() {
+        // 1/(0 + 0·d + 1·d²) = 1/256 ⇒ d² = 256 ⇒ d = 16.
+        let radius = attenuation_radius(0.0, 0.0, 1.0);
+        assert!(
+            (radius - 16.0).abs() < 1e-3,
+            "quadratic attenuation must be solved analytically, got {radius}"
+        );
+    }
+
+    #[test]
+    fn linear_coefficient_solves_analytically_instead_of_falling_back() {
+        // 1/(0 + 1.0·d + 0) = 1/256 ⇒ d = 256.
+        let radius = attenuation_radius(0.0, 1.0, 0.0);
+        assert!(
+            (radius - 256.0).abs() < 1e-3,
+            "linear attenuation must be solved analytically, got {radius}"
+        );
+    }
+}
+
+/// #4258 (OB-D1-02) — `BSFaceGenNiNode` has a dedicated block parser
+/// (`blocks/node.rs`) but `as_ni_node` had no arm for it, so any
+/// `BSFaceGenNiNode` subtree silently dropped out of the imported scene
+/// instead of walking like every other `NiNode`-family wrapper.
+#[cfg(test)]
+mod facegen_node_walker_tests {
+    use super::super::*;
+    use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+    use crate::blocks::node::{BsFaceGenNiNode, NiNode};
+    use crate::types::BlockRef;
+    use std::sync::Arc;
+
+    fn node_with_name(name: &str) -> NiNode {
+        NiNode {
+            av: NiAVObjectData {
+                net: NiObjectNETData {
+                    name: Some(Arc::from(name)),
+                    extra_data_refs: Vec::new(),
+                    controller_ref: BlockRef::NULL,
+                },
+                flags: 0,
+                transform: crate::types::NiTransform::default(),
+                properties: Vec::new(),
+                collision_ref: BlockRef::NULL,
+            },
+            children: vec![BlockRef(0)],
+            effects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn as_ni_node_unwraps_bs_face_gen_ni_node() {
+        let block = BsFaceGenNiNode {
+            base: node_with_name("HeadFaceGen"),
+            starfield_tail: Vec::new(),
+        };
+        let unwrapped = as_ni_node(&block).expect(
+            "as_ni_node must recognize BsFaceGenNiNode as a NiNode-family \
+             wrapper instead of silently dropping its subtree",
+        );
+        assert_eq!(unwrapped.av.net.name.as_deref(), Some("HeadFaceGen"));
+        assert_eq!(
+            unwrapped.children.len(),
+            1,
+            "the wrapped NiNode's children must survive the unwrap — this is \
+             what makes the subtree actually walk"
+        );
+    }
+}

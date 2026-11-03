@@ -1,0 +1,377 @@
+//! Animated property components — set by the animation system each frame.
+//!
+//! Sparse — only entities with active non-transform animation channels need these.
+
+use crate::ecs::sparse_set::SparseSetStorage;
+use crate::ecs::storage::Component;
+use crate::math::{Vec2, Vec3};
+
+/// Animated visibility toggle. When false, the renderer skips this entity.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedVisibility(pub bool);
+impl Component for AnimatedVisibility {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated alpha override (0.0–1.0). Used for material alpha animation.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedAlpha(pub f32);
+impl Component for AnimatedAlpha {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated diffuse color (RGB). Driven by `NiMaterialColorController`
+/// with `target_color = 0`. Pre-#517 this was a single `AnimatedColor`
+/// slot shared by every color controller regardless of target — an
+/// animated emissive and an animated diffuse on the same mesh fought
+/// last-write-wins at the ECS layer, and emissive-intensity flashes
+/// on neon signs / plasma weapons / VATS hits wrote into what the
+/// renderer was going to read as the diffuse multiplier.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedDiffuseColor(pub Vec3);
+impl Component for AnimatedDiffuseColor {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated ambient color (RGB). `NiMaterialColorController` target = 1.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedAmbientColor(pub Vec3);
+impl Component for AnimatedAmbientColor {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated specular color (RGB). `NiMaterialColorController` target = 2.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedSpecularColor(pub Vec3);
+impl Component for AnimatedSpecularColor {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated emissive color (RGB). `NiMaterialColorController` target = 3.
+/// This is the slot the vast majority of animated-color content actually
+/// wants — FNV neon signs, plasma weapon glow, muzzle flashes, magic-effect
+/// color-over-lifetime.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedEmissiveColor(pub Vec3);
+impl Component for AnimatedEmissiveColor {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated BSShaderProperty color (RGB). Driven by
+/// `BSEffectShaderPropertyColorController` /
+/// `BSLightingShaderPropertyColorController` — Skyrim+ shader-level
+/// color override, not one of the legacy NiMaterial slots.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedShaderColor(pub Vec3);
+impl Component for AnimatedShaderColor {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated UV transform: per-axis offset + per-axis scale + rotation.
+/// Driven by `NiTextureTransformController` (channel index in
+/// 0..=4 maps to `UvOffsetU` / `UvOffsetV` / `UvScaleU` / `UvScaleV`
+/// / `UvRotation` — each animated independently). Pre-#525 every
+/// `FloatTarget::UvOffset*` / `FloatTarget::UvScale*` /
+/// `FloatTarget::UvRotation` sample was computed by `animation_system`
+/// then dropped on the floor because the only `FloatTarget` arm with
+/// a sink was `Alpha` — animated water / lava / conveyor belts /
+/// flickering HUD backdrops were silently static.
+///
+/// Identity defaults (`offset = (0, 0)`, `scale = (1, 1)`,
+/// `rotation = 0`) so the component can be inserted with all five
+/// slots zeroed and the animation system fills in only the slots the
+/// active controller drives. The renderer reads `offset` / `scale`
+/// to override the static `Material::uv_offset` / `Material::uv_scale`
+/// at draw-command build time. `rotation` is captured here pending
+/// shader-side `mat2x2` UV rotation support.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedUvTransform {
+    pub offset: Vec2,
+    pub scale: Vec2,
+    pub rotation: f32,
+}
+
+impl AnimatedUvTransform {
+    /// Identity defaults — surface no animation when no float channel
+    /// has written a slot yet. The renderer's `mat.uv_offset` /
+    /// `mat.uv_scale` defaults match this exactly so an entity carrying
+    /// an as-yet-unwritten `AnimatedUvTransform` renders identically
+    /// to one without the component.
+    pub fn identity() -> Self {
+        Self {
+            offset: Vec2::ZERO,
+            scale: Vec2::ONE,
+            rotation: 0.0,
+        }
+    }
+}
+
+impl Default for AnimatedUvTransform {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+impl Component for AnimatedUvTransform {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Per-target morph-target weights. Index = morph-target slot from
+/// `FloatTarget::MorphWeight(idx)`. Vec resizes on first write past
+/// the current length (zero-padded). Driven by
+/// `NiGeomMorpherController` for FaceGen lip-sync, talking-head
+/// animations, and bake-driven facial morphs.
+///
+/// Pre-#525 every `MorphWeight(idx)` sample was dropped because the
+/// only `FloatTarget` sink was `Alpha`. #3231 wired the consumer:
+/// `render::skinned::update_morph_weights` copies these values into
+/// each entity's `MorphSlot` GPU weight buffer every frame, and
+/// `skin_vertices.comp` / `triangle.vert` blend them into vertex
+/// positions (skinned meshes only, v1). A mesh whose `ImportedMesh`
+/// carried no `NiGeomMorpherController` never gets a `MorphSlot`, so
+/// this component can still exist with no renderer-side effect —
+/// consumer wiring, not producer wiring, gates whether it does
+/// anything.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedMorphWeights(pub Vec<f32>);
+
+impl AnimatedMorphWeights {
+    /// Read a morph weight, returning `0.0` when `index` is past the
+    /// vec's current length. Mirrors the legacy engine's behaviour
+    /// where unset morph slots default to zero contribution.
+    pub fn get(&self, index: usize) -> f32 {
+        self.0.get(index).copied().unwrap_or(0.0)
+    }
+
+    /// Write a morph weight at `index`, growing the vec with `0.0`
+    /// padding if necessary. Stable across re-runs because the
+    /// morph-target index range comes from the source NIF and the
+    /// animation system always writes the same slot per channel.
+    pub fn set(&mut self, index: usize, value: f32) {
+        if self.0.len() <= index {
+            self.0.resize(index + 1, 0.0);
+        }
+        self.0[index] = value;
+    }
+}
+
+impl Component for AnimatedMorphWeights {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Animated shader-float scalar. Driven by
+/// `BSLightingShaderPropertyFloatController` /
+/// `BSEffectShaderPropertyFloatController` — Skyrim+ per-shader
+/// scalar uniform (alpha multiplier on effect shaders, refraction
+/// scale, parallax scale, etc.) animated over time.
+///
+/// Today's renderer doesn't multiplex per-named-uniform shader floats,
+/// so a single scalar slot covers every BSShader-float controller
+/// without disambiguating the target uniform — extend to a
+/// `(FixedString, f32)` map when shader-side per-uniform dispatch
+/// lands. The audit recommendation lists the future shape; the
+/// component name is forward-compatible with that growth.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedShaderFloat(pub f32);
+impl Component for AnimatedShaderFloat {
+    type Storage = SparseSetStorage<Self>;
+}
+
+/// Canonical material texture role a flipbook drives (#3901).
+///
+/// Named after the `MaterialTextureSet` roles a legacy
+/// `NiTexturingProperty` slot fills, so no source-format slot number
+/// survives past the import hop: `anim_convert` resolves the NIF's raw
+/// `TexType` into this before any ECS component sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub enum FlipTextureRole {
+    BaseColor,
+    /// Multiplicative dark / light map.
+    Dark,
+    Detail,
+    /// Legacy gloss map.
+    SmoothSpec,
+    /// Glow map.
+    Emissive,
+    /// Normal or bump map.
+    Normal,
+    /// Parallax height map.
+    Height,
+    /// Decal layer `0..=3`.
+    Decal(u8),
+}
+
+/// One material role's flipbook state — `NiFlipController` semantics
+/// (`crates/core/src/animation/types.rs::TextureFlipChannel`). `handles`
+/// are bindless texture indices resolved ONCE, at clip-attach time (the
+/// only point in the production pipeline with a `TextureProvider` +
+/// `VulkanContext` in scope for `resolve_texture`); the per-frame
+/// animation system only picks among the already-resolved handles by
+/// updating `current_index`, never touching the texture registry.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct TextureFlipEntry {
+    /// The material texture role this flipbook replaces.
+    pub role: FlipTextureRole,
+    pub handles: Vec<u32>,
+    /// Whether each of `handles` carries an alpha channel, resolved at the
+    /// same attach-time lookup. The draw path has no texture registry, and
+    /// a flipped `Normal` frame gates the alpha-as-gloss and
+    /// alpha-as-height reads on its *own* format, not the spawn-time
+    /// normal map's (#4301). Parallel to `handles`; a shorter vector reads
+    /// as "unknown" for the missing frames.
+    pub handles_have_alpha: Vec<bool>,
+    pub current_index: usize,
+}
+
+/// Animated texture-flip (flipbook) state, per entity. A `Vec` rather
+/// than a single slot because a shape can in principle carry more than
+/// one `NiFlipController` targeting different texture slots (rare in
+/// vanilla content, but not disallowed by the format) — mirrors
+/// `AnimatedMorphWeights`' per-index `Vec` shape rather than assuming
+/// exactly one animated slot per entity.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimatedTextureFlip(pub Vec<TextureFlipEntry>);
+
+impl AnimatedTextureFlip {
+    /// Every bindless handle held by every flipbook, in every frame — the
+    /// exhaustive lifecycle walk for these textures. Each one was acquired
+    /// once at attach time, so an owner releasing the component must drop
+    /// each of them once (#4427).
+    pub fn all_handles(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().flat_map(|e| e.handles.iter().copied())
+    }
+
+    /// Every flipbook's currently-active `(role, bindless handle)`, skipping
+    /// entries whose `current_index` is out of range for their `handles`.
+    ///
+    /// #3251 — the out-of-range case used to `unwrap_or(0)`, silently
+    /// aliasing to bindless slot 0 (some *other* entity's texture) instead
+    /// of falling back to the caller's static handle the way an absent
+    /// role already does. Not reachable today (the attach path keeps
+    /// `handles.len()` and the valid `current_index` range in lockstep for
+    /// the channel a `TextureFlipEntry` was built from), but a future
+    /// clip-swap path rebinding a differently-sized channel onto an
+    /// already-attached entry (matched only by `role`) would have hit this
+    /// silently.
+    pub fn active_handles(&self) -> impl Iterator<Item = (FlipTextureRole, u32)> + '_ {
+        self.0
+            .iter()
+            .filter_map(|e| e.handles.get(e.current_index).map(|&h| (e.role, h)))
+    }
+
+    /// Whether the currently-active frame for `role` carries alpha, or
+    /// `None` when there is no active frame for it or its alpha presence was
+    /// not recorded (#4301). Callers keep their spawn-time answer on `None`.
+    pub fn active_has_alpha(&self, role: FlipTextureRole) -> Option<bool> {
+        self.0
+            .iter()
+            .filter(|e| e.role == role && e.current_index < e.handles.len())
+            .find_map(|e| e.handles_have_alpha.get(e.current_index).copied())
+    }
+
+    /// The currently-active bindless handle for `role`, or `None` if this
+    /// entity has no flipbook on that role (or its index is out of range —
+    /// see [`Self::active_handles`]).
+    pub fn handle_for_role(&self, role: FlipTextureRole) -> Option<u32> {
+        self.active_handles()
+            .find(|&(r, _)| r == role)
+            .map(|(_, h)| h)
+    }
+}
+
+impl Component for AnimatedTextureFlip {
+    type Storage = SparseSetStorage<Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_range_index_returns_the_active_handle() {
+        let flip = AnimatedTextureFlip(vec![TextureFlipEntry {
+            role: FlipTextureRole::BaseColor,
+            handles: vec![10, 11, 12],
+            handles_have_alpha: Vec::new(),
+            current_index: 1,
+        }]);
+        assert_eq!(flip.handle_for_role(FlipTextureRole::BaseColor), Some(11));
+    }
+
+    #[test]
+    fn absent_role_returns_none() {
+        let flip = AnimatedTextureFlip(vec![TextureFlipEntry {
+            role: FlipTextureRole::BaseColor,
+            handles: vec![10],
+            handles_have_alpha: Vec::new(),
+            current_index: 0,
+        }]);
+        assert_eq!(flip.handle_for_role(FlipTextureRole::Height), None);
+    }
+
+    /// #3251 — an out-of-range `current_index` must read as "no handle",
+    /// not silently alias to bindless slot 0 (some other entity's
+    /// texture).
+    #[test]
+    fn out_of_range_current_index_returns_none_not_slot_zero() {
+        let flip = AnimatedTextureFlip(vec![TextureFlipEntry {
+            role: FlipTextureRole::BaseColor,
+            handles: vec![10, 11],
+            handles_have_alpha: Vec::new(),
+            current_index: 5,
+        }]);
+        assert_eq!(
+            flip.handle_for_role(FlipTextureRole::BaseColor),
+            None,
+            "an out-of-range current_index must not alias to Some(0)"
+        );
+    }
+
+    /// The empty-handles edge case (`current_index` also 0) — a degenerate
+    /// but structurally reachable shape the same fix must cover.
+    #[test]
+    fn empty_handles_returns_none() {
+        let flip = AnimatedTextureFlip(vec![TextureFlipEntry {
+            role: FlipTextureRole::BaseColor,
+            handles: Vec::new(),
+            handles_have_alpha: Vec::new(),
+            current_index: 0,
+        }]);
+        assert_eq!(flip.handle_for_role(FlipTextureRole::BaseColor), None);
+    }
+
+    /// #4301 — alpha presence follows `current_index`, and an unrecorded or
+    /// out-of-range frame reads as `None` so the caller decides.
+    #[test]
+    fn active_has_alpha_follows_the_current_frame() {
+        let entry = |current_index, handles_have_alpha| TextureFlipEntry {
+            role: FlipTextureRole::Normal,
+            handles: vec![5, 6],
+            handles_have_alpha,
+            current_index,
+        };
+        let flip = |e| AnimatedTextureFlip(vec![e]);
+        assert_eq!(
+            flip(entry(0, vec![true, false])).active_has_alpha(FlipTextureRole::Normal),
+            Some(true)
+        );
+        assert_eq!(
+            flip(entry(1, vec![true, false])).active_has_alpha(FlipTextureRole::Normal),
+            Some(false)
+        );
+        assert_eq!(
+            flip(entry(1, vec![true])).active_has_alpha(FlipTextureRole::Normal),
+            None
+        );
+        assert_eq!(
+            flip(entry(2, vec![true, true, true])).active_has_alpha(FlipTextureRole::Normal),
+            None,
+            "an out-of-range frame has no handle, so no alpha answer either"
+        );
+        assert_eq!(
+            flip(entry(0, vec![true, false])).active_has_alpha(FlipTextureRole::Height),
+            None
+        );
+    }
+}

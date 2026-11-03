@@ -1,0 +1,8 @@
+/target
+**/target/
+.direnv/
+result
+__pycache__/
+*.pyc
+*.blend
+*.blend1

@@ -1,0 +1,643 @@
+//! Named `BSShader*` flag constants for the two game-era flag
+//! vocabularies Gamebryo / Creation Engine uses.
+//!
+//! There are three flag pairs in the wild:
+//!
+//!   - **FO3 / FNV** — `BSShaderFlags` (F1) + `BSShaderFlags2` (F2), used by
+//!     `BSShaderPPLightingProperty` and `BSShaderNoLightingProperty`.
+//!   - **Skyrim LE / SE** — `SkyrimShaderPropertyFlags1` (SLSF1) +
+//!     `SkyrimShaderPropertyFlags2` (SLSF2), used by
+//!     `BSLightingShaderProperty` and `BSEffectShaderProperty`.
+//!   - **FO4+** — `Fallout4ShaderPropertyFlags1/2` (F4SF1/F4SF2), again on
+//!     `BSLightingShaderProperty` / `BSEffectShaderProperty`. Captured here
+//!     only where the semantic diverges from Skyrim; most bits overlap.
+//!
+//! **Bits that happen to share the same numeric value do not share the
+//! same semantic across games.** The comment on each constant pins which
+//! game carries which meaning. Sites that test a bit need to know which
+//! game's property they are holding — `BSShaderPPLightingProperty` always
+//! implies FO3/FNV semantics; `BSLightingShaderProperty` implies Skyrim+
+//! (with FO4 overrides for specific bits). Future #437 work should wrap
+//! these into a `GameVariant`-keyed lookup so a single mesh can't pick
+//! the wrong vocabulary.
+//!
+//! References: nif.xml `BSShaderFlags` / `BSShaderFlags2` and
+//! `SkyrimShaderPropertyFlags1/2`.
+
+/// FO3/FNV `BSShaderFlags` — the first flag word of
+/// `BSShaderPPLightingProperty` / `BSShaderNoLightingProperty`.
+///
+/// Most bit semantics overlap with SLSF1; the noteworthy exception is
+/// bit 12 which is `Unknown_3` on FO3/FNV and `Model_Space_Normals` on
+/// Skyrim. Do NOT re-use FO3/FNV bit 12 expecting Skyrim behavior.
+pub mod fo3nv_f1 {
+    /// Bit 7 — `Environment_Mapping`. The stored `env_map_scale` is authored
+    /// only when this or one of the two specialised environment-map bits is set.
+    pub const ENVIRONMENT_MAPPING: u32 = 0x0000_0080;
+    /// Bit 17 — `Eye_Environment_Mapping`.
+    pub const EYE_ENVIRONMENT_MAPPING: u32 = 0x0002_0000;
+    /// Bit 21 — `Window_Environment_Mapping`.
+    pub const WINDOW_ENVIRONMENT_MAPPING: u32 = 0x0020_0000;
+    /// Bit 22 — `Tree_Billboard` per nif.xml `BSShaderFlags`. FO3/FNV has
+    /// no `Own_Emit` bit at all; `skyrim_slsf1::OWN_EMIT` /
+    /// `fo4_slsf1::OWN_EMIT` happen to sit at this same bit position
+    /// (0x0040_0000) on their own, unrelated per-game enums — do NOT
+    /// reuse this constant expecting `Own_Emit` semantics. #2319.
+    pub const TREE_BILLBOARD: u32 = 0x0040_0000;
+    /// Bit 15 — `Refraction`. Same bit + semantic as `skyrim_slsf1::REFRACTION`
+    /// per nif.xml `BSShaderFlags` (bit 15, "switches on refraction power").
+    /// See #2321.
+    pub const REFRACTION: u32 = 0x0000_8000;
+    /// Bit 16 — `Fire_Refraction`. Same bit + semantic as
+    /// `skyrim_slsf1::FIRE_REFRACTION` per nif.xml `BSShaderFlags` (bit 16,
+    /// "switches on refraction power/period"). Paired with `REFRACTION`
+    /// this is the fire/heat-haze proxy discriminator on FO3/FNV
+    /// `BSShaderPPLightingProperty`, mirroring the Skyrim+ path in
+    /// `apply_shader_type_data`. See #2321.
+    pub const FIRE_REFRACTION: u32 = 0x0001_0000;
+    /// Bit 18 — `Hair`. The FO3/FNV hair material: its vertex colours are a
+    /// tint mask the shipped `HairTint` pixel shader reads, not a colour to
+    /// multiply into the albedo (#6130). Measured on both games' vanilla
+    /// archives: 87 of the 105 `meshes\characters\hair\*.nif` author it on
+    /// every `BSShaderPPLightingProperty`; the other 18 are glasses, an
+    /// eyepatch and the powdered wigs.
+    pub const HAIR: u32 = 0x0004_0000;
+    /// Bit 11 — `Parallax_Shader_Index_15`. Authors POM (texture slot 3,
+    /// `Parallax_Occulsion` below) on this material. nif.xml names it
+    /// "Parallax" and notes it selects shader index 15. See #2317.
+    pub const PARALLAX: u32 = 0x0000_0800;
+    /// Bit 28 — `Parallax_Occulsion` (nif.xml's own spelling). Gates
+    /// parallax-occlusion mapping alongside [`PARALLAX`]; both are read at
+    /// the FO3/FNV `BSShaderPPLightingProperty` import boundary before
+    /// binding `parallax_map`/`parallax_max_passes`/`parallax_height_scale`.
+    /// See #2317.
+    pub const PARALLAX_OCCLUSION: u32 = 0x1000_0000;
+    /// Bit 26 — `Decal`. Render on top of coplanar surfaces.
+    pub const DECAL: u32 = 0x0400_0000;
+    /// Bit 27 — `Dynamic_Decal`. Runtime-spawned decal (blood splat).
+    pub const DYNAMIC_DECAL: u32 = 0x0800_0000;
+    /// Bit 31 — `ZBuffer_Test`.
+    pub const ZBUFFER_TEST: u32 = 0x8000_0000;
+}
+
+/// FO3/FNV `BSShaderFlags2` — second flag word.
+pub mod fo3nv_f2 {
+    /// Bit 21 — `Alpha_Decal`. FO3/FNV-only extension that flags a
+    /// mesh as alpha-blended decal (blood splat / gore).
+    /// **Warning**: bit 21 on Skyrim SLSF2 is `Anisotropic_Lighting`
+    /// (`Cloud_LOD` is Skyrim's bit 20), NOT decal — do NOT test this
+    /// constant on a `BSLightingShaderProperty`.
+    pub const ALPHA_DECAL: u32 = 0x0020_0000;
+}
+
+/// Skyrim `SkyrimShaderPropertyFlags1` — first flag word of
+/// `BSLightingShaderProperty` / `BSEffectShaderProperty`.
+pub mod skyrim_slsf1 {
+    /// Bit 12 — `Model_Space_Normals`. BSLighting normal textures carrying
+    /// this flag are already in object space and slot 7 is the alternate
+    /// specular map; neither may be routed through the tangent-space path.
+    pub const MODEL_SPACE_NORMALS: u32 = 0x0000_1000;
+    /// Bit 4 — `Greyscale_To_PaletteColor`. Sample the
+    /// `BSEffectShaderProperty.greyscale_texture` as a colour palette LUT
+    /// indexed by the source-texture luminance. nif.xml: "in
+    /// EffectShaderProperty". See #890 / SK-D4-NEW-04.
+    pub const GREYSCALE_TO_PALETTE_COLOR: u32 = 0x0000_0010;
+    /// Bit 22 — `Own_Emit`. Same position + semantic as `fo4_slsf1::OWN_EMIT`
+    /// — self-illuminating surface, additive blend. FO3/FNV has no
+    /// `Own_Emit` bit at all: `fo3nv_f1` bit 22 is `Tree_Billboard`, an
+    /// unrelated flag that only coincidentally shares this numeric value.
+    /// #2319.
+    pub const OWN_EMIT: u32 = 0x0040_0000;
+    /// Bit 5 — `Greyscale_To_PaletteAlpha`. Sample the
+    /// `BSEffectShaderProperty.greyscale_texture` as an alpha palette LUT.
+    /// See #890.
+    pub const GREYSCALE_TO_PALETTE_ALPHA: u32 = 0x0000_0020;
+    /// Bit 15 — `Refraction`. Enables screen/scene refraction on
+    /// `BSLightingShaderProperty`. Skyrim and FO4 share this bit.
+    pub const REFRACTION: u32 = 0x0000_8000;
+    /// Bit 16 — `Fire_Refraction`. Marks the normal-map-driven heat-haze
+    /// proxy used behind fire effects. Skyrim and FO4 share this bit.
+    pub const FIRE_REFRACTION: u32 = 0x0001_0000;
+    /// Bit 26 — `Decal`. Same bit + semantic as FO3/FNV F1.
+    pub const DECAL: u32 = 0x0400_0000;
+    /// Bit 27 — `Dynamic_Decal`. Same bit + semantic as FO3/FNV F1.
+    pub const DYNAMIC_DECAL: u32 = 0x0800_0000;
+    /// Bit 30 — `Soft_Effect`. Near-camera depth feathering for soft
+    /// particles (smoke, dust, force-field haze). See #890.
+    pub const SOFT_EFFECT: u32 = 0x4000_0000;
+    /// Bit 31 — `ZBuffer_Test`.
+    pub const ZBUFFER_TEST: u32 = 0x8000_0000;
+}
+
+/// Skyrim `SkyrimShaderPropertyFlags2` — second flag word.
+///
+/// **No dedicated Decal bit** — Skyrim meshes only carry decal flags
+/// on SLSF1. See issue #176 for the closed-as-stale analysis of that
+/// mismatch.
+pub mod skyrim_slsf2 {
+    /// Bit 4 — `Double_Sided`. Back-face rendering enabled.
+    /// Only meaningful on Skyrim+ properties. FO3/FNV has no
+    /// equivalent F2 bit; those games route back-face via
+    /// `NiStencilProperty`. See #441.
+    pub const DOUBLE_SIDED: u32 = 0x0000_0010;
+    /// Bit 6 — `Glow_Map`. Enables the third texture-set slot as an
+    /// emissive map. Without it, Skyrim uses that same slot for soft/rim
+    /// lighting masks; slot presence alone does not imply glow (#3068).
+    pub const GLOW_MAP: u32 = 0x0000_0040;
+    /// Bit 17 — `Weapon_Blood`. Blood decals on weapons specifically.
+    pub const WEAPON_BLOOD: u32 = 0x0002_0000;
+    /// Bit 20 — `Cloud_LOD`. Per nif.xml `SkyrimShaderPropertyFlags2`
+    /// bit 20.
+    pub const CLOUD_LOD: u32 = 0x0010_0000;
+    /// Bit 21 — `Anisotropic_Lighting`. Per nif.xml
+    /// `SkyrimShaderPropertyFlags2` bit 21 — the SAME semantic and value
+    /// as `fo4_slsf2::ANISOTROPIC_LIGHTING`, and NOT `Alpha_Decal` (that
+    /// is the FO3/FNV `BSShaderFlags2` meaning of this bit). The legacy
+    /// decal helper must not test bit 21 on a Skyrim+/FO4 property. See #414.
+    pub const ANISOTROPIC_LIGHTING: u32 = 0x0020_0000;
+    /// Bits 25–27 gate Skyrim's soft/rim/back-light maps and response.
+    pub const SOFT_LIGHTING: u32 = 0x0200_0000;
+    pub const RIM_LIGHTING: u32 = 0x0400_0000;
+    pub const BACK_LIGHTING: u32 = 0x0800_0000;
+    /// Bit 30 — `Effect_Lighting`. Scene-lit `BSEffectShaderProperty`
+    /// surface — receives directional light instead of rendering
+    /// purely additive. See #890 / SK-D4-NEW-04.
+    pub const EFFECT_LIGHTING: u32 = 0x4000_0000;
+}
+
+/// FO4+ `Fallout4ShaderPropertyFlags1` — first flag word of
+/// `BSLightingShaderProperty` / `BSEffectShaderProperty` on BSVER >= 130
+/// per nif.xml `#BS_FO4#` gate.
+///
+/// Bits 26 (Decal), 27 (Dynamic_Decal), 31 (ZBuffer_Test) align with
+/// Skyrim SLSF1 — same numeric value, same semantic. Most other bits
+/// diverge from Skyrim; pin the FO4 positions here so decal /
+/// two-sided / alpha-test testing doesn't silently drift when a FO4
+/// mesh happens to be read through the Skyrim vocabulary (or vice
+/// versa). Sourced from nif.xml `Fallout4ShaderPropertyFlags1`
+/// (lines 6443-6477). See #414 / FO4-D3-M1.
+pub mod fo4_slsf1 {
+    pub const SPECULAR: u32 = 0x0000_0001;
+    pub const SKINNED: u32 = 0x0000_0002;
+    pub const TEMP_REFRACTION: u32 = 0x0000_0004;
+    pub const VERTEX_ALPHA: u32 = 0x0000_0008;
+    pub const GREYSCALE_TO_PALETTE_COLOR: u32 = 0x0000_0010;
+    pub const GREYSCALE_TO_PALETTE_ALPHA: u32 = 0x0000_0020;
+    pub const USE_FALLOFF: u32 = 0x0000_0040;
+    pub const ENVIRONMENT_MAPPING: u32 = 0x0000_0080;
+    pub const RGB_FALLOFF: u32 = 0x0000_0100;
+    pub const CAST_SHADOWS: u32 = 0x0000_0200;
+    pub const FACE: u32 = 0x0000_0400;
+    pub const UI_MASK_RECTS: u32 = 0x0000_0800;
+    /// Bit 12 — `Model_Space_Normals`. Matches the Skyrim bit layout;
+    /// the collision with FO3/FNV `Unknown_3` (also bit 12) is why
+    /// callers must know which property type they hold.
+    pub const MODEL_SPACE_NORMALS: u32 = 0x0000_1000;
+    pub const NON_PROJECTIVE_SHADOWS: u32 = 0x0000_2000;
+    pub const LANDSCAPE: u32 = 0x0000_4000;
+    pub const REFRACTION: u32 = 0x0000_8000;
+    pub const FIRE_REFRACTION: u32 = 0x0001_0000;
+    pub const EYE_ENVIRONMENT_MAPPING: u32 = 0x0002_0000;
+    pub const HAIR: u32 = 0x0004_0000;
+    pub const SCREENDOOR_ALPHA_FADE: u32 = 0x0008_0000;
+    pub const LOCALMAP_HIDE_SECRET: u32 = 0x0010_0000;
+    pub const SKIN_TINT: u32 = 0x0020_0000;
+    pub const OWN_EMIT: u32 = 0x0040_0000;
+    pub const PROJECTED_UV: u32 = 0x0080_0000;
+    pub const MULTIPLE_TEXTURES: u32 = 0x0100_0000;
+    pub const TESSELLATE: u32 = 0x0200_0000;
+    /// Bit 26 — shared with SLSF1 / FO3-FNV F1. Decal geometry.
+    pub const DECAL: u32 = 0x0400_0000;
+    /// Bit 27 — shared with SLSF1 / FO3-FNV F1. Runtime-spawned decal.
+    pub const DYNAMIC_DECAL: u32 = 0x0800_0000;
+    pub const CHARACTER_LIGHTING: u32 = 0x1000_0000;
+    /// Bit 29 — `External_Emittance`. Same bit position on FO3/FNV
+    /// `BSShaderFlags` per nif.xml (`prefix="F3SF1"`, `versions="#FO3#"`).
+    /// #4239 / FO3-D1-2026-09-11-03 — decoded into
+    /// `BSShaderPPLightingProperty.shader_flags_1` on FO3/FNV like every
+    /// other bit, but has no dedicated consumer in `legacy_properties.rs`
+    /// yet. No action required immediately; documented for whoever next
+    /// works on emissive fidelity.
+    pub const EXTERNAL_EMITTANCE: u32 = 0x2000_0000;
+    pub const SOFT_EFFECT: u32 = 0x4000_0000;
+    pub const ZBUFFER_TEST: u32 = 0x8000_0000;
+}
+
+/// FO4+ `Fallout4ShaderPropertyFlags2` — second flag word.
+///
+/// **The FO4 F2 layout diverges sharply from Skyrim SLSF2** while retaining
+/// a few shared positions:
+/// - Bit 6 is `Glow_Map` on both FO4 and Skyrim
+/// - Bit 15 is `Dismemberment` on FO4
+/// - Bit 21 is `Anisotropic_Lighting` on FO4 — the same semantic Skyrim
+///   uses at bit 21 (Skyrim's `Cloud_LOD` is a separate bit, 20).
+///   FO3/FNV F2 bit 21 is `Alpha_Decal` — **two different semantics on
+///   the same bit, FO3/FNV vs Skyrim/FO4**
+/// - Bit 24 is `Multi_Layer_Parallax` on FO4
+/// - Bit 25 is `Alpha_Test` on FO4. Skyrim has no `Alpha_Test` bit on
+///   either SLSF1 (bit 25 there is `Remappable_Textures`) or SLSF2 (bit 25
+///   there is `Soft_Lighting`) — it routes alpha-test via `NiAlphaProperty`
+///   on a sibling block instead, per `fo4_slsf2::ALPHA_TEST`'s doc below.
+///
+/// Sourced from nif.xml `Fallout4ShaderPropertyFlags2`
+/// (lines 6479-6513). See #414 / FO4-D3-M1.
+pub mod fo4_slsf2 {
+    pub const ZBUFFER_WRITE: u32 = 0x0000_0001;
+    pub const LOD_LANDSCAPE: u32 = 0x0000_0002;
+    pub const LOD_OBJECTS: u32 = 0x0000_0004;
+    pub const NO_FADE: u32 = 0x0000_0008;
+    /// Bit 4 — `Double_Sided`. Same bit as Skyrim SLSF2.
+    pub const DOUBLE_SIDED: u32 = 0x0000_0010;
+    pub const VERTEX_COLORS: u32 = 0x0000_0020;
+    /// Bit 6 — `Glow_Map`. Same position and semantic as Skyrim SLSF2.
+    pub const GLOW_MAP: u32 = 0x0000_0040;
+    pub const TRANSFORM_CHANGED: u32 = 0x0000_0080;
+    pub const DISMEMBERMENT_MEATCUFF: u32 = 0x0000_0100;
+    pub const TINT: u32 = 0x0000_0200;
+    pub const GRASS_VERTEX_LIGHTING: u32 = 0x0000_0400;
+    pub const GRASS_UNIFORM_SCALE: u32 = 0x0000_0800;
+    pub const GRASS_FIT_SLOPE: u32 = 0x0000_1000;
+    pub const GRASS_BILLBOARD: u32 = 0x0000_2000;
+    pub const NO_LOD_LAND_BLEND: u32 = 0x0000_4000;
+    pub const DISMEMBERMENT: u32 = 0x0000_8000;
+    /// Bit 16 — `Wireframe`. Same bit position on FO3/FNV `BSShaderFlags2`
+    /// per nif.xml (`prefix="F3SF2"`, `versions="#FO3#"`). #4239 /
+    /// FO3-D1-2026-09-11-03 — decoded on FO3/FNV like every other bit but
+    /// has no dedicated consumer in `legacy_properties.rs`; an alternative
+    /// wireframe source (`NiWireframeProperty`) already exists, bounding
+    /// the impact. No action required immediately.
+    pub const WIREFRAME: u32 = 0x0001_0000;
+    pub const WEAPON_BLOOD: u32 = 0x0002_0000;
+    pub const HIDE_ON_LOCAL_MAP: u32 = 0x0004_0000;
+    /// Bit 19 — `Premult_Alpha`. Same bit position on FO3/FNV
+    /// `BSShaderFlags2` per nif.xml (`prefix="F3SF2"`, `versions="#FO3#"`).
+    /// #4239 / FO3-D1-2026-09-11-03 — decoded on FO3/FNV like every other
+    /// bit but has no dedicated consumer in `legacy_properties.rs`. No
+    /// action required immediately.
+    pub const PREMULT_ALPHA: u32 = 0x0008_0000;
+    pub const VATS_TARGET: u32 = 0x0010_0000;
+    /// Bit 21 — `Anisotropic_Lighting` on FO4, the same semantic Skyrim
+    /// uses at this bit. Distinct from `Alpha_Decal` (FO3/FNV) at the
+    /// same numeric value. The reason a legacy `is_decal_from_shader_flags`
+    /// that tests `flags2 & 0x0020_0000` MUST NOT run on FO4 (or Skyrim)
+    /// properties.
+    pub const ANISOTROPIC_LIGHTING: u32 = 0x0020_0000;
+    pub const SKEW_SPECULAR_ALPHA: u32 = 0x0040_0000;
+    pub const MENU_SCREEN: u32 = 0x0080_0000;
+    pub const MULTI_LAYER_PARALLAX: u32 = 0x0100_0000;
+    /// Bit 25 — `Alpha_Test` on FO4. Skyrim routes alpha-test via
+    /// `NiAlphaProperty` on a sibling block, not a shader flag bit.
+    pub const ALPHA_TEST: u32 = 0x0200_0000;
+    pub const GRADIENT_REMAP: u32 = 0x0400_0000;
+    pub const VATS_TARGET_DRAW_ALL: u32 = 0x0800_0000;
+    pub const PIPBOY_SCREEN: u32 = 0x1000_0000;
+    pub const TREE_ANIM: u32 = 0x2000_0000;
+    pub const EFFECT_LIGHTING: u32 = 0x4000_0000;
+    pub const REFRACTION_WRITES_DEPTH: u32 = 0x8000_0000;
+}
+
+/// FO76 / Starfield CRC32-hashed shader flag identifiers.
+///
+/// For `BSVER >= 132` the wire format replaces the `(u32, u32)` flag pair
+/// with two CRC32-tagged arrays (`SF1`/`SF2`). nif.xml defines
+/// `BSShaderCRC32` (lines 6520–6553) with the canonical u32 values for
+/// every recognised flag — sourcing the constants here directly from
+/// the spec means we don't need to compute CRC32 at runtime, and the
+/// values are pinned against any future drift.
+///
+/// The split between `SF1` and `SF2` arrays is purely a wire detail —
+/// the same `BSShaderCRC32` enum populates both, so consumers can search
+/// the union of both arrays for a target flag and stay correct.
+///
+/// Used by `BSLightingShaderProperty` / `BSEffectShaderProperty` /
+/// `BSWaterShaderProperty` / `BSSkyShaderProperty` per nif.xml lines
+/// 6590, 6647, 6701, 6714. Pre-#712 these values were parsed but no
+/// importer call site read them, so every FO76+ decal / two-sided /
+/// own-emit flag was silently dropped.
+pub mod bs_shader_crc32 {
+    /// `Decal` — bit-26 single-pass decal on legacy SLSF1.
+    pub const DECAL: u32 = 3849131744;
+    /// `Dynamic_Decal` — bit-27 runtime-spawned decal on legacy SLSF1.
+    pub const DYNAMIC_DECAL: u32 = 1576614759;
+    /// `Two_Sided` — replaces SLSF2 bit-4 `Double_Sided` at the CRC
+    /// layer. nif.xml uses `TWO_SIDED` (the underscored spelling) here;
+    /// the legacy bit was named `Double_Sided`. Same render semantic.
+    pub const TWO_SIDED: u32 = 759557230;
+    /// `Cast_Shadows` — Cast Shadows.
+    pub const CAST_SHADOWS: u32 = 1563274220;
+    /// `ZBuffer_Test` — Depth test enable.
+    pub const ZBUFFER_TEST: u32 = 1740048692;
+    /// `ZBuffer_Write` — Depth write enable.
+    pub const ZBUFFER_WRITE: u32 = 3166356979;
+    /// `Vertex_Colors` — Vertex-color modulation.
+    pub const VERTEX_COLORS: u32 = 348504749;
+    /// `PBR` — PBR pipeline path.
+    pub const PBR: u32 = 731263983;
+    /// `Skinned` — Skinned mesh.
+    pub const SKINNED: u32 = 3744563888;
+    /// `EnvMap` — Environment-map enable. (nif.xml: `ENVMAP`.)
+    pub const ENVMAP: u32 = 2893749418;
+    /// `Vertex_Alpha` — Vertex-alpha modulation.
+    pub const VERTEX_ALPHA: u32 = 2333069810;
+    /// `Face` — Face / FaceGen path.
+    pub const FACE: u32 = 314919375;
+    /// `Greyscale_To_Palette_Color` — palette-mapped colour.
+    pub const GRAYSCALE_TO_PALETTE_COLOR: u32 = 442246519;
+    /// `Hairtint` — hair-tint path.
+    pub const HAIRTINT: u32 = 1264105798;
+    /// `Skin_Tint` — skin-tint path.
+    pub const SKIN_TINT: u32 = 1483897208;
+    /// `Emit_Enabled` — Bethesda's CRC-era replacement for
+    /// `Own_Emit` (legacy SLSF1 bit 22).
+    pub const EMIT_ENABLED: u32 = 2262553490;
+    /// `Glowmap` — glow-map slot routing.
+    pub const GLOWMAP: u32 = 2399422528;
+    /// `Refraction`.
+    pub const REFRACTION: u32 = 1957349758;
+    /// `Refraction_Falloff`.
+    pub const REFRACTION_FALLOFF: u32 = 902349195;
+    /// `NoFade`.
+    pub const NOFADE: u32 = 2994043788;
+    /// `Inverted_Fade_Pattern`.
+    pub const INVERTED_FADE_PATTERN: u32 = 3030867718;
+    /// `RGB_Falloff`.
+    pub const RGB_FALLOFF: u32 = 3448946507;
+    /// `External_Emittance`.
+    pub const EXTERNAL_EMITTANCE: u32 = 2150459555;
+    /// `ModelSpaceNormals`.
+    pub const MODELSPACENORMALS: u32 = 2548465567;
+    /// `Transform_Changed`.
+    pub const TRANSFORM_CHANGED: u32 = 3196772338;
+    /// `Effect_Lighting`.
+    pub const EFFECT_LIGHTING: u32 = 3473438218;
+    /// `Falloff`.
+    pub const FALLOFF: u32 = 3980660124;
+    /// `Soft_Effect`.
+    pub const SOFT_EFFECT: u32 = 3503164976;
+    /// `Greyscale_To_Palette_Alpha` — palette-mapped alpha.
+    pub const GRAYSCALE_TO_PALETTE_ALPHA: u32 = 2901038324;
+    /// `Weapon_Blood` — weapon blood decals.
+    pub const WEAPON_BLOOD: u32 = 2078326675;
+    /// `LOD_Objects` — LOD object render path.
+    pub const LOD_OBJECTS: u32 = 2896726515;
+    /// `No_Exposure` — opt-out of auto-exposure (Starfield).
+    pub const NO_EXPOSURE: u32 = 3707406987;
+
+    /// `true` when any of the supplied CRC32 flag identifiers is in
+    /// `crcs`. Used by the importer to test SF1+SF2 union.
+    #[inline]
+    pub fn contains_any(crcs: &[u32], targets: &[u32]) -> bool {
+        crcs.iter().any(|c| targets.contains(c))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fo3nv_and_skyrim_decal_bits_agree() {
+        // Both games route decals through SLSF1 bits 26/27 with
+        // identical numeric values. Pinning the shared layout here
+        // ensures a refactor can't silently drift one side.
+        assert_eq!(fo3nv_f1::DECAL, skyrim_slsf1::DECAL);
+        assert_eq!(fo3nv_f1::DYNAMIC_DECAL, skyrim_slsf1::DYNAMIC_DECAL);
+    }
+
+    #[test]
+    fn own_emit_bit_is_shared_between_skyrim_and_fo4_only() {
+        // #2319 — OWN_EMIT (bit 22, 0x0040_0000) is a genuine cross-game
+        // constant between Skyrim and FO4 per nif.xml's
+        // SkyrimShaderPropertyFlags1 / Fallout4ShaderPropertyFlags1, but
+        // FO3/FNV's BSShaderFlags has NO Own_Emit bit at all — its bit 22
+        // is Tree_Billboard, an unrelated flag. The additive-blend gate
+        // in `import/material/dedicated_shader.rs` reads
+        // `skyrim_slsf1::OWN_EMIT` directly (it only ever sees
+        // `BSEffectShaderProperty`, which is Skyrim+-only) — this pin
+        // covers the two constants that genuinely share the semantic.
+        assert_eq!(skyrim_slsf1::OWN_EMIT, fo4_slsf1::OWN_EMIT);
+        assert_eq!(skyrim_slsf1::OWN_EMIT, 0x0040_0000);
+    }
+
+    #[test]
+    fn fo3nv_bit_22_is_tree_billboard_not_own_emit() {
+        // The two flags only coincidentally share a bit position — they
+        // are unrelated per-game semantics, not one constant. Asserting
+        // the numeric equality alongside the distinct name is the whole
+        // point: it documents "same bit, different meaning" instead of
+        // implying they're interchangeable.
+        assert_eq!(fo3nv_f1::TREE_BILLBOARD, 0x0040_0000);
+        assert_eq!(fo3nv_f1::TREE_BILLBOARD, skyrim_slsf1::OWN_EMIT);
+    }
+
+    #[test]
+    fn fo3nv_f2_alpha_decal_and_skyrim_f2_anisotropic_collide() {
+        // Bit 21 (0x0020_0000) carries two different semantics across game
+        // eras: `Alpha_Decal` on FO3/FNV `BSShaderFlags2`, `Anisotropic_Lighting`
+        // on Skyrim/FO4 modern properties. The collision is exactly why callers
+        // must know which property type they're holding — `is_decal_from_shader_flags`
+        // guards this by only being called on FO3/FNV `BSShader*Property` paths.
+        assert_eq!(fo3nv_f2::ALPHA_DECAL, skyrim_slsf2::ANISOTROPIC_LIGHTING);
+    }
+
+    #[test]
+    fn slsf2_double_sided_matches_nif_xml() {
+        // nif.xml SkyrimShaderPropertyFlags2 bit 4 = Double_Sided.
+        assert_eq!(skyrim_slsf2::DOUBLE_SIDED, 1u32 << 4);
+    }
+
+    #[test]
+    fn skyrim_and_fo4_share_the_slsf2_glow_map_bit() {
+        // nif.xml SkyrimShaderPropertyFlags2 and
+        // Fallout4ShaderPropertyFlags2 both define Glow_Map at bit 6.
+        assert_eq!(skyrim_slsf2::GLOW_MAP, 1u32 << 6);
+        assert_eq!(fo4_slsf2::GLOW_MAP, skyrim_slsf2::GLOW_MAP);
+    }
+
+    /// #414 — FO4 shares SLSF1 bits 26/27 with Skyrim + FO3/FNV for
+    /// Decal / Dynamic_Decal. Same numeric value, same semantic —
+    /// pin the cross-game agreement so the shared decal helper can
+    /// keep testing those bits on every game-era modern property.
+    #[test]
+    fn fo4_shares_slsf1_decal_bits_with_skyrim_and_legacy() {
+        assert_eq!(fo4_slsf1::DECAL, skyrim_slsf1::DECAL);
+        assert_eq!(fo4_slsf1::DECAL, fo3nv_f1::DECAL);
+        assert_eq!(fo4_slsf1::DYNAMIC_DECAL, skyrim_slsf1::DYNAMIC_DECAL);
+        assert_eq!(fo4_slsf1::DYNAMIC_DECAL, fo3nv_f1::DYNAMIC_DECAL);
+    }
+
+    /// #414 / SKY-D2-001 (#1879) — bit 21 of the second flag word carries
+    /// TWO semantics across game eras, both at value 0x0020_0000: `Alpha_Decal`
+    /// on FO3/FNV, `Anisotropic_Lighting` on Skyrim AND FO4 (per nif.xml
+    /// `SkyrimShaderPropertyFlags2` / `Fallout4ShaderPropertyFlags2` bit 21).
+    /// A legacy decal helper that tests this bit on a Skyrim+/FO4 property
+    /// reads Anisotropic_Lighting and misclassifies the mesh as a decal.
+    /// (Skyrim `Cloud_LOD` is bit 20, 0x0010_0000 — a separate flag.)
+    #[test]
+    fn f2_bit_21_alpha_decal_legacy_vs_anisotropic_modern() {
+        assert_eq!(fo3nv_f2::ALPHA_DECAL, 0x0020_0000);
+        assert_eq!(skyrim_slsf2::ANISOTROPIC_LIGHTING, 0x0020_0000);
+        assert_eq!(fo4_slsf2::ANISOTROPIC_LIGHTING, 0x0020_0000);
+        // Skyrim Cloud_LOD is the DIFFERENT bit 20.
+        assert_eq!(skyrim_slsf2::CLOUD_LOD, 0x0010_0000);
+    }
+
+    /// #414 — Double_Sided lives at the same bit on Skyrim and FO4 F2.
+    #[test]
+    fn fo4_shares_double_sided_bit_with_skyrim() {
+        assert_eq!(fo4_slsf2::DOUBLE_SIDED, skyrim_slsf2::DOUBLE_SIDED);
+    }
+
+    #[test]
+    fn fo4_shares_model_space_normals_bit_with_skyrim() {
+        assert_eq!(
+            fo4_slsf1::MODEL_SPACE_NORMALS,
+            skyrim_slsf1::MODEL_SPACE_NORMALS
+        );
+    }
+
+    /// #890 — the four `BSEffectShaderProperty`-relevant flag bits share
+    /// the same numeric positions between Skyrim SLSF1/2 and FO4 F4SF1/2
+    /// per nif.xml. Pin the agreement so the `BsEffectShaderData` import
+    /// capture and the future shader-side consumer can rely on a single
+    /// `skyrim_slsf1::*` / `skyrim_slsf2::*` constant set across both
+    /// game eras. The CRC32 layer covers the FO76 / Starfield cases.
+    #[test]
+    fn fo4_shares_effect_shader_bits_with_skyrim() {
+        assert_eq!(
+            fo4_slsf1::GREYSCALE_TO_PALETTE_COLOR,
+            skyrim_slsf1::GREYSCALE_TO_PALETTE_COLOR
+        );
+        assert_eq!(
+            fo4_slsf1::GREYSCALE_TO_PALETTE_ALPHA,
+            skyrim_slsf1::GREYSCALE_TO_PALETTE_ALPHA
+        );
+        assert_eq!(fo4_slsf1::SOFT_EFFECT, skyrim_slsf1::SOFT_EFFECT);
+        assert_eq!(fo4_slsf2::EFFECT_LIGHTING, skyrim_slsf2::EFFECT_LIGHTING);
+    }
+
+    #[test]
+    fn fo4_shares_fire_refraction_bits_with_skyrim() {
+        assert_eq!(fo4_slsf1::REFRACTION, skyrim_slsf1::REFRACTION);
+        assert_eq!(fo4_slsf1::FIRE_REFRACTION, skyrim_slsf1::FIRE_REFRACTION);
+        assert_eq!(skyrim_slsf1::REFRACTION, 1u32 << 15);
+        assert_eq!(skyrim_slsf1::FIRE_REFRACTION, 1u32 << 16);
+    }
+
+    /// #2321 — FO3/FNV `BSShaderFlags` bits 15/16 (Refraction /
+    /// Fire_Refraction) share both bit position and semantic with
+    /// Skyrim/FO4 SLSF1 per nif.xml `BSShaderFlags`. Pin the agreement
+    /// so `apply_pp_lighting_property` can reuse the same
+    /// material_kind=103 promotion the Skyrim+ path already applies.
+    #[test]
+    fn fo3nv_shares_fire_refraction_bits_with_skyrim() {
+        assert_eq!(fo3nv_f1::REFRACTION, skyrim_slsf1::REFRACTION);
+        assert_eq!(fo3nv_f1::FIRE_REFRACTION, skyrim_slsf1::FIRE_REFRACTION);
+        assert_eq!(fo3nv_f1::REFRACTION, 1u32 << 15);
+        assert_eq!(fo3nv_f1::FIRE_REFRACTION, 1u32 << 16);
+    }
+
+    /// #712 — pin the `BSShaderCRC32` constants against the literal
+    /// `value="..."` integers in nif.xml lines 6520-6553.
+    ///
+    /// #4280 — the derivation is fully reproducible, 32/32: reflected
+    /// CRC-32 (polynomial `0xEDB88320`, init `0`, no final XOR — the
+    /// same parameterization `byroredux_bsa::csg::bscrc32` uses) computed
+    /// over the `<option name="...">` string exactly as nif.xml spells
+    /// it, with no case folding (nif.xml's own spelling is already
+    /// uppercase, e.g. `VERTEXCOLORS` with no underscore — NOT the
+    /// underscored `Vertex_Colors` doc annotation used for this
+    /// module's Rust constant names). A prior attempt reused `bscrc32`
+    /// directly, which hard-codes a *lowercase* fold internally; varying
+    /// input case against that function collapses every case variant
+    /// onto the same lowercase hash, so the correct uppercase form was
+    /// never actually tested and the derivation looked opaque. What
+    /// matters for correctness is unchanged: the values match the wire
+    /// literals Bethesda's tools emit, and nif.xml is the authority.
+    ///
+    /// This test exists so a future edit copy-pasting a wrong digit
+    /// fails immediately with a clear message instead of silently
+    /// dropping decal/two-sided detection on a subset of Starfield
+    /// content.
+    /// #748 — extends #712 pin to cover all 32 BSShaderCRC32 entries
+    /// defined in nif.xml (lines 6520-6553). nif.xml defines exactly 32;
+    /// the issue's "~120 unmapped" premise was incorrect — all 32 entries
+    /// were already present in bs_shader_crc32.
+    #[test]
+    fn bs_shader_crc32_matches_nif_xml_literals() {
+        use bs_shader_crc32::*;
+        let cases: &[(&str, u32, u32)] = &[
+            ("CAST_SHADOWS", 1563274220, CAST_SHADOWS),
+            ("ZBUFFER_TEST", 1740048692, ZBUFFER_TEST),
+            ("ZBUFFER_WRITE", 3166356979, ZBUFFER_WRITE),
+            ("TWO_SIDED", 759557230, TWO_SIDED),
+            ("VERTEX_COLORS", 348504749, VERTEX_COLORS),
+            ("PBR", 731263983, PBR),
+            ("SKINNED", 3744563888, SKINNED),
+            ("ENVMAP", 2893749418, ENVMAP),
+            ("VERTEX_ALPHA", 2333069810, VERTEX_ALPHA),
+            ("FACE", 314919375, FACE),
+            (
+                "GRAYSCALE_TO_PALETTE_COLOR",
+                442246519,
+                GRAYSCALE_TO_PALETTE_COLOR,
+            ),
+            ("DECAL", 3849131744, DECAL),
+            ("DYNAMIC_DECAL", 1576614759, DYNAMIC_DECAL),
+            ("HAIRTINT", 1264105798, HAIRTINT),
+            ("SKIN_TINT", 1483897208, SKIN_TINT),
+            ("EMIT_ENABLED", 2262553490, EMIT_ENABLED),
+            ("GLOWMAP", 2399422528, GLOWMAP),
+            ("REFRACTION", 1957349758, REFRACTION),
+            ("REFRACTION_FALLOFF", 902349195, REFRACTION_FALLOFF),
+            ("NOFADE", 2994043788, NOFADE),
+            ("INVERTED_FADE_PATTERN", 3030867718, INVERTED_FADE_PATTERN),
+            ("RGB_FALLOFF", 3448946507, RGB_FALLOFF),
+            ("EXTERNAL_EMITTANCE", 2150459555, EXTERNAL_EMITTANCE),
+            ("MODELSPACENORMALS", 2548465567, MODELSPACENORMALS),
+            ("TRANSFORM_CHANGED", 3196772338, TRANSFORM_CHANGED),
+            ("EFFECT_LIGHTING", 3473438218, EFFECT_LIGHTING),
+            ("FALLOFF", 3980660124, FALLOFF),
+            ("SOFT_EFFECT", 3503164976, SOFT_EFFECT),
+            (
+                "GRAYSCALE_TO_PALETTE_ALPHA",
+                2901038324,
+                GRAYSCALE_TO_PALETTE_ALPHA,
+            ),
+            ("WEAPON_BLOOD", 2078326675, WEAPON_BLOOD),
+            ("LOD_OBJECTS", 2896726515, LOD_OBJECTS),
+            ("NO_EXPOSURE", 3707406987, NO_EXPOSURE),
+        ];
+        for &(name, expected, actual) in cases {
+            assert_eq!(
+                actual, expected,
+                "{name} must match nif.xml BSShaderCRC32 literal {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn bs_shader_crc32_contains_any_finds_target() {
+        let crcs = [
+            bs_shader_crc32::SKINNED,
+            bs_shader_crc32::DECAL,
+            bs_shader_crc32::CAST_SHADOWS,
+        ];
+        assert!(bs_shader_crc32::contains_any(
+            &crcs,
+            &[bs_shader_crc32::DECAL]
+        ));
+        assert!(bs_shader_crc32::contains_any(
+            &crcs,
+            &[bs_shader_crc32::DYNAMIC_DECAL, bs_shader_crc32::DECAL]
+        ));
+        assert!(!bs_shader_crc32::contains_any(
+            &crcs,
+            &[bs_shader_crc32::TWO_SIDED]
+        ));
+        assert!(!bs_shader_crc32::contains_any(
+            &[],
+            &[bs_shader_crc32::DECAL]
+        ));
+    }
+}

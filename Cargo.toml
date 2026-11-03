@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "tools/span-manifest"]
+exclude = ["vendor/byroredux"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-only" # operator decision 2026-11-02; see DECL0006.
+repository = "https://github.com/cargo-build/sculpto-rs"
+
+[workspace.dependencies]
+sculpto-core = { path = "crates/sculpto-core" }
+sculpto-bake = { path = "crates/sculpto-bake" }
+sculpto-mesh = { path = "crates/sculpto-mesh" }
+sculpto-nif = { path = "crates/sculpto-nif" }
+roxmltree = "0.20"

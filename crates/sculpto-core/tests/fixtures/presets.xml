@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SliderPresets>
+    <Preset name="Reference Male" set="Reference HIMBO">
+        <Group name="Reference"/>
+        <SetSlider name="ArmsBiceps" size="big" value="100"/>
+        <SetSlider name="ArmsBiceps" size="small" value="55"/>
+        <SetSlider name="Lean" size="small" value="100"/>
+    </Preset>
+    <Preset name="Reference Female">
+        <SetSlider name="Breasts" size="big" value="0"/>
+    </Preset>
+</SliderPresets>

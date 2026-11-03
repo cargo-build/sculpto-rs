@@ -1,0 +1,484 @@
+//! Animation data types: keyframes, channels, clips.
+
+use crate::math::{Quat, Vec3};
+use crate::string::FixedString;
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
+
+/// How the animation behaves when it reaches its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleType {
+    Clamp,
+    Loop,
+    Reverse,
+}
+
+/// Interpolation type for keyframe data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyType {
+    Linear,
+    Quadratic,
+    Tbc,
+    /// Stepped / constant hold (Gamebryo `KEY_CONST`): the segment holds
+    /// the start key's value until the next key, with no interpolation.
+    /// Used by hard-cut keyframed scenery and IK poses (LC-D5-02 / #1441).
+    Const,
+}
+
+/// Translation keyframe.
+#[derive(Debug, Clone, Copy)]
+pub struct TranslationKey {
+    pub time: f32,
+    pub value: Vec3,
+    pub forward: Vec3,
+    pub backward: Vec3,
+    pub tbc: Option<[f32; 3]>,
+}
+
+/// Rotation keyframe (quaternion).
+#[derive(Debug, Clone, Copy)]
+pub struct RotationKey {
+    pub time: f32,
+    pub value: Quat,
+    pub tbc: Option<[f32; 3]>,
+}
+
+/// Scale keyframe.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleKey {
+    pub time: f32,
+    pub value: f32,
+    pub forward: f32,
+    pub backward: f32,
+    pub tbc: Option<[f32; 3]>,
+}
+
+/// A single channel of transform animation for one named node.
+#[derive(Debug, Clone)]
+pub struct TransformChannel {
+    pub translation_keys: Vec<TranslationKey>,
+    pub translation_type: KeyType,
+    pub rotation_keys: Vec<RotationKey>,
+    pub rotation_type: KeyType,
+    pub scale_keys: Vec<ScaleKey>,
+    pub scale_type: KeyType,
+    /// Per-channel priority from ControlledBlock (0 = lowest, 255 = highest).
+    pub priority: u8,
+}
+
+// ── Non-transform channel types ───────────────────────────────────────
+
+/// What a float channel targets.
+///
+/// #3862 — the canonical vocabulary for both sides of the NIF boundary.
+/// `crates/nif` re-exports this rather than declaring its own copy: the NIF
+/// side had an identical 13-variant enum, and `anim_convert.rs` bridged them
+/// with a pure identity match, so a new target cost four edits instead of
+/// one. The wire discriminators each variant is decoded from (documented per
+/// variant below) came across in that merge — `crates/nif/src/anim/channel.rs`
+/// is what maps `operation` / `target_color` onto these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatTarget {
+    /// Material alpha. `NiAlphaController`.
+    Alpha,
+    /// UV offset U. `NiTextureTransformController` with `operation == 0`.
+    UvOffsetU,
+    /// UV offset V. `operation == 1`.
+    UvOffsetV,
+    /// UV scale U. `operation == 2`.
+    UvScaleU,
+    /// UV scale V. `operation == 3`.
+    UvScaleV,
+    /// UV rotation. `operation == 4`.
+    UvRotation,
+    /// Shader float property — `BSEffectShader` / `BSLightingShader` float
+    /// controllers.
+    ShaderFloat,
+    /// Morph target weight (blend shape). The u32 is the morph index
+    /// into the NiGeomMorpherController's target list.
+    MorphWeight(u32),
+    /// NiLight `dimmer` slot — multiplicative scalar on the base
+    /// color. Animated by `NiLightDimmerController`. See #983.
+    LightDimmer,
+    /// NiLight intensity multiplier — distinct from `dimmer` (some
+    /// content layers flicker on `intensity` while `dimmer` stays
+    /// at the authored steady value). Animated by
+    /// `NiLightIntensityController`. See #983.
+    LightIntensity,
+    /// NiLight `radius` slot. Animated by `NiLightRadiusController`.
+    /// Drives the renderer's per-light attenuation cutoff in world
+    /// units. See #983.
+    LightRadius,
+    /// Material emissive multiplier. Animated by
+    /// `BSMaterialEmittanceMultController`. See #3327. Mirrors
+    /// `ShaderFloat`'s state as of #2221: reaches this far, no
+    /// ECS/render consumer yet.
+    EmissiveMultiple,
+    /// Glass refraction strength (Stealth Boy / heat-haze). Animated by
+    /// `BSRefractionStrengthController`. See #3327 — same no-consumer-yet
+    /// caveat as `EmissiveMultiple`.
+    RefractionStrength,
+}
+
+/// What a color channel targets. Canonical for both sides of the NIF
+/// boundary — see [`FloatTarget`] for why (#3862).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColorTarget {
+    /// Diffuse color. `NiMaterialColorController` with `target_color == 0`.
+    Diffuse,
+    /// Ambient color. `target_color == 1`.
+    Ambient,
+    /// Specular color. `target_color == 2`.
+    Specular,
+    /// Emissive color. `target_color == 3`.
+    Emissive,
+    /// Shader color property.
+    ShaderColor,
+    /// NiLight diffuse color slot — animated by
+    /// `NiLightColorController` with `target_color == 0`. Replaces
+    /// `LightSource.emitter.radiant_intensity` for the duration of the clip.
+    /// See #983.
+    LightDiffuse,
+    /// NiLight ambient color slot — animated by
+    /// `NiLightColorController` with `target_color == 1`. The
+    /// renderer doesn't currently consume the ambient slot per-
+    /// light (cell ambient drives the unlit fallback), but the
+    /// channel is captured so a future ambient-per-light path
+    /// finds the data. See #983.
+    LightAmbient,
+}
+
+/// A float keyframe (alpha, UV params, shader floats).
+#[derive(Debug, Clone, Copy)]
+pub struct AnimFloatKey {
+    pub time: f32,
+    pub value: f32,
+}
+
+/// A color keyframe (RGB).
+#[derive(Debug, Clone, Copy)]
+pub struct AnimColorKey {
+    pub time: f32,
+    pub value: Vec3,
+}
+
+/// A bool keyframe (visibility).
+#[derive(Debug, Clone, Copy)]
+pub struct AnimBoolKey {
+    pub time: f32,
+    pub value: bool,
+}
+
+/// Float animation channel.
+#[derive(Debug, Clone)]
+pub struct FloatChannel {
+    pub target: FloatTarget,
+    pub keys: Vec<AnimFloatKey>,
+}
+
+/// Color animation channel.
+#[derive(Debug, Clone)]
+pub struct ColorChannel {
+    pub target: ColorTarget,
+    pub keys: Vec<AnimColorKey>,
+}
+
+/// Visibility animation channel.
+#[derive(Debug, Clone)]
+pub struct BoolChannel {
+    pub keys: Vec<AnimBoolKey>,
+}
+
+/// Texture flipbook animation channel — `NiFlipController` semantics.
+///
+/// The float-typed `keys` carry the cycle position (the controller's
+/// `NiFloatInterpController` interpolator output: typically a 0..N saw
+/// or stepped ramp). At sample time the runtime picks the source
+/// `source_paths[floor(value) % source_paths.len()]` and rebinds it
+/// into the texture slot identified by `texture_slot`. Source paths
+/// are resolved at clip-load time from the chain
+/// `NiFlipController.sources → NiSourceTexture.filename`, so the
+/// runtime never has to walk back into the NIF scene.
+///
+/// `role` is the canonical material role (#3901), resolved from the
+/// controller's raw `TexType` by `anim_convert::convert_nif_clip` — the
+/// same pairing the static `NiTexturingProperty` slots use in
+/// `crates/nif/src/import/material/legacy_properties.rs`. It is NOT the
+/// `slot_to_role` table, which numbers `BSShaderTextureSet` slots.
+///
+/// `anim_convert::attach_animation_sinks` resolves `source_paths` to
+/// bindless handles once at clip-attach time into an
+/// `AnimatedTextureFlip` sink, `apply_texture_flip_channels`
+/// (`byroredux::systems::animation`) updates its `current_index` from
+/// this channel's curve each frame, and
+/// `byroredux::render::static_meshes` replaces that role's spawn-time
+/// handle with the active frame (base color replaces `TextureHandle`).
+#[derive(Debug, Clone)]
+pub struct TextureFlipChannel {
+    pub role: crate::ecs::FlipTextureRole,
+    pub source_paths: Vec<Arc<str>>,
+    pub keys: Vec<AnimFloatKey>,
+}
+
+/// A complete animation clip (one per NiControllerSequence).
+#[derive(Debug, Clone)]
+pub struct AnimationClip {
+    pub name: String,
+    pub duration: f32,
+    pub cycle_type: CycleType,
+    pub frequency: f32,
+    /// Start-time offset in seconds from `NiControllerSequence.phase` (or the
+    /// embedded controller envelope). Gamebryo's `NiTimeController` maps clip
+    /// time as `frequency * t + phase`, so this staggers instances of the same
+    /// clip that should not animate in lockstep.
+    ///
+    /// Seeded into `AnimationPlayer::local_time` / `AnimationLayer` start time
+    /// at attach rather than added per-sample: the sampler's cycle handling
+    /// (clamp / loop / ping-pong) already normalises `local_time` into
+    /// `[0, duration)`, and an offset applied after that would fight it.
+    ///
+    /// **Zero on all vanilla FNV content** — measured across every FNV + DLC
+    /// mesh archive (20,677 NIFs, 4,989 KFs): not one clip, embedded or KF,
+    /// carries a non-zero phase (nor a frequency ≠ 1). #3097 wired the field
+    /// through the NIF-side clip; pre-#3345 the NIF→core conversion dropped it
+    /// again, so it would have silently no-op'd on the Skyrim/FO4 content where
+    /// phase does appear.
+    pub phase: f32,
+    /// Default weight from `NiControllerSequence.weight` (0.0–1.0).
+    /// Modulates the layer's `effective_weight()` inside
+    /// `sample_blended_transform`: the sequence author can pre-attenuate
+    /// a clip so that even at full layer weight it only contributes
+    /// `weight` of the blend. Distinct from `AnimationLayer::weight`,
+    /// which is the runtime crossfade factor. See #469.
+    ///
+    /// Single-clip playback (`AnimationPlayer` / `advance_time`) does
+    /// not apply `clip.weight` — it's a blend scaler, meaningful only
+    /// when more than one clip contributes at the same priority.
+    pub weight: f32,
+    /// Accumulation root node name — horizontal translation on this node
+    /// is extracted as root motion delta rather than applied as animation.
+    pub accum_root_name: Option<FixedString>,
+    /// Map from interned node name to its transform animation channel.
+    /// Keys are `FixedString` symbols — pre-interned at clip load time so
+    /// the animation hot path does zero-allocation lookups. See #340.
+    /// `FxHashMap` (#3677 / PERF-D1-2026-08-30-01) — `FixedString` is a
+    /// 4-byte interned symbol, exactly the shape std's SipHash-1-3 loses
+    /// on hardest; this map is probed once per animated channel per
+    /// animated entity per frame. See `_audit-common.md`'s "Hot-path
+    /// hashing" doctrine (#2923, #1368, #2174).
+    pub channels: FxHashMap<FixedString, TransformChannel>,
+    /// Float channels: (node_name, channel).
+    pub float_channels: Vec<(FixedString, FloatChannel)>,
+    /// Color channels: (node_name, channel).
+    pub color_channels: Vec<(FixedString, ColorChannel)>,
+    /// Bool channels: (node_name, channel).
+    pub bool_channels: Vec<(FixedString, BoolChannel)>,
+    /// Texture-flipbook channels: (node_name, channel). Captured from
+    /// `NiFlipController` blocks during NIF import. Carries resolved
+    /// source-texture paths so the sample-time consumer can rebind a
+    /// texture without re-walking the NIF scene. See `TextureFlipChannel`.
+    pub texture_flip_channels: Vec<(FixedString, TextureFlipChannel)>,
+    /// Text key events: (time, label). Imported from NiTextKeyExtraData.
+    /// Emitted as transient ECS markers when crossed during playback.
+    /// Labels are interned at clip-load time so the visitor and event-
+    /// emission paths can hand symbols around without per-fire allocations
+    /// (#231 / SI-04). Resolve via `StringPool::resolve` when a `&str`
+    /// is actually required.
+    pub text_keys: Vec<(f32, FixedString)>,
+    /// Extracted root yaw keys `(time, yaw)`: radians about the renderer's
+    /// up axis (+Y), cumulative (unwrapped), linear between keys. Filled only
+    /// where the source extracts the turn out of the pose — Fallout 4's Havok
+    /// reference frame, whose `turninplace*` clips keep the root bone still
+    /// and turn only there (#6241). Empty for every NIF / KF clip, whose turn
+    /// stays in the pose. Read through [`Self::root_yaw_delta`] into
+    /// [`RootMotionYaw`](super::RootMotionYaw).
+    pub root_yaw: Vec<(f32, f32)>,
+}
+
+impl AnimationClip {
+    /// The extracted root yaw at `time`, clamped to the key range; `None` for
+    /// a clip with no [`Self::root_yaw`] keys.
+    pub fn root_yaw_at(&self, time: f32) -> Option<f32> {
+        let keys = &self.root_yaw;
+        let (first, last) = (keys.first()?, keys.last()?);
+        if time <= first.0 {
+            return Some(first.1);
+        }
+        if time >= last.0 {
+            return Some(last.1);
+        }
+        let next = keys.partition_point(|key| key.0 <= time);
+        let (a, b) = (keys[next - 1], keys[next]);
+        let span = b.0 - a.0;
+        let t = if span > 0.0 { (time - a.0) / span } else { 0.0 };
+        Some(a.1 + (b.1 - a.1) * t)
+    }
+
+    /// The root yaw turned between `previous_time` and `current_time` — a
+    /// looping clip that wrapped this tick turns to its end and on from its
+    /// start, like `sampled_root_motion_delta`. Zero without keys.
+    pub fn root_yaw_delta(&self, previous_time: f32, current_time: f32) -> f32 {
+        let yaw = |time| self.root_yaw_at(time).unwrap_or(0.0);
+        if self.cycle_type == CycleType::Loop && current_time < previous_time {
+            (yaw(self.duration) - yaw(previous_time)) + (yaw(current_time) - yaw(0.0))
+        } else {
+            yaw(current_time) - yaw(previous_time)
+        }
+    }
+}
+
+#[cfg(test)]
+mod fx_hash_guard_tests {
+    //! #3677 / PERF-D1-2026-08-30-01 — a source-scan pin, mirroring
+    //! `crates/renderer/src/vulkan/context/mod.rs`'s
+    //! `pose_dirty_crosses_the_crate_boundary_without_siphash` (#2923):
+    //! asserts by text rather than by type so a future edit that reverts
+    //! `AnimationClip.channels` back to std's SipHash-1-3 fails at
+    //! `cargo test` instead of silently regressing the hot path.
+
+    // No negative "must not contain the std form" companion assertion here
+    // (unlike the `crates/renderer` precedent this mirrors): that precedent
+    // scans *other* files, but this one's only source is `types.rs` itself
+    // — self-including via `include_str!` means the negative string would
+    // match this very assertion's own text.
+    #[test]
+    fn animation_clip_channels_stays_fx_hash_map() {
+        let src = include_str!("types.rs");
+        assert!(
+            src.contains("pub channels: FxHashMap<FixedString, TransformChannel>"),
+            "AnimationClip.channels must stay FxHashMap (#3677)"
+        );
+    }
+}
+
+impl AnimationClip {
+    /// M42.11 — the accumulation root's mean horizontal speed across one
+    /// loop, in world units/second, from the *authored* keys. `None` when
+    /// the clip has no accum root, its channel has fewer than two
+    /// translation keys, or the duration is non-positive.
+    ///
+    /// For a `Loop` cycle the accum root's horizontal samples run
+    /// start→destination across one period — the wrap back to the first
+    /// key is the engine's root-motion discontinuity (see
+    /// `sampled_root_motion_delta`), not authored motion — so the speed is
+    /// the straight-line start→end displacement divided by the duration.
+    /// Consumers should sanity-clamp the result: a clip whose COM barely
+    /// moves (in-place idle authored with an accum channel) must fall back
+    /// to the engine's default locomotion speed rather than drive actors
+    /// at ~0 u/s.
+    pub fn authored_horizontal_speed(&self) -> Option<f32> {
+        let accum = self.accum_root_name.as_ref()?;
+        let channel = self.channels.get(accum)?;
+        if channel.translation_keys.len() < 2 {
+            return None;
+        }
+        let first = channel.translation_keys.first()?;
+        let last = channel.translation_keys.last()?;
+        if self.duration <= 0.0 {
+            return None;
+        }
+        let delta = last.value - first.value;
+        let horizontal = Vec3::new(delta.x, 0.0, delta.z).length();
+        Some(horizontal / self.duration)
+    }
+}
+
+#[cfg(test)]
+mod authored_speed_tests {
+    use super::*;
+    use crate::string::StringPool;
+    use rustc_hash::FxHashMap;
+
+    fn clip_with_accum(
+        pool: &mut StringPool,
+        keys: &[(f32, [f32; 3])],
+        duration: f32,
+    ) -> AnimationClip {
+        let mut channels = FxHashMap::default();
+        channels.insert(
+            pool.intern("Bip01"),
+            TransformChannel {
+                translation_keys: keys
+                    .iter()
+                    .map(|(time, v)| TranslationKey {
+                        time: *time,
+                        value: Vec3::from_array(*v),
+                        forward: Vec3::ZERO,
+                        backward: Vec3::ZERO,
+                        tbc: None,
+                    })
+                    .collect(),
+                translation_type: KeyType::Linear,
+                rotation_keys: Vec::new(),
+                rotation_type: KeyType::Linear,
+                scale_keys: Vec::new(),
+                scale_type: KeyType::Linear,
+                priority: 0,
+            },
+        );
+        AnimationClip {
+            name: "test".into(),
+            duration,
+            cycle_type: CycleType::Loop,
+            frequency: 1.0,
+            phase: 0.0,
+            weight: 1.0,
+            accum_root_name: Some(pool.intern("Bip01")),
+            channels,
+            float_channels: Vec::new(),
+            color_channels: Vec::new(),
+            bool_channels: Vec::new(),
+            texture_flip_channels: Vec::new(),
+            text_keys: Vec::new(),
+            root_yaw: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn speed_is_horizontal_displacement_over_duration() {
+        let mut pool = StringPool::new();
+        // 116 units of forward travel (Y-up: the stride is on X/Z) over a
+        // 1.2 s loop → ~96.7 u/s, FNV's mtforward.kf shape.
+        let clip = clip_with_accum(
+            &mut pool,
+            &[(0.0, [0.0, 67.0, 0.0]), (1.2, [116.0, 67.0, 0.0])],
+            1.2,
+        );
+        let speed = clip.authored_horizontal_speed().unwrap();
+        assert!((speed - 96.666).abs() < 0.1, "{speed}");
+        // Vertical travel is animation, not stride — must not count.
+        let clip = clip_with_accum(
+            &mut pool,
+            &[(0.0, [0.0, 0.0, 0.0]), (1.0, [0.0, 90.0, 0.0])],
+            1.0,
+        );
+        let speed = clip.authored_horizontal_speed().unwrap();
+        assert!(
+            speed < 1e-4,
+            "vertical-only COM motion must read as ~0: {speed}"
+        );
+    }
+
+    #[test]
+    fn no_accum_root_or_degenerate_keys_yield_none() {
+        let mut pool = StringPool::new();
+
+        // No accum root bound → the clip drives no root motion at all.
+        let mut clip = clip_with_accum(&mut pool, &[(0.0, [0.0; 3]), (1.0, [5.0; 3])], 1.0);
+        clip.accum_root_name = None;
+        assert!(clip.authored_horizontal_speed().is_none());
+
+        // Accum root present but the channel names a different node.
+        let mut clip = clip_with_accum(&mut pool, &[(0.0, [0.0; 3]), (1.0, [5.0; 3])], 1.0);
+        clip.accum_root_name = Some(pool.intern("Nonexistent"));
+        assert!(clip.authored_horizontal_speed().is_none());
+
+        // Single key = no measurable displacement window.
+        let clip = clip_with_accum(&mut pool, &[(0.0, [0.0; 3])], 1.0);
+        assert!(clip.authored_horizontal_speed().is_none());
+
+        // Non-positive duration guards the division.
+        let clip = clip_with_accum(&mut pool, &[(0.0, [0.0; 3]), (0.0, [5.0; 3])], 0.0);
+        assert!(clip.authored_horizontal_speed().is_none());
+    }
+}

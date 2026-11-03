@@ -1,0 +1,372 @@
+//! Light extraction (#3856, split from `walk/mod.rs`).
+//!
+//! `walk_node_lights` is an independent entry point invoked from
+//! `import/mod.rs`, not from the scene-graph walkers.
+
+use crate::blocks::light::{NiAmbientLight, NiDirectionalLight, NiPointLight, NiSpotLight};
+use crate::scene::NifScene;
+use crate::types::NiTransform;
+
+use super::super::coord::zup_point_to_yup;
+use super::super::transform::compose_transforms;
+use super::super::{ImportedLight, LightKind};
+use super::{
+    as_ni_node, node_is_culled, resolve_affected_node_names, revisit_guard, switch_active_children,
+};
+
+/// Recursively walk the scene graph accumulating world-space transforms
+/// and collecting any NiLight subclass encountered.
+///
+/// #5485 — `visited` (from [`new_visited`], one bitset per entry point)
+/// bounds the walk to one visit per block, and the recursion carries a
+/// depth bounded by `MAX_NIF_NODE_DEPTH`. Pre-fix a self-referencing
+/// `NiNode` recursed forever here: this walker had neither guard.
+pub(crate) fn walk_node_lights(
+    scene: &NifScene,
+    block_idx: usize,
+    parent_transform: &NiTransform,
+    visited: &mut Vec<bool>,
+    depth: u32,
+    out: &mut Vec<ImportedLight>,
+) {
+    let Some(block) = scene.get(block_idx) else {
+        return;
+    };
+    if !revisit_guard(visited, block_idx, depth, "walk_node_lights") {
+        return;
+    }
+
+    // NiSwitchNode / NiLODNode: only walk the active children (#718).
+    if let Some((node, active_children)) = switch_active_children(block) {
+        if node_is_culled(&node.av) {
+            return;
+        }
+        let world_transform = compose_transforms(parent_transform, &node.av.transform);
+        for idx in active_children {
+            walk_node_lights(scene, idx, &world_transform, visited, depth + 1, out);
+        }
+        return;
+    }
+
+    if let Some(node) = as_ni_node(block) {
+        if node_is_culled(&node.av) {
+            return;
+        }
+        let world_transform = compose_transforms(parent_transform, &node.av.transform);
+        for child_ref in &node.children {
+            if let Some(idx) = child_ref.index() {
+                walk_node_lights(scene, idx, &world_transform, visited, depth + 1, out);
+            }
+        }
+        return;
+    }
+
+    // NiLight subclasses — extract using the world transform composed from
+    // the parent chain plus the light's own local transform.
+    if let Some(l) = block.as_any().downcast_ref::<NiPointLight>() {
+        let world = compose_transforms(parent_transform, &l.base.av.transform);
+        let radius = attenuation_radius(
+            l.constant_attenuation,
+            l.linear_attenuation,
+            l.quadratic_attenuation,
+        );
+        out.push(imported_light_from_base(
+            scene,
+            &world,
+            &l.base,
+            LightKind::Point,
+            radius,
+            0.0,
+        ));
+        return;
+    }
+    if let Some(l) = block.as_any().downcast_ref::<NiSpotLight>() {
+        let world = compose_transforms(parent_transform, &l.point.base.av.transform);
+        let radius = attenuation_radius(
+            l.point.constant_attenuation,
+            l.point.linear_attenuation,
+            l.point.quadratic_attenuation,
+        );
+        out.push(imported_light_from_base(
+            scene,
+            &world,
+            &l.point.base,
+            LightKind::Spot,
+            radius,
+            l.outer_spot_angle.to_radians(),
+        ));
+        return;
+    }
+    if let Some(l) = block.as_any().downcast_ref::<NiAmbientLight>() {
+        let world = compose_transforms(parent_transform, &l.base.av.transform);
+        out.push(imported_light_from_base(
+            scene,
+            &world,
+            &l.base,
+            LightKind::Ambient,
+            0.0,
+            0.0,
+        ));
+        return;
+    }
+    if let Some(l) = block.as_any().downcast_ref::<NiDirectionalLight>() {
+        let world = compose_transforms(parent_transform, &l.base.av.transform);
+        out.push(imported_light_from_base(
+            scene,
+            &world,
+            &l.base,
+            LightKind::Directional,
+            0.0,
+            0.0,
+        ));
+        // no return — directional lights are leaves
+    }
+}
+
+pub(crate) fn imported_light_from_base(
+    scene: &NifScene,
+    world: &NiTransform,
+    base: &crate::blocks::light::NiLightBase,
+    kind: LightKind,
+    radius: f32,
+    outer_angle: f32,
+) -> ImportedLight {
+    let translation = zup_point_to_yup(&world.translation);
+
+    // #4395 — Gamebryo's model direction for both `NiSpotLight` and
+    // `NiDirectionalLight` is (1,0,0), and "the world direction is the
+    // first column of the world rotation matrix"
+    // (`gamebryo-v32/Include/NiSpotLight.h`, `NiDirectionalLight.h`) — the
+    // same convention `translate_light` already uses for ESM spot lights.
+    // This used to take the negated THIRD column ("-Z"), an uncited axis.
+    // `rows` is row-major, so column 0 is `rows[i][0]`.
+    let rot = &world.rotation;
+    let emission = [rot.rows[0][0], rot.rows[1][0], rot.rows[2][0]];
+    // The Gamebryo vector is the direction light travels. The canonical
+    // `Emitter.direction` means "outward from the source" for spots but
+    // "toward the light" for directional emitters
+    // (`crates/core/src/lighting.rs`; the shader uses it as `L` directly),
+    // so the directional kind is negated once, here at the boundary.
+    let emission = if kind == LightKind::Directional {
+        emission.map(|c| -c)
+    } else {
+        emission
+    };
+    // Z-up → Y-up via the same [x, z, -y] swap `zup_point_to_yup` uses.
+    let direction = byroredux_core::math::coord::zup_to_yup_pos(emission);
+
+    // Dimmer scales the diffuse contribution — the only channel the
+    // engine currently consumes. Ambient/specular are stored for later.
+    // Gamebryo stores light colors as raw floats in "monitor space" —
+    // effectively sRGB values used as-is with no gamma conversion.  We
+    // pass them through unchanged because the legacy content was
+    // authored for this non-linear-aware pipeline.
+    let d = base.dimmer;
+    let diffuse = base.diffuse_color;
+    let color = [diffuse.r * d, diffuse.g * d, diffuse.b * d];
+
+    let affected_node_names = resolve_affected_node_names(scene, &base.affected_nodes);
+
+    ImportedLight {
+        translation,
+        direction,
+        color,
+        radius,
+        kind,
+        outer_angle,
+        affected_node_names,
+        // #983 — surface the light's NIF block name so the cell
+        // loader can spawn a matching `Name` component; the
+        // animation system resolves NiLight*Controller channels by
+        // that name. `None` for anonymous lights (rare).
+        name: base.av.net.name.clone(),
+    }
+}
+
+/// Solve `1 / (const + lin·d + quad·d²) = THRESHOLD` for distance.
+/// A light's "effective radius" is the distance at which its contribution
+/// drops below a small fraction of its peak. We use 1/256 (~0.4%) which
+/// matches what Bethesda shaders use as a cull threshold.
+pub(crate) fn attenuation_radius(k_const: f32, k_lin: f32, k_quad: f32) -> f32 {
+    const THRESHOLD: f32 = 1.0 / 256.0;
+    // Find distance d where k_quad·d² + k_lin·d + k_const = 1/THRESHOLD
+    let target = 1.0 / THRESHOLD;
+    if k_quad > 1e-6 {
+        // Quadratic: d = (-b + sqrt(b² - 4a(c - target))) / 2a
+        let a = k_quad;
+        let b = k_lin;
+        let c = k_const - target;
+        let disc = b * b - 4.0 * a * c;
+        if disc >= 0.0 {
+            return ((-b + disc.sqrt()) / (2.0 * a)).max(0.0);
+        }
+    }
+    if k_lin > 1e-6 {
+        return ((target - k_const) / k_lin).max(0.0);
+    }
+    // #2210 (NIFAL-D3-02) — no attenuation → effectively infinite. This is
+    // the OPERATIVE case, not a rare fallback: FNV/FO3 spawnable point
+    // lights ship a zero-only attenuation triple (radius control is
+    // deferred to the ESM LIGH record instead — see
+    // `cell_loader/spawn.rs::spawn_nif_lights`'s ESM-radius preference),
+    // so this branch is what 82/82 measured FNV lights actually hit.
+    //
+    // Pre-fix this returned a bare, uncited `2048.0`. `EXTERIOR_CELL_UNITS`
+    // is a genuine citation instead of a nicer-looking guess: it's the
+    // spec-defined Bethesda exterior cell size (4096 units on a side,
+    // every Gamebryo/Creation title Oblivion→Starfield — see its own doc
+    // comment) and `cell_loader/spawn.rs::light_radius_or_default` already
+    // uses it as the sibling "we don't know this light's true radius, make
+    // it at least visible across a cell" fallback for the exact same
+    // semantic gap. Reusing it here (rather than an unrelated magic
+    // number) keeps both "no radius info" fallbacks in this engine
+    // grounded in the same cited constant instead of two independent
+    // guesses that happen to differ.
+    byroredux_core::math::coord::EXTERIOR_CELL_UNITS
+}
+
+#[cfg(test)]
+mod light_dispatch_coverage_tests {
+    //! #2532 (NIFAL-D9-04) — the Lights half of the canonical-tier
+    //! completeness guard, mirroring `import::collision`'s
+    //! `dispatch_coverage_tests`.
+    //!
+    //! `LightKind` resolution is the same shape as `resolve_shape_inner`: a
+    //! `downcast_ref::<…>` chain over block types the parser dispatches. It
+    //! has the same failure mode too — a light block that is parse-dispatched
+    //! in `blocks/dispatch.rs` but has no arm here parses for byte correctness and
+    //! is then silently dropped, with no warning and no missing-block
+    //! diagnostic. One of the six translate-boundary bugs a prior sweep cited
+    //! as evidence this guard was needed was in Lights, and it was found by
+    //! manual code tracing, not by a test.
+    //!
+    //! Structural rather than value-based, deliberately: the property that
+    //! actually rots is "every dispatched kind reaches the boundary", and a
+    //! per-field value harness would not catch a whole type going missing.
+    use std::collections::HashSet;
+
+    /// Every `Ni…Light` struct produced by a dispatch arm whose match key is a
+    /// quoted `"Ni…Light"`. Mirrors `constructed_shape` in the collision
+    /// sibling; kept as its own copy rather than shared because the two scan
+    /// different files for different identifier shapes, and a shared helper
+    /// parameterised on both would be longer than either.
+    fn dispatched_light_structs() -> HashSet<String> {
+        // #4411 — scan the production prefix only. The whole-file scan used
+        // to let a test module (or a comment) naming a `"Ni…Light"` arm with
+        // a nearby `Box::new(` satisfy this extractor even if the production
+        // arm were deleted. `blocks/dispatch.rs` (#6144) carries no test
+        // module today; the cut keeps any future one out of the scan.
+        let src = include_str!("../../blocks/dispatch.rs");
+        let src = byroredux_core::source_scan::production_text_or_whole(src);
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = HashSet::new();
+        for (i, line) in lines.iter().enumerate() {
+            let is_light_arm = line.contains("=>")
+                && line
+                    .split('"')
+                    .any(|tok| tok.starts_with("Ni") && tok.ends_with("Light"));
+            if !is_light_arm {
+                continue;
+            }
+            for candidate in &lines[i..=(i + 2).min(lines.len() - 1)] {
+                let Some(after) = candidate.split("Box::new(").nth(1) else {
+                    continue;
+                };
+                // Light arms are module-qualified (`light::NiPointLight::parse`)
+                // where the collision sibling's shapes are not, so take the LAST
+                // path segment before `::parse` rather than the first
+                // identifier. Reading only the first would yield `light` and
+                // silently produce an empty set — the anti-vacuity assertions
+                // below exist because that is exactly what happened first.
+                let Some(path) = after.split("::parse").next() else {
+                    continue;
+                };
+                let ident: String = path
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(path)
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if ident.starts_with("Ni") && ident.ends_with("Light") {
+                    out.insert(ident);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Every `Ni…Light` struct with a `downcast_ref::<…>` arm in this module.
+    fn resolved_light_structs() -> HashSet<String> {
+        resolved_light_structs_in(include_str!("lights.rs"))
+    }
+
+    /// The scan of [`resolved_light_structs`], on caller-supplied source so
+    /// the #4411 regression test can drive synthetic input.
+    ///
+    /// #4411 — production prefix only, same rule as the dispatch scan: the
+    /// doc comments inside this test module name `Ni…Light` types and used
+    /// to be part of the scanned text, so a comment (or a test) could mark a
+    /// light resolved whose production arm was gone.
+    fn resolved_light_structs_in(src: &str) -> HashSet<String> {
+        let src = byroredux_core::source_scan::production_text_or_whole(src);
+        src.split("downcast_ref::<")
+            .skip(1)
+            .filter_map(|part| {
+                let ident: String = part
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                (ident.starts_with("Ni") && ident.ends_with("Light")).then_some(ident)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_dispatched_light_reaches_the_lightkind_boundary() {
+        let dispatched = dispatched_light_structs();
+        let resolved = resolved_light_structs();
+
+        // Anti-vacuity, same reasoning as the collision sibling: a reformat
+        // that empties either set must fail loudly rather than pass silently.
+        assert!(
+            dispatched.contains("NiPointLight") && dispatched.contains("NiSpotLight"),
+            "dispatch extractor regressed; found {dispatched:?}"
+        );
+        assert!(
+            dispatched.len() >= 4,
+            "expected >=4 dispatched Ni*Light structs, found {}: {dispatched:?}",
+            dispatched.len()
+        );
+        assert!(
+            resolved.contains("NiPointLight"),
+            "resolve extractor regressed; found {resolved:?}"
+        );
+
+        let missing: Vec<_> = dispatched.difference(&resolved).cloned().collect();
+        assert!(
+            missing.is_empty(),
+            "these Ni*Light blocks are parse-dispatched but never reach a \
+             LightKind arm — the authored light is silently dropped: {missing:?}"
+        );
+    }
+
+    /// #4411 — the resolve scan reads production code only. A
+    /// `downcast_ref::<NiFooLight>` mention that lives inside a
+    /// `#[cfg(test)]` module (or a comment, which the same rule removes as
+    /// everything after the marker) must not mark the light resolved;
+    /// before the production-prefix split it could.
+    #[test]
+    fn resolve_scan_ignores_test_module_mentions() {
+        let src = "pub fn f() {\n    downcast_ref::<NiPointLight>();\n}\n\
+                   #[cfg(test)]\nmod t {\n    fn g(b: &dyn std::any::Any) {\n\
+                   b.downcast_ref::<NiFakeTestLight>();\n    }\n}\n";
+        let resolved = resolved_light_structs_in(src);
+        assert!(resolved.contains("NiPointLight"));
+        assert!(
+            !resolved.contains("NiFakeTestLight"),
+            "a #[cfg(test)] mention must not count as a resolve arm: {resolved:?}"
+        );
+    }
+}

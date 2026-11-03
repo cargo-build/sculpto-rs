@@ -1,0 +1,346 @@
+//! String interning for the engine.
+//!
+//! All entity names, asset paths, and shader identifiers go through
+//! [`StringPool`]. Equality checks on [`FixedString`] are integer
+//! comparisons — O(1).
+//!
+//! [`StringPool::intern`] and [`StringPool::get`] case-fold via a
+//! stack buffer for inputs ≤ [`LOWERCASE_STACK_BUF`] bytes (covers
+//! every NIF / ESM / BSA path observed in vanilla content), so the
+//! per-call cost is the case-fold copy plus one hash lookup — no
+//! `String` allocation. Longer inputs fall back to an allocated
+//! lowercase copy. The interner backend itself allocates once per
+//! unique string the first time it is seen.
+
+use crate::ecs::resource::Resource;
+
+/// An interned string handle. Equality is integer comparison, O(1).
+pub type FixedString = string_interner::DefaultSymbol;
+
+/// Stack buffer size used by the case-fold fast path in
+/// [`StringPool::intern`] / [`StringPool::get`]. Sized to cover every
+/// string observed in vanilla Bethesda content (longest BSA asset
+/// path ~120 bytes; longest NIF node name ~64 bytes); inputs that
+/// exceed this fall back to a heap-allocated lowercase copy.
+const LOWERCASE_STACK_BUF: usize = 256;
+
+/// Thread-safe string interner, registered as a global [`Resource`].
+///
+/// Access via `world.resource::<StringPool>()` (read) or
+/// `world.resource_mut::<StringPool>()` (intern new strings).
+pub struct StringPool(string_interner::StringInterner<string_interner::backend::StringBackend>);
+
+impl StringPool {
+    pub fn new() -> Self {
+        Self(string_interner::StringInterner::<
+            string_interner::backend::StringBackend,
+        >::new())
+    }
+
+    /// Intern a string, returning its symbol. The interner backend
+    /// allocates exactly once for each unique string; subsequent
+    /// `intern` calls for the same string (case-insensitive) reuse
+    /// the existing entry.
+    ///
+    /// **Case-insensitive**: strings are lowercased before interning to
+    /// match Gamebryo's GlobalStringTable behavior. "Bip01 Head" and
+    /// "bip01 head" produce the same symbol.
+    ///
+    /// The case-fold itself is allocation-free for inputs ≤
+    /// [`LOWERCASE_STACK_BUF`] bytes (≥ 99 % of engine call sites);
+    /// longer inputs allocate a `String` for the lowercased copy.
+    pub fn intern(&mut self, s: &str) -> FixedString {
+        let mut buf = [0u8; LOWERCASE_STACK_BUF];
+        match ascii_lowercase_into_buf(s, &mut buf) {
+            Some(lower) => self.0.get_or_intern(lower),
+            None => self.0.get_or_intern(s.to_ascii_lowercase()),
+        }
+    }
+
+    /// Resolve a symbol back to its string slice.
+    ///
+    /// **Returns the lowercased canonical form** — the case the caller
+    /// originally passed to [`StringPool::intern`] is *not* preserved.
+    /// This is intentional (every engine consumer of resolved strings —
+    /// asset paths, EDIDs, animation channel names — is
+    /// case-insensitive), but it means this API is wrong for any
+    /// case-preserving use such as book/UI text or paths surfaced to
+    /// mod authors. Those sites carry an `Arc<str>` alongside the
+    /// `FixedString` (see `ImportedNode` / `ImportedMesh` in
+    /// `crates/nif/src/import/`). See #895 for the divergence vs
+    /// Gamebryo's case-preserving `NiFixedString`.
+    pub fn resolve(&self, sym: FixedString) -> Option<&str> {
+        self.0.resolve(sym)
+    }
+
+    /// Look up a string without interning it. Returns `None` if the
+    /// string has never been interned.
+    ///
+    /// Case-insensitive: lowercases before lookup. Same fast/slow path
+    /// split as [`StringPool::intern`] — no allocation for inputs ≤
+    /// [`LOWERCASE_STACK_BUF`] bytes.
+    pub fn get(&self, s: &str) -> Option<FixedString> {
+        let mut buf = [0u8; LOWERCASE_STACK_BUF];
+        match ascii_lowercase_into_buf(s, &mut buf) {
+            Some(lower) => self.0.get(lower),
+            None => self.0.get(s.to_ascii_lowercase()),
+        }
+    }
+
+    /// Dump every interned string in **symbol order** (symbol 0, 1, 2 …).
+    ///
+    /// The `StringBackend` assigns symbols contiguously as strings are
+    /// first interned, so re-interning this exact sequence into a fresh
+    /// pool reproduces identical [`FixedString`] values
+    /// ([`from_dump`](Self::from_dump)). That symbol stability is what lets
+    /// the save format store `FixedString`-bearing components by their raw
+    /// `u32` symbol (see [`fixed_string_serde`]) rather than re-resolving
+    /// every string at the component level.
+    ///
+    /// Strings come back in their canonical lowercased form (the same form
+    /// [`resolve`](Self::resolve) returns); re-interning is idempotent.
+    pub fn dump(&self) -> Vec<String> {
+        use string_interner::Symbol;
+        // Iteration order isn't contractually symbol-order, so index by
+        // symbol explicitly rather than trusting the yield order.
+        let mut by_symbol: Vec<Option<String>> = Vec::new();
+        for (sym, s) in self.0.iter() {
+            let idx = sym.to_usize();
+            if idx >= by_symbol.len() {
+                by_symbol.resize(idx + 1, None);
+            }
+            by_symbol[idx] = Some(s.to_string());
+        }
+        // Every slot 0..len must be filled for a contiguous backend; an
+        // empty slot would desync every later symbol, so surface it loudly.
+        by_symbol
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| s.unwrap_or_else(|| panic!("StringPool dump: gap at symbol {i}")))
+            .collect()
+    }
+
+    /// Rebuild a pool from a [`dump`](Self::dump), reproducing the original
+    /// [`FixedString`] symbol for each string by interning in symbol order.
+    pub fn from_dump(strings: &[String]) -> Self {
+        let mut pool = Self::new();
+        for s in strings {
+            pool.intern(s);
+        }
+        pool
+    }
+}
+
+/// `serde` adapter for serializing a [`FixedString`] as its raw `u32`
+/// symbol, for use with `#[serde(with = "...")]` on component fields.
+///
+/// Only valid when the [`StringPool`] is restored first (via
+/// [`StringPool::from_dump`]) so the symbol resolves to the same string.
+/// The save driver guarantees that ordering: strings are restored before
+/// any component column is deserialized.
+#[cfg(feature = "inspect")]
+pub mod fixed_string_serde {
+    use super::FixedString;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use string_interner::Symbol;
+
+    pub fn serialize<S: Serializer>(fs: &FixedString, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_u32(fs.to_usize() as u32)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<FixedString, D::Error> {
+        let raw = u32::deserialize(de)?;
+        FixedString::try_from_usize(raw as usize)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid FixedString symbol {raw}")))
+    }
+}
+
+/// Copy `s` into `buf`, ASCII-lowercasing in place, and return the
+/// resulting `&str`. Returns `None` when `s` doesn't fit.
+///
+/// `<[u8]>::make_ascii_lowercase` only flips bit 0x20 on bytes in
+/// `0x41..=0x5A`; multi-byte UTF-8 sequences have the high bit set on
+/// every byte and are therefore untouched. The output is the same
+/// codepoint sequence as the input with ASCII upper-case letters
+/// folded — guaranteed valid UTF-8 since the input was a `&str`.
+#[inline]
+fn ascii_lowercase_into_buf<'a>(s: &str, buf: &'a mut [u8]) -> Option<&'a str> {
+    if s.len() > buf.len() {
+        return None;
+    }
+    let dst = &mut buf[..s.len()];
+    dst.copy_from_slice(s.as_bytes());
+    dst.make_ascii_lowercase();
+    // SAFETY: `dst` was filled from a valid `&str`; `make_ascii_lowercase`
+    // only touches ASCII single-byte codepoints, so the bytes still form
+    // valid UTF-8.
+    Some(unsafe { std::str::from_utf8_unchecked(dst) })
+}
+
+impl Default for StringPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Resource for StringPool {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_same_string_returns_same_symbol() {
+        let mut pool = StringPool::new();
+        let a = pool.intern("player");
+        let b = pool.intern("player");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_strings_different_symbols() {
+        let mut pool = StringPool::new();
+        let a = pool.intern("player");
+        let b = pool.intern("enemy");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn resolve_round_trips() {
+        let mut pool = StringPool::new();
+        let sym = pool.intern("hello");
+        assert_eq!(pool.resolve(sym), Some("hello"));
+    }
+
+    #[test]
+    fn get_without_interning() {
+        let mut pool = StringPool::new();
+        assert!(pool.get("missing").is_none());
+
+        let sym = pool.intern("present");
+        assert_eq!(pool.get("present"), Some(sym));
+        assert!(pool.get("still_missing").is_none());
+    }
+
+    #[test]
+    fn case_insensitive_interning() {
+        let mut pool = StringPool::new();
+        let a = pool.intern("Bip01 Head");
+        let b = pool.intern("bip01 head");
+        let c = pool.intern("BIP01 HEAD");
+        assert_eq!(a, b, "mixed case must produce same symbol");
+        assert_eq!(b, c, "upper case must produce same symbol");
+    }
+
+    #[test]
+    fn case_insensitive_get() {
+        let mut pool = StringPool::new();
+        let sym = pool.intern("Scene Root");
+        assert_eq!(pool.get("scene root"), Some(sym));
+        assert_eq!(pool.get("SCENE ROOT"), Some(sym));
+        assert_eq!(pool.get("Scene Root"), Some(sym));
+    }
+
+    #[test]
+    fn resolve_returns_lowercase() {
+        let mut pool = StringPool::new();
+        let sym = pool.intern("Bip01 Spine");
+        assert_eq!(pool.resolve(sym), Some("bip01 spine"));
+    }
+
+    /// Regression for #893 / LC-D6-NEW-01 — strings that exceed the
+    /// 256-byte stack-buffer fast path must still round-trip through
+    /// the heap-allocated fallback. The boundary is exclusive: 256
+    /// bytes fits, 257 falls back.
+    #[test]
+    fn long_string_falls_back_correctly() {
+        let mut pool = StringPool::new();
+
+        // Exactly LOWERCASE_STACK_BUF bytes — fast path.
+        let at_boundary: String = "A".repeat(LOWERCASE_STACK_BUF);
+        let sym_boundary = pool.intern(&at_boundary);
+        assert_eq!(
+            pool.resolve(sym_boundary).map(|s| s.len()),
+            Some(LOWERCASE_STACK_BUF)
+        );
+        assert_eq!(
+            pool.resolve(sym_boundary).unwrap().chars().next(),
+            Some('a')
+        );
+
+        // One byte over — fallback path.
+        let over_boundary: String = "B".repeat(LOWERCASE_STACK_BUF + 1);
+        let sym_over = pool.intern(&over_boundary);
+        assert_eq!(
+            pool.resolve(sym_over).map(|s| s.len()),
+            Some(LOWERCASE_STACK_BUF + 1)
+        );
+        assert_eq!(pool.resolve(sym_over).unwrap().chars().next(), Some('b'));
+
+        // Both paths share the pool — distinct strings get distinct symbols.
+        assert_ne!(sym_boundary, sym_over);
+    }
+
+    /// Regression for #893 / LC-D6-NEW-01 — case-insensitive interning
+    /// must produce the same symbol on both the fast and slow paths.
+    #[test]
+    fn case_insensitive_across_fast_and_slow_paths() {
+        let mut pool = StringPool::new();
+
+        // Short string — fast path on both calls.
+        let short_a = pool.intern("Bip01");
+        let short_b = pool.intern("BIP01");
+        assert_eq!(short_a, short_b);
+
+        // Long string — slow path on both calls.
+        let long_upper = "X".repeat(LOWERCASE_STACK_BUF + 10);
+        let long_mixed = {
+            let mut s = long_upper.clone();
+            // Force a couple of lowercase letters so case-fold is observable.
+            // SAFETY: only ASCII single-byte codepoints are written (b'x' = 0x78);
+            // replacing an ASCII 'X' (0x58) with b'x' keeps the string valid UTF-8.
+            unsafe {
+                let bytes = s.as_bytes_mut();
+                bytes[0] = b'x';
+                bytes[5] = b'x';
+            }
+            s
+        };
+        let sym_upper = pool.intern(&long_upper);
+        let sym_mixed = pool.intern(&long_mixed);
+        assert_eq!(sym_upper, sym_mixed);
+    }
+
+    /// Regression for #893 / LC-D6-NEW-01 — non-ASCII (multi-byte UTF-8)
+    /// input round-trips through the fast path. `make_ascii_lowercase`
+    /// must leave non-ASCII bytes untouched, so the resulting `&str`
+    /// stays valid UTF-8.
+    #[test]
+    fn non_ascii_input_round_trips() {
+        let mut pool = StringPool::new();
+        // "Naïve Café — résumé" mixes ASCII + Latin-1-supplement codepoints.
+        let s = "Naïve Café — Résumé";
+        let sym = pool.intern(s);
+        let resolved = pool.resolve(sym).unwrap();
+        // The Latin-supplement uppercase letters (É, …) are NOT ASCII so
+        // `make_ascii_lowercase` leaves them as-is. The ASCII letters
+        // (N, C, R) get folded.
+        assert_eq!(resolved, "naïve café — résumé");
+    }
+
+    /// Regression for #893 / LC-D6-NEW-01 — repeated intern of the same
+    /// string returns the same symbol and never grows the pool past one
+    /// entry. (Indirectly: if every call were allocating a new entry,
+    /// `pool.0.len()` would grow on each call.)
+    #[test]
+    fn repeated_intern_does_not_grow_pool() {
+        let mut pool = StringPool::new();
+        let sym = pool.intern("BSFadeNode");
+        for _ in 0..100 {
+            assert_eq!(pool.intern("BSFadeNode"), sym);
+            assert_eq!(pool.intern("bsfadenode"), sym);
+            assert_eq!(pool.intern("BSFADENODE"), sym);
+        }
+        assert_eq!(pool.0.len(), 1, "pool must contain exactly one entry");
+    }
+}

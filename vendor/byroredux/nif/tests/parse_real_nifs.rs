@@ -1,0 +1,1120 @@
+//! Per-game NIF parse-rate integration tests.
+//!
+//! These tests walk **every** mesh-bearing archive a game ships (#3041 —
+//! `Game::mesh_archives`, not just the primary one), parse every NIF entry
+//! in each — `.nif`, plus the renamed distant-LOD `.bto`/`.btr` (#2587) —
+//! and assert that at least `MIN_SUCCESS_RATE` of them parse without error.
+//! A failure names the worst archive so a red build says which one regressed.
+//! They are `#[ignore]`d by default because they require game data and
+//! run for several seconds. Opt in with:
+//!
+//! ```sh
+//! cargo test -p byroredux-nif --test parse_real_nifs -- --ignored
+//! ```
+//!
+//! Point the `BYROREDUX_*_DATA` env vars at your `Data/` directories if
+//! your install path differs from the defaults in `common::Game::default_path`.
+
+mod common;
+
+use common::{
+    open_all_mesh_archives, open_ba2_by_name, open_mesh_archive, open_optional_mesh_archives,
+    parse_all_nifs_in_archive, Game, ParseStats,
+};
+
+/// Acceptance threshold per N23.10 + ROADMAP. Gates on the
+/// **recoverable** rate (clean + NiUnknown-recovered + truncated) so a
+/// hard parse failure on any vanilla NIF is a regression. Every
+/// supported game currently hits 100% recoverable — the recovery paths
+/// (block_size seek, runtime size cache, `oblivion_skip_sizes` hint,
+/// dispatch-level unknown-type fallback) absorb under-consuming parser
+/// bugs by substituting `NiUnknown` placeholders and continuing.
+///
+/// The `clean` rate (fully parsed, no placeholders) is printed by
+/// `ParseStats::print_summary` as a secondary metric. Pre-#568 it
+/// masqueraded as the gate metric — the record_success path silently
+/// absorbed `NiUnknown` recoveries, so Skyrim's ~55% placeholder rate
+/// (from bhkRigidBody and friends) reported as "100% clean". Driving
+/// `clean` upward is open work tracked on the individual parser-bug
+/// issues (e.g. #546). This gate stays at recoverable so hard-failure
+/// regressions still fail loud and clear.
+///
+/// If a future mod-content test tolerates partial coverage, define a
+/// separate `MIN_SUCCESS_RATE_MOD` and use it there rather than
+/// loosening the vanilla gate. See issue #487.
+const MIN_RECOVERABLE_RATE: f64 = 1.0;
+
+/// Minimum **clean** parse rate for the headline per-game gate (#3919).
+///
+/// [`MIN_RECOVERABLE_RATE`] counts a truncated scene as recovered, so it is
+/// blind to the failure shape that actually happens: a parser change that
+/// stops one block early and drops every block after it. #3918 did exactly
+/// that — 294 FO3, ≥ 741 FNV and 730 Oblivion vanilla NIFs truncated at
+/// `NiSkinPartition`, a 100 % → 98.29 % clean collapse on FO3 — and this
+/// gate stayed green for two days because the clean rate was a printed
+/// aside, never an assertion. It is one now.
+///
+/// Seeded by the convention the all-meshes gates already use
+/// ([`ArchiveSpec::min_clean`]: "measured minus ~0.5 %, rounded down to the
+/// nearest 0.5 %"), so a single new drift file does not trip it but a real
+/// regression does. One shared floor rather than a per-game table because
+/// every title measures identically; if one ever legitimately diverges, give
+/// it its own row here and thread `Game` through. Measured 2026-09-06 at
+/// `f1abb334`, release build, every archive `open_all_mesh_archives` +
+/// `open_optional_mesh_archives` enumerate on this install:
+///
+/// | Game        | NIFs   | clean  | truncated | floor  |
+/// |-------------|-------:|-------:|----------:|-------:|
+/// | Oblivion    |  9 612 | 100.00 % |      0  | 99.5 % |
+/// | Fallout 3   | 17 172 | 100.00 % |      0  | 99.5 % |
+/// | Fallout NV  | 20 746 | 100.00 % |      0  | 99.5 % |
+/// | Skyrim SE   | 33 468 | 100.00 % |      0  | 99.5 % |
+/// | Fallout 4   | 41 697 | 100.00 % |      0  | 99.5 % |
+/// | Fallout 76  | 58 469 | 100.00 % |      0  | 99.5 % |
+/// | Starfield   | 31 058 | 100.00 % |      0  | 99.5 % |
+///
+/// At this floor the #3918 shape (FO3 98.29 %, Oblivion 92.41 %) is red on
+/// every affected title.
+const MIN_CLEAN_RATE: f64 = 0.995;
+
+/// Walk **every** mesh-bearing archive for `game`, not just the primary one.
+///
+/// #3041 — this gate used to open `game.mesh_archive()` alone. On FNV that is
+/// `Fallout - Meshes.bsa`: 14,881 NIFs out of a corpus that also ships four
+/// story DLC, four pre-order packs and the 1.4 `Update.bsa`. The gate that
+/// certifies "FNV NIF parse rate 100% clean" was measuring a fraction of the
+/// content it claimed, and a parser change breaking only DLC assets — entirely
+/// plausible, since DLC ships later-authored content — would not have turned it
+/// red. `Game::mesh_archives()` already enumerated the full set for the
+/// baseline harnesses (#2334); only this gate had not been moved over.
+///
+/// Per-archive attribution is the point of the loop rather than one merged
+/// walk: a failure has to name the archive that regressed, or the widening
+/// just makes the red build harder to diagnose than the narrow one was.
+///
+/// #3369 — Skyrim SE left the same blind spot open one tier down: a stock
+/// AE `Data/` also ships `_ResourcePack.bsa` and four Creation Club
+/// archives carrying 715 NIFs that no gate opened. Those can't join
+/// `mesh_archives()` (they vary per account, and the baseline harnesses
+/// that share that list compare absolute counts), so this gate also sweeps
+/// `Game::optional_mesh_archives()` — present-only, and safe here precisely
+/// because the assertion below is a rate, not a count.
+fn run_game(game: Game, limit: Option<usize>) {
+    let Some(mut archives) = open_all_mesh_archives(game) else {
+        return; // Skip if game data not available — common::open_all_mesh_archives prints the reason.
+    };
+    let required = archives.len();
+    archives.extend(open_optional_mesh_archives(game));
+    if archives.len() > required {
+        eprintln!(
+            "[{}] + {} optional archive(s) present on this install (#3369)",
+            game.label(),
+            archives.len() - required,
+        );
+    }
+
+    let mut totals = ParseStats::default();
+    let mut worst: Option<(&str, f64, usize)> = None;
+    // #3919 — tracked separately from `worst`: the archive with the most
+    // truncation is not necessarily the one with the most hard failures.
+    let mut worst_clean: Option<(&str, f64, usize)> = None;
+
+    for (name, archive) in &archives {
+        eprintln!(
+            "[{}] opened {} ({} files)",
+            game.label(),
+            name,
+            archive.file_count()
+        );
+
+        // `limit` is a per-archive cap: it exists so a smoke run can bound
+        // work, and bounding it globally would silently stop walking the
+        // later archives entirely — the exact blind spot this fix closes.
+        let stats = parse_all_nifs_in_archive(archive, limit);
+        eprintln!(
+            "[{}/{}] {} NIFs, {} clean, {} truncated, {} failed ({:.2}% recoverable)",
+            game.label(),
+            name,
+            stats.total,
+            stats.clean,
+            stats.truncated.len(),
+            stats.failures.len(),
+            stats.recoverable_rate() * 100.0,
+        );
+
+        // Track the worst archive so the assertions below can name it.
+        if stats.total > 0 {
+            let rate = stats.recoverable_rate();
+            if worst.is_none_or(|(_, worst_rate, _)| rate < worst_rate) {
+                worst = Some((name, rate, stats.failures.len()));
+            }
+            let clean = stats.success_rate();
+            if worst_clean.is_none_or(|(_, worst_rate, _)| clean < worst_rate) {
+                worst_clean = Some((name, clean, stats.truncated.len()));
+            }
+        }
+
+        totals.total += stats.total;
+        totals.clean += stats.clean;
+        totals.guessed_recoveries += stats.guessed_recoveries;
+        totals.truncated.extend(stats.truncated);
+        totals.failures.extend(stats.failures);
+    }
+
+    totals.print_summary(game.label());
+
+    assert!(
+        totals.total > 0,
+        "[{}] expected at least one NIF across {} archive(s)",
+        game.label(),
+        archives.len(),
+    );
+    assert!(
+        totals.recoverable_rate() >= MIN_RECOVERABLE_RATE,
+        "[{}] parse recoverable rate {:.2}% across {} archive(s) is below the {:.0}% \
+         threshold ({} hard failures); worst archive: {}",
+        game.label(),
+        totals.recoverable_rate() * 100.0,
+        archives.len(),
+        MIN_RECOVERABLE_RATE * 100.0,
+        totals.failures.len(),
+        match worst {
+            Some((name, rate, fails)) =>
+                format!("{name} at {:.2}% ({fails} hard failures)", rate * 100.0),
+            None => "none".to_string(),
+        },
+    );
+    // #3919 — the clean floor. Truncation is "recoverable" to the assertion
+    // above, so this is the only one of the two that a dropped-blocks
+    // regression can turn red.
+    assert!(
+        totals.success_rate() >= MIN_CLEAN_RATE,
+        "[{}] parse clean rate {:.2}% across {} archive(s) is below the {:.1}% floor \
+         ({} truncated — a parser regression dropping blocks, see #3918 / #3919); \
+         worst archive: {}",
+        game.label(),
+        totals.success_rate() * 100.0,
+        archives.len(),
+        MIN_CLEAN_RATE * 100.0,
+        totals.truncated.len(),
+        match worst_clean {
+            Some((name, rate, truncated)) => format!(
+                "{name} at {:.2}% clean ({truncated} truncated)",
+                rate * 100.0
+            ),
+            None => "none".to_string(),
+        },
+    );
+    // #3926 — an absolute zero, not a rate, and deliberately so.
+    //
+    // The two assertions above measure how much content a parse lost. This
+    // one measures whether the parser *guessed* to avoid losing it. Only
+    // Oblivion-era files can reach the guessing paths at all (every later
+    // title ships `NifHeader.block_sizes`, so recovery seeks to a length
+    // the file declares), and vanilla Oblivion is 9,612 / 9,612 clean with
+    // zero inferred skips, so zero is the measured state of every shipped
+    // corpus rather than an aspiration.
+    //
+    // It is not redundant with the clean floor. That floor is a 99.5 %
+    // rate, so ~48 Oblivion files could guess their way past it; and the
+    // failure mode being guarded is not bounded by the file it starts in —
+    // a skip landing on a *plausible* boundary parses "successfully" from
+    // the wrong offset and is counted by nothing, clean rate included.
+    // #3925 measured the counted half of that multiplier at 74 genuine
+    // `NiSkinPartition` failures producing 464 downstream `NiNode`
+    // substitutions.
+    assert_eq!(
+        totals.guessed_recoveries,
+        0,
+        "[{}] {} block(s) were skipped by an inferred distance (Oblivion-era median size cache / oblivion_skip_sizes) rather than one the file declares. Every shipped corpus measures zero here, so this is an upstream parser bug being papered over, not a recovery: find the block type that started failing (RUST_LOG=byroredux_nif=info names it) rather than raising this bound (#3926)",
+        game.label(),
+        totals.guessed_recoveries,
+    );
+}
+
+#[test]
+#[ignore = "needs FNV game data on disk"]
+fn parse_rate_fallout_nv() {
+    run_game(Game::FalloutNV, None);
+}
+
+#[test]
+#[ignore = "needs FO3 game data on disk"]
+fn parse_rate_fallout_3() {
+    run_game(Game::Fallout3, None);
+}
+
+#[test]
+#[ignore = "needs Skyrim LE (2011) game data on disk"]
+fn parse_rate_skyrim_le() {
+    // Not a duplicate of the SE gate: SE rebuilt every mesh (BSVER 83 →
+    // 100, `NiTriShape` → `BSTriShape`), so the 2011 corpus exercises the
+    // classic-geometry path under Skyrim's shader and skinning blocks.
+    run_game(Game::SkyrimLE, None);
+}
+
+#[test]
+#[ignore = "needs Skyrim SE game data on disk"]
+fn parse_rate_skyrim_se() {
+    run_game(Game::SkyrimSE, None);
+}
+
+#[test]
+#[ignore = "needs Oblivion game data on disk"]
+fn parse_rate_oblivion() {
+    // Oblivion BSA v103 uses zlib compression (handled in
+    // `crates/bsa/src/archive.rs:470-475`). Previous "decompression not
+    // yet implemented" comment was stale after M26+.
+    run_game(Game::Oblivion, None);
+}
+
+#[test]
+#[ignore = "needs FO4 game data on disk"]
+fn parse_rate_fallout_4() {
+    run_game(Game::Fallout4, None);
+}
+
+#[test]
+#[ignore = "needs FO76 game data on disk"]
+fn parse_rate_fallout_76() {
+    run_game(Game::Fallout76, None);
+}
+
+#[test]
+#[ignore = "needs Starfield game data on disk"]
+fn parse_rate_starfield() {
+    // Starfield meshes use BA2 v2 GNRL with the 32-byte header extension.
+    // Texture archives (BA2 v3 DX10) use a different chunk layout that's
+    // not yet supported and is tracked separately.
+    run_game(Game::Starfield, None);
+}
+
+/// Minimum clean-parse rate for one archive in an all-meshes gate.
+///
+/// Recoverable is always gated at 100% ([`MIN_RECOVERABLE_RATE`]); `min_clean`
+/// is the per-archive *clean* floor, set by the project convention of
+/// "measured minus ~0.5%, rounded down to the nearest 0.5%" so a real
+/// regression trips the gate while a single new drift does not.
+struct ArchiveSpec {
+    name: &'static str,
+    min_clean: f64,
+}
+
+/// Shared driver for the per-game "walk every mesh-bearing archive, gate each
+/// one independently" tests.
+///
+/// #3466 — extracted rather than hand-copied a third time. The FO4 and
+/// Starfield gates were already byte-identical loops differing only in their
+/// spec list and log label; adding Fallout 76 would have made three copies of
+/// the same assertions, and the per-archive attribution in those messages is
+/// the whole reason these exist separately from the headline `run_game` gate.
+///
+/// Deliberately skips a missing archive with `continue` rather than taking the
+/// whole game down the way [`open_all_mesh_archives`]'s all-or-nothing rule
+/// does: these gates assert *rates*, so an absent archive contributes nothing
+/// and costs nothing. That is the same reasoning behind
+/// `Game::optional_mesh_archives` (#3369), which serves the headline gate.
+fn run_all_meshes_gate(game: Game, archives: &[ArchiveSpec]) {
+    let Some(_data_dir) = common::game_data_dir(game) else {
+        return; // skip cleanly when the game is not installed
+    };
+
+    let mut walked = 0usize;
+    let mut total_nifs = 0usize;
+    for spec in archives {
+        let Some(archive) = open_ba2_by_name(game, spec.name) else {
+            eprintln!("[{}] skipping {}: not found", game.label(), spec.name);
+            continue;
+        };
+        let stats = parse_all_nifs_in_archive(&archive, None);
+        stats.print_summary(&format!("{}/{}", game.label(), spec.name));
+        walked += 1;
+        total_nifs += stats.total;
+
+        // An archive that exists but holds no NIFs is a spec error (wrong
+        // name, or a texture/voice archive listed by mistake), not a pass.
+        assert!(
+            stats.total > 0,
+            "[{}/{}] expected at least one NIF — is this a mesh-bearing archive?",
+            game.label(),
+            spec.name
+        );
+        assert!(
+            stats.recoverable_rate() >= MIN_RECOVERABLE_RATE,
+            "[{}/{}] recoverable rate {:.2}% below 100% threshold ({} hard failures)",
+            game.label(),
+            spec.name,
+            stats.recoverable_rate() * 100.0,
+            stats.failures.len()
+        );
+        assert!(
+            stats.success_rate() >= spec.min_clean,
+            "[{}/{}] clean rate {:.2}% below {:.1}% minimum ({} truncated)",
+            game.label(),
+            spec.name,
+            stats.success_rate() * 100.0,
+            spec.min_clean * 100.0,
+            stats.truncated.len()
+        );
+    }
+    eprintln!(
+        "[{}] all-meshes gate: {}/{} archive(s) present, {} NIFs",
+        game.label(),
+        walked,
+        archives.len(),
+        total_nifs,
+    );
+    // #5232 — the data dir resolved, so at least one spec archive must have
+    // too. Without this, an all-absent corpus (or the pre-#5232 silent
+    // skip-on-open-failure) left the loop body unexecuted and the gate green
+    // with zero NIFs measured.
+    assert!(
+        walked > 0,
+        "[{}] data dir resolved but 0/{} spec archives were present",
+        game.label(),
+        archives.len(),
+    );
+}
+
+/// Full Starfield mesh corpus — walks all 5 vanilla mesh archives so the
+/// per-archive clean rates are each independently gated. The headline
+/// `parse_rate_starfield` test only covers Meshes01 (~35% of total NIFs).
+///
+/// Per-archive minimums (clean %) — refreshed 2026-07-11 (#1900 / NIF-D3-02,
+/// mirroring the FO4 #1457 treatment: measured minus ~0.5% margin, rounded
+/// down to the nearest 0.5%). The 2026-04-27 (#759) floors had gone stale
+/// by 2-3 points on every archive except MeshesPatch:
+///   Meshes01.ba2        ≥ 99.5% (31 058 NIFs; 100.00% actual; was 97.0%)
+///   Meshes02.ba2        ≥ 99.5% ( 7 552 NIFs; 100.00% actual; was 99.0%)
+///   MeshesPatch.ba2     ≥ 99.5% (29 849 NIFs; 99.98% actual; was 98.0%)
+///   LODMeshes.ba2       ≥ 99.5% (19 535 NIFs; 100.00% actual; unchanged)
+///   FaceMeshes.ba2      ≥ 99.5% ( 1 282 NIFs; 100.00% actual; unchanged)
+///
+/// #3397 — MeshesPatch's row was refreshed 2026-08-27. Its `98.91% actual`
+/// was the *pre-#2105* measurement (29 849 − 325 truncated); `b7e0318f` took
+/// that tail 325 → 6, i.e. 99.98%, but the floor was never re-tightened after
+/// the fix it predates. At 98.0% the gate tolerated 597 truncations against
+/// an actual 6 — a full revert of #2105 would have left this test green,
+/// which is precisely the regression it exists to catch (and the shape of
+/// #2201, which only tripped because Meshes02's floor happened to sit at
+/// 99.5%). Now on the same "measured minus ~0.5%" rule as its four siblings.
+#[test]
+#[ignore = "needs Starfield game data on disk"]
+fn parse_rate_starfield_all_meshes() {
+    // #3466 — widened from 5 archives to the full official corpus. The five
+    // originals gated ~74% of shipped NIFs; the omissions were led by
+    // `LODMeshesPatch` (19,540 NIFs — the sibling of the *gated*
+    // `MeshesPatch`) and `ShatteredSpace - Main01` (9,198).
+    //
+    // Floors for the newly-added archives follow the same "measured minus
+    // ~0.5%" rule as their five siblings, measured 2026-08-29.
+    run_all_meshes_gate(
+        Game::Starfield,
+        &[
+            ArchiveSpec {
+                name: "Starfield - Meshes01.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "Starfield - Meshes02.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "Starfield - MeshesPatch.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "Starfield - LODMeshes.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "Starfield - FaceMeshes.ba2",
+                min_clean: 0.995,
+            },
+            // #3466 additions.
+            ArchiveSpec {
+                name: "Starfield - LODMeshesPatch.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "ShatteredSpace - Main01.ba2",
+                min_clean: 0.995,
+            },
+            // `ShatteredSpace - Main02.ba2` is deliberately absent: measured
+            // 2026-08-29 it holds 14,934 files and **zero** NIF entries
+            // (14,799 `.ffxanim`, plus `.btd` terrain and strings). Listing
+            // it would trip this gate's own "is this a mesh-bearing archive?"
+            // assertion, which is what surfaced the fact.
+            ArchiveSpec {
+                name: "SFBGS003 - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "SFBGS004 - Main.ba2",
+                min_clean: 0.995,
+            },
+            // SFBGS006 / SFBGS007 are omitted: measured 2026-08-29 they hold
+            // 27 and 29 files respectively and zero NIF entries.
+            ArchiveSpec {
+                name: "SFBGS008 - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "SFBGS00D - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "SFBGS047 - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "SFBGS050 - Main.ba2",
+                min_clean: 0.995,
+            },
+        ],
+    );
+}
+
+/// #1075 / FO4-D5-005 — Full FO4 mesh corpus across both vanilla
+/// archives (`Fallout4 - Meshes.ba2` + `Fallout4 - MeshesExtra.ba2`).
+/// The headline `parse_rate_fallout_4` test only opens the first; the
+/// `MeshesExtra` archive carries DLC mesh overrides, settlement
+/// construction pieces, weapon mods, and power-armor variants whose
+/// block-type coverage gaps are invisible to the existing test.
+/// Mirrors the Starfield multi-archive pattern (#754 / #759).
+///
+/// Per-archive minimums (clean %) — calibrated from a full sweep on
+/// 2026-06-14 (#1457): both archives parse 100.00% clean / 100%
+/// recoverable (Meshes 34 995/34 995, MeshesExtra 124 871/124 871, 0
+/// truncated). The FaceGen truncation tail the 2026-06-02 audit recorded
+/// (1 238 truncated in Meshes.ba2) is gone. Floors set to 0.995 — within
+/// 0.5% of the measured 100%, rounded down — so a real regression (>0.5%
+/// of the corpus losing clean parse) trips the gate while a single new
+/// FaceGen drift does not.
+#[test]
+#[ignore = "needs FO4 game data on disk"]
+fn parse_rate_fo4_all_meshes() {
+    // #3466 — widened from the two base archives (70.8% of shipped NIFs) with
+    // the six DLC `Main.ba2`s, mirroring the FO3/FNV lists in
+    // `Game::mesh_archives` which already enumerate every DLC. `DLCCoast`
+    // (34,411 NIFs) and `DLCNukaWorld` (27,511) are the bulk of the gap.
+    // `DLCUltraHighResolution` is textures only and stays out.
+    run_all_meshes_gate(
+        Game::Fallout4,
+        &[
+            // 100.00% clean measured 2026-06-14 (#1457); -0.5% margin.
+            ArchiveSpec {
+                name: "Fallout4 - Meshes.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "Fallout4 - MeshesExtra.ba2",
+                min_clean: 0.995,
+            },
+            // #3466 additions.
+            ArchiveSpec {
+                name: "DLCCoast - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "DLCNukaWorld - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "DLCRobot - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "DLCworkshop01 - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "DLCworkshop02 - Main.ba2",
+                min_clean: 0.995,
+            },
+            ArchiveSpec {
+                name: "DLCworkshop03 - Main.ba2",
+                min_clean: 0.995,
+            },
+        ],
+    );
+}
+
+/// #3466 — Fallout 76 had **no** all-meshes gate at all: `Game::mesh_archives`
+/// lists only `SeventySix - Meshes.ba2`, which is 34.8% of the 168,220 NIFs
+/// the game ships. The `unknown_ceiling_fallout_76` baseline reads
+/// `unknown_blocks 0` and passes precisely because that one archive genuinely
+/// has zero — every `BSDistantObjectExtraData` block (#3461) sits in the
+/// content no gate opened.
+///
+/// MEASURED 2026-08-29, and the reason this gate was worth adding: the two
+/// `GeneratedMeshes` archives carried a large truncation tail no gate had
+/// ever seen (`GeneratedMeshes02` 0.00% clean, `GeneratedMeshes01` 95.03%),
+/// pointing at the `BSDistantObjectExtraData` dispatch gap of #3461.
+/// #4628 — re-measured 2026-10-03 on the post-2026-09-20 install: all five
+/// archives are 100.00% clean (102,980 NIFs total), so the two
+/// `GeneratedMeshes` floors were re-tightened from 0.945/0.0 to the
+/// measured−0.5% convention — at 0.0 the gate would have tolerated a full
+/// return of the 2,055-NIF truncation tail against an actual zero.
+///
+/// #4628 — the 16 `*UpdateMain` patch archives this list carried (00–15,
+/// measured 2026-08-29) are gone from the current install: the 2026-09-20
+/// rewrite of `SeventySix - Meshes.ba2` (58,469 → 63,305 NIFs) folded the
+/// live-service patch stack back into the base archive, so all 16 entries
+/// resolved to "skipping: not found" and silently un-walked the gate.
+/// `SeventySix - Startup.ba2` (12 NIFs) ships with the base game and is the
+/// remaining mesh-bearing archive the old list missed.
+///
+/// Historical NOTE (#3466): the `block_coverage_baselines` /
+/// `per_block_baselines` baselines were once deliberately NOT regenerated
+/// alongside this gate, because doing so before #3461 landed would have
+/// baked FO76's then-112,716 `NiUnknown` blocks into the accepted ceiling.
+/// #3461 landed 2026-09-02 and #4628 regenerated `fallout_76.tsv` with 0
+/// unknowns; #5260 since re-measured the other three drift-stale coverage
+/// totals (FO4 805,148 / FO76 1,770,751 / SSE 856,103, all 0 NiUnknown)
+/// and the ceiling gate now pins `total_blocks` itself, so a rewritten
+/// install can never drift silently again. This gate is rate-based, so it
+/// can widen independently — which is the whole reason the two tiers are
+/// separate.
+#[test]
+#[ignore = "needs FO76 game data on disk"]
+fn parse_rate_fo76_all_meshes() {
+    run_all_meshes_gate(
+        Game::Fallout76,
+        &[
+            ArchiveSpec {
+                name: "SeventySix - Meshes.ba2",
+                min_clean: 0.995,
+            },
+            // `SeventySix - MeshesExtra.ba2` is deliberately absent despite the
+            // name: measured 2026-08-29 it is 2,219 files, all `.tome`, and
+            // zero NIF entries. The issue's suggested list included it.
+            ArchiveSpec {
+                name: "SeventySix - StaticMeshes.ba2",
+                min_clean: 0.995,
+            },
+            // 100.00% clean re-measured 2026-10-03 (#4628 install rewrite;
+            // 20,270 NIFs now). Floor is measured−0.5% per the convention —
+            // it was 0.945 against the pre-rewrite 95.03% with its 1,007-NIF
+            // truncation tail.
+            ArchiveSpec {
+                name: "SeventySix - GeneratedMeshes01.ba2",
+                min_clean: 0.995,
+            },
+            // 100.00% clean re-measured 2026-10-03 (2,055 NIFs now; the
+            // pre-rewrite archive truncated every NIF it had). Floor is
+            // measured−0.5% per the convention; the old 0.0 floor was honest
+            // bookkeeping for a tail this install no longer ships.
+            ArchiveSpec {
+                name: "SeventySix - GeneratedMeshes02.ba2",
+                min_clean: 0.995,
+            },
+            // 12 NIFs, added with the #4628 list repair. Floor measured−0.5%
+            // per the convention.
+            ArchiveSpec {
+                name: "SeventySix - Startup.ba2",
+                min_clean: 0.995,
+            },
+        ],
+    );
+}
+
+/// Smoke subset — runs the first 50 NIFs from each available game in one
+/// test so `cargo test -- --ignored` gives a fast signal without waiting
+/// for the full per-game sweep. Useful during parser refactors.
+#[test]
+#[ignore = "needs FNV game data on disk"]
+fn parse_rate_smoke_all_games() {
+    for game in [
+        Game::FalloutNV,
+        Game::Fallout3,
+        Game::SkyrimLE,
+        Game::SkyrimSE,
+        Game::Oblivion,
+        Game::Fallout4,
+        Game::Fallout76,
+        Game::Starfield,
+    ] {
+        let Some(archive) = open_mesh_archive(game) else {
+            continue;
+        };
+        let stats = parse_all_nifs_in_archive(&archive, Some(50));
+        stats.print_summary(&format!("{} (smoke)", game.label()));
+        if stats.total > 0 {
+            assert!(
+                stats.recoverable_rate() >= MIN_RECOVERABLE_RATE,
+                "[{} smoke] parse recoverable rate {:.2}% below threshold",
+                game.label(),
+                stats.recoverable_rate() * 100.0,
+            );
+        }
+    }
+}
+
+/// #401 — particle emitters must surface from real game content. Walks
+/// the first up-to-200 NIFs in any candidate folder (`fire`, `smoke`,
+/// `fx`, etc.) of every available reference archive, parses each, and
+/// asserts that each one produces at least one
+/// [`ImportedParticleEmitterFlat`]. Pre-fix the importer dropped every
+/// NiPSysBlock and every torch rendered as an invisible node — this test
+/// would have caught it.
+///
+/// #3286 — this used to `return` on the **first** game that yielded any
+/// emitters. FNV is first in the list and always yields them, so on any
+/// machine with FNV data installed the loop never reached Fallout 3,
+/// Oblivion or Skyrim SE — confirmed by `--nocapture`, which printed only
+/// the `[Fallout New Vegas]` line. That made this test useless as the
+/// coverage it was cited for: FO3's typed-particle decode
+/// (`extract_emitter_params` / `extract_emitter_rate`) shares FNV's
+/// dispatch with no FO3 gate, but "shares the code path" is an inference,
+/// and this is the one piece of real-archive infrastructure that could
+/// turn it into a verified fact. Every present archive is now swept and
+/// asserted independently.
+#[test]
+#[ignore = "needs FNV game data on disk"]
+fn real_archive_torch_meshes_surface_particle_emitters() {
+    use byroredux_nif::import::import_nif_particle_emitters;
+
+    let candidate_folders = ["fire", "fx", "smoke", "fxsmoke", "magic", "effects"];
+    let games_to_try = [
+        Game::FalloutNV,
+        Game::Fallout3,
+        Game::Oblivion,
+        Game::SkyrimSE,
+    ];
+
+    let mut swept: Vec<(Game, usize, usize)> = Vec::new();
+    let mut barren: Vec<Game> = Vec::new();
+    // (game, emitters, with_params, with_rate, with_budget) — see #3343.
+    let mut magnitudes: Vec<(Game, usize, usize, usize, usize)> = Vec::new();
+    for game in games_to_try {
+        let Some(archive) = open_mesh_archive(game) else {
+            continue;
+        };
+        let all_files = archive.list_files();
+        let mut total_emitters = 0usize;
+        let mut paths_with_emitters: Vec<String> = Vec::new();
+        // #3343 — presence alone is not coverage. Pre-fix the loop asserted
+        // only `!emitters.is_empty()`, so a regression that zeroed every
+        // authored rate, radius, life or base_scale left this test green: it
+        // could detect the emitter *blocks* vanishing and nothing else, which
+        // is precisely what the typed-emitter decode (`5708b5b9` / `9db60714`)
+        // needed pinned. Accumulate decoded magnitudes alongside the count.
+        let mut with_params = 0usize;
+        let mut with_rate = 0usize;
+        let mut with_budget = 0usize;
+        // Walk up to 200 candidate NIFs per game so the test stays
+        // fast (a few seconds) but has enough samples to find at least
+        // one emitter in any reasonable mesh archive.
+        let candidates: Vec<&String> = all_files
+            .iter()
+            .filter(|f| {
+                let lower = f.to_ascii_lowercase();
+                lower.ends_with(".nif") && candidate_folders.iter().any(|c| lower.contains(c))
+            })
+            .take(200)
+            .collect();
+
+        for path in &candidates {
+            let bytes = match archive.extract(path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let scene = match byroredux_nif::parse_nif(&bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let emitters = import_nif_particle_emitters(&scene);
+            if !emitters.is_empty() {
+                total_emitters += emitters.len();
+                for em in &emitters {
+                    // A decoded param block must carry finite, positive spawn
+                    // magnitudes — a zeroed or NaN decode is the regression
+                    // this counts against, not a legitimately absent block.
+                    if let Some(p) = &em.emitter_params {
+                        if p.initial_radius.is_finite()
+                            && p.initial_radius > 0.0
+                            && p.life_span.is_finite()
+                            && p.life_span > 0.0
+                        {
+                            with_params += 1;
+                        }
+                    }
+                    if em.emitter_rate.is_some_and(|r| r.is_finite() && r > 0.0) {
+                        with_rate += 1;
+                    }
+                    if em.max_particles.is_some_and(|m| m > 0) {
+                        with_budget += 1;
+                    }
+                }
+                if paths_with_emitters.len() < 5 {
+                    paths_with_emitters.push((*path).clone());
+                }
+            }
+        }
+
+        if total_emitters > 0 {
+            eprintln!(
+                "[{}] {} emitters across {} meshes (params={} rate={} budget={}) \
+                 (sampled {} NIFs from candidate folders)",
+                game.label(),
+                total_emitters,
+                paths_with_emitters.len(),
+                with_params,
+                with_rate,
+                with_budget,
+                candidates.len(),
+            );
+            for p in &paths_with_emitters {
+                eprintln!("  example: {}", p);
+            }
+        } else {
+            eprintln!(
+                "[{}] NO emitters in {} candidate NIFs",
+                game.label(),
+                candidates.len(),
+            );
+            barren.push(game);
+        }
+        swept.push((game, candidates.len(), total_emitters));
+        magnitudes.push((game, total_emitters, with_params, with_rate, with_budget));
+    }
+
+    if swept.is_empty() {
+        eprintln!("no reference game data available — skipping (set BYROREDUX_*_DATA env vars)");
+        return;
+    }
+    assert!(
+        barren.is_empty(),
+        "these installed archives yielded zero particle emitters across their \
+         candidate folders: {:?} — the importer regressed for them (the audit's \
+         invisible-torch failure mode is back). Swept: {:?}",
+        barren.iter().map(|g| g.label()).collect::<Vec<_>>(),
+        swept
+            .iter()
+            .map(|(g, c, e)| (g.label(), *c, *e))
+            .collect::<Vec<_>>(),
+    );
+    eprintln!(
+        "[emitters] {} archive(s) swept, all non-zero: {:?}",
+        swept.len(),
+        swept
+            .iter()
+            .map(|(g, _, e)| (g.label(), *e))
+            .collect::<Vec<_>>(),
+    );
+
+    // #3343 — magnitude floors. Presence-only assertions above prove the
+    // emitter blocks are still found; these prove the typed decode still
+    // produces usable numbers out of them.
+    //
+    // Floors are fractions, not the absolute counts the audit quoted. This
+    // test samples the first 200 candidate NIFs per game, and `list_files()`
+    // does not return a stable order — two consecutive runs over the same FNV
+    // archive sampled 346 and then 439 emitters. An absolute pin would be
+    // flaky by construction. A fraction is invariant to which 200 files the
+    // sample happens to draw.
+    //
+    // Measured at fix time, all four installed games decoded params and budget
+    // for **100%** of the emitters they sampled — the absolute sample size
+    // moved run to run (FNV drew 220, 346 and 439 across three runs) but the
+    // ratio did not budge. A 50% floor therefore leaves wide headroom for a
+    // content-scope change while a decode that zeroes or NaNs the authored
+    // magnitudes drops straight through it. Live counts print on every run.
+    //
+    // `params` and `budget` are near-universal on real content: essentially
+    // every authored emitter carries a `NiPSysEmitter` base block and a
+    // `NiPSysData` budget.
+    //
+    // #3754 — `rate` now carries a per-game floor too. It used to be pinned
+    // only by `total_rate > 0` further down, i.e. "some emitter in some
+    // installed archive decoded a rate" — which cannot see a regression that
+    // takes out one game, or most of one. That is exactly the shape of the
+    // defect this floor was added for: authored ramp-up curves were being
+    // discarded whole on 20 of FO3's 294 emitter meshes and the suite stayed
+    // green, because the files legitimately reported `None` and nothing
+    // counted the ratio.
+    //
+    // Measured 2026-08-30 over this test's own sampled population, which is
+    // richer than the whole archive (it draws only from `fire`/`fx`/`smoke`/
+    // `magic`/`effects`, the folders that author rates):
+    //
+    //     FNV 236/237 (99.6%) · FO3 111/115 (96.5%)
+    //     Oblivion 272/272 · Skyrim SE 138/138 (100%)
+    //
+    // Same 50% floor as its siblings, for the same reason: the sample is a
+    // non-deterministic 200 files, so the floor has to tolerate a different
+    // draw while still catching a chain that stops decoding.
+    const MIN_PARAMS_FRACTION: f64 = 0.50;
+    const MIN_BUDGET_FRACTION: f64 = 0.50;
+    const MIN_RATE_FRACTION: f64 = 0.50;
+    let mut magnitude_failures: Vec<String> = Vec::new();
+    let mut total_rate = 0usize;
+    for (game, emitters, params, rate, budget) in &magnitudes {
+        total_rate += *rate;
+        let n = *emitters as f64;
+        if (*params as f64) < n * MIN_PARAMS_FRACTION {
+            magnitude_failures.push(format!(
+                "{}: only {}/{} emitters decoded finite positive initial_radius+life_span (floor {:.0}%)",
+                game.label(),
+                params,
+                emitters,
+                MIN_PARAMS_FRACTION * 100.0,
+            ));
+        }
+        if (*budget as f64) < n * MIN_BUDGET_FRACTION {
+            magnitude_failures.push(format!(
+                "{}: only {}/{} emitters decoded a non-zero BS Max Vertices budget (floor {:.0}%)",
+                game.label(),
+                budget,
+                emitters,
+                MIN_BUDGET_FRACTION * 100.0,
+            ));
+        }
+        if (*rate as f64) < n * MIN_RATE_FRACTION {
+            magnitude_failures.push(format!(
+                "{}: only {}/{} emitters decoded a finite positive birth rate \
+                 (floor {:.0}%) — the NiPSysEmitterCtlr -> interpolator chain \
+                 regressed for this game (#3754)",
+                game.label(),
+                rate,
+                emitters,
+                MIN_RATE_FRACTION * 100.0,
+            ));
+        }
+    }
+    assert!(
+        magnitude_failures.is_empty(),
+        "authored particle magnitudes regressed — the emitter blocks are still \
+         found but their decoded values are not usable: {:?}",
+        magnitude_failures,
+    );
+    // Retained below the per-game floor as the cross-corpus backstop it has
+    // always been: it fires even if every game somehow reported zero
+    // emitters, where the per-game ratio has nothing to divide.
+    assert!(
+        total_rate > 0,
+        "no emitter in any swept archive decoded a finite positive birth rate — \
+         the NiPSysEmitterCtlr -> interpolator chain regressed (#3343). Swept: {:?}",
+        magnitudes
+            .iter()
+            .map(|(g, e, p, r, b)| (g.label(), *e, *p, *r, *b))
+            .collect::<Vec<_>>(),
+    );
+    eprintln!(
+        "[emitters] magnitude floors OK: {:?}",
+        magnitudes
+            .iter()
+            .map(|(g, e, p, r, b)| (g.label(), *e, *p, *r, *b))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// #689 — verify the empirical absence of `NiSequenceStreamHelper` in
+/// vanilla content. The 2026-04-25 audit (and the 2026-04-17 audit
+/// before it) inferred a missing-importer-path bug from the comment in
+/// `crates/nif/src/blocks/controller.rs` that says we don't consume the
+/// block. This test walks Oblivion + FNV + Skyrim SE meshes archives
+/// (`.nif` + `.kf`) and asserts zero `NiSequenceStreamHelper` blocks
+/// across the whole corpus — pinning the audit's stale premise so a
+/// future audit doesn't spend cycles on it.
+///
+/// If this assertion ever fires, vanilla content has appeared that
+/// uses the legacy chain and the importer needs the Path-3 arm sketched
+/// in `.claude/issues/689/INVESTIGATION.md`.
+#[test]
+#[ignore = "needs Oblivion/FNV/Skyrim SE game data on disk"]
+fn vanilla_archives_have_zero_nisequencestreamhelper() {
+    let games = [Game::Oblivion, Game::FalloutNV, Game::SkyrimSE];
+    let mut total_scanned = 0usize;
+    let mut total_ssh = 0usize;
+    let mut ssh_examples: Vec<(String, String)> = Vec::new();
+    let mut tried_any_archive = false;
+
+    for game in games {
+        let Some(archive) = open_mesh_archive(game) else {
+            continue;
+        };
+        tried_any_archive = true;
+        for path in archive.list_files() {
+            let lower = path.to_ascii_lowercase();
+            if !(lower.ends_with(".nif") || lower.ends_with(".kf")) {
+                continue;
+            }
+            total_scanned += 1;
+            let Ok(bytes) = archive.extract(&path) else {
+                continue;
+            };
+            let Ok(scene) = byroredux_nif::parse_nif(&bytes) else {
+                continue;
+            };
+            for block in &scene.blocks {
+                if block.block_type_name() == "NiSequenceStreamHelper" {
+                    total_ssh += 1;
+                    if ssh_examples.len() < 8 {
+                        ssh_examples.push((game.label().to_string(), path.clone()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if !tried_any_archive {
+        eprintln!("no reference game data available — skipping (set BYROREDUX_*_DATA env vars)");
+        return;
+    }
+
+    eprintln!(
+        "scanned {} files across vanilla Oblivion + FNV + Skyrim SE meshes BSAs",
+        total_scanned
+    );
+    eprintln!("NiSequenceStreamHelper occurrences: {}", total_ssh);
+
+    assert_eq!(
+        total_ssh,
+        0,
+        "expected zero NiSequenceStreamHelper blocks in vanilla content; found {} \
+         (first {} examples: {:?}). The importer's Path 3 arm is now needed — \
+         see .claude/issues/689/INVESTIGATION.md for the fix sketch.",
+        total_ssh,
+        ssh_examples.len(),
+        ssh_examples
+    );
+}
+
+/// #3369 regression — the two archive tiers must stay disjoint and the
+/// optional one must actually name Skyrim's Creation Club / Anniversary
+/// corpus. #3712 widened this to also pin Oblivion's eight vanilla DLC
+/// archives and the `Skyrim - Animations.bsa` entry that fix's own
+/// SIBLING check found missing from both games' lists.
+///
+/// Needs no game data on purpose: the defect #3369 filed was a *list*
+/// omission, so the guard belongs on the list, where it also runs on the
+/// CI machine that has no `Data/` at all. The halves it pins:
+///
+/// * Disjointness — an entry in both tiers would be walked twice by this
+///   gate, double-counting its NIFs into the rate.
+/// * Non-empty for Skyrim SE — the whole point of #3369. If someone
+///   "simplifies" the arm back to `_ => &[]`, the 715+44 NIFs silently
+///   fall out of the gate again with nothing turning red.
+/// * Non-empty for Oblivion (#3712) — the 1,580 DLC NIFs (16.4% of the
+///   full corpus) that were covered by no test in the repository before
+///   this fix, on the one game where an undispatched sizeless block
+///   truncates the rest of the scene rather than degrading gracefully.
+#[test]
+fn archive_tiers_are_disjoint_and_skyrim_optional_is_populated() {
+    for game in Game::ALL {
+        let required = game.mesh_archives();
+        for opt in game.optional_mesh_archives() {
+            assert!(
+                !required.contains(opt),
+                "[{}] {opt:?} is in both mesh_archives() and optional_mesh_archives(); \
+                 run_game would walk it twice",
+                game.label(),
+            );
+        }
+    }
+
+    let skyrim = Game::SkyrimSE.optional_mesh_archives();
+    for expected in [
+        "_ResourcePack.bsa",
+        "ccBGSSSE001-Fish.bsa",
+        "ccBGSSSE025-AdvDSGS.bsa",
+        "ccBGSSSE037-Curios.bsa",
+        "ccQDRSSE001-SurvivalMode.bsa",
+        "Skyrim - Animations.bsa",
+    ] {
+        assert!(
+            skyrim.contains(&expected),
+            "#3369/#3712: {expected:?} dropped out of Skyrim SE's optional mesh archives — \
+             the NIFs it guards are unreachable from the parse-rate gate again",
+        );
+    }
+
+    let oblivion = Game::Oblivion.optional_mesh_archives();
+    for expected in [
+        "Knights.bsa",
+        "DLCBattlehornCastle.bsa",
+        "DLCFrostcrag.bsa",
+        "DLCHorseArmor.bsa",
+        "DLCOrrery.bsa",
+        "DLCShiveringIsles - Meshes.bsa",
+        "DLCThievesDen.bsa",
+        "DLCVileLair.bsa",
+    ] {
+        assert!(
+            oblivion.contains(&expected),
+            "#3712: {expected:?} dropped out of Oblivion's optional mesh archives — \
+             1,580 DLC NIFs (16.4% of the corpus) are unreachable from the parse-rate \
+             gate, and from oblivion_block_count_parity's truncation-cascade check, again",
+        );
+    }
+}
+
+/// #3924 — the runtime and this gate must sweep the same present-only tier.
+///
+/// Checked for both games that have one. Skyrim SE is the case the issue
+/// named; Oblivion turned out to have the identical gap, and a larger one —
+/// its profile listed `Oblivion - Meshes.bsa` alone while this gate has swept
+/// eight vanilla DLC archives since #3712, 1,580 NIFs / 16.4% of the corpus.
+///
+/// `Game::optional_mesh_archives` above is a test-harness concept: #3369
+/// extended it so the parse-rate gate would stop ignoring the 715 NIFs an
+/// Anniversary Edition install ships in `_ResourcePack.bsa` and the Creation
+/// Club bundles. The engine had no counterpart at all — the `skyrim_se`
+/// profile named none of them, and none is a numeric sibling of a listed
+/// archive, so `numeric_sibling_paths` could not reach them either. The gate
+/// was therefore certifying content the engine could not open, and
+/// `--esm ccBGSSSE001-Fish.esm` — the natural way to reach AE content, and
+/// the case #3369 widened the gate for — was a 404 surface.
+///
+/// `assets/debug_profiles.toml` now carries the runtime half. This asserts
+/// every name in the harness tier is reachable from the profile, in either
+/// its required (`default_bsas`) or its present-only (`optional_bsas`) list
+/// — `Skyrim - Animations.bsa` sits in the former, being on every install.
+///
+/// One-way by design: the profile may name more than this gate sweeps, and
+/// does. A texture- or sound-only add-on archive (Shivering Isles ships its
+/// textures, sounds and voices separately from its meshes) belongs in the
+/// runtime tier and has no business in a *mesh* corpus list.
+///
+/// Read as text rather than parsed: this crate has no TOML dependency and
+/// no reason to grow one for a name check. The section is sliced at the next
+/// `[profiles.` header so a name belonging to a different game cannot
+/// satisfy it.
+#[test]
+fn skyrim_optional_archives_match_the_corpus_gate_tier() {
+    let toml_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/debug_profiles.toml");
+    let toml =
+        std::fs::read_to_string(&toml_path).unwrap_or_else(|e| panic!("read {toml_path:?}: {e}"));
+
+    for (game, header) in [
+        (Game::SkyrimSE, "[profiles.skyrim_se]"),
+        (Game::Oblivion, "[profiles.oblivion]"),
+    ] {
+        let start = toml
+            .find(header)
+            .unwrap_or_else(|| panic!("{toml_path:?} has no {header} block"))
+            + header.len();
+        let section = match toml[start..].find("\n[profiles.") {
+            Some(end) => &toml[start..start + end],
+            None => &toml[start..],
+        };
+
+        let missing: Vec<&str> = game
+            .optional_mesh_archives()
+            .iter()
+            .copied()
+            .filter(|name| !section.contains(&format!("\"{name}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "#3924: {missing:?} are swept by this gate but named nowhere in \
+             {header} — the gate would be measuring parse coverage for content \
+             the engine has no way to open. Add them to that profile's \
+             `optional_bsas` (present-only) or `default_bsas` (every install).",
+        );
+    }
+}

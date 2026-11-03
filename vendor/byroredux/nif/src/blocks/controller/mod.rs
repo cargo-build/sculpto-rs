@@ -1,0 +1,902 @@
+//! NIF animation controller blocks.
+//!
+//! Covers the NiTimeController hierarchy and NiControllerSequence.
+//! Parsed enough to advance the stream correctly; actual animation
+//! interpretation comes later.
+
+use super::base::NiObjectNETData;
+use super::NiObject;
+use crate::impl_ni_object;
+use crate::stream::NifStream;
+use crate::types::BlockRef;
+use crate::version::NifVersion;
+use std::any::Any;
+use std::io;
+use std::sync::Arc;
+
+mod legacy;
+mod morph;
+mod sequence;
+#[cfg(test)]
+mod sequence_pre_10_1_0_106_tests;
+mod shader;
+
+pub use legacy::{NiLookAtController, NiPathController, NiSequenceStreamHelper, NiUVController};
+pub use morph::{MorphTarget, MorphWeight, NiGeomMorpherController, NiMorphData};
+pub use sequence::{
+    BsRefractionFirePeriodController, ControlledBlock, NiControllerManager, NiControllerSequence,
+    NiMultiTargetTransformController,
+};
+pub use shader::{
+    BsShaderController, NiLightColorController, NiLightFloatController, NiMaterialColorController,
+    NiTextureTransformController, ShaderControllerKind,
+};
+
+// ── NiTimeController base ──────────────────────────────────────────────
+
+/// Base fields for all NiTimeController subclasses (26 bytes).
+#[derive(Debug)]
+pub struct NiTimeControllerBase {
+    pub next_controller_ref: BlockRef,
+    pub flags: u16,
+    pub frequency: f32,
+    pub phase: f32,
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub target_ref: BlockRef,
+}
+
+impl NiTimeControllerBase {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let next_controller_ref = stream.read_block_ref()?;
+        let flags = stream.read_u16_le()?;
+        let frequency = stream.read_f32_le()?;
+        let phase = stream.read_f32_le()?;
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let target_ref = stream.read_block_ref()?;
+        Ok(Self {
+            next_controller_ref,
+            flags,
+            frequency,
+            phase,
+            start_time,
+            stop_time,
+            target_ref,
+        })
+    }
+}
+
+/// Parse the `NiInterpController` abstract layer: the `NiTimeController`
+/// base (26 B) plus the `Manager Controlled` 1-byte bool that
+/// `NiInterpController` inserts `since="10.1.0.104" until="10.1.0.108"`
+/// (nif.xml), between the base and the `NiSingleInterpController.Interpolator`
+/// ref. The flag value is consumed for stream-position correctness only —
+/// the engine does not yet act on controller-manager sequencing — so it is
+/// read-and-discarded rather than threaded into every controller struct.
+///
+/// On all retail Bethesda versions (Oblivion 20.0.0.x, FO3+ 20.2.0.7) the
+/// gate is false and this is exactly `NiTimeControllerBase::parse`; the bool
+/// only appears on old Gamebryo content in the 10.1.0.104–108 band (e.g.
+/// Oblivion's `_1stperson\skeleton.nif`). Used by every NiInterpController
+/// descendant: `NiSingleInterpController` (and its whole subtree),
+/// `NiMultiTargetTransformController`, `NiGeomMorpherController`.
+/// `NiMorphController` is `until=10.0.1.0` (disjoint from the bool's
+/// `since=10.1.0.104`), so it correctly stays on the plain base. (#1506)
+pub(crate) fn parse_interp_controller_base(
+    stream: &mut NifStream,
+) -> io::Result<NiTimeControllerBase> {
+    let base = NiTimeControllerBase::parse(stream)?;
+    if stream.version().has_interp_controller_manager_controlled() {
+        let _manager_controlled = stream.read_bool()?;
+    }
+    Ok(base)
+}
+
+// ── NiTimeController (fallback for unknown controller subtypes) ────────
+
+/// Stub for unknown controller types. Reads only the base 26 bytes.
+#[derive(Debug)]
+pub struct NiTimeController {
+    pub base: NiTimeControllerBase,
+}
+
+impl NiTimeController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        Ok(Self {
+            base: NiTimeControllerBase::parse(stream)?,
+        })
+    }
+}
+
+// ── BSLagBoneController ────────────────────────────────────────────────
+//
+// Skyrim+ controller that trails a bone behind an actor (cape sway,
+// hair drag, dragon-wing physics, banner cloth). nif.xml ships three
+// trailing floats after the NiTimeController base:
+//
+//   Linear Velocity   (f32)  — How long it takes to rotate about an
+//                              actor back to the rest position.
+//   Linear Rotation   (f32)  — How the bone lags rotation.
+//   Maximum Distance  (f32)  — How far the bone will tail an actor.
+//
+// Pre-#837 the type fell through to the NiTimeController base-only
+// stub, so the trailing 12 bytes were eaten by `block_size` recovery
+// and 42-78 WARN-level realignment events fired per Skyrim Meshes0
+// sweep — drowning out real per-block drift bugs (#838).
+#[derive(Debug)]
+pub struct BsLagBoneController {
+    pub base: NiTimeControllerBase,
+    pub linear_velocity: f32,
+    pub linear_rotation: f32,
+    pub maximum_distance: f32,
+}
+
+impl BsLagBoneController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiTimeControllerBase::parse(stream)?;
+        let linear_velocity = stream.read_f32_le()?;
+        let linear_rotation = stream.read_f32_le()?;
+        let maximum_distance = stream.read_f32_le()?;
+        Ok(Self {
+            base,
+            linear_velocity,
+            linear_rotation,
+            maximum_distance,
+        })
+    }
+}
+
+// ── BSProceduralLightningController ────────────────────────────────────
+//
+// Skyrim+ lightning-effect controller paired with dummy TriShapes to
+// generate procedural lightning bolt geometry (storm spells, special
+// effects). Per nif.xml: 9 interpolator refs driving generation /
+// mutation / subdivision / branch count / branch-count variation /
+// length / length-variation / width / arc-offset, then bolt-shape
+// scalars (subdivisions u16, num_branches u16, num_branches_var u16,
+// 6 floats, 3 byte-bools), then a Shader Property ref.
+//
+// 73 trailing bytes total (Skyrim version) on top of NiTimeController.
+// Pre-#837 these all fell into `block_size` recovery and produced
+// per-block WARN noise on the 3 Meshes0 instances per sweep (rare
+// content — fewer than BSLagBoneController, but on the same channel).
+#[derive(Debug)]
+pub struct BsProceduralLightningController {
+    pub base: NiTimeControllerBase,
+    pub interp_generation: BlockRef,
+    pub interp_mutation: BlockRef,
+    pub interp_subdivision: BlockRef,
+    pub interp_num_branches: BlockRef,
+    pub interp_num_branches_var: BlockRef,
+    pub interp_length: BlockRef,
+    pub interp_length_var: BlockRef,
+    pub interp_width: BlockRef,
+    pub interp_arc_offset: BlockRef,
+    pub subdivisions: u16,
+    pub num_branches: u16,
+    pub num_branches_variation: u16,
+    pub length: f32,
+    pub length_variation: f32,
+    pub width: f32,
+    pub child_width_mult: f32,
+    pub arc_offset: f32,
+    pub fade_main_bolt: bool,
+    pub fade_child_bolts: bool,
+    pub animate_arc_offset: bool,
+    pub shader_property: BlockRef,
+}
+
+impl BsProceduralLightningController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiTimeControllerBase::parse(stream)?;
+        let interp_generation = stream.read_block_ref()?;
+        let interp_mutation = stream.read_block_ref()?;
+        let interp_subdivision = stream.read_block_ref()?;
+        let interp_num_branches = stream.read_block_ref()?;
+        let interp_num_branches_var = stream.read_block_ref()?;
+        let interp_length = stream.read_block_ref()?;
+        let interp_length_var = stream.read_block_ref()?;
+        let interp_width = stream.read_block_ref()?;
+        let interp_arc_offset = stream.read_block_ref()?;
+        let subdivisions = stream.read_u16_le()?;
+        let num_branches = stream.read_u16_le()?;
+        let num_branches_variation = stream.read_u16_le()?;
+        let length = stream.read_f32_le()?;
+        let length_variation = stream.read_f32_le()?;
+        let width = stream.read_f32_le()?;
+        let child_width_mult = stream.read_f32_le()?;
+        let arc_offset = stream.read_f32_le()?;
+        let fade_main_bolt = stream.read_bool()?;
+        let fade_child_bolts = stream.read_bool()?;
+        let animate_arc_offset = stream.read_bool()?;
+        let shader_property = stream.read_block_ref()?;
+        Ok(Self {
+            base,
+            interp_generation,
+            interp_mutation,
+            interp_subdivision,
+            interp_num_branches,
+            interp_num_branches_var,
+            interp_length,
+            interp_length_var,
+            interp_width,
+            interp_arc_offset,
+            subdivisions,
+            num_branches,
+            num_branches_variation,
+            length,
+            length_variation,
+            width,
+            child_width_mult,
+            arc_offset,
+            fade_main_bolt,
+            fade_child_bolts,
+            animate_arc_offset,
+            shader_property,
+        })
+    }
+}
+
+// ── NiSingleInterpController ───────────────────────────────────────────
+// Adds: interpolator_ref (Ref = i32 = 4 bytes) for version >= 10.1.0.104.
+// Subclasses: NiTransformController, NiVisController, NiAlphaController,
+//             NiTextureTransformController, NiKeyframeController, etc.
+
+/// Controller with a single interpolator reference.
+/// Used for NiTransformController, NiVisController, NiAlphaController,
+/// NiTextureTransformController, and BSShader*Controller types.
+#[derive(Debug)]
+pub struct NiSingleInterpController {
+    pub base: NiTimeControllerBase,
+    pub interpolator_ref: BlockRef,
+}
+
+impl NiSingleInterpController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // NiInterpController layer (base + Manager Controlled bool, #1506).
+        let base = parse_interp_controller_base(stream)?;
+        // NiSingleInterpController: interpolator ref (since 10.1.0.104)
+        let interpolator_ref = if stream.version() >= NifVersion::V10_1_0_104 {
+            stream.read_block_ref()?
+        } else {
+            BlockRef::NULL
+        };
+        Ok(Self {
+            base,
+            interpolator_ref,
+        })
+    }
+}
+
+// ── BSMaterialEmittanceMultController / BSRefractionStrengthController /
+//    BSFrustumFOVController ───────────────────────────────────────────
+//
+// Per nif.xml:6780 / 6802 / 7019, all three inherit `NiFloatInterpController`
+// -> `NiSingleInterpController` with no fields of their own, so the byte
+// parse is identical to the shared base — pre-#3327 they parsed straight
+// into a bare `NiSingleInterpController`, which is byte-correct but erases
+// their RTTI the same way the `NiKeyframeController`/etc. family did before
+// #2562/#2563 (see that section's comment above for the general shape of
+// the problem). `anim/entry.rs` dispatches by `block_type_name()` string, so
+// all three landed in the shared "NiSingleInterpController" arm, which only
+// attempts `extract_transform_channel_at` — none of them drive a transform,
+// so it silently produced nothing. #3327.
+
+/// `BSMaterialEmittanceMultController` / `BSRefractionStrengthController` /
+/// `BSFrustumFOVController` — see the module comment above. Parser-scope
+/// fix only (#3327): this restores correct RTTI/dispatch so
+/// `anim/entry.rs` can route the two material-float controllers through
+/// `extract_float_channel_at`. `BSFrustumFOVController`'s camera-FOV
+/// animation has no ECS/render consumer yet — its arm preserves RTTI but
+/// intentionally extracts no channel (see `anim/entry.rs`).
+#[derive(Debug)]
+pub struct BsNamedFloatInterpController {
+    /// Original block type name, so `block_type_name()` reports the real
+    /// RTTI instead of the shared "NiSingleInterpController" label.
+    pub type_name: &'static str,
+    pub base: NiSingleInterpController,
+}
+
+impl NiObject for BsNamedFloatInterpController {
+    fn block_type_name(&self) -> &'static str {
+        self.type_name
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl BsNamedFloatInterpController {
+    pub fn parse(stream: &mut NifStream, type_name: &'static str) -> io::Result<Self> {
+        Ok(Self {
+            type_name,
+            base: NiSingleInterpController::parse(stream)?,
+        })
+    }
+}
+
+// ── NiKeyframeController / NiTransformController / NiVisController /
+//    NiAlphaController ────────────────────────────────────────────────
+//
+// Each declares exactly one additional field beyond
+// NiSingleInterpController: `Data` (a Ref, `until="10.1.0.103"`) — the
+// pre-Gamebryo-10.1.0.104 complement to the `since="10.1.0.104"`
+// interpolator ref NiSingleInterpController::parse already gates
+// correctly. NiTransformController is a bare nif.xml rename of
+// NiKeyframeController with zero fields of its own, so it carries the
+// same Data ref. Mirrors BsKeyframeController's existing `data_ref`
+// field (#1337).
+//
+// Pre-#2562/#2563 all four parsed as a bare NiSingleInterpController —
+// the Data ref simply never read, dropping the stream 4 bytes short of
+// the block boundary on any file below v10.1.0.104. This was the last
+// remaining Oblivion NIF truncation: `marker_map.nif` (v4.2.1.0) dropped
+// 8 of its 13 blocks, including both NiTriShape subtrees, because the
+// desync cascaded through every block after the NiKeyframeController.
+//
+// Giving these a dedicated type (rather than leaving them as a bare
+// NiSingleInterpController) also restores their real block-type-name
+// RTTI, which `anim/entry.rs`'s embedded-controller extraction already
+// dispatches on by string — seeing "NiSingleInterpController" instead
+// of e.g. "NiAlphaController" for a bare-typed block, per that RTTI
+// erasure, made those match arms unreachable. See the matching
+// `downcast_ref::<NiPreSplitDataController>()` updates there.
+
+/// `NiKeyframeController` / `NiTransformController` / `NiVisController` /
+/// `NiAlphaController` — see the module comment above.
+#[derive(Debug)]
+pub struct NiPreSplitDataController {
+    /// Original block type name, so `block_type_name()` reports the
+    /// real RTTI instead of a shared "generic controller" label.
+    pub type_name: &'static str,
+    pub base: NiSingleInterpController,
+    /// `Data` ref — only present `until="10.1.0.103"`; NULL afterwards,
+    /// where the interpolator carries the equivalent data.
+    pub data_ref: BlockRef,
+}
+
+impl NiObject for NiPreSplitDataController {
+    fn block_type_name(&self) -> &'static str {
+        self.type_name
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl NiPreSplitDataController {
+    pub fn parse(stream: &mut NifStream, type_name: &'static str) -> io::Result<Self> {
+        let base = NiSingleInterpController::parse(stream)?;
+        let data_ref = if stream.version().has_keyframe_controller_data() {
+            stream.read_block_ref()?
+        } else {
+            BlockRef::NULL
+        };
+        Ok(Self {
+            type_name,
+            base,
+            data_ref,
+        })
+    }
+}
+
+// ── BSKeyframeController ────────────────────────────────────────────────
+//
+// nif.xml hierarchy: NiTimeController → NiInterpController →
+// NiSingleInterpController → NiKeyframeController → BSKeyframeController.
+// The on-disk tail beyond the NiSingleInterpController base is:
+//   NiKeyframeController.Data  (Ref<NiKeyframeData>, until="10.1.0.103")
+//   BSKeyframeController.Data 2 (Ref<NiKeyframeData>, always)
+//
+// Pre-#1337 BSKeyframeController fell through to the NiTimeController
+// base-only stub, relying on block_size recovery to skip the trailing
+// refs on FO3+. Oblivion v10.0.1.x is sizeless (no recovery), so the
+// missing `Data` + `Data 2` refs cascade-truncated the per-bone
+// controller chain of every old-Oblivion creature (minotaurold.nif).
+
+/// `BSKeyframeController` — Bethesda extended keyframe controller.
+#[derive(Debug)]
+pub struct BsKeyframeController {
+    pub base: NiSingleInterpController,
+    /// `NiKeyframeController.Data` — only present `until="10.1.0.103"`
+    /// (old Oblivion); NULL afterwards, where the interpolator carries it.
+    pub data_ref: BlockRef,
+    /// `BSKeyframeController.Data 2` — always present.
+    pub data2_ref: BlockRef,
+}
+
+impl BsKeyframeController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // base + (Interpolator since 10.1.0.104, gated inside).
+        let base = NiSingleInterpController::parse(stream)?;
+        let data_ref = if stream.version().has_keyframe_controller_data() {
+            stream.read_block_ref()?
+        } else {
+            BlockRef::NULL
+        };
+        let data2_ref = stream.read_block_ref()?;
+        Ok(Self {
+            base,
+            data_ref,
+            data2_ref,
+        })
+    }
+}
+
+// ── NiFlipController ───────────────────────────────────────────────────
+//
+// Texture-flip animation controller (flipbook / water-ripple / caustic
+// cycling). Subclass of `NiFloatInterpController` →
+// `NiSingleInterpController` → `NiTimeController`. nif.xml line 3720.
+// On Oblivion (20.0.0.5) the version-gated `Accum Time` and `Delta`
+// fields are out (they're `until 10.1.0.103`), so the on-disk layout
+// reduces to:
+//
+//   NiTimeController base              (26 B)
+//   NiSingleInterpController           (4 B — interpolator ref)
+//   Texture Slot    (TexType u32)      (4 B)
+//   Num Sources     (u32)              (4 B)
+//   Sources[Num Sources]               (4 B each)
+//   = 38 + 4 × N bytes
+//
+// Pre-#394 this was a terminal parse error on Oblivion creatures
+// that ship flipbook textures, since there's no `block_sizes` table
+// to fall back on. See audit OBL-D5-H2.
+
+/// `NiFlipController` — flipbook / texture-cycle animation driver.
+#[derive(Debug)]
+pub struct NiFlipController {
+    pub base: NiSingleInterpController,
+    /// `Accum Time` (`since="3.3.0.13" until="10.1.0.103"`) — only
+    /// present on old-Gamebryo content below the lowest version this
+    /// engine's `NifVersion` enum represents (`V4_0_0_0`), so the
+    /// `since` bound is always trivially satisfied whenever the
+    /// `until` gate passes. `0.0` (unauthored) on every supported
+    /// Bethesda NIF. #2563.
+    pub accum_time: f32,
+    /// `Delta` — time between two flips, `until="10.1.0.103"`. Same
+    /// gate as `accum_time`. #2563.
+    pub delta: f32,
+    /// `TexType` enum — 0=BASE_MAP, 4=GLOW_MAP, etc. Kept as u32 so
+    /// the consumer can route to the right texture slot.
+    pub texture_slot: u32,
+    /// References to the source textures to cycle through. Typically
+    /// 2–8 frames for water ripples or fire flicker.
+    pub sources: Vec<BlockRef>,
+}
+
+impl NiFlipController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiSingleInterpController::parse(stream)?;
+        // #2563 — `Accum Time` (f32, until 10.1.0.103) and `Delta` (f32,
+        // until 10.1.0.103) are version-gated off on every supported
+        // Bethesda NIF (Oblivion / FO3 / FNV / Skyrim / FO4 / FO76 /
+        // Starfield are all >= 10.1.0.104), so this is a no-op on real
+        // content today — but pre-fix the read was skipped
+        // unconditionally rather than gated, silently mis-parsing any
+        // old-Gamebryo / mod NetImmerse file below that version. Shares
+        // `has_keyframe_controller_data()`'s gate — same `until=
+        // "10.1.0.103"` boundary as NiSingleInterpController's sibling
+        // Data-ref fields, just two plain floats here instead of a Ref.
+        let (accum_time, delta) = if stream.version().has_keyframe_controller_data() {
+            (stream.read_f32_le()?, stream.read_f32_le()?)
+        } else {
+            (0.0, 0.0)
+        };
+        let texture_slot = stream.read_u32_le()?;
+        let num_sources = stream.read_u32_le()?;
+        // #2523 — BlockRef is a plain u32 newtype, size_of-aware bound applies.
+        let mut sources = stream.allocate_vec_sized::<BlockRef>(num_sources)?;
+        for _ in 0..num_sources {
+            sources.push(stream.read_block_ref()?);
+        }
+        Ok(Self {
+            base,
+            accum_time,
+            delta,
+            texture_slot,
+            sources,
+        })
+    }
+}
+
+// ── NiBSBoneLODController ──────────────────────────────────────────────
+//
+// Bethesda extension of the deprecated `NiBoneLODController` — a
+// creature-skeleton LOD switcher keyed off camera distance. 34 files
+// in the Oblivion vanilla sweep tripped the unknown-block dispatch
+// before #394. Subclass of `NiBoneLODController` →
+// `NiTimeController`. nif.xml line 3836.
+//
+// Wire layout — three phases, with the shape-group tail gated on
+// non-Bethesda content per nif.xml `vercond="#NISTREAM#"`
+// (`#NISTREAM#` resolves to `#BSVER# #EQ# 0`, line 10):
+//
+//   NiTimeController base                   (26 B)
+//   LOD             (u32)                   ( 4 B)
+//   Num LODs        (u32)                   ( 4 B)
+//   Num Node Groups (u32)                   ( 4 B, dropped — see below)
+//   Node Groups[Num LODs] — each is:
+//       Num Nodes (u32) + Nodes[Num Nodes] (Ptr, 4 B each)
+//   ── only when bsver == 0 (Morrowind / Oblivion / non-Bethesda):
+//   Num Shape Groups (u32)                  ( 4 B — since 4.2.2.0)
+//   Shape Groups 1[Num Shape Groups] — each is:
+//       Num Skin Info (u32) + SkinInfo[Num Skin Info] (8 B each)
+//   Num Shape Groups 2 (u32)                ( 4 B)
+//   Shape Groups 2[Num Shape Groups 2]      (Ref, 4 B each)
+//
+// Pre-fix the shape-group tail was always read, so on every Bethesda
+// game past Morrowind/Oblivion (FO3 bsver=21 onward) the parser ate
+// 4+ extra bytes past the block body, hit `0xFFFFFFFF` reading the
+// next block's data as `Num Shape Groups`, and bailed via `allocate_vec`
+// with "NIF claims 4294967295 elements". 34 instances regressed on
+// FNV (`meshes/characters/_male/skeleton.nif` and every creature
+// skeleton) — surfaced by the R3 per-block histogram landing in the
+// same session. `Num Node Groups` (the unused u32) is preserved on
+// the wire for **all** content per nif.xml line 3828: it has no
+// `vercond` and no `since` gate, so it's always present even though
+// our consumer drops it.
+//
+// Variable-size with two nested dynamic arrays. Parsed eagerly so
+// Oblivion loads don't truncate the rest of the NIF waiting on a
+// `block_sizes` hint that never comes.
+
+/// One `NodeSet` entry inside the outer LOD table — a bone-index
+/// list that maps distance-LOD-level → which bones to activate.
+#[derive(Debug)]
+pub struct NodeSet {
+    pub nodes: Vec<BlockRef>,
+}
+
+/// One `SkinInfo` entry inside the outer `NiBoneLODController`
+/// shape-groups table: a (shape, skin_instance) pair.
+#[derive(Debug, Clone, Copy)]
+pub struct BoneLodSkinInfo {
+    pub shape_ptr: BlockRef,
+    pub skin_instance_ref: BlockRef,
+}
+
+/// One `SkinInfoSet` entry — a group of `BoneLodSkinInfo` pairs.
+#[derive(Debug)]
+pub struct BoneLodSkinInfoSet {
+    pub skin_infos: Vec<BoneLodSkinInfo>,
+}
+
+/// `NiBSBoneLODController` — Bethesda creature-skeleton LOD switcher.
+#[derive(Debug)]
+pub struct NiBsBoneLodController {
+    pub base: NiTimeControllerBase,
+    /// Current active LOD level (authored initial value).
+    pub lod: u32,
+    /// Per-LOD bone-index lists; outer length == `num_lods`.
+    pub node_groups: Vec<NodeSet>,
+    /// Shape groups (primary) — present since 4.2.2.0 on every
+    /// Bethesda target version.
+    pub shape_groups_1: Vec<BoneLodSkinInfoSet>,
+    /// Shape groups (secondary) — refs to `NiTriBasedGeom` parents.
+    pub shape_groups_2: Vec<BlockRef>,
+}
+
+impl NiBsBoneLodController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiTimeControllerBase::parse(stream)?;
+        let lod = stream.read_u32_le()?;
+        let num_lods = stream.read_u32_le()?;
+        let _num_node_groups = stream.read_u32_le()?;
+        // NodeSet contains a heap-indirect Vec<BlockRef> field — stays on
+        // the loose per-byte bound (#2523: size_of::<NodeSet>() would
+        // undercount its true variable on-disk footprint).
+        let mut node_groups = stream.allocate_vec::<NodeSet>(num_lods)?;
+        for _ in 0..num_lods {
+            let count = stream.read_u32_le()?;
+            // #2523 — BlockRef is a plain u32 newtype, size_of-aware bound applies.
+            let mut nodes = stream.allocate_vec_sized::<BlockRef>(count)?;
+            for _ in 0..count {
+                nodes.push(stream.read_block_ref()?);
+            }
+            node_groups.push(NodeSet { nodes });
+        }
+        // Shape-group tail is non-Bethesda only. nif.xml gates each of
+        // these four fields on `vercond="#NISTREAM#"` which expands to
+        // `#BSVER# #EQ# 0` — i.e. Morrowind, Oblivion, and pure-Niflib
+        // content only. Every Bethesda game past Oblivion (FO3 bsver=21
+        // → Starfield bsver=172) ends the block at the close of
+        // node_groups; reading further over-consumes by 4+ bytes and
+        // trips `allocate_vec` on whatever sentinel the next block
+        // happens to start with.
+        let (shape_groups_1, shape_groups_2) = if stream.bsver()
+            == crate::version::bsver::PRE_BETHESDA
+        {
+            let num_shape_groups = stream.read_u32_le()?;
+            // BoneLodSkinInfoSet contains a heap-indirect
+            // Vec<BoneLodSkinInfo> field — stays on the loose per-byte
+            // bound (#2523).
+            let mut shape_groups_1 = stream.allocate_vec::<BoneLodSkinInfoSet>(num_shape_groups)?;
+            for _ in 0..num_shape_groups {
+                let count = stream.read_u32_le()?;
+                // #2523 — BoneLodSkinInfo is two BlockRefs, no heap
+                // indirection, size_of-aware bound applies.
+                let mut skin_infos = stream.allocate_vec_sized::<BoneLodSkinInfo>(count)?;
+                for _ in 0..count {
+                    let shape_ptr = stream.read_block_ref()?;
+                    let skin_instance_ref = stream.read_block_ref()?;
+                    skin_infos.push(BoneLodSkinInfo {
+                        shape_ptr,
+                        skin_instance_ref,
+                    });
+                }
+                shape_groups_1.push(BoneLodSkinInfoSet { skin_infos });
+            }
+            let num_shape_groups_2 = stream.read_u32_le()?;
+            // #2523 — BlockRef is a plain u32 newtype, size_of-aware bound applies.
+            let mut shape_groups_2 = stream.allocate_vec_sized::<BlockRef>(num_shape_groups_2)?;
+            for _ in 0..num_shape_groups_2 {
+                shape_groups_2.push(stream.read_block_ref()?);
+            }
+            (shape_groups_1, shape_groups_2)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Self {
+            base,
+            lod,
+            node_groups,
+            shape_groups_1,
+            shape_groups_2,
+        })
+    }
+}
+
+// ── bhkBlendController ─────────────────────────────────────────────────
+//
+// Havok ragdoll blend controller — drives blend weights between multiple
+// Havok animations (typically skeleton.nif files per nif.xml line 3927).
+// 1,427 blocks across vanilla FNV (845) + FO3 (582) fell into NiUnknown
+// pre-#551 because no dispatch arm existed.
+//
+// Wire layout (nif.xml line 3927):
+//   NiTimeController base (26 B — nif.xml line 3600)
+//   Keys: uint (4 B — "Seems to be always zero.")
+//
+// Note: contrary to the audit's suggestion, this is NOT a
+// NiSingleInterpController — it inherits NiTimeController directly, with
+// NO interpolator ref. The trailing `keys` u32 is the only field.
+
+/// bhkBlendController — Havok blend-weight controller for ragdoll /
+/// animation layering on FO3 + FNV skeletons. See #551.
+#[derive(Debug)]
+pub struct BhkBlendController {
+    pub base: NiTimeControllerBase,
+    /// Per nif.xml always zero on disk, but preserved so a future
+    /// importer can branch if Bethesda ever shipped a non-zero value.
+    pub keys: u32,
+}
+
+impl BhkBlendController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiTimeControllerBase::parse(stream)?;
+        let keys = stream.read_u32_le()?;
+        Ok(Self { base, keys })
+    }
+}
+
+// ── BSNiAlphaPropertyTestRefController ─────────────────────────────────
+//
+// Skyrim SE controller that animates the alpha-test threshold on
+// `NiAlphaProperty` (dissolve effects, fade transitions, ghost-reveal
+// VFX). Wire layout inherits `NiFloatInterpController` → `NiSingleInterpController`
+// with no additional fields (nif.xml line 6279). Pre-#552, 751 SE
+// blocks fell into NiUnknown because no dispatch arm existed.
+//
+// Wrapped in a dedicated newtype so telemetry and downstream importers
+// see the original RTTI name via `block_type_name()` — the bulk of the
+// `NiSingleInterpController`-aliased family currently erases its RTTI
+// (separate tech debt, not in scope here).
+
+/// Skyrim SE animated alpha-test threshold controller. See #552.
+#[derive(Debug)]
+pub struct BsNiAlphaPropertyTestRefController {
+    pub base: NiSingleInterpController,
+}
+
+impl BsNiAlphaPropertyTestRefController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        Ok(Self {
+            base: NiSingleInterpController::parse(stream)?,
+        })
+    }
+}
+
+// ── NiFloatExtraDataController ─────────────────────────────────────────
+//
+// Animates a NiFloatExtraData tag attached to an NiAVObject (FOV
+// multipliers, scale overrides, wetness levels — any tool-authored
+// engine hook that exposes a float knob). nif.xml line 3797:
+//
+//   NiTimeController base                       (26 B)
+//   NiSingleInterpController.interpolator_ref   (4 B, since 10.1.0.104)
+//   NiExtraDataController.extra_data_name       (4 B string index,
+//                                                since 10.2.0.0)
+//   (pre-10.1.0.0 extras gated out on FO3+)
+//
+// 1,657 blocks across SE (180 controller + 1,312 data) + FO3/FNV fell
+// into NiUnknown pre-#553 because no dispatch existed. `NiFloatExtraData`
+// itself rides the shared `NiExtraData` dispatch; this is the controller
+// that ticks it over time.
+
+/// FO3+ animated NiFloatExtraData controller. See #553.
+#[derive(Debug)]
+pub struct NiFloatExtraDataController {
+    pub base: NiTimeControllerBase,
+    pub interpolator_ref: BlockRef,
+    /// Name of the NiFloatExtraData tag this controller animates.
+    /// Resolved against the header string table at 20.1+.
+    pub extra_data_name: Option<Arc<str>>,
+    /// `Data` ref (`NiFloatData`, `until="10.1.0.103"`) — same trailing
+    /// field every `NiSingleInterpController` sibling in this family
+    /// declares (#2562 / #2563); NULL on every supported Bethesda NIF.
+    /// The older `Num Extra Bytes` / `Unknown Bytes` / `Unknown Extra
+    /// Bytes` fields (`until="10.1.0.0"`, an even earlier boundary) are
+    /// deliberately out of scope here — #2563 only asks for the `Data`
+    /// ref, and that older band is unreachable by any version this
+    /// engine's `NifVersion` enum can even represent below it in a way
+    /// that would also satisfy `until="10.1.0.103"` in a genuinely
+    /// distinct band worth the extra parsing.
+    pub data_ref: BlockRef,
+}
+
+impl NiFloatExtraDataController {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // NiExtraDataController inherits NiSingleInterpController →
+        // NiInterpController, so it carries the Manager Controlled bool on
+        // the 10.1.0.104–108 band. Route through the shared base. (#1543)
+        //
+        // #2067 (TD2-108) — base + interpolator_ref via the shared wrapper
+        // instead of reimplementing the prologue inline.
+        let NiSingleInterpController {
+            base,
+            interpolator_ref,
+        } = NiSingleInterpController::parse(stream)?;
+        // NiExtraDataController.extra_data_name (since 10.2.0.0).
+        let extra_data_name = if stream.version() >= NifVersion::V10_2_0_0 {
+            stream.read_string()?
+        } else {
+            None
+        };
+        // #2563 — trailing Data ref, until 10.1.0.103. Note this and
+        // `extra_data_name` above are mutually exclusive in practice
+        // (10.2.0.0 vs 10.1.0.103), but both gates are independently
+        // correct per nif.xml's declared field order regardless.
+        let data_ref = if stream.version().has_keyframe_controller_data() {
+            stream.read_block_ref()?
+        } else {
+            BlockRef::NULL
+        };
+        Ok(Self {
+            base,
+            interpolator_ref,
+            extra_data_name,
+            data_ref,
+        })
+    }
+}
+
+// ── BSShaderController family ──────────────────────────────────────────
+//
+// The four (+1) Bethesda shader property controllers each wrap
+// `NiSingleInterpController` with a trailing `uint` enum identifying
+// which shader slot the animation drives. Pre-#407 the trailing u32
+// was unconsumed and block_size recovery seeked past; #407 added the
+// read but dropped the value on the floor. This block preserves the
+// value on a typed `BsShaderController` so the animation importer
+// can route key streams to the correct shader uniform once the
+// animated-shader pipeline lands. See #350 / audit S5-02.
+
+// ── NiLight controller family ──────────────────────────────────────────
+//
+// Animated controllers on NiLight/NiPointLight/NiSpotLight:
+//   - NiLightColorController: ambient/diffuse color animation.
+//     Inherits NiPoint3InterpController + `target_color: LightColor (u16)`.
+//   - NiLightDimmerController: overall dimmer value.
+//     Inherits NiFloatInterpController, no extra fields.
+//   - NiLightIntensityController (FO3+): HDR intensity.
+//     Inherits NiFloatInterpController, no extra fields.
+//   - NiLightRadiusController (FO4+): light radius.
+//     Inherits NiFloatInterpController, no extra fields.
+//
+// Pre-#433 all four were missing from dispatch — every lantern flicker,
+// campfire pulse, torch flicker, magic-spell glow, terminal-screen bloom,
+// and plasma weapon effect in Bethesda content landed as NiUnknown and
+// silently stopped animating. Per nif.xml lines 3776 / 3750 / 5025 /
+// 8444.
+
+// ── NiMaterialColorController ──────────────────────────────────────────
+// Inherits NiSingleInterpController, adds: target_color (MaterialColor enum, u16).
+
+// ── NiTextureTransformController ───────────────────────────────────────
+// Inherits NiFloatInterpController → NiSingleInterpController, adds:
+// shader_map (bool), texture_slot (u32 TexType), operation (u32 TransformMember).
+
+// ── NiMultiTargetTransformController ───────────────────────────────────
+// Inherits NiInterpController (which adds nothing for FNV), adds:
+// num_extra_targets (u16) + extra_targets (Ptr[]).
+
+// ── NiControllerManager ────────────────────────────────────────────────
+// Inherits NiTimeController, adds: cumulative (bool, 1 byte), sequences, palette.
+
+// ── NiControllerSequence ───────────────────────────────────────────────
+// Does NOT inherit NiTimeController. Inherits NiSequence → NiObject.
+
+// ── BSRefractionFirePeriodController ──────────────────────────────────
+// Inherits NiTimeController (not NiSingleInterpController).
+// Adds one explicit Ref<NiInterpolator> field per nif.xml line 6832.
+// Versions: FO3 (v20.2.0.7 / bsver 21).
+
+#[cfg(test)]
+mod tests;
+
+// ── NiGeomMorpherController ──────────────────────────────────────────
+
+// ── NiMorphData ──────────────────────────────────────────────────────
+
+// ── NiSequenceStreamHelper ─────────────────────────────────────────────
+//
+// Morrowind / NetImmerse-era animation root. Inherits from NiObjectNET
+// with no extra fields: the per-bone drivers hang off the controller
+// chain (NiKeyframeController instances) and the text keys hang off the
+// extra_data list.
+//
+// Empirically not used by any vanilla content we ship support for: a
+// 47,934-NIF sweep across Oblivion + FNV + Skyrim SE meshes BSAs found
+// zero references — pinned by `vanilla_archives_have_zero_nisequencestreamhelper`
+// in `crates/nif/tests/parse_real_nifs.rs` (see also
+// `.claude/issues/689/INVESTIGATION.md`). All vanilla animated content
+// uses NiControllerSequence, which the importer already handles via
+// `import_kf` Path 2.
+//
+// Bethesda kept the block parseable in their Gamebryo runtime for
+// backwards-compat with Morrowind / very-early mod content, so we mirror
+// that — the parser accepts it (no hard-fail on unknown types in
+// v20.0.0.5 which has no block_sizes recovery), but the importer has no
+// consumer for it. An importer path will be needed when Morrowind ESM
+// support lands; estimate is 1-2 days against real Morrowind .kf files.
+
+// ── NiUVController ────────────────────────────────────────────────────
+//
+// DEPRECATED (pre-10.1), REMOVED (20.3). The last Bethesda game that
+// ships with NiUVController is Oblivion (v20.0.0.5) — water, fire, and
+// banner meshes rely on it to scroll texture coordinates. Inherits
+// from NiTimeController with two trailing fields: target_attribute (u16)
+// and data ref (NiUVData). See issue #156... wait #154.
+//
+// The parser is stateless beyond the NiTimeController base; the actual
+// keyframe data lives in the referenced NiUVData block. The UV channel
+// extractor in anim.rs can pick it up later — parsing is the blocker.
+
+// ── NiLookAtController ────────────────────────────────────────────────
+// Inherits NiTimeController. DEPRECATED (10.2), REMOVED (20.5) — appears
+// in Oblivion/FO3/FNV/Skyrim-LE but never in Skyrim-SE+. Orients a target
+// NiNode at a follow target; the engine later replaced this with
+// NiLookAtInterpolator on a plain NiTransformController. See #228.
+
+// ── NiPathController ──────────────────────────────────────────────────
+// Inherits NiTimeController. DEPRECATED (10.2), REMOVED (20.5) — cutscene
+// and environmental animation spline follower. The engine later replaced
+// this with NiPathInterpolator on a plain NiTransformController. See #228.
+
+impl_ni_object!(
+    NiTimeController,
+    BsLagBoneController => "BSLagBoneController",
+    BsProceduralLightningController => "BSProceduralLightningController",
+    NiSingleInterpController,
+    BsKeyframeController => "BSKeyframeController",
+    NiFlipController,
+    NiBsBoneLodController => "NiBSBoneLODController",
+    BhkBlendController => "bhkBlendController",
+    BsNiAlphaPropertyTestRefController => "BSNiAlphaPropertyTestRefController",
+    NiFloatExtraDataController,
+);
+
+#[cfg(test)]
+mod path_lookat_tests;

@@ -1,0 +1,462 @@
+//! Regression tests for #976 (NIF-D4-NEW-02) — `BSLightingShaderProperty`
+//! with a Starfield `.mat` JSON material reference must populate
+//! `material_path` via the shared `material_path_from_name` helper.
+//!
+//! Pre-fix the walker used an inline suffix check that only accepted
+//! `.bgsm` / `.bgem`, so any `.mat` reference arrived with
+//! `material_path = None` and the BgsmProvider lookup chain never
+//! received the path.
+
+use super::*;
+use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+use crate::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet, ShaderTypeData};
+use crate::blocks::tri_shape::NiTriShape;
+use crate::blocks::NiObject;
+use crate::header::NifHeader;
+use crate::stream::NifStream;
+use crate::types::{BlockRef, NiTransform};
+use byroredux_core::string::StringPool;
+use std::sync::Arc;
+
+fn empty_net_with_name(name: &str) -> NiObjectNETData {
+    NiObjectNETData {
+        name: Some(Arc::from(name)),
+        extra_data_refs: Vec::new(),
+        controller_ref: BlockRef::NULL,
+    }
+}
+
+/// Minimal `BSLightingShaderProperty` whose `net.name` is set to `name`.
+/// All numeric fields are defaults; `texture_set_ref` is NULL so only
+/// the `material_path` code-path is exercised.
+fn lighting_shader_with_name(name: &str) -> BSLightingShaderProperty {
+    BSLightingShaderProperty {
+        shader_type: 0,
+        net: empty_net_with_name(name),
+        material_reference: false,
+        shader_flags_1: 0,
+        shader_flags_2: 0,
+        sf1_crcs: Vec::new(),
+        sf2_crcs: Vec::new(),
+        uv_offset: [0.0, 0.0],
+        uv_scale: [1.0, 1.0],
+        texture_set_ref: BlockRef::NULL,
+        emissive_color: [0.0; 3],
+        emissive_multiple: 1.0,
+        root_material_path: None,
+        texture_clamp_mode: 3,
+        alpha: 1.0,
+        refraction_strength: 0.0,
+        glossiness: 80.0,
+        specular_color: [1.0; 3],
+        specular_strength: 1.0,
+        lighting_effect_1: 0.3,
+        lighting_effect_2: 2.0,
+        subsurface_rolloff: 0.3,
+        rimlight_power: 2.0,
+        backlight_power: 0.0,
+        grayscale_to_palette_scale: 1.0,
+        fresnel_power: 5.0,
+        wetness: None,
+        luminance: None,
+        do_translucency: false,
+        translucency: None,
+        texture_arrays: Vec::new(),
+        shader_type_data: ShaderTypeData::None,
+        starfield_tail: Vec::new(),
+    }
+}
+
+/// Parse the real 12-byte Starfield material-reference body so importer tests
+/// exercise the parser's placeholder-bearing stub rather than a hand-built
+/// approximation.
+fn parsed_starfield_material_reference(name: &str) -> BSLightingShaderProperty {
+    let header = NifHeader {
+        strings: vec![Arc::from(name)],
+        max_string_length: name.len() as u32,
+        ..NifHeader::test_starfield()
+    };
+    let mut data = Vec::new();
+    data.extend_from_slice(&0i32.to_le_bytes()); // name string-table index
+    data.extend_from_slice(&0u32.to_le_bytes()); // extra-data ref count
+    data.extend_from_slice(&(-1i32).to_le_bytes()); // controller ref
+    let mut stream = NifStream::new(&data, &header);
+    let shader = BSLightingShaderProperty::parse(&mut stream)
+        .expect("Starfield material reference must parse as a stub");
+    assert!(shader.material_reference);
+    assert_eq!(stream.position(), data.len() as u64);
+    shader
+}
+
+/// Minimal NiTriShape whose `shader_property_ref` points at block `idx`.
+fn tri_shape_with_shader_ref(idx: u32) -> NiTriShape {
+    NiTriShape {
+        av: NiAVObjectData {
+            net: NiObjectNETData {
+                name: Some(Arc::from("TestMesh")),
+                extra_data_refs: Vec::new(),
+                controller_ref: BlockRef::NULL,
+            },
+            flags: 0,
+            transform: NiTransform::default(),
+            properties: Vec::new(),
+            collision_ref: BlockRef::NULL,
+        },
+        data_ref: BlockRef::NULL,
+        skin_instance_ref: BlockRef::NULL,
+        shader_property_ref: BlockRef(idx),
+        alpha_property_ref: BlockRef::NULL,
+        num_materials: 0,
+        active_material_index: 0,
+    }
+}
+
+/// Shared helper: build a one-block NifScene containing a
+/// `BSLightingShaderProperty` with `name`, then extract material info.
+fn extract_for_shader_name(name: &str) -> (MaterialInfo, StringPool) {
+    let shader = lighting_shader_with_name(name);
+    let blocks: Vec<Box<dyn NiObject>> = vec![Box::new(shader)];
+    let scene = NifScene {
+        blocks,
+        ..NifScene::default()
+    };
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+    (info, pool)
+}
+
+/// Core regression: Starfield `.mat` on `BSLightingShaderProperty.name`
+/// must land in `material_path`. Pre-#976 the inline `.bgsm`/`.bgem`
+/// check silently dropped `.mat` references.
+#[test]
+fn bslighting_mat_reference_captured() {
+    let (info, pool) = extract_for_shader_name("materials\\armor\\dragonscale.mat");
+    // StringPool lowercases; the key assertion is that material_path is Some.
+    let resolved = info.material_path.and_then(|s| pool.resolve(s));
+    assert_eq!(
+        resolved,
+        Some("materials\\armor\\dragonscale.mat"),
+        "BSLightingShaderProperty .mat name must populate material_path"
+    );
+}
+
+/// Regression for #2353: a parsed material-reference stub contributes its
+/// external path only. Its fabricated scalar defaults must not claim inline
+/// material authorship.
+#[test]
+fn bslighting_material_reference_stub_does_not_claim_material_data() {
+    let shader = parsed_starfield_material_reference("materials\\sf\\armor.mat");
+    let scene = NifScene {
+        blocks: vec![Box::new(shader)],
+        ..NifScene::default()
+    };
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+
+    assert_eq!(
+        info.material_path.and_then(|path| pool.resolve(path)),
+        Some("materials\\sf\\armor.mat"),
+        "the external material path must survive the stub guard",
+    );
+    assert!(!info.has_material_data);
+    assert!(!info.specular_authored);
+    assert!(!info.has_uv_transform);
+    assert!(matches!(
+        info.emissive_source,
+        byroredux_core::ecs::components::material::EmissiveSource::None
+    ));
+}
+
+/// Parity: existing `.bgsm` suffix must still work after the refactor.
+#[test]
+fn bslighting_bgsm_reference_still_captured() {
+    let (info, pool) = extract_for_shader_name("materials\\actors\\iron.bgsm");
+    let resolved = info.material_path.and_then(|s| pool.resolve(s));
+    assert_eq!(
+        resolved,
+        Some("materials\\actors\\iron.bgsm"),
+        "BSLightingShaderProperty .bgsm name must still populate material_path"
+    );
+}
+
+/// Parity: existing `.bgem` suffix must still work after the refactor.
+#[test]
+fn bslighting_bgem_reference_still_captured() {
+    let (info, pool) = extract_for_shader_name("materials\\effects\\magic.bgem");
+    let resolved = info.material_path.and_then(|s| pool.resolve(s));
+    assert_eq!(
+        resolved,
+        Some("materials\\effects\\magic.bgem"),
+        "BSLightingShaderProperty .bgem name must still populate material_path"
+    );
+}
+
+/// Case-insensitive: `.MAT` (capitalised) must be recognised as a material
+/// reference. The resolved string is the StringPool-lowercased canonical form.
+#[test]
+fn bslighting_mat_case_insensitive() {
+    let (info, pool) = extract_for_shader_name("materials\\test.MAT");
+    let resolved = info.material_path.and_then(|s| pool.resolve(s));
+    // StringPool lowercases all paths; the important thing is that material_path
+    // is Some (i.e. the path was captured at all), not what the exact case is.
+    assert_eq!(
+        resolved,
+        Some("materials\\test.mat"),
+        "is_material_reference must be case-insensitive for .mat (pool returns lowercase)"
+    );
+}
+
+/// Trailing-whitespace stripping: `is_material_reference` trims trailing
+/// whitespace / null bytes (#749), so `"foo.bgsm\0"` must resolve
+/// despite the null terminator.
+#[test]
+fn bslighting_trailing_nul_trimmed() {
+    let (info, _pool) = extract_for_shader_name("materials\\foo.bgsm\0");
+    assert!(
+        info.material_path.is_some(),
+        "trailing null byte must not prevent material_path capture"
+    );
+}
+
+/// A plain NIF name (no material suffix) must leave `material_path = None`.
+#[test]
+fn bslighting_plain_name_does_not_set_material_path() {
+    let (info, _pool) = extract_for_shader_name("SomeEditorName");
+    assert!(
+        info.material_path.is_none(),
+        "plain NIF name must not populate material_path"
+    );
+}
+
+/// A `BSShaderTextureSet` on a `.mat`-named shader must still populate
+/// the texture slots — material_path capture must not gate texture extraction.
+#[test]
+fn bslighting_mat_name_plus_texture_set_both_captured() {
+    let shader = lighting_shader_with_name("materials\\test.mat");
+    let tex_set = BSShaderTextureSet {
+        textures: vec![
+            "textures\\test_d.dds".to_string(),
+            "textures\\test_n.dds".to_string(),
+        ],
+    };
+
+    let blocks: Vec<Box<dyn NiObject>> = vec![Box::new(shader), Box::new(tex_set)];
+    // Patch texture_set_ref to point at block 1.
+    let mut scene = NifScene {
+        blocks,
+        ..NifScene::default()
+    };
+    // Wire the texture_set_ref on the lighting shader in the scene.
+    // NifScene::blocks is Vec<Box<dyn NiObject>>; cast via downcast
+    // is not available generically, so rebuild with the right ref.
+    let shader2 = {
+        let mut s = lighting_shader_with_name("materials\\test.mat");
+        s.texture_set_ref = BlockRef(1);
+        s
+    };
+    scene.blocks[0] = Box::new(shader2);
+
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+
+    // StringPool lowercases all paths.
+    let mat = info.material_path.and_then(|s| pool.resolve(s));
+    assert_eq!(
+        mat,
+        Some("materials\\test.mat"),
+        "material_path must be captured"
+    );
+    let tex = info.texture_path.and_then(|s| pool.resolve(s));
+    assert_eq!(
+        tex,
+        Some("textures\\test_d.dds"),
+        "texture_path must be captured"
+    );
+    let nrm = info.normal_map.and_then(|s| pool.resolve(s));
+    assert_eq!(
+        nrm,
+        Some("textures\\test_n.dds"),
+        "normal_map must be captured"
+    );
+}
+
+/// #3507 / FO4-2026-08-27-D5-01 — `BSLightingShaderProperty.texture_clamp_mode`
+/// is an unconditional field (nif.xml:6597) parsed on Skyrim, FO4, FO76 and
+/// Starfield alike, but `apply_bs_lighting_shader` never copied it —
+/// authored non-default clamp modes (7.9% of vanilla FO4 lit materials,
+/// measured — architecture wall-kit trim, LOD atlases) silently fell back
+/// to `MaterialInfo`'s WRAP_S_WRAP_T default.
+#[test]
+fn bslighting_texture_clamp_mode_is_captured() {
+    let mut shader = lighting_shader_with_name("");
+    // CLAMP_S_CLAMP_T — the mode the wrap-default would otherwise mask.
+    shader.texture_clamp_mode = 0;
+    let blocks: Vec<Box<dyn NiObject>> = vec![Box::new(shader)];
+    let scene = NifScene {
+        blocks,
+        ..NifScene::default()
+    };
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+
+    assert_eq!(
+        info.texture_clamp_mode, 0,
+        "authored CLAMP_S_CLAMP_T must survive apply_bs_lighting_shader, \
+         not fall back to the WRAP_S_WRAP_T default"
+    );
+    assert!(
+        info.texture_clamp_mode_consumed,
+        "the consumed gate must be set so a later legacy-property arm \
+         (unreachable for a real BSLightingShaderProperty mesh, but the \
+         invariant every other writer upholds) can't clobber it"
+    );
+}
+
+/// A `BSLightingShaderProperty` authoring the ordinary WRAP_S_WRAP_T mode
+/// (the common case — 92% of the measured vanilla FO4 corpus) must still
+/// mark the field consumed, distinguishing "authored the default" from
+/// "never ran this arm at all".
+#[test]
+fn bslighting_default_clamp_mode_still_marks_consumed() {
+    let shader = lighting_shader_with_name(""); // texture_clamp_mode: 3 (default)
+    let blocks: Vec<Box<dyn NiObject>> = vec![Box::new(shader)];
+    let scene = NifScene {
+        blocks,
+        ..NifScene::default()
+    };
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+
+    assert_eq!(info.texture_clamp_mode, 3);
+    assert!(info.texture_clamp_mode_consumed);
+}
+
+/// Regression for #4251 — `apply_shader_type_data`'s `EnvironmentMap` arm
+/// (the BSLightingShaderProperty dedicated-shader writer) must latch
+/// `env_map_scale_consumed`, mirroring the #3514/#3517 fix shape for
+/// `refraction_strength`/`texture_clamp_mode` immediately above. Without
+/// the latch, a later legacy-property write (which already gates on this
+/// same flag in `legacy_properties.rs`) could clobber the dedicated value.
+#[test]
+fn bslighting_env_map_scale_is_captured_and_marks_consumed() {
+    let mut shader = lighting_shader_with_name("");
+    shader.shader_type = 1; // EnvironmentMap
+    shader.shader_type_data = ShaderTypeData::EnvironmentMap { env_map_scale: 2.5 };
+    let blocks: Vec<Box<dyn NiObject>> = vec![Box::new(shader)];
+    let scene = NifScene {
+        blocks,
+        ..NifScene::default()
+    };
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+
+    assert_eq!(info.env_map_scale, 2.5);
+    assert!(
+        info.env_map_scale_consumed,
+        "the consumed gate must be set so a later legacy-property arm \
+         can't clobber the dedicated-shader env_map_scale value (#4251)"
+    );
+}
+
+/// #4282 — the FO4+/FO76+ wetness envelope and FO76+ luminance quad on
+/// `BSLightingShaderProperty` must cross into `MaterialInfo` (and from
+/// there `ImportedMaterial` → `Material`): pre-fix they were parsed onto
+/// the block and discarded, with no sink existing at all. The capture
+/// deliberately drops the FO4-family `metalness`/trailing unknowns —
+/// their Starfield wire positions hold the luminance quad instead
+/// (#2622), so only the five unambiguous wetness fields map.
+#[test]
+fn bslighting_wetness_and_luminance_cross_the_boundary() {
+    use crate::blocks::shader::{LuminanceParams, WetnessParams};
+    use byroredux_core::ecs::components::material::{LuminanceShading, WetnessShading};
+
+    let mut shader = lighting_shader_with_name("");
+    shader.wetness = Some(WetnessParams {
+        spec_scale: 1.5,
+        spec_power: 24.0,
+        min_var: 0.02,
+        env_map_scale: 3.0,
+        fresnel_power: 4.5,
+        // Starfield's wire position for this pair holds the luminance
+        // quad; the canonical sink must not carry it as metalness.
+        metalness: 9.9,
+        unknown_1: 8.8,
+        unknown_2: 7.7,
+    });
+    shader.luminance = Some(LuminanceParams {
+        lum_emittance: 100.0,
+        exposure_offset: 13.5,
+        final_exposure_min: 0.5,
+        final_exposure_max: 2.0,
+    });
+    let blocks: Vec<Box<dyn NiObject>> = vec![Box::new(shader)];
+    let scene = NifScene {
+        blocks,
+        ..NifScene::default()
+    };
+    let shape = tri_shape_with_shader_ref(0);
+    let mut pool = StringPool::new();
+    let info = extract_material_info(&scene, &shape, &[], &mut pool);
+
+    assert_eq!(
+        info.wetness,
+        Some(WetnessShading {
+            spec_scale: 1.5,
+            spec_power: 24.0,
+            min_var: 0.02,
+            env_map_scale: 3.0,
+            fresnel_power: 4.5,
+        }),
+        "the five unambiguous wetness fields cross the boundary"
+    );
+    assert_eq!(
+        info.luminance,
+        Some(LuminanceShading {
+            lum_emittance: 100.0,
+            exposure_offset: 13.5,
+            final_exposure_min: 0.5,
+            final_exposure_max: 2.0,
+        }),
+        "the luminance quad crosses the boundary"
+    );
+
+    // …and the full pipeline forwards them onto `ImportedMaterial`.
+    let imported = info.into_imported_material(&mut pool, None);
+    assert_eq!(
+        imported.wetness,
+        Some(WetnessShading {
+            spec_scale: 1.5,
+            spec_power: 24.0,
+            min_var: 0.02,
+            env_map_scale: 3.0,
+            fresnel_power: 4.5,
+        })
+    );
+    assert_eq!(
+        imported.luminance,
+        Some(LuminanceShading {
+            lum_emittance: 100.0,
+            exposure_offset: 13.5,
+            final_exposure_min: 0.5,
+            final_exposure_max: 2.0,
+        })
+    );
+}
+
+/// #4282 — absent blocks stay `None`; the sink must not fabricate a
+/// default envelope for the 97.9% of content that authors neither.
+#[test]
+fn bslighting_wetness_and_luminance_default_to_none() {
+    let (info, mut pool) = extract_for_shader_name("plain.nif");
+    assert_eq!(info.wetness, None);
+    assert_eq!(info.luminance, None);
+    let imported = info.into_imported_material(&mut pool, None);
+    assert_eq!(imported.wetness, None);
+    assert_eq!(imported.luminance, None);
+}

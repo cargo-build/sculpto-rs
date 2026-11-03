@@ -1,0 +1,1069 @@
+//! `BSGeometry` — Starfield-era replacement for `BSTriShape`.
+//!
+//! Starfield (and forward) replaced the FO4-era `BSTriShape` /
+//! `BSSubIndexTriShape` family with a new top-level mesh container
+//! that splits the geometry data out of the `.nif` and into companion
+//! `.mesh` files. The `.nif` itself only carries bounds, three
+//! property/skin refs, and up to 4 `BSGeometryMesh` slots; each slot
+//! holds either an external `.mesh` filename (the 99% Starfield case)
+//! or — when bit `0x200` of the parent's NiAVObject flags is set — an
+//! inline `BSGeometryMeshData` payload (UDEC3-packed normals/tangents,
+//! half-float UVs, meshlets, cull data).
+//!
+//! ## Authority
+//!
+//! nif.xml does **not** define a top-level `<niobject name="BSGeometry">`
+//! — only a comment inside `NiGeometry` (line 3855) describing the
+//! rename. The wire layout this parser implements is taken from
+//! [`nifly`](https://github.com/ousnius/nifly), the niftools fork that
+//! has Starfield read/write support:
+//!
+//!   * `include/Geometry.hpp` — class definitions
+//!   * `src/Geometry.cpp::BSGeometry::Sync` (line 1769)
+//!   * `src/Geometry.cpp::BSGeometryMesh::Sync` (line 1754)
+//!   * `src/Geometry.cpp::BSGeometryMeshData::Sync` (line 1596)
+//!
+//! Per-archive 2026-04-26 baseline:
+//!   * `Starfield - Meshes01.ba2`  — 190 549 occurrences (24.74% of all blocks)
+//!   * `Starfield - FaceMeshes.ba2` —  13 713 occurrences (14.27% of all blocks)
+//!
+//! Pre-#708 every one fell to `NiUnknown` and the entire mesh body
+//! was discarded on read.
+
+use super::base::NiAVObjectData;
+use super::tri_shape::half_to_f32;
+use super::{traits, NiObject};
+use crate::stream::NifStream;
+use crate::types::{BlockRef, NiTransform};
+use std::any::Any;
+use std::io;
+
+/// Bit on the parent NiAVObject's `flags` field that switches
+/// `BSGeometryMesh` between external (`meshName`) and inline
+/// (`BSGeometryMeshData`) payload. Per nifly `BSGeometry::HasInternalGeomData`.
+const FLAG_INTERNAL_GEOM_DATA: u32 = 0x200;
+
+/// `BSGeometry` block (Starfield+). Top-level scene-graph mesh container.
+#[derive(Debug)]
+pub struct BSGeometry {
+    /// `NiObjectNET` + `NiAVObject` base fields. The `flags` member
+    /// here is read for the `0x200` internal-geom-data gate.
+    pub av: NiAVObjectData,
+    /// Per-mesh-LOD bounding sphere. `(center, radius)`.
+    pub bounding_sphere: ([f32; 3], f32),
+    /// `boundMinMax`: 6 contiguous floats nifly carries verbatim. Per
+    /// the C++ source these are unbounded — the field is private and
+    /// not consumed by any export or rendering path; we keep the raw
+    /// values so a future LOD selector can use them.
+    pub bound_min_max: [f32; 6],
+    /// Skin instance ref (`NiBoneContainer`).
+    pub skin_instance_ref: BlockRef,
+    /// Shader-property ref (`BSShaderProperty` / `BSLightingShaderProperty`).
+    pub shader_property_ref: BlockRef,
+    /// Alpha-property ref (`NiAlphaProperty`).
+    pub alpha_property_ref: BlockRef,
+    /// Up to 4 mesh LOD slots. Each is either an external `.mesh`
+    /// file reference or an inline mesh body. Vec is empty when all
+    /// 4 slot bytes were zero.
+    pub meshes: Vec<BSGeometryMesh>,
+}
+
+impl BSGeometry {
+    /// `true` when bit `0x200` of `av.flags` is set — the parent
+    /// NiAVObject's flag the per-mesh decode reads to choose between
+    /// the `meshName` external-file branch and the inline
+    /// `BSGeometryMeshData` branch.
+    pub fn has_internal_geom_data(&self) -> bool {
+        (self.av.flags & FLAG_INTERNAL_GEOM_DATA) != 0
+    }
+
+    /// Parse a `BSGeometry` from `stream`.
+    ///
+    /// The pre-mesh prefix is the standard `NiAVObject` Skyrim+ shape
+    /// (no properties list — same call as `BSTriShape`) followed by
+    /// the bounding-sphere + bound-min-max + 3 refs that distinguish
+    /// `BSGeometry` from its predecessors.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let av = NiAVObjectData::parse_no_properties(stream)?;
+
+        let bs_center = stream.read_ni_point3()?;
+        let bs_radius = stream.read_f32_le()?;
+        let bounding_sphere = ([bs_center.x, bs_center.y, bs_center.z], bs_radius);
+
+        let mut bound_min_max = [0.0f32; 6];
+        for slot in &mut bound_min_max {
+            *slot = stream.read_f32_le()?;
+        }
+
+        let skin_instance_ref = stream.read_block_ref()?;
+        let shader_property_ref = stream.read_block_ref()?;
+        let alpha_property_ref = stream.read_block_ref()?;
+
+        // Up to 4 mesh-LOD slots. nifly: `for i in 0..4 { stream.Sync(testByte);
+        // if (testByte) meshes[i].Sync(stream); }`. The `testByte` is a u8
+        // boolean — present (1) or absent (0).
+        let internal = (av.flags & FLAG_INTERNAL_GEOM_DATA) != 0;
+        let mut meshes = Vec::new();
+        for slot in 0..4u32 {
+            let test_byte = stream.read_u8()?;
+            if test_byte != 0 {
+                meshes.push(BSGeometryMesh::parse(stream, slot, internal)?);
+            }
+        }
+
+        Ok(Self {
+            av,
+            bounding_sphere,
+            bound_min_max,
+            skin_instance_ref,
+            shader_property_ref,
+            alpha_property_ref,
+            meshes,
+        })
+    }
+}
+
+impl NiObject for BSGeometry {
+    fn block_type_name(&self) -> &'static str {
+        "BSGeometry"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn traits::HasObjectNET> {
+        Some(self)
+    }
+    fn as_av_object(&self) -> Option<&dyn traits::HasAVObject> {
+        Some(self)
+    }
+    fn as_shader_refs(&self) -> Option<&dyn traits::HasShaderRefs> {
+        Some(self)
+    }
+}
+
+impl traits::HasObjectNET for BSGeometry {
+    fn name(&self) -> Option<&str> {
+        self.av.net.name.as_deref()
+    }
+    fn name_arc(&self) -> Option<&std::sync::Arc<str>> {
+        self.av.net.name.as_ref()
+    }
+    fn extra_data_refs(&self) -> &[BlockRef] {
+        &self.av.net.extra_data_refs
+    }
+    fn controller_ref(&self) -> BlockRef {
+        self.av.net.controller_ref
+    }
+}
+
+impl traits::HasAVObject for BSGeometry {
+    fn flags(&self) -> u32 {
+        self.av.flags
+    }
+    fn transform(&self) -> &NiTransform {
+        &self.av.transform
+    }
+    fn properties(&self) -> &[BlockRef] {
+        &[]
+    }
+    fn collision_ref(&self) -> BlockRef {
+        self.av.collision_ref
+    }
+}
+
+impl traits::HasShaderRefs for BSGeometry {
+    fn shader_property_ref(&self) -> BlockRef {
+        self.shader_property_ref
+    }
+    fn alpha_property_ref(&self) -> BlockRef {
+        self.alpha_property_ref
+    }
+}
+
+/// One LOD slot of a `BSGeometry`. Carries either an external `.mesh`
+/// file reference or — when the parent's flag `0x200` is set — the full
+/// inline geometry body.
+#[derive(Debug)]
+pub struct BSGeometryMesh {
+    /// Which of the parent's 4 slot bytes this mesh occupied (0-3),
+    /// captured before `BSGeometry::parse`'s loop counter is discarded.
+    /// `meshes` only contains *present* slots (the `test_byte == 0` ones
+    /// are skipped, not pushed as placeholders), so a slot's position in
+    /// `BSGeometry::meshes` is NOT the same as its authored LOD index
+    /// once any earlier slot is absent or itself a sentinel — a future
+    /// LOD selector needs this to know which level it actually loaded.
+    /// See #2631 / SF2D2-D2-03.
+    pub lod_slot: u32,
+    /// Triangle-index byte size hint (always present, regardless of
+    /// internal/external).
+    pub tri_size: u32,
+    /// Vertex-count hint (always present).
+    pub num_verts: u32,
+    /// Per-mesh flags. Distinct from `BSGeometry.av.flags` — nifly
+    /// notes this is "often 64". Stored verbatim for downstream use.
+    pub flags: u32,
+    /// External `.mesh` file reference OR inline mesh body, gated by
+    /// the parent `BSGeometry.av.flags & 0x200`.
+    pub kind: BSGeometryMeshKind,
+}
+
+/// Branch of [`BSGeometryMesh`] — external file path or inline mesh body.
+#[derive(Debug)]
+pub enum BSGeometryMeshKind {
+    /// External `.mesh` file reference. Holds either a 41-character
+    /// SHA-1 hex name (the vanilla Starfield convention) or a
+    /// human-readable path. Mirrors `BSGeometryMesh::meshName`.
+    External { mesh_name: String },
+    /// Inline mesh body. Present when the parent's NiAVObject flag
+    /// `0x200` is set. Vanilla Starfield does **not** ship inline
+    /// data — every mesh references an external `.mesh` file — but
+    /// the format permits it and authoring tools / ports may emit it.
+    Internal { mesh_data: Box<BSGeometryMeshData> },
+}
+
+impl BSGeometryMesh {
+    /// Parse one mesh-LOD slot. `slot` is this slot's index (0-3) in the
+    /// parent's 4-byte test-byte array — the caller's own loop counter,
+    /// captured here so it survives the sentinel-slot skip (#2631). `internal`
+    /// is the parent's `flags & 0x200`-derived gate.
+    pub fn parse(stream: &mut NifStream, slot: u32, internal: bool) -> io::Result<Self> {
+        let tri_size = stream.read_u32_le()?;
+        let num_verts = stream.read_u32_le()?;
+        let flags = stream.read_u32_le()?;
+
+        let kind = if internal {
+            BSGeometryMeshKind::Internal {
+                mesh_data: Box::new(BSGeometryMeshData::parse(stream, MeshTrailer::Required)?),
+            }
+        } else {
+            // `meshName.Sync(stream, 4)` in nifly — a u32 length-prefixed
+            // inline string. Same as `read_sized_string`.
+            let mesh_name = stream.read_sized_string()?;
+            BSGeometryMeshKind::External { mesh_name }
+        };
+
+        Ok(Self {
+            lod_slot: slot,
+            tri_size,
+            num_verts,
+            flags,
+            kind,
+        })
+    }
+}
+
+/// Whether a mesh body may end after its LOD array (#3777, #4269).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshTrailer {
+    /// A standalone `.mesh` file: the stream is exactly the body, so
+    /// "nothing follows the LODs" is observable and means no trailer
+    /// (Starfield's facegen bodies).
+    OptionalAtEnd,
+    /// An inline body inside the NIF stream: nifly always writes the
+    /// meshlet + cull-data trailer, and the stream's remainder belongs to
+    /// whatever follows the body, so the trailer is read unconditionally.
+    Required,
+}
+
+/// Inline mesh body. Mirrors `nifly::BSGeometryMeshData` — the
+/// version-gated Starfield mesh-data payload.
+///
+/// Storage choices: vertex positions are decoded from i16 NORM
+/// (per-axis scale = `havok_scale * scale * (norm / 32768)`) into
+/// `[f32; 3]` as they're read. Normals and tangents are stored as
+/// the raw u32 UDEC3 values; the renderer can unpack via
+/// [`unpack_udec3_xyzw`] when consumed. Half-float UVs are unpacked
+/// to f32 immediately because there's no value in deferring.
+#[derive(Debug, Default)]
+pub struct BSGeometryMeshData {
+    /// Format version. nifly bails out early if `version > 2` so the
+    /// rest of the body is opt-out for unrecognised stream versions.
+    pub version: u32,
+    /// Triangle list. Each triangle is three u16 vertex indices.
+    pub triangles: Vec<[u16; 3]>,
+    /// Position scale factor written to disk (multiplied by the
+    /// hard-coded havok-units constant when decoding vertex coords).
+    /// `<= 0.0` is a sentinel for "no body follows" — mirrors nifly's
+    /// `if (scale <= 0.0f) return;` early-out.
+    pub scale: f32,
+    /// Number of bone weights stored per vertex. `0` means no skin
+    /// weights are serialised.
+    pub weights_per_vert: u32,
+    /// Decoded vertex positions in source mesh-local Z-up units (havok-scaled).
+    /// The NIF importer performs the basis and engine-unit conversion.
+    pub vertices: Vec<[f32; 3]>,
+    /// Primary UV channel (decoded from half-floats).
+    pub uvs0: Vec<[f32; 2]>,
+    /// Secondary UV channel (decoded from half-floats).
+    pub uvs1: Vec<[f32; 2]>,
+    /// Vertex colours (`ByteColor4` — 4×u8, raw).
+    pub colors: Vec<[u8; 4]>,
+    /// Raw UDEC3 packed normals (10:10:10:2 unsigned-fixed-point).
+    /// Use [`unpack_udec3_xyzw`] for the per-channel `[-1, 1]` floats.
+    pub normals_raw: Vec<u32>,
+    /// Raw UDEC3 packed tangents (10:10:10:2). The 2-bit `W` channel
+    /// is the bitangent sign.
+    pub tangents_raw: Vec<u32>,
+    /// Per-vertex bone weights. Outer index = vertex; inner length =
+    /// [`Self::weights_per_vert`].
+    pub skin_weights: Vec<Vec<BoneWeight>>,
+    /// Optional LOD triangle lists. Each entry is a full reduced
+    /// triangle list at the corresponding LOD level.
+    pub lods: Vec<Vec<[u16; 3]>>,
+    /// Meshlet table (DirectX-style cluster culling primitives).
+    pub meshlets: Vec<Meshlet>,
+    /// Cull-data per meshlet — `(center, expand)` Vector3 pair.
+    pub cull_data: Vec<CullData>,
+}
+
+/// One bone-weight entry. `bone_index` is the slot in the parent
+/// skin-instance bones array; `weight` is u16 NORM (`/ 65535.0`).
+///
+/// `#[repr(C)]` + `Default` so the parser can bulk-read the flat
+/// per-vertex weight array via `read_pod_vec::<BoneWeight>(n)` —
+/// 4 bytes per entry (2× u16, no padding), matches the on-disk
+/// little-endian layout. See #873.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct BoneWeight {
+    pub bone_index: u16,
+    pub weight: u16,
+}
+
+/// Meshlet entry — DirectX 12 cluster-culling layout.
+///
+/// `#[repr(C)]` + `Default` so `read_pod_vec::<Meshlet>(n)` lands
+/// the bulk read in one `read_exact`. 16 bytes per entry (4× u32,
+/// no padding). See #873.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct Meshlet {
+    pub vert_count: u32,
+    pub vert_offset: u32,
+    pub prim_count: u32,
+    pub prim_offset: u32,
+}
+
+/// Per-meshlet bounding cull data — `center` + `expand` (axis-aligned
+/// half-extents).
+///
+/// `#[repr(C)]` + `Default` so `read_pod_vec::<CullData>(n)` lands
+/// the bulk read in one `read_exact`. 24 bytes per entry (6× f32 as
+/// two `[f32; 3]` arrays, no padding). See #873.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct CullData {
+    pub center: [f32; 3],
+    pub expand: [f32; 3],
+}
+
+// SAFETY (MEM-05, #1439): each is a `#[repr(C)]` aggregate of all-bit-
+// patterns-valid scalars (`u16` / `u32` / `[f32; 3]`) with no padding, so
+// any `size_of`-byte sequence is a sound value — the precondition
+// `read_pod_vec::<T>` relies on for its raw `read_exact` cast.
+unsafe impl crate::stream::AnyBitPattern for BoneWeight {}
+unsafe impl crate::stream::AnyBitPattern for Meshlet {}
+unsafe impl crate::stream::AnyBitPattern for CullData {}
+
+impl BSGeometryMeshData {
+    /// Hard-coded havok-scale constant from nifly. Starfield `.mesh`
+    /// files are normalised to metric units; this scale brings the
+    /// default vertex positions back to Skyrim-equivalent sizes.
+    /// Per `BSGeometryMeshData::havokScale` (private member).
+    ///
+    /// `pub(crate)` so the import boundary can bring the parent
+    /// `BSGeometry.bounding_sphere` — authored in the same normalised
+    /// units — into the unit system these decoded positions use (#4394).
+    pub(crate) const HAVOK_SCALE: f32 = 69.969;
+
+    /// Parse a standalone external `.mesh` file (SF-D4-02 Stage B).
+    ///
+    /// The external `.mesh` format is identical to the inline `BSGeometryMeshData`
+    /// body — nifly's `NifFile::LoadExternalShapeData` calls `meshData.Sync(s)`
+    /// directly on the raw stream with no wrapper header or magic number.
+    pub fn parse_from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        use crate::header::NifHeader;
+        use crate::version::NifVersion;
+        let header = NifHeader::detached(NifVersion::V20_2_0_7, 12, 172);
+        let mut stream = NifStream::new(bytes, &header);
+        Self::parse(&mut stream, MeshTrailer::OptionalAtEnd)
+    }
+
+    fn parse(stream: &mut NifStream, trailer: MeshTrailer) -> io::Result<Self> {
+        let version = stream.read_u32_le()?;
+        // nifly: `if (version > 2) return;` — leave every body field
+        // empty so the parent record can still finalise.
+        if version > 2 {
+            return Ok(Self::empty(version));
+        }
+
+        let n_tri_indices = stream.read_u32_le()?;
+        let tri_count = (n_tri_indices / 3) as usize;
+        // F10 (#1589) — bulk read 3-u16 triangles (matches the LOD path).
+        let triangles = stream.read_u16_triple_array(tri_count)?;
+
+        let scale = stream.read_f32_le()?;
+        // Sentinel: scale ≤ 0 means "the rest of the body is absent".
+        // Vanilla Starfield uses this for the segment-only / skin-weight-only
+        // mesh slots that share a parent BSGeometry with a populated slot.
+        if scale <= 0.0 {
+            return Ok(Self {
+                version,
+                triangles,
+                scale,
+                weights_per_vert: 0,
+                vertices: Vec::new(),
+                uvs0: Vec::new(),
+                uvs1: Vec::new(),
+                colors: Vec::new(),
+                normals_raw: Vec::new(),
+                tangents_raw: Vec::new(),
+                skin_weights: Vec::new(),
+                lods: Vec::new(),
+                meshlets: Vec::new(),
+                cull_data: Vec::new(),
+            });
+        }
+
+        let weights_per_vert = stream.read_u32_le()?;
+
+        // #1263 / NIF-D5-NEW-03 — bulk-read the raw u16 stream then
+        // unpack in a tight loop. The per-element `unpack_norm_i16` /
+        // `half_to_f32` transform prevents direct `read_pod_vec::<[f32; N]>`
+        // (the on-disk and runtime layouts differ in size), so the
+        // helper API used by #873 doesn't fit directly. The trade is
+        // one extra intermediate `Vec<u16>` allocation for collapsing
+        // N×K stream-read calls into a single bulk read — net win at
+        // typical Starfield mesh sizes (1000+ verts) where the per-read
+        // bounds-check + cursor-advance dominates the alloc cost.
+        let n_vertices = stream.read_u32_le()?;
+        let vertices: Vec<[f32; 3]> = stream
+            .read_u16_array(n_vertices as usize * 3)?
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|c| {
+                [
+                    unpack_norm_i16(c[0] as i16, scale, Self::HAVOK_SCALE),
+                    unpack_norm_i16(c[1] as i16, scale, Self::HAVOK_SCALE),
+                    unpack_norm_i16(c[2] as i16, scale, Self::HAVOK_SCALE),
+                ]
+            })
+            .collect();
+
+        let n_uv1 = stream.read_u32_le()?;
+        let uvs0: Vec<[f32; 2]> = stream
+            .read_u16_array(n_uv1 as usize * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| [half_to_f32(c[0]), half_to_f32(c[1])])
+            .collect();
+
+        let n_uv2 = stream.read_u32_le()?;
+        let uvs1: Vec<[f32; 2]> = stream
+            .read_u16_array(n_uv2 as usize * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| [half_to_f32(c[0]), half_to_f32(c[1])])
+            .collect();
+
+        // Bulk reads — `[u8; 4]` and `u32` are POD; one `read_exact`
+        // each replaces the per-element push loops. The `allocate_vec`
+        // calls would have done their own check_alloc anyway; the bulk
+        // readers do the equivalent check inside `read_pod_vec`. See
+        // #873 (NIF-PERF-09).
+        let n_colors = stream.read_u32_le()?;
+        let colors = stream.read_u8_quad_array(n_colors as usize)?;
+
+        let n_normals = stream.read_u32_le()?;
+        let normals_raw = stream.read_u32_array(n_normals as usize)?;
+
+        let n_tangents = stream.read_u32_le()?;
+        let tangents_raw = stream.read_u32_array(n_tangents as usize)?;
+
+        let n_total_weights = stream.read_u32_le()?;
+        // Per nifly: weight count is interpreted as a *flat* count of
+        // BoneWeight entries; the per-vertex grouping is `weights_per_vert`.
+        // When `weights_per_vert == 0` we skip the resize (no skin weights).
+        //
+        // #2032 / PERF-D8-01 — bulk-read via `read_pod_vec::<BoneWeight>`
+        // (matches the `meshlets`/`cull_data` sibling reads below and
+        // `BoneWeight`'s own doc comment) instead of a per-element
+        // `allocate_vec` + two-`read_u16_le` loop. Reads
+        // `outer_len * weights_per_vert`, NOT `n_total_weights` — floor
+        // division means `outer_len * weights_per_vert <= n_total_weights`
+        // whenever there's a remainder, and the old per-row loop only
+        // ever consumed that same truncated count from the stream, so
+        // this preserves the exact byte-for-byte stream position. The
+        // product can't overflow `usize`: it's bounded above by
+        // `n_total_weights` itself (a `u32`), by construction of floor
+        // division.
+        let skin_weights: Vec<Vec<BoneWeight>> = match n_total_weights.checked_div(weights_per_vert)
+        {
+            Some(outer_len) => {
+                let weights_per_vert = weights_per_vert as usize;
+                let flat =
+                    stream.read_pod_vec::<BoneWeight>(outer_len as usize * weights_per_vert)?;
+                flat.chunks_exact(weights_per_vert)
+                    .map(|c| c.to_vec())
+                    .collect()
+            }
+            // #2620 / SF2D2-D2-02 — `weights_per_vert == 0` means "no
+            // per-vertex grouping is possible" (there is no skin data to
+            // return, hence `Vec::new()` below), but it does NOT mean
+            // "no bytes were written." `n_total_weights` is a flat
+            // BoneWeight count independent of the grouping divisor; if a
+            // `.mesh` body ever ships `weights_per_vert == 0` alongside
+            // `n_total_weights > 0`, that many 4-byte `BoneWeight`
+            // entries (2×u16 each) are still on disk. Pre-fix this arm
+            // read zero bytes and left the cursor sitting in the middle
+            // of that payload, so every subsequent field (`n_lods` /
+            // `n_meshlets` / `n_cull_data`) decoded from garbage. `skip`
+            // never allocates (just moves the cursor) and is itself
+            // bounds-checked against the backing data length, so a
+            // hostile `n_total_weights` fails gracefully here instead of
+            // corrupting the rest of the parse.
+            None => {
+                stream.skip(n_total_weights as u64 * 4)?;
+                Vec::new()
+            }
+        };
+
+        let n_lods = stream.read_u32_le()?;
+        let mut lods = stream.allocate_vec::<Vec<[u16; 3]>>(n_lods)?;
+        for _ in 0..n_lods {
+            let n_lod_tri_indices = stream.read_u32_le()?;
+            let lod_tri_count = n_lod_tri_indices as usize / 3;
+            // Bulk read 3-u16 triangles — `read_u16_triple_array` does
+            // its own check_alloc against the byte budget. See #874 +
+            // #873.
+            let tris = stream.read_u16_triple_array(lod_tri_count)?;
+            lods.push(tris);
+        }
+
+        // Bulk struct reads — `Meshlet` (4 × u32 = 16 B) and `CullData`
+        // (6 × f32 = 24 B) are `#[repr(C)] + Default + Copy` and decode
+        // in one `read_pod_vec` per array. See #873.
+        //
+        // #3777 — the meshlet + cull-data trailer is OPTIONAL. Starfield's
+        // facegen `.mesh` bodies end exactly at the last LOD entry and ship
+        // no trailer at all, so reading `n_meshlets` unconditionally hit
+        // `failed to fill whole buffer`, which cascaded: the Stage B LOD-slot
+        // loop in `import/mesh/bs_geometry.rs` logs the error at `debug!` and
+        // `continue`s, every slot exhausts, and the shape never becomes an
+        // `ImportedMesh`. End-to-end that was 1,282 of 1,282
+        // `Starfield - FaceMeshes.ba2` NIFs importing ZERO geometry — every
+        // Starfield NPC headless.
+        //
+        // A field-by-field walk classifying where each of the 680,239 vanilla
+        // `.mesh` bodies ends splits 4,832 `ENDS_AFTER_LODS` / 675,407
+        // `FULL_EXACT` (byte-exact through `cull_data`), and the split is
+        // 100% clean along the FaceMeshes archive boundary. It is NOT "skinned
+        // bodies omit the trailer" — 10,185 `FULL_EXACT` bodies carry skin
+        // weights too. So the rule is positional, not content-derived: if
+        // nothing follows the LOD array, there is no trailer.
+        //
+        // Deliberately gated on `remaining() == 0` rather than swallowing an
+        // EOF error from the reads themselves: a body that ends *mid*-trailer
+        // is corrupt and must still fail, and both arrays remain fully
+        // bounds-checked when they are present.
+        //
+        // #4269 — the test is only meaningful for a standalone `.mesh`
+        // body, whose stream IS the body. An inline (Stage A, flag 0x200)
+        // body is read from the NIF stream itself, where `remaining()`
+        // counts every byte after it (further slots, blocks, the footer)
+        // and says nothing about this body. There the trailer follows
+        // nifly's `BSGeometryMeshData::Sync`, which reads and writes it
+        // unconditionally: `MeshTrailer::Required`.
+        let trailer_absent =
+            matches!(trailer, MeshTrailer::OptionalAtEnd) && stream.remaining() == 0;
+        let (meshlets, cull_data) = if trailer_absent {
+            (Vec::new(), Vec::new())
+        } else {
+            let n_meshlets = stream.read_u32_le()?;
+            let meshlets = stream.read_pod_vec::<Meshlet>(n_meshlets as usize)?;
+
+            let n_cull_data = stream.read_u32_le()?;
+            let cull_data = stream.read_pod_vec::<CullData>(n_cull_data as usize)?;
+            (meshlets, cull_data)
+        };
+
+        Ok(Self {
+            version,
+            triangles,
+            scale,
+            weights_per_vert,
+            vertices,
+            uvs0,
+            uvs1,
+            colors,
+            normals_raw,
+            tangents_raw,
+            skin_weights,
+            lods,
+            meshlets,
+            cull_data,
+        })
+    }
+
+    /// All-empty body for unrecognised version numbers.
+    fn empty(version: u32) -> Self {
+        Self {
+            version,
+            triangles: Vec::new(),
+            scale: 0.0,
+            weights_per_vert: 0,
+            vertices: Vec::new(),
+            uvs0: Vec::new(),
+            uvs1: Vec::new(),
+            colors: Vec::new(),
+            normals_raw: Vec::new(),
+            tangents_raw: Vec::new(),
+            skin_weights: Vec::new(),
+            lods: Vec::new(),
+            meshlets: Vec::new(),
+            cull_data: Vec::new(),
+        }
+    }
+}
+
+/// Decode a single i16 NORM-encoded position component back to a
+/// world-space float. Mirrors nifly's `unpack` lambda inside
+/// `BSGeometryMeshData::Sync` (line 1644). Negative i16 divides by
+/// `32768`, non-negative by `32767`.
+fn unpack_norm_i16(raw: i16, scale: f32, axis_scale: f32) -> f32 {
+    if raw < 0 {
+        (raw as f32 / 32768.0) * scale * axis_scale
+    } else {
+        (raw as f32 / 32767.0) * scale * axis_scale
+    }
+}
+
+/// Unpack a UDEC3 (10:10:10:2 unsigned-fixed) word into per-channel
+/// `[-1, 1]` floats. The 2-bit `W` channel becomes the 4th component
+/// (used as the bitangent-sign on tangents). Per the FIXME at
+/// `BSGeometryMeshData::Sync` line 1709 — Bethesda stores unsigned
+/// fixed-point and expects the consumer to map back to signed range.
+pub fn unpack_udec3_xyzw(raw: u32) -> [f32; 4] {
+    let x = (raw & 0x3FF) as f32;
+    let y = ((raw >> 10) & 0x3FF) as f32;
+    let z = ((raw >> 20) & 0x3FF) as f32;
+    let w = ((raw >> 30) & 0x3) as f32;
+    [
+        (x / 1023.0) * 2.0 - 1.0,
+        (y / 1023.0) * 2.0 - 1.0,
+        (z / 1023.0) * 2.0 - 1.0,
+        (w / 3.0) * 2.0 - 1.0,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpack_udec3_zero_maps_to_minus_one() {
+        // raw=0 → all channels at the minimum of the unsigned
+        // 10-bit (or 2-bit for W) range → -1.0 after the
+        // [0, 1023] → [-1, 1] remap.
+        let unp = unpack_udec3_xyzw(0);
+        assert_eq!(unp, [-1.0, -1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn unpack_udec3_max_maps_to_plus_one() {
+        // raw=0xFFFFFFFF → every channel at its max
+        // (1023 for the three 10-bit slots, 3 for the 2-bit W).
+        // All map back to +1.0 exactly.
+        let unp = unpack_udec3_xyzw(0xFFFF_FFFF);
+        assert!((unp[0] - 1.0).abs() < 1e-6);
+        assert!((unp[1] - 1.0).abs() < 1e-6);
+        assert!((unp[2] - 1.0).abs() < 1e-6);
+        assert!((unp[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unpack_udec3_axis_isolation() {
+        // X = 511 (mid of 1023), Y = Z = 0, W = 0 → roughly 0.0 on X,
+        // -1.0 elsewhere. Catches a misordered shift / mask pair.
+        let raw: u32 = 511;
+        let unp = unpack_udec3_xyzw(raw);
+        assert!((unp[0] - ((511.0 / 1023.0) * 2.0 - 1.0)).abs() < 1e-6);
+        assert_eq!(unp[1], -1.0);
+        assert_eq!(unp[2], -1.0);
+        assert_eq!(unp[3], -1.0);
+    }
+
+    #[test]
+    fn unpack_norm_i16_scales_by_havok_constant() {
+        // raw=32767 (max positive i16) with scale=1 should give
+        // exactly 1 × HAVOK_SCALE. Negative case divides by 32768.
+        let pos = unpack_norm_i16(32767, 1.0, BSGeometryMeshData::HAVOK_SCALE);
+        assert!((pos - BSGeometryMeshData::HAVOK_SCALE).abs() < 1e-3);
+
+        let neg = unpack_norm_i16(-32768, 1.0, BSGeometryMeshData::HAVOK_SCALE);
+        assert!((neg + BSGeometryMeshData::HAVOK_SCALE).abs() < 1e-3);
+    }
+
+    /// The facegen-shaped body (ends after its LODs) with an optional
+    /// trailer appended, as the bytes of one `BSGeometryMeshData`.
+    fn minimal_body(trailer: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tri_indices
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // scale
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // weights_per_vert
+        for _ in 0..7 {
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // the seven count fields
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_lods = 0
+        if trailer {
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // n_meshlets = 1
+            bytes.extend_from_slice(&[0u8; 16]);
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // n_cull_data = 1
+            bytes.extend_from_slice(&[0u8; 24]);
+        }
+        bytes
+    }
+
+    /// Parse one inline (Stage A) mesh slot — `tri_size`, `num_verts`,
+    /// `flags`, then the body — from `body` followed by `tail`, the bytes
+    /// of whatever comes next in the NIF. Returns the slot and how many
+    /// bytes it consumed.
+    fn parse_inline(body: &[u8], tail: &[u8]) -> (io::Result<BSGeometryMesh>, usize) {
+        use crate::header::NifHeader;
+        use crate::version::NifVersion;
+        let mut bytes = vec![0u8; 12];
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(tail);
+        let header = NifHeader::detached(NifVersion::V20_2_0_7, 12, 172);
+        let mut stream = NifStream::new(&bytes, &header);
+        let slot = BSGeometryMesh::parse(&mut stream, 0, true);
+        (slot, stream.position() as usize)
+    }
+
+    /// #4269 — on the inline path the trailer is read whatever follows the
+    /// body: `remaining()` counts the rest of the NIF there, so it cannot
+    /// signal the end of this body. The slot stops exactly after its
+    /// trailer, leaving the following bytes for the next reader.
+    #[test]
+    fn an_inline_body_reads_its_trailer_and_stops_after_it() {
+        let body = minimal_body(true);
+        let (slot, consumed) = parse_inline(&body, &[0xAB; 32]);
+        let slot = slot.expect("an inline body with its trailer parses");
+        let BSGeometryMeshKind::Internal { mesh_data } = slot.kind else {
+            panic!("flag 0x200 selects the inline body");
+        };
+        assert_eq!(
+            (mesh_data.meshlets.len(), mesh_data.cull_data.len()),
+            (1, 1)
+        );
+        assert_eq!(
+            consumed,
+            12 + body.len(),
+            "the next block's bytes are untouched"
+        );
+    }
+
+    /// #4269 — the facegen "ends after the LODs" shape is a `.mesh`-file
+    /// property only. An inline body without its trailer is truncated,
+    /// as it is to nifly, even at the very end of the stream where the
+    /// `.mesh` rule would have accepted it.
+    #[test]
+    fn an_inline_body_missing_its_trailer_is_an_error() {
+        let body = minimal_body(false);
+        assert!(
+            BSGeometryMeshData::parse_from_bytes(&body).is_ok(),
+            "the .mesh shape"
+        );
+        let (slot, _) = parse_inline(&body, &[]);
+        assert!(
+            slot.is_err(),
+            "inline bodies always carry the trailer (nifly Sync)"
+        );
+    }
+
+    /// Regression for #768 / NIF-D3-13. A hostile `weights_per_vert =
+    /// 0xFFFFFFFF` paired with a matching `n_total_weights` makes
+    /// `outer_len = 1` (passes the outer `allocate_vec` budget guard
+    /// from #764). Pre-#768 the inner row used
+    /// `Vec::with_capacity(weights_per_vert)`, which on overcommit
+    /// systems would request ~16 GB of virtual memory and the
+    /// subsequent `read_u16_le` would fail with a generic EOF
+    /// message (or, in resource-constrained environments, OOM-panic
+    /// the process).
+    ///
+    /// #2032 / PERF-D8-01 replaced the per-row `allocate_vec` +
+    /// `read_u16_le` loop with a single bulk `read_pod_vec` over
+    /// #3777 — the meshlet + cull-data trailer is OPTIONAL.
+    ///
+    /// Starfield facegen `.mesh` bodies end exactly at the last LOD entry.
+    /// Reading `n_meshlets` unconditionally hit "failed to fill whole
+    /// buffer", which cascaded through the Stage B LOD-slot loop (whose
+    /// `Err` arm logs at `debug!` and continues) until every slot exhausted
+    /// and the shape never became an `ImportedMesh`: 1,282 of 1,282
+    /// `Starfield - FaceMeshes.ba2` NIFs imported ZERO geometry, so every
+    /// Starfield NPC rendered headless.
+    ///
+    /// A field-by-field walk over all 680,239 vanilla `.mesh` bodies splits
+    /// 4,832 ending after the LODs / 675,407 byte-exact through
+    /// `cull_data`, 100% clean along the FaceMeshes archive boundary — and
+    /// NOT along "carries skin weights" (10,185 full-length bodies do too).
+    #[test]
+    fn a_body_ending_after_the_lod_array_parses_without_a_trailer() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tri_indices
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // scale
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // weights_per_vert
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_vertices
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_colors
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_normals
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tangents
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_total_weights
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_lods = 0 → EOF here
+
+        let data = BSGeometryMeshData::parse_from_bytes(&bytes)
+            .expect("a body that ends at the LOD array must parse, not EOF");
+        assert!(data.meshlets.is_empty());
+        assert!(data.cull_data.is_empty());
+    }
+
+    /// The trailer must still be read when it IS present — 675,407 of the
+    /// 680,239 vanilla bodies carry one, so tolerating its absence must not
+    /// become ignoring its presence.
+    #[test]
+    fn a_body_with_a_trailer_still_reads_it() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tri_indices
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // scale
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // weights_per_vert
+        for _ in 0..7 {
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // the seven count fields
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_lods = 0
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_meshlets = 1
+        bytes.extend_from_slice(&[0u8; 16]); // one Meshlet (4 x u32)
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_cull_data = 1
+        bytes.extend_from_slice(&[0u8; 24]); // one CullData (6 x f32)
+
+        let data = BSGeometryMeshData::parse_from_bytes(&bytes)
+            .expect("a full-length body must still parse");
+        assert_eq!(data.meshlets.len(), 1);
+        assert_eq!(data.cull_data.len(), 1);
+    }
+
+    /// A body that ends *mid*-trailer is corrupt and must still fail. The
+    /// tolerance is positional — "nothing follows the LOD array" — not a
+    /// swallowed EOF from the reads themselves.
+    #[test]
+    fn a_body_that_ends_inside_the_trailer_still_errors() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..7 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_lods = 0
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_meshlets = 1
+        bytes.extend_from_slice(&[0u8; 8]); // ...but only half a Meshlet
+
+        assert!(
+            BSGeometryMeshData::parse_from_bytes(&bytes).is_err(),
+            "a truncated trailer is corruption, not the facegen shape"
+        );
+    }
+
+    /// `outer_len * weights_per_vert` elements — that byte count
+    /// (~17 GB here) trips `read_pod_vec`'s own `check_alloc` guard,
+    /// which checks the hard `MAX_SINGLE_ALLOC_BYTES` cap BEFORE the
+    /// remaining-stream-bytes check `allocate_vec` used,
+    /// so the rejection message changed shape (now "exceeds hard cap"
+    /// rather than "only N bytes remain") while the contract — graceful
+    /// error, never a panic or unbounded allocation — is unchanged.
+    #[test]
+    fn weights_per_vert_hostile_returns_err_not_panic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version (≤ 2 → keep parsing)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tri_indices
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // scale (positive)
+        bytes.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // weights_per_vert HOSTILE
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_vertices
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv2
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_colors
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_normals
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tangents
+        bytes.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // n_total_weights HOSTILE
+                                                               // (outer_len = 0xFFFFFFFF / 0xFFFFFFFF = 1)
+        bytes.push(0x00); // 1 byte padding so outer
+                          // allocate_vec(1) passes its
+                          // remaining ≥ count check.
+
+        let result = BSGeometryMeshData::parse_from_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "hostile weights_per_vert must error gracefully, not panic"
+        );
+        // Pre-#768 would either panic (OOM) or fail with a generic EOF
+        // read error; post-#2032 the bulk `read_pod_vec` path rejects
+        // the ~17 GB request via `check_alloc`'s hard-cap guard before
+        // any heap allocation is attempted. Asserting on the text
+        // catches any future regression that re-introduces an
+        // unbounded allocation on this path.
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds hard cap"),
+            "expected read_pod_vec's check_alloc hard-cap rejection, got: {msg}"
+        );
+    }
+
+    /// Regression for #2032 / PERF-D8-01. Pins that the bulk
+    /// `read_pod_vec::<BoneWeight>` migration produces byte-identical
+    /// `skin_weights` content AND stream-position behavior to the old
+    /// per-element `allocate_vec` + two-`read_u16_le` loop — including
+    /// the truncating-division edge case where `n_total_weights` isn't
+    /// evenly divisible by `weights_per_vert`.
+    ///
+    /// `n_total_weights` (5) is intentionally NOT a multiple of
+    /// `weights_per_vert` (2); the on-disk data after it holds only
+    /// `outer_len * weights_per_vert` = 4 `BoneWeight` entries (16
+    /// bytes), immediately followed by the real `n_lods` field — i.e.
+    /// this models a stream where the redundant `n_total_weights`
+    /// count doesn't perfectly match the vertex-grouped data that
+    /// actually follows on disk, exactly the case the old loop (and
+    /// therefore the new bulk read) must floor-divide around. If the
+    /// migration had used `n_total_weights` directly instead of
+    /// `outer_len * weights_per_vert`, it would try to read a 5th
+    /// entry's worth of bytes from what are actually the `n_lods` /
+    /// `n_meshlets` / `n_cull_data` fields, corrupting the parse.
+    #[test]
+    fn skin_weights_bulk_read_matches_per_element_semantics() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tri_indices
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // scale (positive)
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // weights_per_vert
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_vertices
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv2
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_colors
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_normals
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tangents
+
+        // n_total_weights(5) / weights_per_vert(2) floor-divides to
+        // outer_len = 2, so only 4 BoneWeight entries are ever
+        // consumed — the on-disk layout reflects that (4 entries, not
+        // 5) so a correct reader lands exactly on `n_lods` next.
+        bytes.extend_from_slice(&5u32.to_le_bytes()); // n_total_weights
+        let weights: [(u16, u16); 4] = [(10, 100), (11, 200), (20, 300), (21, 400)];
+        for (bone_index, weight) in weights {
+            bytes.extend_from_slice(&bone_index.to_le_bytes());
+            bytes.extend_from_slice(&weight.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_lods
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_meshlets
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_cull_data
+
+        let data = BSGeometryMeshData::parse_from_bytes(&bytes)
+            .expect("well-formed skin-weight body must parse");
+
+        assert_eq!(
+            data.skin_weights.len(),
+            2,
+            "outer_len must floor-divide n_total_weights(5) / weights_per_vert(2) = 2"
+        );
+        assert_eq!(
+            data.skin_weights[0]
+                .iter()
+                .map(|w| (w.bone_index, w.weight))
+                .collect::<Vec<_>>(),
+            vec![(10, 100), (11, 200)],
+        );
+        assert_eq!(
+            data.skin_weights[1]
+                .iter()
+                .map(|w| (w.bone_index, w.weight))
+                .collect::<Vec<_>>(),
+            vec![(20, 300), (21, 400)],
+        );
+        // If the bulk read had consumed `n_total_weights` (5) elements
+        // instead of `outer_len * weights_per_vert` (4), it would have
+        // read 4 extra bytes past the intended 16-byte skin-weight
+        // region — landing mid-way into the real `n_lods` field's
+        // bytes and either misreading `n_lods` as garbage (causing
+        // `allocate_vec` to reject it) or misaligning every read after
+        // it. `lods.len() == 0` is the observable proof the cursor
+        // landed exactly where the old per-element loop left it.
+        assert_eq!(data.lods.len(), 0);
+    }
+
+    /// Regression for #2620 / SF2D2-D2-02: `weights_per_vert == 0` with
+    /// `n_total_weights > 0` means "no per-vertex grouping is possible"
+    /// (`skin_weights` is correctly empty), NOT "no bytes were written."
+    /// Pre-fix, the `None` arm of `checked_div` read zero bytes and left
+    /// the cursor sitting in the middle of the still-on-disk `BoneWeight`
+    /// payload, so `n_lods` (and everything after it) decoded from
+    /// garbage. This fixture places a real, non-zero `n_lods` entry right
+    /// after 2 undrained `BoneWeight` entries (8 bytes) — a correct
+    /// reader must skip exactly those 8 bytes and land precisely on
+    /// `n_lods`.
+    #[test]
+    fn weights_per_vert_zero_with_nonzero_total_skips_payload_not_zero_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tri_indices
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // scale (positive)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // weights_per_vert = 0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_vertices
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_uv2
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_colors
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_normals
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_tangents
+
+        // n_total_weights > 0 but weights_per_vert == 0 → checked_div
+        // returns None. 2 BoneWeight entries (2×u16 each = 4 bytes) are
+        // still on disk and MUST be skipped, not left unread.
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // n_total_weights
+        for (bone_index, weight) in [(99u16, 999u16), (88, 888)] {
+            bytes.extend_from_slice(&bone_index.to_le_bytes());
+            bytes.extend_from_slice(&weight.to_le_bytes());
+        }
+
+        // One real LOD entry: 1 triangle (3 indices).
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_lods
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // n_lod_tri_indices for LOD 0
+        for idx in [5u16, 6, 7] {
+            bytes.extend_from_slice(&idx.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_meshlets
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_cull_data
+
+        let data = BSGeometryMeshData::parse_from_bytes(&bytes)
+            .expect("weights_per_vert=0 body with a real n_lods after it must parse");
+
+        assert!(
+            data.skin_weights.is_empty(),
+            "weights_per_vert=0 correctly yields no per-vertex weight grouping"
+        );
+        assert_eq!(
+            data.lods.len(),
+            1,
+            "the cursor must land exactly on n_lods after skipping the 8-byte \
+             BoneWeight payload — a wrong skip size would either misread n_lods \
+             as garbage (parse error / wrong count) or misalign every field after it"
+        );
+        assert_eq!(data.lods[0], vec![[5, 6, 7]]);
+    }
+}

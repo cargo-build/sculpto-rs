@@ -1,0 +1,1762 @@
+//! Unit tests for `World` — spawn/despawn, query, resource access,
+//! interior mutability invariants. Extracted from `world.rs` to keep
+//! the production code under ~800 lines; pulled in via
+//! `#[cfg(test)] #[path = "..."] mod tests;`.
+
+use super::*;
+use crate::ecs::packed::PackedStorage;
+use crate::ecs::sparse_set::SparseSetStorage;
+
+struct Health(f32);
+impl Component for Health {
+    type Storage = SparseSetStorage<Self>;
+}
+
+struct Position {
+    x: f32,
+    y: f32,
+}
+impl Component for Position {
+    type Storage = PackedStorage<Self>;
+}
+
+struct Velocity {
+    dx: f32,
+    dy: f32,
+}
+impl Component for Velocity {
+    type Storage = PackedStorage<Self>;
+}
+
+// ── Basic World operations ──────────────────────────────────────────
+
+#[test]
+fn spawn_and_insert() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    world.insert(e, Position { x: 1.0, y: 2.0 });
+
+    assert_eq!(world.get::<Health>(e).unwrap().0, 100.0);
+    assert_eq!(world.get::<Position>(e).unwrap().x, 1.0);
+}
+
+#[test]
+fn despawn_removes_every_component() {
+    let mut world = World::new();
+    let a = world.spawn();
+    let b = world.spawn();
+
+    world.insert(a, Health(100.0));
+    world.insert(a, Position { x: 1.0, y: 2.0 });
+    world.insert(a, Velocity { dx: 3.0, dy: 4.0 });
+    world.insert(b, Health(50.0));
+    world.insert(b, Position { x: 5.0, y: 6.0 });
+
+    world.despawn(a);
+
+    assert!(world.get::<Health>(a).is_none(), "Health not removed");
+    assert!(world.get::<Position>(a).is_none(), "Position not removed");
+    assert!(world.query::<Velocity>().unwrap().get(a).is_none());
+
+    // b is untouched.
+    assert_eq!(world.get::<Health>(b).unwrap().0, 50.0);
+    assert_eq!(world.get::<Position>(b).unwrap().x, 5.0);
+}
+
+#[test]
+fn despawn_nonexistent_entity_is_noop() {
+    let mut world = World::new();
+    let a = world.spawn();
+    world.insert(a, Health(100.0));
+
+    // Entity id beyond next_entity — no-op, not a panic.
+    world.despawn(12345);
+
+    assert_eq!(world.get::<Health>(a).unwrap().0, 100.0);
+}
+
+#[test]
+fn despawn_batch_removes_sparse_and_packed_rows_once() {
+    let mut world = World::new();
+    let entities = (0..6).map(|_| world.spawn()).collect::<Vec<_>>();
+    for (index, &entity) in entities.iter().enumerate() {
+        world.insert(entity, Health(index as f32));
+        world.insert(
+            entity,
+            Position {
+                x: index as f32,
+                y: -(index as f32),
+            },
+        );
+        if index % 2 == 0 {
+            world.insert(entity, Velocity { dx: 1.0, dy: 2.0 });
+        }
+    }
+    let next_before = world.next_entity_id();
+
+    // Unsorted input, a duplicate, and an invalid ID exercise the public
+    // normalization contract before each storage receives the batch.
+    world.despawn_batch(vec![
+        entities[4],
+        entities[1],
+        entities[4],
+        next_before + 100,
+    ]);
+
+    for &removed in &[entities[1], entities[4]] {
+        assert!(world.get::<Health>(removed).is_none());
+        assert!(world.get::<Position>(removed).is_none());
+        assert!(world.get::<Velocity>(removed).is_none());
+    }
+    for &survivor in &[entities[0], entities[2], entities[3], entities[5]] {
+        assert!(world.get::<Health>(survivor).is_some());
+        assert!(world.get::<Position>(survivor).is_some());
+    }
+    assert_eq!(world.count::<Health>(), 4);
+    assert_eq!(world.count::<Position>(), 4);
+    assert_eq!(world.count::<Velocity>(), 2);
+    assert_eq!(
+        world.spawn(),
+        next_before,
+        "batch despawn must not reuse IDs"
+    );
+}
+
+#[test]
+fn despawn_empty_storages_is_noop() {
+    let mut world = World::new();
+    world.register::<Health>();
+    let a = world.spawn();
+    // Entity was spawned but never got any component.
+    world.despawn(a);
+    assert!(world.get::<Health>(a).is_none());
+}
+
+#[test]
+fn despawn_does_not_reclaim_entity_ids() {
+    // next_entity must keep growing — reusing IDs without generation
+    // tagging would cause silent component aliasing (see #36, #372).
+    let mut world = World::new();
+    let a = world.spawn();
+    world.insert(a, Health(1.0));
+    let next_before = world.next_entity_id();
+
+    world.despawn(a);
+    let c = world.spawn();
+
+    assert_eq!(c, next_before, "spawn should advance, not reclaim");
+    assert_ne!(c, a, "reclaimed id would alias stale component data");
+}
+
+#[test]
+fn different_storage_backends() {
+    let mut world = World::new();
+    let a = world.spawn();
+    let b = world.spawn();
+
+    world.insert(a, Health(50.0));
+    world.insert(b, Health(75.0));
+    world.insert(a, Position { x: 0.0, y: 0.0 });
+
+    assert_eq!(world.count::<Health>(), 2);
+    assert_eq!(world.count::<Position>(), 1);
+
+    assert!(world.has::<Health>(a));
+    assert!(world.has::<Health>(b));
+    assert!(world.has::<Position>(a));
+    assert!(!world.has::<Position>(b));
+}
+
+#[test]
+fn remove_component() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let removed = world.remove::<Health>(e).unwrap();
+    assert_eq!(removed.0, 100.0);
+    assert!(!world.has::<Health>(e));
+}
+
+#[test]
+fn mutate_component() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    world.get_mut::<Health>(e).unwrap().0 -= 25.0;
+    assert_eq!(world.get::<Health>(e).unwrap().0, 75.0);
+}
+
+#[test]
+fn get_nonexistent() {
+    let world = World::new();
+    assert!(world.get::<Health>(0).is_none());
+    assert!(world.get::<Position>(999).is_none());
+}
+
+#[test]
+fn lazy_storage_init() {
+    let world = World::new();
+    assert_eq!(world.count::<Health>(), 0);
+    assert!(!world.has::<Health>(0));
+}
+
+// ── Single-component query ──────────────────────────────────────────
+
+#[test]
+fn query_read_single() {
+    let mut world = World::new();
+    let a = world.spawn();
+    let b = world.spawn();
+    world.insert(a, Health(100.0));
+    world.insert(b, Health(50.0));
+
+    let q = world.query::<Health>().unwrap();
+    assert_eq!(q.get(a).unwrap().0, 100.0);
+    assert_eq!(q.get(b).unwrap().0, 50.0);
+    assert_eq!(q.len(), 2);
+}
+
+#[test]
+fn query_write_single() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    {
+        let mut q = world.query_mut::<Health>().unwrap();
+        q.get_mut(e).unwrap().0 -= 30.0;
+    }
+
+    assert_eq!(world.get::<Health>(e).unwrap().0, 70.0);
+}
+
+#[test]
+fn query_write_insert_remove() {
+    let mut world = World::new();
+    let a = world.spawn();
+    let b = world.spawn();
+    world.insert(a, Health(100.0));
+
+    {
+        let mut q = world.query_mut::<Health>().unwrap();
+        q.insert(b, Health(200.0));
+        q.remove(a);
+    }
+
+    assert!(world.get::<Health>(a).is_none());
+    assert_eq!(world.get::<Health>(b).unwrap().0, 200.0);
+}
+
+// ── #1367: cached storage-pointer regression guards ─────────────────────
+// QueryRead/QueryWrite/ComponentRef resolve the downcast once in `new()` and
+// hand out references derived from a cached raw pointer (was a per-access
+// `downcast_ref`). These pin that the cache stays valid + correct across many
+// accesses, and that QueryWrite's shared `get` and exclusive `get_mut` borrows
+// alternate soundly through the same `*mut`.
+
+#[test]
+fn query_write_cached_storage_interleaved_get_get_mut() {
+    let mut world = World::new();
+    let entities: Vec<_> = (0..64)
+        .map(|i| {
+            let e = world.spawn();
+            world.insert(e, Health(i as f32));
+            e
+        })
+        .collect();
+
+    {
+        let mut q = world.query_mut::<Health>().unwrap();
+        for pass in 1..=100u32 {
+            for (i, &e) in entities.iter().enumerate() {
+                // Mutate through the cached *mut, then read back through it —
+                // must observe our own write immediately. A stale/aliasing
+                // cache would diverge here.
+                q.get_mut(e).unwrap().0 += 1.0;
+                assert_eq!(q.get(e).unwrap().0, i as f32 + pass as f32);
+            }
+        }
+    }
+
+    for (i, &e) in entities.iter().enumerate() {
+        assert_eq!(world.get::<Health>(e).unwrap().0, i as f32 + 100.0);
+    }
+}
+
+#[test]
+fn query_read_cached_storage_repeated_get_stable() {
+    let mut world = World::new();
+    let a = world.spawn();
+    let b = world.spawn();
+    world.insert(a, Health(11.0));
+    world.insert(b, Health(22.0));
+
+    let q = world.query::<Health>().unwrap();
+    for _ in 0..1000 {
+        assert_eq!(q.get(a).unwrap().0, 11.0);
+        assert_eq!(q.get(b).unwrap().0, 22.0);
+        assert!(q.get(999).is_none());
+    }
+    assert_eq!(q.iter().count(), 2);
+}
+
+#[test]
+fn component_ref_cached_deref_stable() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(42.0));
+
+    let r = world.get::<Health>(e).unwrap();
+    // Many derefs through the cached component pointer stay valid + equal.
+    for _ in 0..1000 {
+        assert_eq!(r.0, 42.0);
+    }
+}
+
+#[test]
+fn query_returns_none_for_unregistered() {
+    let world = World::new();
+    assert!(world.query::<Health>().is_none());
+    assert!(world.query_mut::<Health>().is_none());
+}
+
+#[test]
+fn query_after_register() {
+    let mut world = World::new();
+    world.register::<Health>();
+
+    let q = world.query::<Health>().unwrap();
+    assert_eq!(q.len(), 0);
+}
+
+// ── Multiple concurrent queries ─────────────────────────────────────
+
+#[test]
+fn multiple_read_queries_coexist() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    world.insert(e, Position { x: 1.0, y: 2.0 });
+
+    // Two reads at the same time — no deadlock, no borrow error.
+    let q_health = world.query::<Health>().unwrap();
+    let q_pos = world.query::<Position>().unwrap();
+
+    assert_eq!(q_health.get(e).unwrap().0, 100.0);
+    assert_eq!(q_pos.get(e).unwrap().x, 1.0);
+}
+
+#[test]
+fn query_2_mut_read_and_write() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Position { x: 10.0, y: 20.0 });
+    world.insert(e, Velocity { dx: 5.0, dy: 3.0 });
+
+    {
+        let (q_pos, mut q_vel) = world.query_2_mut::<Position, Velocity>().unwrap();
+
+        let pos = q_pos.get(e).unwrap();
+        let vel = q_vel.get_mut(e).unwrap();
+        // Apply position offset to velocity.
+        vel.dx += pos.x;
+        vel.dy += pos.y;
+    }
+
+    assert_eq!(world.get::<Velocity>(e).unwrap().dx, 15.0);
+    assert_eq!(world.get::<Velocity>(e).unwrap().dy, 23.0);
+}
+
+#[test]
+fn query_2_mut_mut_both_writable() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Position { x: 1.0, y: 2.0 });
+    world.insert(e, Velocity { dx: 10.0, dy: 20.0 });
+
+    {
+        let (mut q_pos, mut q_vel) = world.query_2_mut_mut::<Position, Velocity>().unwrap();
+
+        let vel = q_vel.get(e).unwrap();
+        let dx = vel.dx;
+        let dy = vel.dy;
+
+        let pos = q_pos.get_mut(e).unwrap();
+        pos.x += dx;
+        pos.y += dy;
+
+        let vel = q_vel.get_mut(e).unwrap();
+        vel.dx = 0.0;
+        vel.dy = 0.0;
+    }
+
+    assert_eq!(world.get::<Position>(e).unwrap().x, 11.0);
+    assert_eq!(world.get::<Position>(e).unwrap().y, 22.0);
+    assert_eq!(world.get::<Velocity>(e).unwrap().dx, 0.0);
+}
+
+#[test]
+#[should_panic(expected = "must be different component types")]
+fn query_2_mut_same_type_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _ = world.query_2_mut::<Health, Health>();
+}
+
+#[test]
+#[should_panic(expected = "must be different component types")]
+fn query_2_mut_mut_same_type_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _ = world.query_2_mut_mut::<Health, Health>();
+}
+
+// ── Iteration ───────────────────────────────────────────────────────
+
+#[test]
+fn query_iter() {
+    let mut world = World::new();
+    for i in 0..5 {
+        let e = world.spawn();
+        world.insert(e, Health(i as f32 * 10.0));
+    }
+
+    let q = world.query::<Health>().unwrap();
+    let sum: f32 = q.iter().map(|(_, h)| h.0).sum();
+    assert_eq!(sum, 100.0); // 0 + 10 + 20 + 30 + 40
+}
+
+#[test]
+fn query_iter_mut() {
+    let mut world = World::new();
+    for i in 0..3 {
+        let e = world.spawn();
+        world.insert(e, Health(i as f32 * 10.0));
+    }
+
+    {
+        let mut q = world.query_mut::<Health>().unwrap();
+        for (_, health) in q.iter_mut() {
+            health.0 *= 2.0;
+        }
+    }
+
+    let q = world.query::<Health>().unwrap();
+    let mut values: Vec<f32> = q.iter().map(|(_, h)| h.0).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(values, vec![0.0, 20.0, 40.0]);
+}
+
+// ── Intersection iteration (the real-world use case) ────────────────
+
+#[test]
+fn intersection_iteration() {
+    let mut world = World::new();
+
+    // Entity 0: has both Position + Velocity
+    let e0 = world.spawn();
+    world.insert(e0, Position { x: 0.0, y: 0.0 });
+    world.insert(e0, Velocity { dx: 1.0, dy: 2.0 });
+
+    // Entity 1: only Position
+    let e1 = world.spawn();
+    world.insert(e1, Position { x: 5.0, y: 5.0 });
+
+    // Entity 2: has both
+    let e2 = world.spawn();
+    world.insert(e2, Position { x: 10.0, y: 10.0 });
+    world.insert(e2, Velocity { dx: 3.0, dy: 4.0 });
+
+    {
+        let (q_vel, mut q_pos) = world.query_2_mut::<Velocity, Position>().unwrap();
+
+        // Iterate the smaller set (velocity), look up in the larger.
+        for (entity, vel) in q_vel.iter() {
+            if let Some(pos) = q_pos.get_mut(entity) {
+                pos.x += vel.dx;
+                pos.y += vel.dy;
+            }
+        }
+    }
+
+    // e0 moved, e1 untouched, e2 moved.
+    assert_eq!(world.get::<Position>(e0).unwrap().x, 1.0);
+    assert_eq!(world.get::<Position>(e0).unwrap().y, 2.0);
+    assert_eq!(world.get::<Position>(e1).unwrap().x, 5.0);
+    assert_eq!(world.get::<Position>(e1).unwrap().y, 5.0);
+    assert_eq!(world.get::<Position>(e2).unwrap().x, 13.0);
+    assert_eq!(world.get::<Position>(e2).unwrap().y, 14.0);
+}
+
+// ── Resource tests ──────────────────────────────────────────────────
+
+struct DeltaTime(f32);
+impl Resource for DeltaTime {}
+
+struct GameConfig {
+    gravity: f32,
+    max_speed: f32,
+}
+impl Resource for GameConfig {}
+
+#[test]
+fn resource_insert_and_read() {
+    let mut world = World::new();
+    world.insert_resource(DeltaTime(1.0 / 60.0));
+
+    let dt = world.resource::<DeltaTime>();
+    assert!((dt.0 - 1.0 / 60.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn resource_insert_and_mutate() {
+    let mut world = World::new();
+    world.insert_resource(DeltaTime(1.0 / 60.0));
+
+    {
+        let mut dt = world.resource_mut::<DeltaTime>();
+        dt.0 = 1.0 / 30.0;
+    }
+
+    let dt = world.resource::<DeltaTime>();
+    assert!((dt.0 - 1.0 / 30.0).abs() < f32::EPSILON);
+}
+
+/// #6136 - `init_resource` is insert-if-absent: a value already installed (a
+/// save restore's, say) survives the ~155 call sites that "ensure" the resource.
+#[test]
+fn init_resource_inserts_the_default_only_when_absent() {
+    #[derive(Default)]
+    struct Tuning(u32);
+    impl Resource for Tuning {}
+
+    let mut world = World::new();
+    world.init_resource::<Tuning>();
+    assert_eq!(
+        world.resource::<Tuning>().0,
+        0,
+        "an absent resource gets its default"
+    );
+
+    world.insert_resource(Tuning(7));
+    world.init_resource::<Tuning>();
+    assert_eq!(
+        world.resource::<Tuning>().0,
+        7,
+        "an existing resource is left untouched"
+    );
+}
+
+/// #6136 - rustdoc attaches a `///` block to the next item, so each resource
+/// method's doc must sit directly above it: `init_resource` once landed between
+/// `insert_resource`'s doc and its signature, and rustdoc then described
+/// `init_resource` as returning a previous value.
+#[test]
+fn insert_resource_keeps_its_own_doc() {
+    const WORLD_RS: &str = include_str!("world.rs");
+    let (before, _) = WORLD_RS
+        .split_once("    pub fn insert_resource<")
+        .expect("insert_resource exists");
+    let doc = before.rsplit("\n\n").next().expect("a doc block");
+    assert!(
+        doc.contains("Insert a global resource. Returns the previous value"),
+        "insert_resource's doc block must sit directly above it"
+    );
+    let (before, _) = WORLD_RS
+        .split_once("    pub fn init_resource<")
+        .expect("init_resource exists");
+    let doc = before.rsplit("\n\n").next().expect("a doc block");
+    assert!(
+        !doc.contains("Returns the previous value"),
+        "init_resource must not carry insert_resource's doc"
+    );
+}
+
+#[test]
+fn two_resource_types_coexist() {
+    let mut world = World::new();
+    world.insert_resource(DeltaTime(0.016));
+    world.insert_resource(GameConfig {
+        gravity: -9.81,
+        max_speed: 50.0,
+    });
+
+    // Both readable at the same time.
+    let dt = world.resource::<DeltaTime>();
+    let config = world.resource::<GameConfig>();
+    assert!((dt.0 - 0.016).abs() < f32::EPSILON);
+    assert!((config.gravity - -9.81).abs() < f32::EPSILON);
+    assert!((config.max_speed - 50.0).abs() < f32::EPSILON);
+}
+
+#[test]
+#[should_panic(expected = "Resource `")]
+fn missing_resource_panics_with_type_name() {
+    let world = World::new();
+    let _ = world.resource::<DeltaTime>();
+}
+
+#[test]
+#[should_panic(expected = "not found")]
+fn missing_resource_mut_panics() {
+    let world = World::new();
+    let _ = world.resource_mut::<DeltaTime>();
+}
+
+#[test]
+fn remove_resource_returns_value() {
+    let mut world = World::new();
+    world.insert_resource(DeltaTime(0.016));
+
+    let removed = world.remove_resource::<DeltaTime>().unwrap();
+    assert!((removed.0 - 0.016).abs() < f32::EPSILON);
+
+    // Gone now.
+    assert!(world.try_resource::<DeltaTime>().is_none());
+}
+
+#[test]
+fn remove_nonexistent_resource_returns_none() {
+    let mut world = World::new();
+    assert!(world.remove_resource::<DeltaTime>().is_none());
+}
+
+#[test]
+fn resource_overwrite_returns_old() {
+    let mut world = World::new();
+    let first = world.insert_resource(DeltaTime(0.016));
+    assert!(first.is_none()); // no previous value
+
+    let second = world.insert_resource(DeltaTime(0.033));
+    assert!(second.is_some());
+    assert!((second.unwrap().0 - 0.016).abs() < f32::EPSILON);
+
+    let dt = world.resource::<DeltaTime>();
+    assert!((dt.0 - 0.033).abs() < f32::EPSILON);
+}
+
+#[test]
+fn resource_visible_to_system_via_scheduler() {
+    use crate::ecs::scheduler::Scheduler;
+
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    world.insert_resource(DeltaTime(0.5));
+
+    let mut scheduler = Scheduler::new();
+    scheduler.add(|world: &World, _dt: f32| {
+        let dt = world.resource::<DeltaTime>();
+        let mut q = world.query_mut::<Health>().unwrap();
+        for (_, health) in q.iter_mut() {
+            // Drain 60 HP/sec.
+            health.0 -= 60.0 * dt.0;
+        }
+    });
+
+    scheduler.run(&world, 0.0);
+    assert_eq!(world.get::<Health>(e).unwrap().0, 70.0);
+}
+
+#[test]
+fn try_resource_returns_none_when_missing() {
+    let world = World::new();
+    assert!(world.try_resource::<DeltaTime>().is_none());
+    assert!(world.try_resource_mut::<DeltaTime>().is_none());
+}
+
+// ── Name + StringPool + find_by_name ────────────────────────────────
+
+// ── FormIdComponent + find_by_form_id ──────────────────────────────
+
+use crate::ecs::components::FormIdComponent;
+use crate::form_id::{FormIdPair, FormIdPool, LocalFormId, PluginId};
+
+#[test]
+fn form_id_component_attach_and_query() {
+    let mut world = World::new();
+    world.insert_resource(FormIdPool::new());
+
+    let pair = FormIdPair {
+        plugin: PluginId::from_filename("Skyrim.esm"),
+        local: LocalFormId(0x000014),
+    };
+    let fid = world.resource_mut::<FormIdPool>().intern(pair);
+
+    let e = world.spawn();
+    world.insert(e, FormIdComponent(fid));
+
+    let got = world.get::<FormIdComponent>(e).unwrap();
+    assert_eq!(got.0, fid);
+}
+
+#[test]
+fn find_by_form_id_hit() {
+    let mut world = World::new();
+    world.insert_resource(FormIdPool::new());
+
+    let pair = FormIdPair {
+        plugin: PluginId::from_filename("Skyrim.esm"),
+        local: LocalFormId(0x000014),
+    };
+    let fid = world.resource_mut::<FormIdPool>().intern(pair);
+
+    let e = world.spawn();
+    world.insert(e, FormIdComponent(fid));
+
+    assert_eq!(world.find_by_form_id(fid), Some(e));
+}
+
+#[test]
+fn find_by_form_id_miss() {
+    let mut world = World::new();
+    world.insert_resource(FormIdPool::new());
+
+    let pair_a = FormIdPair {
+        plugin: PluginId::from_filename("Skyrim.esm"),
+        local: LocalFormId(0x000014),
+    };
+    let pair_b = FormIdPair {
+        plugin: PluginId::from_filename("Skyrim.esm"),
+        local: LocalFormId(0x000015),
+    };
+    let fid_a = world.resource_mut::<FormIdPool>().intern(pair_a);
+    let fid_b = world.resource_mut::<FormIdPool>().intern(pair_b);
+
+    let e = world.spawn();
+    world.insert(e, FormIdComponent(fid_a));
+
+    assert!(world.find_by_form_id(fid_b).is_none());
+}
+
+#[test]
+fn find_by_form_id_no_components() {
+    let world = World::new();
+    let mut pool = FormIdPool::new();
+    let fid = pool.intern(FormIdPair {
+        plugin: PluginId::from_filename("Skyrim.esm"),
+        local: LocalFormId(0x001),
+    });
+    assert!(world.find_by_form_id(fid).is_none());
+}
+
+/// #1698 — `PhysicsSourceForm` (the diagnostic-only backlink standalone
+/// bhk-collision entities carry) must NOT be visible to `find_by_form_id`.
+/// That lookup backs console `prid` / Papyrus `ObjectReference` resolution
+/// and assumes at most one canonical entity per form id; if a physics
+/// proxy entity showed up here it could shadow the actual placement root.
+#[test]
+fn find_by_form_id_ignores_physics_source_form() {
+    use crate::ecs::components::PhysicsSourceForm;
+
+    let mut world = World::new();
+    world.insert_resource(FormIdPool::new());
+
+    let pair = FormIdPair {
+        plugin: PluginId::from_filename("Skyrim.esm"),
+        local: LocalFormId(0x0E283F),
+    };
+    let fid = world.resource_mut::<FormIdPool>().intern(pair);
+
+    // Placement root: the canonical entity, carries FormIdComponent.
+    let placement_root = world.spawn();
+    world.insert(placement_root, FormIdComponent(fid));
+
+    // A standalone bhk-collision proxy sharing the same form id, but
+    // tagged with the diagnostic-only backlink instead.
+    let collision_proxy = world.spawn();
+    world.insert(collision_proxy, PhysicsSourceForm(fid));
+
+    assert_eq!(
+        world.find_by_form_id(fid),
+        Some(placement_root),
+        "find_by_form_id must resolve to the FormIdComponent-carrying \
+         placement root, never the PhysicsSourceForm-tagged proxy"
+    );
+}
+
+#[test]
+fn form_id_pool_as_world_resource() {
+    let mut world = World::new();
+    world.insert_resource(FormIdPool::new());
+
+    let pair = FormIdPair {
+        plugin: PluginId::from_filename("Oblivion.esm"),
+        local: LocalFormId(0x100),
+    };
+
+    let fid = world.resource_mut::<FormIdPool>().intern(pair);
+    let pool = world.resource::<FormIdPool>();
+    assert_eq!(pool.resolve(fid).unwrap().local, LocalFormId(0x100));
+    assert_eq!(pool.len(), 1);
+    assert!(!pool.is_empty());
+}
+
+// ── Name + StringPool + find_by_name ────────────────────────────────
+
+use crate::ecs::components::Name;
+use crate::string::StringPool;
+
+#[test]
+fn name_component_attach_and_query() {
+    let mut world = World::new();
+    world.insert_resource(StringPool::new());
+
+    let sym = world.resource_mut::<StringPool>().intern("player");
+    let e = world.spawn();
+    world.insert(e, Name(sym));
+
+    let name = world.get::<Name>(e).unwrap();
+    assert_eq!(name.0, sym);
+
+    let pool = world.resource::<StringPool>();
+    assert_eq!(pool.resolve(name.0), Some("player"));
+}
+
+#[test]
+fn find_by_name_hit() {
+    let mut world = World::new();
+    world.insert_resource(StringPool::new());
+
+    let sym = world.resource_mut::<StringPool>().intern("hero");
+    let e = world.spawn();
+    world.insert(e, Name(sym));
+
+    assert_eq!(world.find_by_name("hero"), Some(e));
+}
+
+#[test]
+fn find_by_name_miss() {
+    let mut world = World::new();
+    world.insert_resource(StringPool::new());
+
+    let sym = world.resource_mut::<StringPool>().intern("hero");
+    let e = world.spawn();
+    world.insert(e, Name(sym));
+
+    assert!(world.find_by_name("villain").is_none());
+}
+
+#[test]
+fn find_by_name_no_pool() {
+    let world = World::new();
+    assert!(world.find_by_name("anything").is_none());
+}
+
+#[test]
+fn find_by_name_no_name_components() {
+    let mut world = World::new();
+    world.insert_resource(StringPool::new());
+    world.resource_mut::<StringPool>().intern("ghost");
+
+    assert!(world.find_by_name("ghost").is_none());
+}
+
+#[test]
+fn string_pool_as_world_resource() {
+    let mut world = World::new();
+    world.insert_resource(StringPool::new());
+
+    let sym = {
+        let mut pool = world.resource_mut::<StringPool>();
+        pool.intern("asset/texture.png")
+    };
+
+    let pool = world.resource::<StringPool>();
+    assert_eq!(pool.resolve(sym), Some("asset/texture.png"));
+}
+
+// ── Regression: remove/get_mut must not create empty storage (#39) ──
+
+#[test]
+fn remove_nonexistent_does_not_create_storage() {
+    let mut world = World::new();
+    // Remove a component type that was never inserted.
+    assert!(world.remove::<Health>(0).is_none());
+    // query should still return None (no storage created).
+    assert!(world.query::<Health>().is_none());
+}
+
+#[test]
+#[should_panic(expected = "was never spawned")]
+#[cfg(debug_assertions)]
+fn insert_unspawned_entity_panics_debug() {
+    let mut world = World::new();
+    // Entity 999 was never spawned — should panic in debug mode.
+    world.insert(999, Health(100.0));
+}
+
+#[test]
+fn get_mut_nonexistent_does_not_create_storage() {
+    let mut world = World::new();
+    // get_mut on a type that was never inserted.
+    assert!(world.get_mut::<Health>(0).is_none());
+    // query should still return None.
+    assert!(world.query::<Health>().is_none());
+}
+
+// ── resource_2_mut tests ────────────────────────────────────────
+
+struct ResA(f32);
+impl Resource for ResA {}
+struct ResB(f32);
+impl Resource for ResB {}
+
+#[test]
+fn resource_2_mut_both_writable() {
+    let mut world = World::new();
+    world.insert_resource(ResA(1.0));
+    world.insert_resource(ResB(2.0));
+
+    {
+        let (mut a, mut b) = world.resource_2_mut::<ResA, ResB>();
+        a.0 += 10.0;
+        b.0 += 20.0;
+    }
+
+    let a = world.resource::<ResA>();
+    let b = world.resource::<ResB>();
+    assert!((a.0 - 11.0).abs() < 1e-6);
+    assert!((b.0 - 22.0).abs() < 1e-6);
+}
+
+#[test]
+fn resource_2_mut_reverse_order_same_result() {
+    let mut world = World::new();
+    world.insert_resource(ResA(1.0));
+    world.insert_resource(ResB(2.0));
+
+    // Acquire in reverse generic order — lock ordering should still prevent deadlock.
+    let (mut b, mut a) = world.resource_2_mut::<ResB, ResA>();
+    b.0 = 99.0;
+    a.0 = 88.0;
+    drop(b);
+    drop(a);
+
+    assert!((world.resource::<ResA>().0 - 88.0).abs() < 1e-6);
+    assert!((world.resource::<ResB>().0 - 99.0).abs() < 1e-6);
+}
+
+#[test]
+fn try_resource_2_reads_both_in_either_generic_order() {
+    let mut world = World::new();
+    assert!(
+        world.try_resource_2::<ResA, ResB>().is_none(),
+        "neither exists"
+    );
+    world.insert_resource(ResA(1.0));
+    assert!(
+        world.try_resource_2::<ResA, ResB>().is_none(),
+        "one missing is none"
+    );
+    world.insert_resource(ResB(2.0));
+    {
+        let (a, b) = world.try_resource_2::<ResA, ResB>().expect("both exist");
+        assert_eq!((a.0, b.0), (1.0, 2.0));
+    }
+    // Named the other way round, the guards still come back in (A, B) order.
+    let (b, a) = world.try_resource_2::<ResB, ResA>().expect("both exist");
+    assert_eq!((b.0, a.0), (2.0, 1.0));
+}
+
+#[test]
+#[should_panic(expected = "must be different resource types")]
+fn try_resource_2_same_type_panics() {
+    let mut world = World::new();
+    world.insert_resource(ResA(1.0));
+    let _ = world.try_resource_2::<ResA, ResA>();
+}
+
+/// #6101 - readers that name the pair in opposite orders, against a writer that
+/// takes it through `resource_2_mut`, all acquire in `TypeId` order and cannot
+/// deadlock. An unsorted nested `try_resource` pair is the ABBA this replaced;
+/// it hangs here (under writer-preferring locks) rather than failing, so the
+/// run is bounded by a watchdog.
+///
+/// Ignored under Miri (#6234): it tests lock order, not pointer provenance, and
+/// its 6000 lock round-trips outrun the 20 s watchdog at Miri's speed, which
+/// turned the `ecs-query-miri` gate red.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "lock-order stress test; outruns the watchdog under Miri (#6234)"
+)]
+fn try_resource_2_does_not_deadlock_against_resource_2_mut() {
+    let mut world = World::new();
+    world.insert_resource(ResA(0.0));
+    world.insert_resource(ResB(0.0));
+    let world = std::sync::Arc::new(world);
+    let (done, finished) = std::sync::mpsc::channel();
+    let mut workers = Vec::new();
+    for reverse in [false, true] {
+        let world = std::sync::Arc::clone(&world);
+        let done = done.clone();
+        workers.push(std::thread::spawn(move || {
+            for _ in 0..2000 {
+                if reverse {
+                    let (_b, _a) = world.try_resource_2::<ResB, ResA>().unwrap();
+                } else {
+                    let (_a, _b) = world.try_resource_2::<ResA, ResB>().unwrap();
+                }
+            }
+            let _ = done.send(());
+        }));
+    }
+    let writer = {
+        let world = std::sync::Arc::clone(&world);
+        let done = done.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let (mut a, mut b) = world.resource_2_mut::<ResB, ResA>();
+                a.0 += 1.0;
+                b.0 += 1.0;
+            }
+            let _ = done.send(());
+        })
+    };
+    for _ in 0..3 {
+        finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a sorted pair acquisition must not deadlock");
+    }
+    for worker in workers.into_iter().chain([writer]) {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+#[should_panic(expected = "must be different resource types")]
+fn resource_2_mut_same_type_panics() {
+    let mut world = World::new();
+    world.insert_resource(ResA(1.0));
+    let _ = world.resource_2_mut::<ResA, ResA>();
+}
+
+#[test]
+fn try_resource_2_mut_returns_some_when_both_present() {
+    let mut world = World::new();
+    world.insert_resource(ResA(1.0));
+    world.insert_resource(ResB(2.0));
+
+    {
+        let (mut a, mut b) = world
+            .try_resource_2_mut::<ResA, ResB>()
+            .expect("both resources present, expected Some");
+        a.0 = 7.0;
+        b.0 = 9.0;
+    }
+    assert!((world.resource::<ResA>().0 - 7.0).abs() < 1e-6);
+    assert!((world.resource::<ResB>().0 - 9.0).abs() < 1e-6);
+}
+
+#[test]
+fn try_resource_2_mut_returns_none_when_a_missing() {
+    let mut world = World::new();
+    world.insert_resource(ResB(2.0));
+    assert!(world.try_resource_2_mut::<ResA, ResB>().is_none());
+}
+
+#[test]
+fn try_resource_2_mut_returns_none_when_b_missing() {
+    let mut world = World::new();
+    world.insert_resource(ResA(1.0));
+    assert!(world.try_resource_2_mut::<ResA, ResB>().is_none());
+}
+
+#[test]
+fn try_resource_2_mut_returns_none_when_both_missing() {
+    let world = World::new();
+    assert!(world.try_resource_2_mut::<ResA, ResB>().is_none());
+}
+
+#[test]
+#[should_panic(expected = "must be different resource types")]
+fn try_resource_2_mut_same_type_panics() {
+    let world = World::new();
+    // Panics regardless of whether the resource is present — same-type
+    // lock would deadlock.
+    let _ = world.try_resource_2_mut::<ResA, ResA>();
+}
+
+// ── insert_batch equivalence (#512) ─────────────────────────────────
+
+/// Regression: `insert_batch` must produce a World state bit-identical
+/// to a serial `insert` loop with the same items. SparseSet backend.
+#[test]
+fn insert_batch_equivalent_to_serial_insert_sparse_set() {
+    const N: u32 = 500;
+
+    let mut world_a = World::new();
+    let mut world_b = World::new();
+    let entities_a: Vec<_> = (0..N).map(|_| world_a.spawn()).collect();
+    let entities_b: Vec<_> = (0..N).map(|_| world_b.spawn()).collect();
+
+    // World A: serial inserts.
+    for (i, &e) in entities_a.iter().enumerate() {
+        world_a.insert(e, Health(i as f32));
+    }
+
+    // World B: one batch insert.
+    world_b.insert_batch(
+        entities_b
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| (e, Health(i as f32))),
+    );
+
+    // Same entity count, same stored values.
+    let qa = world_a.query::<Health>().unwrap();
+    let qb = world_b.query::<Health>().unwrap();
+    let collect_a: Vec<_> = qa.iter().map(|(e, h)| (e, h.0)).collect();
+    let collect_b: Vec<_> = qb.iter().map(|(e, h)| (e, h.0)).collect();
+    assert_eq!(collect_a, collect_b);
+    assert_eq!(collect_a.len() as u32, N);
+}
+
+/// Same coverage for the PackedStorage backend — the two storage
+/// impls route through different `insert` paths (sparse-set vs
+/// binary-search insert-at-position).
+#[test]
+fn insert_batch_equivalent_to_serial_insert_packed() {
+    const N: u32 = 500;
+
+    let mut world_a = World::new();
+    let mut world_b = World::new();
+    let entities_a: Vec<_> = (0..N).map(|_| world_a.spawn()).collect();
+    let entities_b: Vec<_> = (0..N).map(|_| world_b.spawn()).collect();
+
+    for (i, &e) in entities_a.iter().enumerate() {
+        world_a.insert(
+            e,
+            Position {
+                x: i as f32,
+                y: -(i as f32),
+            },
+        );
+    }
+    world_b.insert_batch(entities_b.iter().enumerate().map(|(i, &e)| {
+        (
+            e,
+            Position {
+                x: i as f32,
+                y: -(i as f32),
+            },
+        )
+    }));
+
+    let qa = world_a.query::<Position>().unwrap();
+    let qb = world_b.query::<Position>().unwrap();
+    let a: Vec<_> = qa.iter().map(|(e, p)| (e, p.x, p.y)).collect();
+    let b: Vec<_> = qb.iter().map(|(e, p)| (e, p.x, p.y)).collect();
+    assert_eq!(a, b);
+}
+
+/// Empty batch is a no-op — no storage is created if it didn't exist,
+/// and existing storages are untouched.
+#[test]
+fn insert_batch_empty_iterator_is_noop() {
+    let mut world = World::new();
+    world.insert_batch::<Health, _>(std::iter::empty());
+    // Query must still be None — storage wasn't created by the empty
+    // batch.
+    // Actually — `storage_write` creates the storage eagerly. Verify
+    // the contract: empty storage is fine, query returns an empty
+    // iterator (not None — because storage exists but has no rows).
+    let q = world.query::<Health>();
+    // `None` is also acceptable if a future change makes storage lazy.
+    if let Some(q) = q {
+        assert_eq!(q.iter().count(), 0);
+    }
+}
+
+/// Overwrite semantics — inserting the same entity twice via batch
+/// must overwrite, same as serial `insert`.
+#[test]
+fn insert_batch_overwrites_existing_component() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(1.0));
+    world.insert_batch([(e, Health(99.0))]);
+    let q = world.query::<Health>().unwrap();
+    let h = q.iter().find(|(eid, _)| *eid == e).map(|(_, h)| h.0);
+    assert_eq!(h, Some(99.0));
+}
+
+// ── Deadlock detection (debug-only) ────────────────────────────────
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn query_read_then_write_same_type_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _read = world.query::<Health>().unwrap();
+    let _write = world.query_mut::<Health>(); // deadlock → panic
+}
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn query_write_then_read_same_type_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _write = world.query_mut::<Health>().unwrap();
+    let _read = world.query::<Health>(); // deadlock → panic
+}
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn query_write_then_write_same_type_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _w1 = world.query_mut::<Health>().unwrap();
+    let _w2 = world.query_mut::<Health>(); // deadlock → panic
+}
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn resource_read_then_write_same_type_panics() {
+    let mut world = World::new();
+    world.insert_resource(ResA(42.0));
+
+    let _read = world.try_resource::<ResA>().unwrap();
+    let _write = world.resource_mut::<ResA>(); // deadlock → panic
+}
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn resource_write_then_read_same_type_panics() {
+    let mut world = World::new();
+    world.insert_resource(ResA(42.0));
+
+    let _write = world.resource_mut::<ResA>();
+    let _read = world.resource::<ResA>(); // deadlock → panic
+}
+
+#[test]
+fn query_read_then_write_different_types_ok() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    world.insert(e, Position { x: 1.0, y: 2.0 });
+
+    let _read = world.query::<Health>().unwrap();
+    let _write = world.query_mut::<Position>().unwrap();
+    // No panic — different types.
+}
+
+#[test]
+fn sequential_query_after_drop_ok() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    {
+        let _write = world.query_mut::<Health>().unwrap();
+    }
+    // Write dropped — read should succeed.
+    let _read = world.query::<Health>().unwrap();
+}
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn get_then_query_mut_same_type_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _ref = world.get::<Health>(e).unwrap();
+    let _write = world.query_mut::<Health>(); // deadlock → panic
+}
+
+#[test]
+#[should_panic(expected = "ECS deadlock detected")]
+fn has_while_holding_write_panics() {
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+
+    let _write = world.query_mut::<Health>().unwrap();
+    let _ = world.has::<Health>(e); // deadlock → panic
+}
+
+// ── Poisoned-lock cascade reporting (issue #95) ─────────────────────
+
+#[test]
+fn poisoned_storage_lock_panics_with_type_name() {
+    use std::sync::Arc;
+
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    let world = Arc::new(world);
+
+    // Poison the Health storage from another thread.
+    let w = Arc::clone(&world);
+    let _ = std::thread::spawn(move || {
+        let _q = w.query_mut::<Health>().unwrap();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+
+    // Now any access to Health from this thread should surface a
+    // type-aware panic — not the generic "lock poisoned".
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.query::<Health>();
+    }));
+    let err = result.expect_err("expected poisoned-lock panic");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("Health") && msg.contains("poisoned"),
+        "panic message should name the component type and mention poisoning, got: {msg}"
+    );
+}
+
+#[test]
+fn poisoned_resource_lock_panics_with_type_name() {
+    use std::sync::Arc;
+
+    let mut world = World::new();
+    world.insert_resource(ResA(42.0));
+    let world = Arc::new(world);
+
+    let w = Arc::clone(&world);
+    let _ = std::thread::spawn(move || {
+        let _r = w.resource_mut::<ResA>();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.try_resource::<ResA>();
+    }));
+    let err = result.expect_err("expected poisoned-lock panic");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("ResA") && msg.contains("poisoned"),
+        "panic message should name the resource type and mention poisoning, got: {msg}"
+    );
+}
+
+/// Regression test for issue #1837: replacing a resource whose lock was
+/// poisoned must re-panic loud with the type name (the #466 fail-fast
+/// policy), not `.ok()`-swallow the `PoisonError` into an ambiguous `None`
+/// that reads as "no prior value existed".
+#[test]
+fn insert_resource_over_poisoned_lock_panics_with_type_name() {
+    use std::sync::Arc;
+
+    let mut world = World::new();
+    world.insert_resource(ResA(42.0));
+    let world_arc = Arc::new(world);
+
+    // Poison the ResA lock from another thread.
+    let w = Arc::clone(&world_arc);
+    let _ = std::thread::spawn(move || {
+        let _r = w.resource_mut::<ResA>();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+
+    let mut world = Arc::try_unwrap(world_arc)
+        .unwrap_or_else(|_| panic!("Arc still aliased after worker join"));
+
+    // Replacing the poisoned resource must panic naming `ResA`, not return
+    // a silent `None` (pre-#1837 behaviour).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.insert_resource(ResA(7.0));
+    }));
+    let err = result.expect_err("expected poisoned-lock panic from insert_resource");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("ResA") && msg.contains("poisoned"),
+        "insert_resource panic should name the resource type, got: {msg}"
+    );
+}
+
+/// Regression test for issue #36: `spawn()` must panic when the
+/// `EntityId` counter would overflow, not wrap silently.
+#[test]
+#[should_panic(expected = "overflowed EntityId")]
+fn spawn_panics_on_entity_id_overflow() {
+    let mut world = World::new();
+    // Jam the counter to u32::MAX. The next spawn() returns MAX
+    // and the increment inside should panic.
+    world.next_entity = EntityId::MAX;
+    let last = world.spawn();
+    assert_eq!(last, EntityId::MAX);
+    // This call must panic — u32::MAX + 1 overflows.
+    let _ = world.spawn();
+}
+
+/// Regression test for issue #137: when the poisoned-lock panic
+/// path fires inside `query`/`resource`/etc., the RAII `TrackedRead`/
+/// `TrackedWrite` scope guard must untrack the pending row. Before
+/// the fix, `track_read` / `track_write` were called directly before
+/// `lock.read()/write()`, and the stale row leaked into the
+/// thread-local tracker — a subsequent `catch_unwind` recovery
+/// would then see a false "deadlock detected" panic on the same type.
+#[test]
+fn lock_tracker_is_clean_after_poisoned_panic() {
+    use super::super::lock_tracker;
+    use std::sync::Arc;
+
+    // Sanity check: tracker is empty at the start of this test. In
+    // debug builds the thread-local map is per-thread and each test
+    // runs on a fresh worker thread, so this must hold.
+    assert!(lock_tracker::is_clean(), "lock tracker must start clean");
+
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    let world = Arc::new(world);
+
+    // Poison the Health storage from another thread.
+    let w = Arc::clone(&world);
+    let _ = std::thread::spawn(move || {
+        let _q = w.query_mut::<Health>().unwrap();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+
+    // Each of the nine affected methods must leave the tracker
+    // clean after its poisoned-lock panic unwinds. Iterating over
+    // the representative set (single read/write, 2-read/write,
+    // resource read/write, resource 2-write, try_read/try_write)
+    // covers every `TrackedRead::new` / `TrackedWrite::new` call
+    // site in `world.rs`.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.query::<Health>();
+    }));
+    assert!(
+        lock_tracker::is_clean(),
+        "tracker row leaked after query<Health> poison-panic"
+    );
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world.query_mut::<Health>();
+    }));
+    assert!(
+        lock_tracker::is_clean(),
+        "tracker row leaked after query_mut<Health> poison-panic"
+    );
+
+    // query_2_mut: the FIRST tracked scope must also untrack if
+    // the second lock panics. Here the Health lock is poisoned —
+    // the exact arm that panics depends on TypeId ordering, but
+    // either way both scopes must untrack cleanly.
+    let mut world2 = World::new();
+    let e = world2.spawn();
+    world2.insert(e, Health(100.0));
+    world2.insert(e, Position { x: 0.0, y: 0.0 });
+    let world2 = Arc::new(world2);
+    let w = Arc::clone(&world2);
+    let _ = std::thread::spawn(move || {
+        let _q = w.query_mut::<Health>().unwrap();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world2.query_2_mut::<Position, Health>();
+    }));
+    assert!(
+        lock_tracker::is_clean(),
+        "tracker row leaked after query_2_mut poison-panic"
+    );
+
+    // Resource path mirrors the storage path.
+    let mut world3 = World::new();
+    world3.insert_resource(ResA(42.0));
+    let world3 = Arc::new(world3);
+    let w = Arc::clone(&world3);
+    let _ = std::thread::spawn(move || {
+        let _r = w.resource_mut::<ResA>();
+        panic!("intentional panic to poison the resource lock");
+    })
+    .join();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = world3.try_resource::<ResA>();
+    }));
+    assert!(
+        lock_tracker::is_clean(),
+        "tracker row leaked after try_resource<ResA> poison-panic"
+    );
+}
+
+/// Regression test for issue #466: when `World::despawn` walks the
+/// type-erased storage map and trips a poisoned lock, the panic must
+/// name the offending component type instead of the literal
+/// `"<unknown>"`. Pre-fix the loop discarded the `TypeId` and passed
+/// `"<unknown>"` to the helper, masking the cascade source.
+#[test]
+fn despawn_poisoned_lock_panics_with_type_name() {
+    use std::sync::Arc;
+
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    let world_arc = Arc::new(world);
+
+    // Poison the Health storage from another thread.
+    let w = Arc::clone(&world_arc);
+    let _ = std::thread::spawn(move || {
+        let _q = w.query_mut::<Health>().unwrap();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+
+    // Reclaim ownership now that the worker thread has dropped its
+    // Arc clone. `try_unwrap` succeeds because strong_count == 1.
+    let mut world = Arc::try_unwrap(world_arc)
+        .unwrap_or_else(|_| panic!("Arc still aliased after worker join"));
+
+    // `despawn` walks all storages with `&mut self`. The poisoned
+    // Health lock should now panic — and the message must name
+    // `Health`, not `<unknown>`.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.despawn(e);
+    }));
+    let err = result.expect_err("expected poisoned-lock panic from despawn");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("Health") && msg.contains("poisoned"),
+        "despawn panic should name the component type, got: {msg}"
+    );
+}
+
+/// Regression test for issue #1836: `clear_entities` (the M45 snapshot-
+/// restore path) walks the type-erased storage map, so a poisoned lock must
+/// name the offending component type via the #466 side-table — like
+/// `despawn` — instead of the generic "poisoned during clear_entities"
+/// message that discarded the `TypeId` key.
+#[test]
+fn clear_entities_poisoned_lock_panics_with_type_name() {
+    use std::sync::Arc;
+
+    let mut world = World::new();
+    let e = world.spawn();
+    world.insert(e, Health(100.0));
+    let world_arc = Arc::new(world);
+
+    // Poison the Health storage from another thread.
+    let w = Arc::clone(&world_arc);
+    let _ = std::thread::spawn(move || {
+        let _q = w.query_mut::<Health>().unwrap();
+        panic!("intentional panic to poison the lock");
+    })
+    .join();
+
+    let mut world = Arc::try_unwrap(world_arc)
+        .unwrap_or_else(|_| panic!("Arc still aliased after worker join"));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.clear_entities();
+    }));
+    let err = result.expect_err("expected poisoned-lock panic from clear_entities");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("Health") && msg.contains("poisoned"),
+        "clear_entities panic should name the component type, got: {msg}"
+    );
+}
+
+// ── Save/load support: clear_entities + set_next_entity (M45) ────────────
+
+#[test]
+fn clear_entities_empties_all_storages_across_backends() {
+    let mut world = World::new();
+    // Mix a sparse-set and a packed component so both DynStorage::clear
+    // impls are exercised.
+    let a = world.spawn();
+    let b = world.spawn();
+    world.insert(a, Health(1.0));
+    world.insert(b, Health(2.0));
+    world.insert(a, Position { x: 5.0, y: 6.0 });
+
+    assert_eq!(world.count::<Health>(), 2);
+    assert_eq!(world.count::<Position>(), 1);
+
+    world.clear_entities();
+
+    assert_eq!(world.count::<Health>(), 0);
+    assert_eq!(world.count::<Position>(), 0);
+    // Storages persist (queries still resolve), they're just empty.
+    assert!(world.query::<Health>().is_some());
+    // next_entity is untouched by clear — only set_next_entity moves it.
+    assert_eq!(world.next_entity_id(), 2);
+}
+
+#[test]
+fn set_next_entity_then_insert_at_original_ids() {
+    // Mimics the load path: clear, set the saved high-water mark, then
+    // re-insert components at their original (sparse) entity ids without
+    // calling spawn().
+    let mut world = World::new();
+    world.set_next_entity(10);
+    // id 7 is < next_entity (10), so insert passes its guard even though
+    // spawn() was never called for it.
+    world.insert(7, Health(99.0));
+    world.insert_batch::<Position, _>(vec![(3, Position { x: 1.0, y: 2.0 })]);
+
+    assert_eq!(world.next_entity_id(), 10);
+    assert_eq!(world.get::<Health>(7).map(|h| h.0), Some(99.0));
+    let q = world.query::<Position>().unwrap();
+    assert_eq!(q.iter().map(|(e, _)| e).collect::<Vec<_>>(), vec![3]);
+}
+
+/// #2149 / ECS-2507-03 — the tracker scope must still be armed when the
+/// query wrapper's fallible downcast runs.
+mod tracker_defuse_ordering_tests {
+    use super::super::lock_tracker;
+    use super::*;
+
+    /// Positive control: the reordering must not have broken the ordinary
+    /// hand-off. Every query kind acquires, hands its tracker row to the
+    /// wrapper, and untracks on drop.
+    #[test]
+    fn every_query_kind_hands_off_and_untracks_cleanly() {
+        assert!(lock_tracker::is_clean(), "tracker must start clean");
+
+        let mut world = World::new();
+        let e = world.spawn();
+        world.insert(e, Health(100.0));
+        world.insert(e, Position { x: 1.0, y: 2.0 });
+
+        {
+            let _q = world.query::<Health>().unwrap();
+            assert!(!lock_tracker::is_clean(), "the read must be tracked");
+        }
+        assert!(lock_tracker::is_clean(), "query() must untrack on drop");
+
+        {
+            let _q = world.query_mut::<Health>().unwrap();
+        }
+        assert!(lock_tracker::is_clean(), "query_mut() must untrack on drop");
+
+        {
+            let (_a, _b) = world.query_2_mut::<Health, Position>().unwrap();
+        }
+        assert!(
+            lock_tracker::is_clean(),
+            "query_2_mut() must untrack both on drop"
+        );
+
+        {
+            let (_a, _b) = world.query_2_mut_mut::<Health, Position>().unwrap();
+        }
+        assert!(
+            lock_tracker::is_clean(),
+            "query_2_mut_mut() must untrack both on drop"
+        );
+    }
+
+    /// The ordering itself. The failure this guards is unreachable by
+    /// construction — two distinct types cannot share a `TypeId`, so
+    /// `QueryRead::new`'s `downcast_ref().expect(...)` cannot fire, and the
+    /// resource wrappers are currently infallible struct construction. That is
+    /// exactly why this needs a source assertion rather than a behavioural
+    /// test: if any wrapper construction can panic in the future with its scope
+    /// already defused, the tracker row is owned by nobody and the next
+    /// acquisition after `catch_unwind` reports a spurious deadlock (#137,
+    /// #2149, #3264).
+    #[test]
+    fn defuse_follows_wrapper_construction_at_every_access_site() {
+        const WORLD_RS: &str = include_str!("world.rs");
+
+        for (site, wrapper) in [
+            ("pub fn query<", "QueryRead::new"),
+            ("pub fn query_mut<", "QueryWrite::new"),
+            ("pub fn resource<", "ResourceRead::new"),
+            ("pub fn resource_mut<", "ResourceWrite::new"),
+            ("pub fn try_resource<", "ResourceRead::new"),
+            ("pub fn try_resource_mut<", "ResourceWrite::new"),
+        ] {
+            let body = WORLD_RS
+                .split_once(site)
+                .unwrap_or_else(|| panic!("`{site}` not found in world.rs"))
+                .1;
+            let body = body.split_once("\n    }").expect("no end of fn").0;
+            let construct = body
+                .find(wrapper)
+                .unwrap_or_else(|| panic!("{site} no longer builds a {wrapper}"));
+            let defuse = body
+                .find("scope.defuse()")
+                .unwrap_or_else(|| panic!("{site} no longer defuses its scope"));
+            assert!(
+                construct < defuse,
+                "{site} defuses at byte {defuse} before constructing {wrapper} \
+                 at byte {construct} — a wrapper panic would leave the tracker \
+                 row owned by nobody (#2149 / #137 / #3264)",
+            );
+        }
+
+        // The two-guard forms: both wrappers must exist before either defuse,
+        // since either construction can panic and a half-defused pair orphans
+        // a row. These have two TypeId-ordered branches, so check each on its
+        // own — comparing across branches proves nothing.
+        for site in [
+            "pub fn query_2_mut<",
+            "pub fn query_2_mut_mut<",
+            "pub fn resource_2_mut<",
+        ] {
+            let body = WORLD_RS
+                .split_once(site)
+                .unwrap_or_else(|| panic!("`{site}` not found in world.rs"))
+                .1;
+            let body = body.split_once("\n    }").expect("no end of fn").0;
+            let branches: Vec<&str> = body.split("} else {").collect();
+            assert_eq!(
+                branches.len(),
+                2,
+                "{site} no longer has exactly the two TypeId-ordered branches \
+                 this test walks",
+            );
+            for (i, branch) in branches.iter().enumerate() {
+                let last_construct = branch
+                    .rfind("::new(guard")
+                    .unwrap_or_else(|| panic!("{site} branch {i} builds no access wrapper"));
+                let first_defuse = branch
+                    .find(".defuse()")
+                    .unwrap_or_else(|| panic!("{site} branch {i} defuses no scope"));
+                assert!(
+                    last_construct < first_defuse,
+                    "{site} branch {i} defuses at byte {first_defuse} before \
+                     the last wrapper construction at byte {last_construct} \
+                     — both wrappers must exist before either defuse \
+                     (#2149 / #3264)",
+                );
+            }
+        }
+    }
+}

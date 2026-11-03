@@ -1,0 +1,1236 @@
+//! NIF file format version handling.
+//!
+//! Gamebryo encodes the version as a packed u32: major.minor.patch.build
+//! where each component gets 8 bits (except major which is sometimes larger).
+//! The actual encoding is: (major << 24) | (minor << 16) | (patch << 8) | build.
+//!
+//! ## `since=` / `until=` semantic doctrine (#935)
+//!
+//! nif.xml's `<add since="A" until="B">` attribute pair is **inclusive**
+//! on both ends: the field is present at every version `v` such that
+//! `A <= v <= B`. niftools' own `verexpr` token table backs this up —
+//! `#NI_BS_LTE_FO3#` is documented as "All NI + BS *until* Fallout 3"
+//! and uses the operator `<=`. nifly mirrors the same convention with
+//! `<=`-comparisons against `V10_0_1_X` enum values.
+//!
+//! Translate to Rust comparisons:
+//!
+//! - `since="X"`  →  `stream.version() >= NifVersion(X)`
+//! - `until="X"`  →  `stream.version() <= NifVersion(X)`
+//!
+//! The pre-#935 codebase carried an exclusive interpretation
+//! (`stream.version() < NifVersion(X)` for `until="X"`) introduced
+//! by the #765 / #769 sweep. That was wrong — every gate would
+//! mis-skip its field at the boundary version exactly. Bethesda
+//! content is unaffected because every shipping `until=` gate sits
+//! at a version older than 20.0.0.5 (Oblivion baseline), so the
+//! predicate collapsed to `false` either way. The bug bit on
+//! pre-Bethesda Gamebryo / NetImmerse content (Civ4 Colonial Fleet,
+//! IndustryGiant 2, Morrowind-era mods).
+
+use std::fmt;
+
+/// NIF file format version, packed as a u32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NifVersion(pub u32);
+
+impl NifVersion {
+    // ── Pre-NetImmerse (never seen in the wild here; lower bound only) ──
+    /// #3621 (OBL-D1-01) — nif.xml's earliest attested version, the
+    /// `since=` floor for a handful of fields (`NiTexturingProperty`'s
+    /// `Apply Mode` and `Has Bump Map Texture`) that predate everything
+    /// else this parser has ever needed a constant for. No file below
+    /// `V4_0_0_0` has been observed in any corpus this repo has parsed —
+    /// this constant exists purely so those two `since=` gates can be
+    /// expressed correctly rather than left as an implicit "always true".
+    pub const V3_3_0_13: Self = Self(0x0303000D);
+
+    // ── NetImmerse / early Gamebryo (4.x – 5.x) ──────────────────────
+    /// Earliest NetImmerse version seen in the wild (Civ4-era content).
+    pub const V4_0_0_0: Self = Self(0x04000000);
+    /// Morrowind era
+    pub const V4_0_0_2: Self = Self(0x04000002);
+    /// v4.1.0.1 — endianness flag introduced.
+    pub const V4_1_0_1: Self = Self(0x04010001);
+    /// First version that authors `NiZBufferProperty.z_function`
+    /// (pre-4.1.0.12 NIFs predate the field). No Bethesda title ships
+    /// in `< 4.1.0.12` — defensive constant used by the property
+    /// parser's pre-V4 fallback branch. See NIF-D4-NEW-09 (audit
+    /// 2026-05-12).
+    pub const V4_1_0_12: Self = Self(0x0401000C);
+    /// v4.2.1.0 — NiNode screen-texture count field introduced.
+    pub const V4_2_1_0: Self = Self(0x04020100);
+    /// v4.2.2.0 — NiAVObject collision-ref path changes.
+    pub const V4_2_2_0: Self = Self(0x04020200);
+    /// v5.0.0.1 — block-type table introduced in header.
+    pub const V5_0_0_1: Self = Self(0x05000001);
+    /// v5.0.0.6 — group table introduced in header.
+    pub const V5_0_0_6: Self = Self(0x05000006);
+
+    // ── Gamebryo 10.x ─────────────────────────────────────────────────
+    /// v10.0.0.0 — transition from NetImmerse 5.x naming.
+    pub const V10_0_0_0: Self = Self(0x0A000000);
+    /// v10.0.0.6 — seen in early Gamebryo test/debug content.
+    pub const V10_0_0_6: Self = Self(0x0A000006);
+    /// v10.0.1.0 — extra-data list, NiAVObject collision-ref, and
+    /// NiGeometryData flags appear at `>= V10_0_1_0`. High-frequency
+    /// boundary (~20 call sites across block parsers).
+    pub const V10_0_1_0: Self = Self(0x0A000100);
+    /// v10.0.1.2 — BSStreamHeader appears at this version (Oblivion
+    /// tools export); also the string-name field on NiAVObject.
+    pub const V10_0_1_2: Self = Self(0x0A000102);
+    /// v10.0.1.3 — minor variant of the 10.0.1.x family.
+    pub const V10_0_1_3: Self = Self(0x0A000103);
+    /// v10.0.1.4 — rare; seen in some Oblivion-era mod content.
+    pub const V10_0_1_4: Self = Self(0x0A000104);
+    /// v10.0.1.8 — `user_version` field appears in NIF header.
+    pub const V10_0_1_8: Self = Self(0x0A000108);
+    /// Pre-Gamebryo boundary: Order float present in XYZ-rotation blocks at <= this version
+    pub const V10_1_0_0: Self = Self(0x0A010000);
+    /// v10.1.0.1 — minor transition version.
+    pub const V10_1_0_1: Self = Self(0x0A010001);
+    /// v10.1.0.101 — NiSkinInstance `skin_partition_ref` field added.
+    pub const V10_1_0_101: Self = Self(0x0A010065);
+    /// v10.1.0.103 — NiGeomMorpherController interpolator path.
+    pub const V10_1_0_103: Self = Self(0x0A010067);
+    /// v10.1.0.104 — NiTimeController `interpolator_ref` field added.
+    /// High-frequency boundary (~6 call sites).
+    pub const V10_1_0_104: Self = Self(0x0A010068);
+    /// v10.1.0.106 — NiLight `switch_state` field added.
+    /// High-frequency boundary (~6 call sites).
+    pub const V10_1_0_106: Self = Self(0x0A01006A);
+    /// v10.1.0.108 — inclusive upper bound of the `NiInterpController`
+    /// `Manager Controlled` bool (`since=10.1.0.104 until=10.1.0.108`). See
+    /// `has_interp_controller_manager_controlled`. (#1506)
+    pub const V10_1_0_108: Self = Self(0x0A01006C);
+    /// v10.1.0.109 — inclusive upper bound of the `NiQuatTransform`
+    /// `TRS Valid` bool[3] (`until=10.1.0.109`). See
+    /// `has_quat_transform_trs_valid`. (#1506)
+    pub const V10_1_0_109: Self = Self(0x0A01006D);
+    /// v10.1.0.110 — lower bound of the `NiBlendInterpolator` byte-sized
+    /// middle band (`Array Size` byte, `Priority` byte). (#1508)
+    pub const V10_1_0_110: Self = Self(0x0A01006E);
+    /// v10.1.0.111 — inclusive upper bound of the `NiBlendInterpolator`
+    /// legacy layout (the modern `Flags`-gated layout starts at
+    /// 10.1.0.112). (#1508)
+    pub const V10_1_0_111: Self = Self(0x0A01006F);
+    /// v10.1.0.112 — lower bound of the modern `NiBlendInterpolator`
+    /// layout (`Flags` + `Weight Threshold` + Flags-gated fields). (#1508)
+    pub const V10_1_0_112: Self = Self(0x0A010070);
+    /// v10.1.0.113 — one below the NiGeometryData bsver gate.
+    pub const V10_1_0_113: Self = Self(0x0A010071);
+    /// v10.1.0.114 — NiGeometryData data-flags layout changes.
+    pub const V10_1_0_114: Self = Self(0x0A010072);
+    /// v10.2.0.0 — NiTimeController extra-data name field added.
+    /// High-frequency boundary (~8 call sites).
+    pub const V10_2_0_0: Self = Self(0x0A020000);
+    /// v10.4.0.0 — rare pre-Bethesda 10.4.x family.
+    pub const V10_4_0_0: Self = Self(0x0A040000);
+    /// v10.4.0.1 — NiSwitchNode / particle fields.
+    pub const V10_4_0_1: Self = Self(0x0A040001);
+    /// v10.4.0.2 — rare; seen in some Gamebryo SDK samples.
+    pub const V10_4_0_2: Self = Self(0x0A040002);
+
+    // ── Bethesda 20.x ─────────────────────────────────────────────────
+    /// v20.0.0.2 — early Oblivion pre-release content.
+    pub const V20_0_0_2: Self = Self(0x14000002);
+    /// v20.0.0.3 — Oblivion little-endian flag boundary.
+    pub const V20_0_0_3: Self = Self(0x14000003);
+    /// Oblivion (v20.0.0.4 — most common Oblivion version)
+    pub const V20_0_0_4: Self = Self(0x14000004);
+    /// Oblivion (v20.0.0.5 — some Oblivion NIFs)
+    pub const V20_0_0_5: Self = Self(0x14000005);
+    /// v20.1.0.0 — just below the string-table threshold.
+    pub const V20_1_0_0: Self = Self(0x14010000);
+    /// v20.1.0.2 — rare; used in some Oblivion-era NifSkope exports.
+    pub const V20_1_0_2: Self = Self(0x14010002);
+    /// v20.1.0.3 — NiGeometryData vertex-count / UV layout changes.
+    /// High-frequency boundary (~5 call sites).
+    pub const V20_1_0_3: Self = Self(0x14010003);
+    /// v20.2.0.5 — block sizes appear in header; NiSpotLight inner
+    /// angle field added. High-frequency boundary (~6 call sites).
+    pub const V20_2_0_5: Self = Self(0x14020005);
+    /// v20.2.0.6 — `NiPersistentSrcTextureRendererData.Pad Num Pixels`
+    /// appears at this version (nif.xml `since="20.2.0.6"`). Below every
+    /// retail Oblivion NIF (20.0.0.x); at/above every FO3+ title.
+    pub const V20_2_0_6: Self = Self(0x14020006);
+    /// Fallout 3+ (v20.2.0.7) — also the version Skyrim/FO4 report; no
+    /// separate SSE constant exists since the bit pattern is identical.
+    pub const V20_2_0_7: Self = Self(0x14020007);
+    /// v20.3.0.4 — rare; seen in some Gamebryo 2.6 SDK content.
+    pub const V20_3_0_4: Self = Self(0x14030004);
+    /// v20.5.0.4 — rare; seen in some Gamebryo 3.x SDK content.
+    pub const V20_5_0_4: Self = Self(0x14050004);
+
+    /// v20.1.0.1 — the inclusive boundary at which Gamebryo introduced
+    /// the per-file string table. Headers `>= STRING_TABLE_THRESHOLD`
+    /// carry `(strings, max_string_length)` after the block table;
+    /// stream reads beyond this version follow the indexed-string path,
+    /// older versions inline length-prefixed strings.
+    ///
+    /// MUST be kept in lockstep across `header.rs::NifHeader::parse`
+    /// and `stream.rs::NifStream` — drift here misreads every block's
+    /// name. See `header.rs:~224` and `stream.rs:~411`.
+    pub const STRING_TABLE_THRESHOLD: Self = Self(0x14010001);
+
+    /// v20.1.0.1 — inclusive upper bound of `NiTexturingProperty`'s
+    /// standalone `Apply Mode` field (nif.xml `since="3.3.0.13"
+    /// until="20.1.0.1"`). At v20.1.0.2+ Apply Mode instead lives packed
+    /// into `TexturingFlags` bits 1-3 (mask `0x000E`). See
+    /// `blocks/properties.rs`'s `Apply Mode` decode.
+    ///
+    /// Numerically identical to [`STRING_TABLE_THRESHOLD`] today (both
+    /// happen to land on v20.1.0.1) but a **distinct, independent**
+    /// concept — `STRING_TABLE_THRESHOLD`'s own doc scopes its lockstep
+    /// contract to `header.rs`/`stream.rs` only. `properties.rs` reusing
+    /// that constant would be an undeclared third consumer with no
+    /// recovery anchor if the two ever needed to diverge (#4152).
+    pub const APPLY_MODE_STANDALONE_UNTIL: Self = Self(0x14010001);
+
+    pub fn major(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+    pub fn minor(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+    pub fn patch(self) -> u8 {
+        (self.0 >> 8) as u8
+    }
+    pub fn build(self) -> u8 {
+        self.0 as u8
+    }
+
+    // ── "Old Oblivion" (v10.0.x) layout predicates ──────────────────
+    //
+    // NIF file versions in `[10.0.0.0, 10.1.0.114)` (nifly/openmw
+    // `VER_OB_OLD`) predate several layout additions. These named,
+    // version-aware helpers centralize the per-file-version questions so
+    // block parsers query *intent* instead of scattering raw
+    // `version < V10_1_0_0` literals — the GameVariant doctrine
+    // (`format_abstraction.md` / NIFAL). Because `NifVariant::detect`
+    // routes both v10.0.x and v20.0.0.5 to the same `Oblivion` variant,
+    // these live on `NifVersion` (the per-file version) rather than on
+    // the variant. See #1337.
+
+    /// Every `NiObject` in `[10.0.0.0, 10.1.0.114)` carries a leading
+    /// 4-byte `groupID` (nifly `NiObject::Get`, `BasicTypes.hpp:972`).
+    /// The `bhkRefObject` Havok-serializable subtree is the lone
+    /// exception (its Get-chain never reaches `NiObject::Get`), so the
+    /// dispatcher pairs this version test with the
+    /// `is_havok_serializable` type predicate.
+    pub fn has_object_group_id(self) -> bool {
+        self >= Self::V10_0_0_0 && self < Self::V10_1_0_114
+    }
+
+    /// `hkpMoppCode.Offset` (origin `Vector4`) is `since="10.1.0.0"` —
+    /// absent on old-Oblivion `bhkMoppBvTreeShape` (#1329).
+    pub fn has_mopp_offset(self) -> bool {
+        self >= Self::V10_1_0_0
+    }
+
+    /// `bhkNiTriStripsShape.Scale` (`Vector4`) is `since="10.1.0.0"` —
+    /// absent on old-Oblivion strips collision shapes (#1337).
+    pub fn has_havok_strips_scale(self) -> bool {
+        self >= Self::V10_1_0_0
+    }
+
+    /// `NiSkinData.Skin Partition` is a `Ref` carried inline (between
+    /// `Num Bones` and `Has Vertex Weights`) `since="4.0.0.2"
+    /// until="10.1.0.0"`; later versions moved it to `NiSkinInstance`.
+    /// Old-Oblivion creature skin data still has it (#1337).
+    ///
+    /// #2168 — the `since` bound was missing, so at exactly `V4_0_0_0`
+    /// this returned `true` and the parser read a 4-byte ref that isn't
+    /// on disk, misaligning the rest of the block.
+    pub fn has_skin_data_partition_ref(self) -> bool {
+        self >= Self::V4_0_0_2 && self <= Self::V10_1_0_0
+    }
+
+    /// `NiSkinData.Has Vertex Weights` is a `bool` `since="4.2.1.0"`
+    /// with `default="true"` — absent on older files, where the weights
+    /// array is present unconditionally.
+    ///
+    /// #2168 — this field was read unconditionally, unlike every other
+    /// version-gated field in the same parser. Below 4.2.1.0 that
+    /// over-read one byte and misaligned every subsequent float in the
+    /// `BoneData` array. Versions this old predate the `block_sizes`
+    /// table (`>= 20.2.0.5`), so there is no per-block recovery anchor —
+    /// the drift would cascade the way the #1301/#1310/#1337 v10.x
+    /// truncation family did.
+    pub fn has_skin_data_vertex_weights_flag(self) -> bool {
+        self >= Self::V4_2_1_0
+    }
+
+    /// The pre-Gamebryo-10.1.0.104 `Data` ref boundary. nif.xml declares
+    /// this same `until="10.1.0.103"` complement to
+    /// `NiSingleInterpController.Interpolator` (`since="10.1.0.104"`) on
+    /// several sibling subclasses, all named `Data` in the schema, always
+    /// a single `Ref` pointing at their own data-object type:
+    /// `NiKeyframeController.Data` (`NiKeyframeData`, #1337) —
+    /// `NiTransformController` inherits it unchanged (nif.xml: "replaces
+    /// NiKeyframeController", zero own fields) — `NiVisController.Data`
+    /// (`NiVisData`), `NiAlphaController.Data` (`NiFloatData`),
+    /// `NiTextureTransformController.Data` (`NiFloatData`),
+    /// `NiMaterialColorController.Data` / `NiLightColorController.Data`
+    /// (`NiPosData`), `NiFloatExtraDataController.Data` (`NiFloatData`).
+    /// The same split reaches four more types in the `NiPSys*Ctlr` family:
+    /// `NiPSysEmitterCtlr.Data` (`NiPSysEmitterCtlrData`, mutually
+    /// exclusive with its own `since="10.1.0.104"` Visibility
+    /// Interpolator), `NiPSysModifierActiveCtlr.Data` (`NiVisData`), and
+    /// `NiPSysModifierFloatCtlr.Data` (`NiFloatData`, inherited by its 19
+    /// dispatch aliases) — parsed in `blocks/particle.rs`. (`Data` on
+    /// `NiFloatsExtraDataController`, plural, has no dispatch arm and is
+    /// out of scope until one is added.) Old-Oblivion-and-earlier content
+    /// stores the data ref directly; `since="10.1.0.104"` it is replaced
+    /// by the interpolator ref. (#1337 / #2562 / #2563 / #3174)
+    ///
+    /// See also [`has_ni_sequence_prologue`](Self::has_ni_sequence_prologue)
+    /// — `NiSequence`'s own `Accum Root Name` / `Text Keys` pair sits on
+    /// this identical `until="10.1.0.103"` boundary but is a distinct
+    /// concept (unrelated to any `Data` ref), so it gets its own named
+    /// helper rather than reusing this one under a misleading name. (#3476)
+    pub fn has_keyframe_controller_data(self) -> bool {
+        self <= Self::V10_1_0_103
+    }
+
+    /// The `until="10.1.0.103"` pre-Gamebryo-10.1.0.104 layout `NiSequence`
+    /// / `ControlledBlock` themselves carry, gating three fields:
+    /// `NiSequence.Accum Root Name`, `NiSequence.Text Keys` (both replaced
+    /// `since="10.1.0.106"` by `NiControllerSequence`'s re-declared,
+    /// disjointly-gated same-named fields), and `ControlledBlock.Target
+    /// Name` (replaced `since="10.1.0.104"` by `Node Name`). Bit-identical
+    /// boundary to [`has_keyframe_controller_data`](Self::has_keyframe_controller_data)
+    /// but a different concept — see that method's doc. (#2345 / #3468 /
+    /// #3476)
+    pub fn has_ni_sequence_prologue(self) -> bool {
+        self <= Self::V10_1_0_103
+    }
+
+    /// nif.xml's `since="10.1.0.106"` boundary gating every field
+    /// `NiControllerSequence` (the derived class) adds beyond its
+    /// `NiSequence` base — `Weight`, `Text Keys`, `Cycle Type`,
+    /// `Frequency`, `Start`/`Stop Time`, `Manager`, `Accum Root Name` —
+    /// plus the `ControlledBlock` fields nif.xml adds at the same
+    /// version: `Interpolator` and (paired with `#BSSTREAM#`) `Priority`.
+    /// Below this version a `NiControllerSequence` is structurally just
+    /// its `NiSequence` base, and each of these `ControlledBlock` fields
+    /// is absent entirely. (#2345 / #3476)
+    pub fn has_controller_sequence_fields(self) -> bool {
+        self >= Self::V10_1_0_106
+    }
+
+    /// `NiInterpController.Manager Controlled` is a 1-byte `bool` present
+    /// only `since="10.1.0.104" until="10.1.0.108"` (nif.xml, both ends
+    /// inclusive). It sits between the `NiTimeController` base and the
+    /// `NiSingleInterpController.Interpolator` ref, so every
+    /// NiInterpController descendant in that narrow band carries it.
+    /// Retail Bethesda content (Oblivion 20.0.0.x, FO3+ 20.2.0.7) is far
+    /// above the upper bound, so this is false everywhere except old
+    /// Gamebryo content (e.g. Oblivion's `_1stperson\skeleton.nif`,
+    /// file-version 10.1.0.106). (#1506)
+    pub fn has_interp_controller_manager_controlled(self) -> bool {
+        self >= Self::V10_1_0_104 && self <= Self::V10_1_0_108
+    }
+
+    /// `NiQuatTransform.TRS Valid` is a trailing `bool[3]` (3 × 1-byte
+    /// bool, one per Translation/Rotation/Scale component) present only
+    /// `until="10.1.0.109"` (nif.xml, inclusive). After it the struct is
+    /// just translation + rotation + scale. Retail Bethesda content
+    /// (Oblivion 20.0.0.x, FO3+ 20.2.0.7) is above the bound, so the bytes
+    /// are absent there; they appear on old Gamebryo content such as
+    /// Oblivion's `_1stperson\skeleton.nif` (10.1.0.106), where every
+    /// `NiTransformInterpolator` carries them. (#1506)
+    pub fn has_quat_transform_trs_valid(self) -> bool {
+        self <= Self::V10_1_0_109
+    }
+
+    /// `bhkRigidBody` below `10.1.0.0` uses a distinct wire layout: it
+    /// predates the `since="10.1.0.0"` CInfo additions (the duplicated
+    /// filter/entity prefix and the max-velocity / penetration triple)
+    /// and carries the `<= VER_OB_OLD` `bhkWorldObject` Unknown. (#1329)
+    pub fn uses_old_rigid_body_layout(self) -> bool {
+        self < Self::V10_1_0_0
+    }
+}
+
+impl fmt::Display for NifVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}.{}.{}",
+            self.major(),
+            self.minor(),
+            self.patch(),
+            self.build()
+        )
+    }
+}
+
+/// Named `user_version_2` (BSVER) thresholds.
+///
+/// Bethesda's NIFs carry a `user_version_2` byte that disambiguates
+/// the engine variant when the wire-format version alone is not
+/// enough (every Bethesda title since Oblivion ships `V20_2_0_7`).
+/// Block parsers gate field reads on `stream.bsver()` against these
+/// boundaries; the canonical retail values per game are documented
+/// on [`NifVariant::bsver`].
+///
+/// Use these constants in raw `bsver` comparisons instead of bare
+/// decimal literals — the symbols survive cross-file refactors and
+/// document intent at the call site. See [`NifVariant`] for the
+/// feature-flag helpers that wrap most common predicates.
+pub mod bsver {
+    /// Pre-Bethesda authoring tools (Morrowind era, NifSkope older
+    /// builds) — every Bethesda title is `>= FO3_FNV`.
+    pub const PRE_BETHESDA: u32 = 0;
+    /// `bhkBlendCollisionObject` carries two trailing `Unknown Float 1/2`
+    /// fields on content with `bsver < RIGID_BODY_EXTRA_FLOATS` (nif.xml
+    /// `bhkBlendCollisionObject`, `#BSVER# #LT# 9`) — read on the `is_blend`
+    /// path in `blocks/collision/collision_object.rs`, NOT on `bhkRigidBody`.
+    /// (The const name predates the correct attribution; it gates the blend
+    /// object's extra floats.) Pre-collision-v2 Oblivion dev builds
+    /// (e.g. boxtest skeleton.nif, bsver=6) hit this; standard Oblivion
+    /// (bsver=11) does not. See #549.
+    pub const RIGID_BODY_EXTRA_FLOATS: u32 = 9;
+    /// The single BSVER cut that splits the morph family's legacy layout
+    /// from its modern one (#2423 / TD7-001).
+    ///
+    /// nif.xml expresses it from both sides, and these are the *only*
+    /// three fields in the whole spec that key on the 9/10 boundary:
+    ///   * `NiGeomMorpherController.Num Unknown Ints` / `Unknown Ints`
+    ///     — `vercond="#BSVER# #GT# 9"`, i.e. present at `bsver >= 10`.
+    ///   * `Morph.Legacy Weight` — `vercond="#BSVER# #LT# 10"`, i.e.
+    ///     present at `bsver <= 9`.
+    ///
+    /// Because the two halves are exact complements over integers, one
+    /// constant is the honest encoding: two separately-named constants
+    /// at 9 and 10 would let the halves of a single cut drift apart.
+    /// Read the call-site comments in
+    /// `blocks/controller/morph.rs` for which field each side gates.
+    ///
+    /// **Not** [`RIGID_BODY_EXTRA_FLOATS`] despite the adjacent value —
+    /// that constant gates `bhkBlendCollisionObject`'s trailing floats
+    /// and is semantically unrelated; see its own warning.
+    pub const MORPH_LEGACY_CUTOFF: u32 = 10;
+    /// Oblivion BSVER (v20.0.0.4 / v20.0.0.5 or v20.2.0.7 with uv=11).
+    /// Pre-collision v2 content ships `bsver < RIGID_BODY_EXTRA_FLOATS`;
+    /// standard Oblivion content ships at exactly 11.
+    ///
+    /// **Test-fixture-only by design, not dead code** (#4160): no parser
+    /// branches on "is this exactly Oblivion's bsver" the way it does on
+    /// the threshold constants around it — Oblivion content is instead
+    /// selected by falling below every later cut (`RIGID_BODY_EXTRA_FLOATS`,
+    /// `FO3_FNV`, etc.), the same "narrow the era from above" pattern
+    /// `NifVariant::detect` uses. This constant's job is naming the value
+    /// for [`NifHeader::test_oblivion`](crate::header::NifHeader::test_oblivion)
+    /// and other fixtures so a boundary test reads as "Oblivion" rather
+    /// than a bare `11`. A future dead-code sweep should leave it — see
+    /// the removals at #1511/#1840/#1897 for the actually-dead class this
+    /// is deliberately NOT part of.
+    pub const OBLIVION: u32 = 11;
+    /// Upper bound of the nif.xml `#NI_BS_LTE_16#` verset ("All NI + BS
+    /// until BSVER 16"). Content with `bsver > NI_BS_LTE_16` carries the
+    /// post-Oblivion additions gated on `!#NI_BS_LTE_16#` — e.g.
+    /// `NiPSysGravityModifier.World Aligned` (the byte that over-read on
+    /// Oblivion bsver=11 when this was mis-gated on NIF version, #1306-sib)
+    /// and the `bhkRagdollConstraint` motor fields. Oblivion (bsver 11) is
+    /// `<= 16`; FO3-era and later (bsver 34+) is `> 16`.
+    pub const NI_BS_LTE_16: u32 = 16;
+    /// `NiMaterialProperty` carries the `Emissive Mult` float only on
+    /// content with `bsver > MATERIAL_EMISSIVE_MULT` (nif.xml
+    /// `#BSVER# #GT# 21`). Strict `>`, so FO3-era content at exactly 21
+    /// is excluded and defaults emissive_mult to 1.0. See #323.
+    pub const MATERIAL_EMISSIVE_MULT: u32 = 21;
+    /// Pre-retail FO3 dev builds that first added refraction fields
+    /// (`refraction_strength`, `refraction_fire_period`) to
+    /// BSShaderPPLightingProperty. Content with `bsver > FO3_REFRACTION`
+    /// carries these fields.
+    pub const FO3_REFRACTION: u32 = 14;
+    /// Pre-retail FO3 dev builds that added parallax fields
+    /// (`parallax_max_passes`, `parallax_scale`). Content with
+    /// `bsver > FO3_PARALLAX` carries these fields.
+    pub const FO3_PARALLAX: u32 = 24;
+    /// First BSVER whose `NiControllerSequence` carries the FO3-era
+    /// singular `Ref<BSAnimNotes>`. The singular layout is inclusive from
+    /// this value through [`ANIM_NOTES_THRESHOLD`]; later content stores a
+    /// counted list instead.
+    pub const FO3_ANIM_NOTES_LOWER: u32 = 24;
+    /// BSVER threshold at which NiAVObject `flags` widens from u16 to
+    /// u32 (`bsver > FLAGS_U32_THRESHOLD`). nif.xml gates
+    /// `NiAVObject.Flags` on the inline `#BSVER# #GT# 26` vercond (no
+    /// named token); u16 at `bsver <= 26`.
+    pub const FLAGS_U32_THRESHOLD: u32 = 26;
+    /// `NiMaterialProperty` drops its `Ambient Color`/`Diffuse Color` fields
+    /// (both pinned to white) once `bsver >= MATERIAL_COMPACT_COLORS` (nif.xml
+    /// `#BSVER# #LT# 26`, i.e. present strictly below 26). Independent of
+    /// [`FLAGS_U32_THRESHOLD`] despite sharing the same value of 26 today —
+    /// that constant gates the unrelated `NiAVObject.flags` u16→u32 widen.
+    /// Keep this a distinct constant even though the values coincide so a
+    /// future correction of one doesn't silently move the other. See #4153.
+    pub const MATERIAL_COMPACT_COLORS: u32 = 26;
+    /// Upper bound of NiControllerSequence's FO3-era singular animation-
+    /// notes reference. Content with `bsver > ANIM_NOTES_THRESHOLD` carries
+    /// a counted list; content below [`FO3_ANIM_NOTES_LOWER`] has no field.
+    pub const ANIM_NOTES_THRESHOLD: u32 = 28;
+    /// Fallout 3 retail + Fallout New Vegas (binary-identical at
+    /// BSVER 34 per nif.xml `V20_2_0_7_FO3`).
+    pub const FO3_FNV: u32 = 34;
+    /// bhkRigidBody `body_flags` switches from u32 (`bsver < 76`) to
+    /// u16 (`bsver >= 76`). Sits between FO3_FNV and SKYRIM_LE in the
+    /// dev-build BSVER timeline.
+    pub const RIGID_BODY_FLAGS16: u32 = 76;
+    /// Skyrim LE.
+    pub const SKYRIM_LE: u32 = 83;
+    /// Skyrim Special Edition.
+    pub const SKYRIM_SE: u32 = 100;
+    /// BSStreamHeader's `Max Filepath` field is present only on content
+    /// with `bsver >= MAX_FILEPATH` (nif.xml `#BS_GTE_103#`). See #1898 /
+    /// NIF-D2-06.
+    pub const MAX_FILEPATH: u32 = 103;
+    /// Fallout 4 (also covers 132 / 139 patch BSVERs in shipping
+    /// content per the `Fallout4` variant fan-out; this constant is
+    /// the lower bound).
+    pub const FALLOUT4: u32 = 130;
+    /// Intentional gap: no retail game shipped at BSVER 131.
+    /// BSLightingShaderProperty / BSEffectShaderProperty flag arrays
+    /// and CRC fields are BOTH absent at this value — parsers must
+    /// handle it as a no-op for both branches.
+    ///
+    /// **Test-fixture/assertion-only by design, not dead code** (#4160
+    /// SIBLING sweep) — `carries_typed_shader_flags`/`carries_crc_shader_
+    /// flags` gate on `FALLOUT4`/`FO4_CRC_FLAGS` directly, so 131 falling
+    /// in neither range is a derived consequence, not something checked
+    /// against by name. This constant's job is naming the gap band for
+    /// `bsver_shader_flag_band_tests` and the `shader_tests::fo4` fixture
+    /// that builds a header at exactly this value.
+    pub const FO4_SHADER_GAP: u32 = 131;
+    /// FO4 patch — shader flags switch to CRC hash arrays
+    /// (`bsver >= FO4_CRC_FLAGS`). Corresponds to nif.xml's
+    /// `#BS_GTE_132#` predicate.
+    pub const FO4_CRC_FLAGS: u32 = 132;
+    /// Exclusive upper bound of the FO4-DLC range that authors the
+    /// `BSEffectShaderProperty` SSR / skin-tint trailing bools — i.e.
+    /// the range `FALLOUT4..FO4_DLC_UPPER` (BSVER 130..=139) carries
+    /// `use_ssr` / `wetness_use_ssr` after `env_map_scale` on
+    /// shader_type = 1 (EnvironmentMap) and `skin_tint_alpha` after
+    /// the RGB triple on shader_type = 5 (SkinTint). FO76+
+    /// (`bsver >= FO76 = 155`) does NOT carry these fields.
+    ///
+    /// The previous interpretation (`env_map_scale` "moves inside
+    /// wetness" at this BSVER) was empirically wrong — gating wetness
+    /// env_map_scale on this threshold dropped Starfield Meshes01
+    /// parse rate from 97.21% → 95.77%. See `shader.rs:943-957` for
+    /// the empirical evidence and #1223 for the fix that obsoleted
+    /// the wetness claim.
+    pub const FO4_DLC_UPPER: u32 = 140;
+    /// Lower bound for FO76 SF2 CRC arrays (`bsver >= FO76_SF2_CRCS`).
+    /// The `num_sf2` count field is only present at this BSVER and
+    /// above; below it the SF2 array is always empty.
+    pub const FO76_SF2_CRCS: u32 = 152;
+    /// Fallout 76 (lower bound; FO76 spans 155..=167 in shipping
+    /// content — see [`NifVariant::detect`]'s FO76 match arm, which
+    /// branches on this exact value). NOT 152 — that's
+    /// [`FO76_SF2_CRCS`], an unrelated shader-flag-array threshold that
+    /// happens to sit just below this one. #4161 fixed this doc's
+    /// lower bound after it drifted to the wrong constant's value.
+    pub const FO76: u32 = 155;
+    /// Exclusive upper bound `NifVariant::detect` uses to separate
+    /// `Fallout76` from `Starfield` (`uv2 < FO76_STARFIELD_BOUNDARY` is
+    /// FO76). "Cosmetic distinction today" per `detect`'s own comment —
+    /// every shader/block conditional that matters gates on
+    /// `bsver >= 132`, which both bands satisfy identically — but named
+    /// here (#4161) rather than left as a bare `170` literal, matching
+    /// every other version-band edge in this module. FO76 retail is
+    /// only confirmed through 167; the gap up to this boundary
+    /// classifies unconfirmed 168/169 content as FO76 rather than
+    /// Starfield pending a confirmed FO76 dev-build corpus (#173).
+    pub const FO76_STARFIELD_BOUNDARY: u32 = 170;
+    /// Starfield (lower bound). A corpus-wide bsver histogram over 87,994
+    /// retail Starfield NIFs observes only `{172,173,174,175}` — 168-171
+    /// is unattested in shipped content (#2639); 170 is the historical
+    /// cutoff vs FO76 dev builds.
+    pub const STARFIELD: u32 = 172;
+    /// Starfield dev+ builds that carry a `form_id` field in some
+    /// blocks (e.g. NiNode). Content with `bsver >= SF_FORM_ID` has
+    /// this field; retail Starfield at 172 does not.
+    pub const SF_FORM_ID: u32 = 173;
+    /// Starfield builds that carry the undocumented 2-byte field between
+    /// `BSWeakReferenceNode`'s weak-ref array and `unkInt1` (#2105).
+    ///
+    /// **Deliberately separate from [`SF_FORM_ID`]** even though #2105
+    /// originally reused it. The two properties do not correlate, and
+    /// assuming they did cost 93.9% of `Starfield - Meshes02.ba2` (#2201):
+    ///
+    /// | bsver | `form_id` per entry | 2-byte gap | observed in           |
+    /// |-------|---------------------|------------|-----------------------|
+    /// | 172   | no                  | no         | "packin" composites   |
+    /// | 173   | yes                 | **no**     | `Meshes02.ba2`        |
+    /// | 174   | yes                 | **no**     | `MeshesPatch.ba2` (13 files) |
+    /// | 175   | yes                 | **yes**    | `MeshesPatch.ba2`     |
+    ///
+    /// 174 IS observed (13 bsver-174 terrain files in `MeshesPatch.ba2`,
+    /// all parsing clean under this gate — #2640), and it lands on the
+    /// no-gap side: `form_id` present, 2-byte gap absent. The boundary is
+    /// pinned exactly at 175, not merely "somewhere in (173, 175]".
+    pub const SF_WEAK_REF_GAP: u32 = 175;
+
+    /// True when `bsver` carries the **typed** `u32` shader-flag pair
+    /// (`shader_flags_1` / `shader_flags_2`) on `BSLightingShaderProperty`
+    /// and `BSEffectShaderProperty`.
+    ///
+    /// Mirrors the parse gate in `blocks/shader.rs`
+    /// (`bsver <= FALLOUT4`). Consumers that test SLSF1/SLSF2 bits must
+    /// gate on this rather than on a bare `bsver >= FALLOUT4`: the latter
+    /// reads as "flags are live" across the whole FO4+ range even where
+    /// the fields are structurally absent. See #2603.
+    pub const fn carries_typed_shader_flags(bsver: u32) -> bool {
+        bsver <= FALLOUT4
+    }
+
+    /// True when `bsver` carries the **CRC32** shader-flag arrays
+    /// (`sf1_crcs` / `sf2_crcs`) instead of the typed pair. Mirrors the
+    /// parse gate `bsver >= FO4_CRC_FLAGS`. See #2603.
+    pub const fn carries_crc_shader_flags(bsver: u32) -> bool {
+        bsver >= FO4_CRC_FLAGS
+    }
+
+    /// True for the one BSVER that carries **neither** shader-flag
+    /// encoding — [`FO4_SHADER_GAP`] (131). Dev-stream 131 ships no
+    /// shader-flag fields at all, so every SLSF bit reads as 0 and every
+    /// CRC array is empty no matter what the source authored.
+    ///
+    /// This is the diagnostic seam #2603 asked for: a reader hitting an
+    /// unexpectedly flagless FO4-era mesh can call this instead of
+    /// rediscovering the gap band from the parser. Masked on vanilla FO4
+    /// because the BGSM merge supplies the same attributes downstream.
+    pub const fn is_shader_flag_gap(bsver: u32) -> bool {
+        !carries_typed_shader_flags(bsver) && !carries_crc_shader_flags(bsver)
+    }
+}
+
+#[cfg(test)]
+mod bsver_shader_flag_band_tests {
+    use super::bsver::*;
+
+    /// The three predicates must partition the BSVER line exactly the way
+    /// `blocks/shader.rs` parses it: typed pair at or below 130, CRC
+    /// arrays at or above 132, and nothing at all at 131.
+    #[test]
+    fn gap_band_is_exactly_131() {
+        for bsver in 0..=200u32 {
+            let typed = carries_typed_shader_flags(bsver);
+            let crc = carries_crc_shader_flags(bsver);
+            assert!(!(typed && crc), "bsver {bsver} claims both flag encodings");
+            assert_eq!(
+                is_shader_flag_gap(bsver),
+                bsver == FO4_SHADER_GAP,
+                "bsver {bsver} misclassified against the {FO4_SHADER_GAP} gap band"
+            );
+        }
+    }
+
+    /// Pin the band edges against the constants the parser gates on, so a
+    /// renumbering of either bound has to update this test deliberately.
+    #[test]
+    fn band_edges_match_parser_gates() {
+        assert!(carries_typed_shader_flags(FALLOUT4));
+        assert!(!carries_typed_shader_flags(FO4_SHADER_GAP));
+        assert!(!carries_crc_shader_flags(FO4_SHADER_GAP));
+        assert!(carries_crc_shader_flags(FO4_CRC_FLAGS));
+        assert!(carries_crc_shader_flags(FO76));
+        assert!(carries_crc_shader_flags(STARFIELD));
+    }
+}
+
+/// Which game generation produced this NIF.
+///
+/// Derived once from the header's (version, user_version, user_version_2) triplet.
+/// Block parsers query semantic feature flags on this enum instead of comparing
+/// raw version numbers, keeping game-specific quirks in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NifVariant {
+    /// Morrowind (NIF ≤ 4.x, NetImmerse era)
+    Morrowind,
+    /// Oblivion (NIF 20.0.0.5, user_version < 11)
+    Oblivion,
+    /// Fallout 3 dev/mod NIFs (NIF 20.2.0.7, uv=11, uv2 < 34 — fans out
+    /// across bsver 14, 16, 21, 24-33 in pre-retail authoring tools).
+    /// Retail FO3 ships at bsver=34 and detects as `FalloutNV` instead
+    /// (the two are binary-identical at that BSVER per nif.xml line 208:
+    /// `<version id="V20_2_0_7_FO3" num="20.2.0.7" user="11" bsver="34"
+    /// ext="rdt">Fallout 3, Fallout NV</version>`).
+    Fallout3,
+    /// Fallout New Vegas (NIF 20.2.0.7, uv=11, uv2=34)
+    FalloutNV,
+    /// Skyrim LE (NIF 20.2.0.7, uv=12, uv2=83)
+    SkyrimLE,
+    /// Skyrim SE (NIF 20.2.0.7, uv=12, uv2=100)
+    SkyrimSE,
+    /// Fallout 4 (NIF 20.2.0.7, uv=12, uv2=130)
+    Fallout4,
+    /// Fallout 76 (NIF 20.2.0.7, uv=12, uv2=155)
+    Fallout76,
+    /// Starfield (NIF 20.2.0.7, uv=12, uv2≥170)
+    Starfield,
+    /// Unknown version — parse with best effort.
+    Unknown,
+}
+
+impl NifVariant {
+    /// Determine the game variant from the NIF header version triplet.
+    pub fn detect(version: NifVersion, user_version: u32, user_version_2: u32) -> Self {
+        if version.0 <= 0x04000002 {
+            return Self::Morrowind;
+        }
+        // V20.0.0.4 and V20.0.0.5 are exclusively Oblivion — no other game uses these.
+        // Check before the uv/uv2 match to avoid misidentifying as FO3/FNV.
+        //
+        // #943 / NIF-D2-NEW-03 considered routing `V20_0_0_4 user=11`
+        // to `Fallout3` because nif.xml's `#FO3#` verset (line 44)
+        // includes `V20_0_0_4__11`. nif.xml line 196 itself lists the
+        // version as "Oblivion, Fallout 3" — genuinely ambiguous. The
+        // existing test `detect_oblivion_edge_cases` pins the prior
+        // decision that `(V20_0_0_4, 11, _)` is Oblivion.
+        //
+        // FO3-D6-01 / #2087 — #1219's premise that "no retail FO3 NIF
+        // ships at v20.0.0.4 / vanilla content never hits it" is
+        // EMPIRICALLY FALSE. A header-only `nif_stats` scan of the
+        // vanilla, unmodified `Fallout - Meshes.bsa` fires the one-shot
+        // warn below exactly once, isolated to
+        // `meshes\triggers\collisionboxstatic.nif` — a real FO3 archive
+        // entry (a generic invisible trigger-volume utility mesh,
+        // plausibly a literal Oblivion-era asset carried over unchanged).
+        // The routing deliberately STAYS Oblivion anyway because the
+        // misroute is unobservable: the sole `NifVariant` consumer,
+        // `havok_scale_for` (`lib.rs`), maps `Oblivion` and `Fallout3` to
+        // the identical 7.0 Havok-to-engine scale. Revisit this only if a
+        // future consumer distinguishes the two variants — see the
+        // harmlessness guard in
+        // `detect_ambiguous_v20_0_0_4_uv11_stays_oblivion_pending_sample`.
+        //
+        // #1219 — the process-lifetime one-shot warn below still fires so
+        // a modded FO3 corpus at this tuple surfaces in the log with its
+        // values; it is no longer "silent on every supported game" (the
+        // vanilla FO3 mesh above hits it once).
+        if version == NifVersion::V20_0_0_4 && user_version == 11 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                log::warn!(
+                    "NifVariant::detect: ambiguous tuple (V20_0_0_4, \
+                     user_version=11, user_version_2={}) routed as Oblivion \
+                     pending sample-data disambiguation — nif.xml lists \
+                     v20.0.0.4 as \"Oblivion, Fallout 3\" and the `#FO3#` \
+                     verset includes V20_0_0_4__11. File a sample to flip \
+                     the routing (#1219).",
+                    user_version_2,
+                );
+            });
+        }
+        if version == NifVersion::V20_0_0_4 || version == NifVersion::V20_0_0_5 {
+            return Self::Oblivion;
+        }
+        // V20.2.0.7+ — disambiguate by user_version and user_version_2 (BSVER).
+        match (user_version, user_version_2) {
+            // user_version < 11: Oblivion exports on v20.2.0.7 (NifSkope, older tools)
+            (uv, _) if uv < 11 => Self::Oblivion,
+            (11, uv2) if uv2 < bsver::FO3_FNV => Self::Fallout3,
+            (11, bsver::FO3_FNV) => Self::FalloutNV,
+            (12, uv2) if uv2 <= bsver::SKYRIM_LE => Self::SkyrimLE,
+            (12, uv2) if uv2 <= bsver::SKYRIM_SE => Self::SkyrimSE,
+            // 101-129: unknown gap, treat as SkyrimSE (closest known)
+            (12, uv2) if uv2 < bsver::FALLOUT4 => Self::SkyrimSE,
+            (12, uv2) if uv2 < bsver::FO76 => Self::Fallout4,
+            // Fallout 76 retail ships BSVER 155–167. Starfield dev/retail
+            // ships 168+. The 155..170 window below is the currently-
+            // known FO76 range; 168/169 in the wild are reportedly early
+            // Starfield dev builds that we classify as FO76 anyway.
+            // Cosmetic distinction today — every shader / block
+            // conditional we care about is gated on `bsver >= 132`,
+            // which covers both identically. Re-tighten to `< 168` once
+            // a confirmed Starfield dev-build corpus lands (#173).
+            (12, uv2) if uv2 < bsver::FO76_STARFIELD_BOUNDARY => Self::Fallout76,
+            (12, _) => Self::Starfield,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Single representative `user_version_2` per game variant.
+    /// Hard-pinned to one value each — `FO3=34, FNV=34, SK=83,
+    /// SK_SE=100, FO4=130, FO76=155, SF=172` — for callers that need
+    /// "the" BSVER associated with a game (e.g. fixture builders,
+    /// telemetry buckets, the version-detection unit tests).
+    ///
+    /// **This value is one representative, not an exhaustive span.**
+    /// Shipping content covers wider BSVER ranges per game:
+    /// FO4 ships at `{130, 132, 139}`, FO76 spans `152..=167`, and
+    /// Starfield is unbounded `≥168`. Parser callers that need to
+    /// honour the file's actual `user_version_2` (e.g. nif.xml's
+    /// per-field `#BSVER#` conditionals) MUST use `stream.bsver()`,
+    /// not this method.
+    ///
+    /// `Fallout3` returns 34 to match the retail value even though
+    /// the variant itself matches dev/mod pre-retail builds (in-file
+    /// bsver < 34). The variant exists for parser routing — the
+    /// retail bsver is the right answer to "what BSVER does FO3
+    /// canonically ship at?"
+    ///
+    /// See #937 / NIF-D2-NEW-01 for the audit history (pre-fix
+    /// `Fallout3.bsver()` returned 21, one of many dev-tool BSVERs in
+    /// the [0, 33] fan-out, which contradicted the hard-pin) and
+    /// NIF-D2-NEW-09 (audit 2026-05-12) for the FO4/FO76/SF span
+    /// clarification.
+    pub fn bsver(self) -> u32 {
+        match self {
+            Self::Morrowind | Self::Oblivion => 0,
+            // Retail FO3 ships at bsver=34, identical to FNV. See #937.
+            Self::Fallout3 | Self::FalloutNV => 34,
+            Self::SkyrimLE => 83,
+            Self::SkyrimSE => 100,
+            Self::Fallout4 => 130,
+            Self::Fallout76 => 155,
+            Self::Starfield => 172,
+            Self::Unknown => 0,
+        }
+    }
+
+    // ── Feature flags ──────────────────────────────────────────────
+    // Each method documents which games have the feature and why.
+    // Parsers call these instead of raw `user_version_2 >= N` checks.
+    //
+    // #938 / NIF-D2-NEW-04 removed three predicates (compact_material,
+    // has_emissive_mult, has_shader_emissive_color); #1511 removed six more;
+    // #1840 removed seven more (has_material_crc, has_properties_list,
+    // avobject_flags_u32, has_shader_alpha_refs, has_effects_list,
+    // uses_bs_tri_shape, has_culling_mode); #1897 removed the last
+    // survivor, `has_shader_property_fo3_fields` — its sole claimed
+    // consumer (`ShaderFlags::classify` in `shader_flags.rs`) was itself
+    // transitively dead (test-only), so the predicate had zero production
+    // call sites like every one before it. All had zero production call
+    // sites — every parser queries `stream.bsver()` directly per the
+    // raw-bsver doctrine (base.rs / node.rs, #160 / #1331 / #1838 / #1839).
+    // Keeping a call-site-less predicate as an "approved helper" alongside
+    // the raw-bsver path was an architectural foot-gun: a contributor
+    // adopting one (e.g. the Fallout3-vs-FalloutNV `avobject_flags_u32`, or
+    // any variant helper that answers `false` on the `Unknown` hybrid-header
+    // corner) reintroduces the one-bsver-step transitional-export mis-parse
+    // those call sites were fixed to avoid. No feature-flag predicates
+    // remain on `NifVariant` — this doctrine is fully enforced now.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_components() {
+        let v = NifVersion::V20_2_0_7;
+        assert_eq!(v.major(), 0x14); // 20
+        assert_eq!(v.minor(), 0x02);
+        assert_eq!(v.patch(), 0x00);
+        assert_eq!(v.build(), 0x07);
+    }
+
+    #[test]
+    fn version_display() {
+        assert_eq!(NifVersion::V20_2_0_7.to_string(), "20.2.0.7");
+        assert_eq!(NifVersion::V4_0_0_2.to_string(), "4.0.0.2");
+        assert_eq!(NifVersion::V20_0_0_5.to_string(), "20.0.0.5");
+    }
+
+    /// #1337 — the "old Oblivion" (v10.0.x) layout predicates. v10.0.1.0
+    /// / v10.0.1.2 take the old paths; standard Oblivion v20.0.0.5 and
+    /// every later title (FO3/FNV/Skyrim/FO4) take the modern paths.
+    #[test]
+    fn old_oblivion_layout_predicates() {
+        let v10 = NifVersion::V10_0_1_2; // VER_OB_OLD band
+        let v20 = NifVersion::V20_0_0_5; // standard Oblivion / modern band
+
+        // groupID version band [10.0.0.0, 10.1.0.114): v10.0.x in, v20 out.
+        assert!(v10.has_object_group_id());
+        assert!(!v20.has_object_group_id());
+
+        // since 10.1.0.0 fields — present on v20, absent on v10.0.x.
+        assert!(!v10.has_mopp_offset() && v20.has_mopp_offset());
+        assert!(!v10.has_havok_strips_scale() && v20.has_havok_strips_scale());
+
+        // until-boundary fields — present on v10.0.x, absent on v20.
+        assert!(v10.has_skin_data_partition_ref() && !v20.has_skin_data_partition_ref());
+        assert!(v10.has_keyframe_controller_data() && !v20.has_keyframe_controller_data());
+
+        // old rigid-body layout: v10.0.x only.
+        assert!(v10.uses_old_rigid_body_layout() && !v20.uses_old_rigid_body_layout());
+
+        // boundary: exactly 10.1.0.0 is "modern" for the scale/offset
+        // (since=10.1.0.0) but still carries the skin-partition ref
+        // (until=10.1.0.0, inclusive).
+        let b = NifVersion::V10_1_0_0;
+        assert!(b.has_mopp_offset() && b.has_skin_data_partition_ref());
+    }
+
+    /// #3476 — `has_ni_sequence_prologue` / `has_controller_sequence_fields`
+    /// pin the exact boundary the 19-raw-comparison refactor now routes
+    /// through named helpers instead. `has_ni_sequence_prologue` is
+    /// bit-identical to `has_keyframe_controller_data` (both `<=
+    /// V10_1_0_103`) but names a distinct concept.
+    #[test]
+    fn ni_sequence_and_controller_sequence_helpers() {
+        let below = NifVersion::V10_1_0_103;
+        let gap = NifVersion::V10_1_0_104; // 104/105: prologue gone, fields not yet present
+        let at = NifVersion::V10_1_0_106;
+        let above = NifVersion::V20_0_0_5;
+
+        assert!(below.has_ni_sequence_prologue());
+        assert!(!gap.has_ni_sequence_prologue());
+        assert!(!at.has_ni_sequence_prologue());
+        assert!(!above.has_ni_sequence_prologue());
+
+        assert!(!below.has_controller_sequence_fields());
+        assert!(!gap.has_controller_sequence_fields());
+        assert!(at.has_controller_sequence_fields());
+        assert!(above.has_controller_sequence_fields());
+
+        // Bit-identical to has_keyframe_controller_data at this boundary,
+        // per the doc cross-reference on both methods.
+        assert_eq!(
+            below.has_ni_sequence_prologue(),
+            below.has_keyframe_controller_data()
+        );
+        assert_eq!(
+            above.has_ni_sequence_prologue(),
+            above.has_keyframe_controller_data()
+        );
+    }
+
+    /// #2168 — both `NiSkinData` layout gates carry their full nif.xml
+    /// range, not just one bound.
+    ///
+    /// `Skin Partition` is `since="4.0.0.2" until="10.1.0.0"`; the
+    /// `since` half was missing, so exactly `V4_0_0_0` claimed a 4-byte
+    /// ref that isn't on disk. `Has Vertex Weights` is `since="4.2.1.0"`
+    /// and had no gate at all.
+    #[test]
+    fn skin_data_layout_gates_carry_both_nif_xml_bounds() {
+        // Skin Partition ref — closed range [4.0.0.2, 10.1.0.0].
+        assert!(
+            !NifVersion::V4_0_0_0.has_skin_data_partition_ref(),
+            "below since=4.0.0.2 the inline ref is absent — reading it \
+             over-reads 4 bytes and misaligns the BoneData array (#2168)"
+        );
+        assert!(
+            NifVersion::V4_0_0_2.has_skin_data_partition_ref(),
+            "since bound is inclusive"
+        );
+        assert!(
+            NifVersion::V10_1_0_0.has_skin_data_partition_ref(),
+            "until bound is inclusive"
+        );
+        assert!(!NifVersion::V20_0_0_5.has_skin_data_partition_ref());
+
+        // Has Vertex Weights — since=4.2.1.0, open-ended above.
+        assert!(
+            !NifVersion::V4_0_0_2.has_skin_data_vertex_weights_flag(),
+            "below since=4.2.1.0 the byte is absent (default=true) — reading \
+             it over-reads one byte (#2168)"
+        );
+        assert!(
+            NifVersion::V4_2_1_0.has_skin_data_vertex_weights_flag(),
+            "since bound is inclusive"
+        );
+
+        // Every currently supported title sits far above both bounds, which
+        // is why this had zero live blast radius: Oblivion 20.0.0.5,
+        // FO3/FNV 20.2.0.7, Skyrim+ higher.
+        for v in [NifVersion::V20_0_0_5, NifVersion::V20_2_0_7] {
+            assert!(v.has_skin_data_vertex_weights_flag());
+            assert!(!v.has_skin_data_partition_ref());
+        }
+    }
+
+    /// #1506 — the two narrow 10.1.0.x sub-band predicates that gate the
+    /// `NiInterpController.Manager Controlled` bool (since=10.1.0.104
+    /// until=10.1.0.108) and the `NiQuatTransform.TRS Valid` bool[3]
+    /// (until=10.1.0.109). Both must be true on the first-person
+    /// skeleton's 10.1.0.106 and false on all retail Bethesda versions.
+    #[test]
+    fn old_gamebryo_10_1_sub_band_predicates() {
+        let skel = NifVersion::V10_1_0_106; // _1stperson\skeleton.nif
+        let obliv = NifVersion::V20_0_0_5;
+        let fo3 = NifVersion::V20_2_0_7;
+
+        // Manager Controlled: inclusive [10.1.0.104, 10.1.0.108].
+        assert!(skel.has_interp_controller_manager_controlled());
+        assert!(NifVersion::V10_1_0_104.has_interp_controller_manager_controlled());
+        assert!(NifVersion::V10_1_0_108.has_interp_controller_manager_controlled());
+        assert!(!NifVersion::V10_1_0_109.has_interp_controller_manager_controlled());
+        assert!(!NifVersion::V10_1_0_103.has_interp_controller_manager_controlled());
+        assert!(!obliv.has_interp_controller_manager_controlled());
+        assert!(!fo3.has_interp_controller_manager_controlled());
+
+        // TRS Valid: inclusive upper bound 10.1.0.109.
+        assert!(skel.has_quat_transform_trs_valid());
+        assert!(NifVersion::V10_1_0_109.has_quat_transform_trs_valid());
+        assert!(!NifVersion::V10_1_0_113.has_quat_transform_trs_valid());
+        assert!(!obliv.has_quat_transform_trs_valid());
+        assert!(!fo3.has_quat_transform_trs_valid());
+    }
+
+    #[test]
+    fn version_ordering() {
+        assert!(NifVersion::V4_0_0_2 < NifVersion::V20_0_0_5);
+        assert!(NifVersion::V20_0_0_5 < NifVersion::V20_2_0_7);
+    }
+
+    #[test]
+    fn version_constants_match_packed() {
+        assert_eq!(NifVersion::V4_0_0_2.0, 0x04000002);
+        assert_eq!(NifVersion::V20_0_0_5.0, 0x14000005);
+        assert_eq!(NifVersion::V20_2_0_7.0, 0x14020007);
+    }
+
+    #[test]
+    fn detect_morrowind() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V4_0_0_2, 0, 0),
+            NifVariant::Morrowind,
+        );
+    }
+
+    #[test]
+    fn detect_oblivion() {
+        // Standard Oblivion v20.0.0.4: most common Oblivion NIF version
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 11, 11),
+            NifVariant::Oblivion,
+        );
+        // Standard Oblivion v20.0.0.5
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_5, 0, 0),
+            NifVariant::Oblivion,
+        );
+        // Oblivion on v20.2.0.7 with low user_version
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 10, 0),
+            NifVariant::Oblivion,
+        );
+    }
+
+    #[test]
+    fn detect_oblivion_edge_cases() {
+        // v20.0.0.4 is always Oblivion regardless of user_version/user_version_2
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 0, 0),
+            NifVariant::Oblivion,
+        );
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 11, 34),
+            NifVariant::Oblivion,
+        );
+        // v20.0.0.5 is always Oblivion regardless of user_version/user_version_2
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_5, 11, 34),
+            NifVariant::Oblivion,
+        );
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_5, 12, 100),
+            NifVariant::Oblivion,
+        );
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_5, 0, 25),
+            NifVariant::Oblivion,
+        );
+        // v20.2.0.7 with user_version=0 (NifSkope export)
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 0, 0),
+            NifVariant::Oblivion,
+        );
+        // v20.2.0.7 with user_version=10 (some Oblivion mods)
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 10, 25),
+            NifVariant::Oblivion,
+        );
+    }
+
+    /// FO3-D6-01 (#2087) — harmlessness guard for the ambiguous
+    /// `(V20_0_0_4, user_version=11)` routing. Contrary to #1219's original
+    /// premise, a retail FO3 NIF DOES ship at this tuple: vanilla
+    /// `Fallout - Meshes.bsa` carries `meshes\triggers\collisionboxstatic.nif`
+    /// there (one hit, header-only `nif_stats` scan). Routing stays Oblivion
+    /// because the misroute is unobservable — the sole `NifVariant` consumer,
+    /// `havok_scale_for`, maps both `Oblivion` and `Fallout3` to the same 7.0
+    /// scale. If a future change ever diverges the two variants' Havok scale,
+    /// this assertion fails and flags that `collisionboxstatic.nif` would then
+    /// silently misroute.
+    #[test]
+    fn ambiguous_v20_0_0_4_misroute_is_unobservable_via_havok_scale() {
+        use crate::header::NifHeader;
+        let header = |version: NifVersion, uv: u32, uv2: u32| NifHeader::detached(version, uv, uv2);
+        // The collisionboxstatic.nif tuple detects as Oblivion; a canonical
+        // FO3 header (V20_2_0_7, 11, 21 — see `detect_fallout3`) as Fallout3.
+        let oblivion = header(NifVersion::V20_0_0_4, 11, 11);
+        let fallout3 = header(NifVersion::V20_2_0_7, 11, 21);
+        assert_eq!(
+            NifVariant::detect(
+                oblivion.version,
+                oblivion.user_version,
+                oblivion.user_version_2
+            ),
+            NifVariant::Oblivion,
+        );
+        assert_eq!(
+            NifVariant::detect(
+                fallout3.version,
+                fallout3.user_version,
+                fallout3.user_version_2
+            ),
+            NifVariant::Fallout3,
+        );
+        assert_eq!(
+            crate::havok_scale_for(&oblivion),
+            crate::havok_scale_for(&fallout3),
+            "Oblivion (collisionboxstatic.nif's variant) and Fallout3 must \
+             share a Havok scale — otherwise the #2087 misroute becomes \
+             observable",
+        );
+    }
+
+    /// #1219 — the ambiguous `(V20_0_0_4, user_version=11, _)` tuple is the
+    /// nif.xml "Oblivion, Fallout 3" case; routing pins to Oblivion. A real
+    /// vanilla-FO3 sample now exists (`meshes\triggers\collisionboxstatic.nif`,
+    /// #2087) but does not justify flipping — see the harmlessness guard
+    /// `ambiguous_v20_0_0_4_misroute_is_unobservable_via_havok_scale` above.
+    /// This test guards the routing stays Oblivion.
+    #[test]
+    fn detect_ambiguous_v20_0_0_4_uv11_stays_oblivion_pending_sample() {
+        // The audit's ambiguous tuple — primary case the warn fires on.
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 11, 0),
+            NifVariant::Oblivion,
+            "ambiguous (V20_0_0_4, 11, 0) must route Oblivion until \
+             sample data justifies the flip",
+        );
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 11, 34),
+            NifVariant::Oblivion,
+            "ambiguous (V20_0_0_4, 11, 34) must route Oblivion until \
+             sample data justifies the flip",
+        );
+        // Non-ambiguous neighbours (user_version != 11) must continue
+        // routing Oblivion via the unconditional v20.0.0.4 branch — the
+        // warn path must NOT shadow them.
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 0, 0),
+            NifVariant::Oblivion,
+        );
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_0_0_4, 10, 0),
+            NifVariant::Oblivion,
+        );
+    }
+
+    #[test]
+    fn detect_gap_ranges() {
+        // BSVER 101-129 (between SkyrimSE and FO4) → SkyrimSE
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 110),
+            NifVariant::SkyrimSE,
+        );
+        // BSVER 156-169 (between FO76 and Starfield) → FO76
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 160),
+            NifVariant::Fallout76,
+        );
+        // BSVER 170+ → Starfield
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 200),
+            NifVariant::Starfield,
+        );
+    }
+
+    #[test]
+    fn detect_fallout3() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 11, 21),
+            NifVariant::Fallout3,
+        );
+    }
+
+    #[test]
+    fn detect_fallout_nv() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 11, 34),
+            NifVariant::FalloutNV,
+        );
+    }
+
+    #[test]
+    fn detect_skyrim_le() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 83),
+            NifVariant::SkyrimLE,
+        );
+    }
+
+    #[test]
+    fn detect_skyrim_se() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 100),
+            NifVariant::SkyrimSE,
+        );
+    }
+
+    #[test]
+    fn detect_fallout4() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 130),
+            NifVariant::Fallout4,
+        );
+    }
+
+    #[test]
+    fn detect_fallout76() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 155),
+            NifVariant::Fallout76,
+        );
+    }
+
+    #[test]
+    fn detect_starfield() {
+        assert_eq!(
+            NifVariant::detect(NifVersion::V20_2_0_7, 12, 172),
+            NifVariant::Starfield,
+        );
+    }
+
+    /// AUDIT_NIF Dim 2 hard-pin: `bsver()` must return the canonical
+    /// retail BSVER per nif.xml — `FO3=34, FNV=34, SK=83, SK_SE=100,
+    /// FO4=130, FO76=155, SF=172`. `Fallout3` returns 34 even though
+    /// the variant matches pre-retail dev/mod files; retail FO3 ships
+    /// at bsver=34 and detects as `FalloutNV` (same wire BSVER), so 34
+    /// is the right "what does this game canonically ship at?" value.
+    /// Pre-#937 the FO3 arm returned 21 (one of many dev-tool BSVERs)
+    /// which contradicted the hard-pin. NIF-D2-NEW-02 adds explicit
+    /// Starfield + Unknown asserts so the full enum surface is pinned.
+    #[test]
+    fn bsver_values() {
+        assert_eq!(NifVariant::Morrowind.bsver(), 0);
+        assert_eq!(NifVariant::Oblivion.bsver(), 0);
+        assert_eq!(NifVariant::Fallout3.bsver(), 34);
+        assert_eq!(NifVariant::FalloutNV.bsver(), 34);
+        assert_eq!(NifVariant::SkyrimLE.bsver(), 83);
+        assert_eq!(NifVariant::SkyrimSE.bsver(), 100);
+        assert_eq!(NifVariant::Fallout4.bsver(), 130);
+        assert_eq!(NifVariant::Fallout76.bsver(), 155);
+        assert_eq!(NifVariant::Starfield.bsver(), 172);
+        assert_eq!(NifVariant::Unknown.bsver(), 0);
+    }
+
+    // #938 / #1511 / #1840 / #1897 — the per-feature predicate tests
+    // (feature_properties_list / _shader_alpha_refs / _effects_list /
+    // _material_crc / _culling_mode / _has_shader_property_fo3_fields,
+    // and earlier _compact_material / _has_emissive_mult) were deleted
+    // alongside the call-site-less predicates they exercised. Every
+    // parser queries `stream.bsver()` directly; see the comment block on
+    // the `Feature flags` section in the impl. No feature-flag predicates
+    // remain on `NifVariant`.
+}

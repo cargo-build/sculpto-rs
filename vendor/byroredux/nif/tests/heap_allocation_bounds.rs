@@ -1,0 +1,832 @@
+//! Heap-allocation regression test (#1247 / NIF-D6-INFO-03).
+//!
+//! All four allocation-hygiene architectural pins (NIF-PERF-01 #832,
+//! NIF-PERF-02 #833, NIF-PERF-03 #831, #408 blanket sweep) shipped as
+//! code-review-only fixes — every audit had to re-run grep checks to
+//! confirm they still held. This test promotes the verification from
+//! audit-cadence to CI-cadence by parsing a representative synthetic
+//! NIF inside a `dhat::Profiler` scope and asserting upper bounds on
+//! both block count and byte total.
+//!
+//! Gated on the `dhat-heap` cargo feature so default `cargo test`
+//! runs without paying the global-allocator override:
+//!
+//! ```bash
+//! cargo test -p byroredux-nif --features dhat-heap --test heap_allocation_bounds
+//! ```
+//!
+//! The target runs as a `harness = false` sequential `main` (#5050):
+//! dhat counts every allocation in the process while a profiler is
+//! live, and the libtest harness keeps allocating on its own threads
+//! (test-thread spawn, output capture, result bookkeeping), which made
+//! the exact `total_blocks == 1` pin below fail in roughly half of
+//! default parallel runs. One test at a time on the main thread means
+//! nothing else allocates mid-measurement, the profiler singleton
+//! needs no lock, and the gate is deterministic under any invocation.
+//! With the feature off the binary compiles to a no-op `main` that
+//! exits 0.
+//!
+//! Runs in CI as its own `nif-heap-allocation-bounds` job (`ci.yml`) —
+//! dhat's `#[global_allocator]` override must not share a process with
+//! the default `cargo-test` job's suite. See #1763. Failures here
+//! mean a future block-parser change re-introduced an
+//! `or_insert(name.to_string())`-class pattern (#832), dropped a
+//! `read_pod_vec` for a per-element push loop (#833), discarded an
+//! `allocate_vec` binding (#831), or grew a `Vec::with_capacity`
+//! call site outside the `allocate_vec` / `read_pod_vec` family
+//! (#408 / #1245).
+//!
+//! Bounds are intentionally loose at first landing — the goal is to
+//! catch order-of-magnitude regressions, not micro-shifts. Tighten as
+//! follow-up work lands. See [`#1247`].
+
+// With the feature off the only live item is the no-op `main` — the
+// fixtures below are then dead code by construction.
+#![cfg_attr(not(feature = "dhat-heap"), allow(dead_code))]
+
+#[cfg(feature = "dhat-heap")]
+fn main() {
+    use std::io::Write as _;
+
+    let tests: &[(&str, fn())] = &[
+        (
+            "forged_bone_count_does_not_allocate_the_bone_array",
+            forged_bone_count_does_not_allocate_the_bone_array,
+        ),
+        (
+            "bulk_array_allocates_exactly_one_output_buffer",
+            bulk_array_allocates_exactly_one_output_buffer,
+        ),
+        (
+            "parse_skyrim_se_single_node_stays_within_heap_budget",
+            parse_skyrim_se_single_node_stays_within_heap_budget,
+        ),
+        (
+            "parse_fo4_packed_vertices_stays_within_heap_budget",
+            parse_fo4_packed_vertices_stays_within_heap_budget,
+        ),
+        (
+            "parse_fo4_tangent_space_vertices_presizes_the_tangent_vec",
+            parse_fo4_tangent_space_vertices_presizes_the_tangent_vec,
+        ),
+        (
+            "parse_skyrim_se_geometry_particle_stays_within_heap_budget",
+            parse_skyrim_se_geometry_particle_stays_within_heap_budget,
+        ),
+        (
+            "parse_skin_blocks_stays_within_heap_budget",
+            parse_skin_blocks_stays_within_heap_budget,
+        ),
+    ];
+    let mut failed = 0usize;
+    for (name, test) in tests {
+        print!("{name} ... ");
+        std::io::stdout().flush().ok();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(test)) {
+            Ok(()) => println!("ok"),
+            Err(_) => {
+                // The default panic hook already printed the assertion
+                // message and its location to stderr.
+                println!("FAILED");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        println!("\n{failed} of {} tests failed", tests.len());
+        std::process::exit(1);
+    }
+    println!("\n{} tests passed", tests.len());
+}
+
+#[cfg(not(feature = "dhat-heap"))]
+fn main() {}
+
+#[cfg(feature = "dhat-heap")]
+use byroredux_nif::parse_nif;
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+/// #4623: rejecting the bulk float read is too late if the bone Vec has
+/// already reserved 68 bytes per claimed element. Measure the reservation,
+/// since both the old and corrected parser otherwise return the same EOF.
+#[cfg(feature = "dhat-heap")]
+fn forged_bone_count_does_not_allocate_the_bone_array() {
+    use byroredux_nif::{blocks::skin::BsSkinBoneData, header::NifHeader, stream::NifStream};
+
+    let count = 16_384u32;
+    let mut bytes = count.to_le_bytes().to_vec();
+    bytes.resize(4 + count as usize, 0); // passes the old one-byte-per-bone bound
+    let header = NifHeader::detached(byroredux_nif::version::NifVersion::V20_2_0_7, 12, 130);
+    let mut stream = NifStream::new(&bytes, &header);
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let before = dhat::HeapStats::get();
+    let result = BsSkinBoneData::parse(&mut stream);
+    let after = dhat::HeapStats::get();
+    assert!(result.is_err());
+    assert!(
+        after.total_bytes - before.total_bytes < 4096,
+        "a rejected count must allocate only its diagnostic, not a 1 MiB bone array"
+    );
+}
+
+/// #4796: a large bulk array must allocate only its final typed output.
+/// Peak-byte bounds on tiny whole-NIF fixtures cannot detect a scratch copy.
+#[cfg(feature = "dhat-heap")]
+fn bulk_array_allocates_exactly_one_output_buffer() {
+    use byroredux_nif::{header::NifHeader, stream::NifStream, version::NifVersion};
+
+    let count = 65_536;
+    let data: Vec<u8> = (0..count as u32).flat_map(u32::to_le_bytes).collect();
+    let header = NifHeader::detached(NifVersion::V20_2_0_7, 0, 0);
+    let mut stream = NifStream::new(&data, &header);
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let before = dhat::HeapStats::get();
+    let values = stream.read_u32_array(count).unwrap();
+    let after = dhat::HeapStats::get();
+    assert_eq!(after.total_blocks - before.total_blocks, 1);
+    assert_eq!(after.total_bytes - before.total_bytes, (count * 4) as u64);
+    assert_eq!(stream.position(), data.len() as u64);
+    assert!(values.iter().enumerate().all(|(i, &v)| v == i as u32));
+}
+
+// ── Synthetic Skyrim SE fixture (single NiNode root) ────────────────
+//
+// Mirrors `tests/synthetic_fixtures.rs::build_skyrim_se_nif` — kept
+// inline here so this test file is fully self-contained (each
+// `tests/` file is its own binary, so sharing helpers requires a
+// `tests/common/` refactor that's out of scope for the gate landing).
+
+fn w8(buf: &mut Vec<u8>, v: u8) {
+    buf.push(v);
+}
+fn w16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn w32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn wf32(buf: &mut Vec<u8>, v: f32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn wsstr(buf: &mut Vec<u8>, s: &str) {
+    w32(buf, s.len() as u32);
+    buf.extend_from_slice(s.as_bytes());
+}
+fn wshort(buf: &mut Vec<u8>, s: &str) {
+    let len = s.len() + 1;
+    w8(buf, len as u8);
+    buf.extend_from_slice(s.as_bytes());
+    w8(buf, 0);
+}
+
+/// Build a minimal Skyrim SE NIF — single empty NiNode root.
+fn build_skyrim_se_minimal_nif() -> Vec<u8> {
+    let mut nif = Vec::new();
+    nif.extend_from_slice(b"Gamebryo File Format, Version 20.2.0.7\n");
+    w32(&mut nif, 0x14020007);
+    w8(&mut nif, 1);
+    w32(&mut nif, 12);
+    let num_blocks: u32 = 1;
+    w32(&mut nif, num_blocks);
+    w32(&mut nif, 100);
+    wshort(&mut nif, "ByroRedux Test");
+    wshort(&mut nif, "");
+    wshort(&mut nif, "");
+    w16(&mut nif, 1);
+    wsstr(&mut nif, "NiNode");
+    for _ in 0..num_blocks {
+        w16(&mut nif, 0);
+    }
+    let block_sizes_offset = nif.len();
+    for _ in 0..num_blocks {
+        w32(&mut nif, 0);
+    }
+    w32(&mut nif, 1);
+    w32(&mut nif, 10);
+    wsstr(&mut nif, "Scene Root");
+    w32(&mut nif, 0);
+    let block_start = nif.len();
+    w32(&mut nif, 0);
+    w32(&mut nif, 0);
+    w32(&mut nif, 0xFFFFFFFF);
+    w32(&mut nif, 0x0E);
+    for _ in 0..3 {
+        wf32(&mut nif, 0.0);
+    }
+    wf32(&mut nif, 1.0);
+    wf32(&mut nif, 0.0);
+    wf32(&mut nif, 0.0);
+    wf32(&mut nif, 0.0);
+    wf32(&mut nif, 1.0);
+    wf32(&mut nif, 0.0);
+    wf32(&mut nif, 0.0);
+    wf32(&mut nif, 0.0);
+    wf32(&mut nif, 1.0);
+    wf32(&mut nif, 1.0);
+    w32(&mut nif, 0xFFFFFFFF);
+    w32(&mut nif, 0);
+    w32(&mut nif, 0);
+    let block_size = (nif.len() - block_start) as u32;
+    nif[block_sizes_offset..block_sizes_offset + 4].copy_from_slice(&block_size.to_le_bytes());
+    nif
+}
+
+/// Headline allocation-bound regression: parse a one-NiNode Skyrim SE
+/// NIF and assert that the parser stays within a generous heap budget.
+///
+/// Bounds picked empirically on the first landing — actual measured
+/// values were `~80 blocks / ~6 KB`. We pin at **5× actual** (400
+/// blocks / 32 KB) so the gate catches order-of-magnitude regressions
+/// without false-positive churn on every refactor. Tighten in
+/// follow-up work as the corpus and the allocation discipline
+/// stabilise (see audit-skill `audit-nif` Dim 6).
+///
+/// The test asserts on `max_blocks` / `max_bytes` (peak live), NOT
+/// `total_blocks` / `total_bytes` (lifetime cumulative) — peak is the
+/// metric we care about for "did the parser keep its working set
+/// bounded." Lifetime cumulative is sensitive to short-lived
+/// allocations (string interning churn, scratch vectors) that don't
+/// affect steady-state memory pressure.
+#[cfg(feature = "dhat-heap")]
+fn parse_skyrim_se_single_node_stays_within_heap_budget() {
+    // The profiler is `Drop`-tied — collected stats reflect everything
+    // allocated while it's live. Snapshot is taken inside the scope so
+    // teardown allocations (the Vec / scene cleanup) don't pollute the
+    // measurement.
+    let nif_bytes = build_skyrim_se_minimal_nif();
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let scene = parse_nif(&nif_bytes).expect("synthetic Skyrim SE NIF should parse");
+    let stats = dhat::HeapStats::get();
+
+    assert_eq!(scene.blocks.len(), 1, "fixture has one NiNode block");
+
+    // 400 blocks ≈ 5× measured baseline on 2026-05-23.
+    assert!(
+        stats.max_blocks < 400,
+        "max_blocks regression: {} >= 400 — a future block parser likely \
+         re-introduced an or_insert(name.to_string()) / Vec::with_capacity \
+         hot-loop pattern that the #408 / #832 / #833 sweep removed. \
+         See #1247 + the audit-nif Dim 6 checklist.",
+        stats.max_blocks
+    );
+
+    // 32 KB ≈ 5× measured baseline on 2026-05-23.
+    assert!(
+        stats.max_bytes < 32 * 1024,
+        "max_bytes regression: {} >= 32768 — a future block parser likely \
+         dropped a read_pod_vec for a per-element push loop, or sized \
+         a scratch buffer with the wrong element-count K. See #1247 + \
+         the audit-nif Dim 6 checklist.",
+        stats.max_bytes
+    );
+}
+
+// ── #1381 (PERF-D2-NEW-03) — geometry + particle path coverage ──────
+//
+// The headline gate above only walks a bare NiNode, leaving the
+// geometry (BSTriShape) and particle (NiPSysEmitter) block parsers —
+// the ones that actually do the bulk per-element allocation the #832 /
+// #833 / #408 discipline guards — uncovered. This fixture adds one of
+// each so a regression in their allocation hygiene fails at CI cadence.
+//
+// Both blocks use the minimal (empty-geometry / zeroed-field) wire
+// layout the per-block unit tests already pin
+// (`tri_shape_skin_vertex_tests::minimal_bs_tri_shape_bytes`,
+// `particle::parse_sphere_emitter_consumes_full_block`). A non-zero
+// packed-vertex BSTriShape would exercise the vertex-vector path too but
+// needs a hand-encoded `BSVertexDesc` + matching packed data — a future
+// tightening, tracked alongside #1247.
+
+/// Minimal Skyrim SE BSTriShape body — empty geometry (0 verts / 0 tris).
+/// Layout mirrors `minimal_bs_tri_shape_bytes` in the per-block tests:
+/// NiObjectNET(12) + flags(4) + transform(52) + collision_ref(4) +
+/// center(12) + radius(4) + 3 refs(12) + vertex_desc(8) +
+/// num_triangles(2) + num_vertices(2) + data_size(4) +
+/// particle_data_size(4) = 120 bytes.
+fn bs_tri_shape_block() -> Vec<u8> {
+    let mut d = Vec::new();
+    // NiObjectNET: name=-1 (no string), extra_data count=0, controller=-1
+    w32(&mut d, 0xFFFFFFFF);
+    w32(&mut d, 0);
+    w32(&mut d, 0xFFFFFFFF);
+    // NiAVObject (SSE, no properties): flags + transform + collision_ref
+    w32(&mut d, 0); // flags
+    for _ in 0..3 {
+        wf32(&mut d, 0.0); // translation
+    }
+    for row in 0..3 {
+        for col in 0..3 {
+            wf32(&mut d, if row == col { 1.0 } else { 0.0 }); // identity rotation
+        }
+    }
+    wf32(&mut d, 1.0); // scale
+    w32(&mut d, 0xFFFFFFFF); // collision_ref
+                             // BSTriShape: center(3) + radius + skin/shader/alpha refs + vertex_desc
+    for _ in 0..3 {
+        wf32(&mut d, 0.0); // bound center
+    }
+    wf32(&mut d, 0.0); // bound radius
+    w32(&mut d, 0xFFFFFFFF); // skin_ref
+    w32(&mut d, 0xFFFFFFFF); // shader_property_ref
+    w32(&mut d, 0xFFFFFFFF); // alpha_property_ref
+    w32(&mut d, 0); // vertex_desc low (no attrs, stride 0)
+    w32(&mut d, 0); // vertex_desc high
+    w16(&mut d, 0); // num_triangles (SSE bsver<130: u16)
+    w16(&mut d, 0); // num_vertices
+    w32(&mut d, 0); // data_size — 0 ⇒ no vertex/triangle loops
+    w32(&mut d, 0); // particle_data_size (SSE unconditional, #341)
+    d
+}
+
+// ── #2114 / D8-02 — non-zero packed-vertex BSTriShape fixture ───────
+//
+// The zero-vertex `bs_tri_shape_block()` above never exercises
+// `decode_bs_vertex_stream`'s per-vertex loop (`bs_tri_shape.rs:903`)
+// — the actual #833/#831 packed-vertex allocation site. A revert of
+// the `allocate_vec(nv)?` output-vec reservations back to `Vec::new()`
+// + per-`push` growth would pass every gate above undetected. This
+// fixture builds an FO4 (BSVER 130) BSTriShape with 16 real packed
+// half-float-position vertices so the loop actually runs.
+
+/// FO4-era BSTriShape body carrying `num_vertices` packed half-float-
+/// position vertices, no triangles. Without `tangent_space`, `vertex_desc`
+/// sets only `VF_VERTEX` (0x001) with a 2-quad (8-byte) stride: 3×f16
+/// position + 1×f16 unused-W padding (nif.xml `BSVertexData`, no
+/// `VF_TANGENTS` so the trailing slot is discarded, not `Bitangent X`).
+///
+/// With `tangent_space` it sets `VF_VERTEX | VF_NORMALS | VF_TANGENTS`
+/// (0x019, a 4-quad / 16-byte stride): position + `Bitangent X`, a 4-byte
+/// normal + `Bitangent Y`, and a 4-byte tangent + `Bitangent Z`. That is the
+/// descriptor every normal-mapped Skyrim SE+/FO4+ mesh carries, and the only
+/// one that runs `decode_bs_vertex_stream`'s conditional tangent pre-size
+/// (#4206, guarded by #4617).
+///
+/// Every position is `0x0000` (half-float zero) and every normal / tangent
+/// byte is `0x80` — content doesn't matter, only that `num_vertices` is
+/// non-zero so `decode_bs_vertex_stream`'s allocate-then-push path actually
+/// executes.
+fn bs_tri_shape_block_with_vertices(num_vertices: u16, tangent_space: bool) -> Vec<u8> {
+    const VF_VERTEX: u64 = 0x001;
+    const VF_NORMALS: u64 = 0x008;
+    const VF_TANGENTS: u64 = 0x010;
+    let (attrs, stride): (u64, u32) = if tangent_space {
+        (VF_VERTEX | VF_NORMALS | VF_TANGENTS, 16)
+    } else {
+        (VF_VERTEX, 8)
+    };
+    let vertex_size_quads = (stride / 4) as u64;
+    let vertex_desc = (attrs << 44) | vertex_size_quads;
+
+    let mut d = Vec::new();
+    // NiObjectNET: name=-1 (no string), extra_data count=0, controller=-1
+    w32(&mut d, 0xFFFFFFFF);
+    w32(&mut d, 0);
+    w32(&mut d, 0xFFFFFFFF);
+    // NiAVObject (FO4+, no properties): flags + transform + collision_ref
+    w32(&mut d, 0); // flags
+    for _ in 0..3 {
+        wf32(&mut d, 0.0); // translation
+    }
+    for row in 0..3 {
+        for col in 0..3 {
+            wf32(&mut d, if row == col { 1.0 } else { 0.0 }); // identity rotation
+        }
+    }
+    wf32(&mut d, 1.0); // scale
+    w32(&mut d, 0xFFFFFFFF); // collision_ref
+                             // BSTriShape: center(3) + radius + skin/shader/alpha refs + vertex_desc
+    for _ in 0..3 {
+        wf32(&mut d, 0.0); // bound center
+    }
+    wf32(&mut d, 0.0); // bound radius
+    w32(&mut d, 0xFFFFFFFF); // skin_ref
+    w32(&mut d, 0xFFFFFFFF); // shader_property_ref
+    w32(&mut d, 0xFFFFFFFF); // alpha_property_ref
+    d.extend_from_slice(&vertex_desc.to_le_bytes());
+    w32(&mut d, 0); // num_triangles (FO4+ BSVER>=130: u32)
+    w16(&mut d, num_vertices);
+    let data_size = stride * num_vertices as u32; // stride × num_vertices + 0 triangles
+    w32(&mut d, data_size);
+    // Packed vertex stream: per vertex, 3×half position + 1×half (unused W,
+    // or `Bitangent X` under VF_TANGENTS), then the normal and tangent quads
+    // when `tangent_space`.
+    for _ in 0..num_vertices {
+        w16(&mut d, 0x0000); // x (half 0.0)
+        w16(&mut d, 0x0000); // y
+        w16(&mut d, 0x0000); // z
+        w16(&mut d, 0x0000); // unused W / Bitangent X
+        if tangent_space {
+            d.extend_from_slice(&[0x80; 8]); // normal + Bitangent Y, tangent + Bitangent Z
+        }
+    }
+    // No trailing particle_data_size field — FO4+ (BSVER >= 130) drops it
+    // (`stream.bsver() < bsver::FALLOUT4` gate in `bs_tri_shape.rs`).
+    d
+}
+
+/// Build a minimal FO4 NIF containing a single non-zero-vertex
+/// BSTriShape. `parse_nif` walks every declared block regardless of
+/// scene-graph connectivity, so no NiNode wrapper is needed (mirrors
+/// `build_skyrim_se_minimal_nif`'s single-block minimalism).
+fn build_fo4_packed_vertex_nif(num_vertices: u16, tangent_space: bool) -> Vec<u8> {
+    let mut nif = Vec::new();
+    nif.extend_from_slice(b"Gamebryo File Format, Version 20.2.0.7\n");
+    w32(&mut nif, 0x14020007); // version 20.2.0.7
+    w8(&mut nif, 1); // little-endian
+    w32(&mut nif, 12); // user_version
+    let num_blocks: u32 = 1;
+    w32(&mut nif, num_blocks);
+    w32(&mut nif, 130); // bsver = 130 (FO4) — selects the half-float position path
+    wshort(&mut nif, "ByroRedux Test"); // author
+    wshort(&mut nif, ""); // process_script (bsver <= FALLOUT4)
+    wshort(&mut nif, ""); // export_script
+    wshort(&mut nif, ""); // max_filepath (bsver >= 103)
+    w16(&mut nif, 1); // block type count
+    wsstr(&mut nif, "BSTriShape");
+    w16(&mut nif, 0); // block 0 → type 0
+    let block_sizes_offset = nif.len();
+    w32(&mut nif, 0); // block size placeholder
+    w32(&mut nif, 0); // string table: num_strings = 0
+    w32(&mut nif, 0); // string table: max_string_length = 0
+    w32(&mut nif, 0); // num_groups
+
+    let block_start = nif.len();
+    nif.extend_from_slice(&bs_tri_shape_block_with_vertices(
+        num_vertices,
+        tangent_space,
+    ));
+    let block_size = (nif.len() - block_start) as u32;
+    nif[block_sizes_offset..block_sizes_offset + 4].copy_from_slice(&block_size.to_le_bytes());
+    nif
+}
+
+/// #2114 / D8-02 — packed-vertex allocation-bound gate. Parses an FO4
+/// BSTriShape with 16 real (non-zero) vertices under dhat so a future
+/// regression in `decode_bs_vertex_stream`'s allocate-then-push
+/// discipline (reverting `allocate_vec` to `Vec::new()` + per-element
+/// `push` growth) fails at CI cadence — the sibling zero-vertex
+/// fixtures above never execute that loop body at all.
+#[cfg(feature = "dhat-heap")]
+fn parse_fo4_packed_vertices_stays_within_heap_budget() {
+    let nif_bytes = build_fo4_packed_vertex_nif(16, false);
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let scene = parse_nif(&nif_bytes).expect("synthetic FO4 packed-vertex NIF should parse");
+    let stats = dhat::HeapStats::get();
+
+    assert_eq!(scene.blocks.len(), 1, "fixture has one BSTriShape block");
+
+    // Measured 10 blocks / 1230 bytes on 2026-07-20 (16 vertices × 4
+    // pre-reserved output vecs + NIF header/string-table overhead). Same
+    // loose-headroom philosophy as the sibling gates (~5× blocks, ~6.5×
+    // bytes) — catch an order-of-magnitude regression, not micro-shifts.
+    assert!(
+        stats.max_blocks < 50,
+        "max_blocks regression: {} >= 50 (measured 10) — decode_bs_vertex_stream \
+         likely reverted an allocate_vec(nv) reservation to Vec::new() + \
+         per-element push growth. See #2114 / D8-02 + #833 / #831.",
+        stats.max_blocks
+    );
+    assert!(
+        stats.max_bytes < 8 * 1024,
+        "max_bytes regression: {} >= 8192 (measured 1230) — decode_bs_vertex_stream \
+         likely reverted an allocate_vec(nv) reservation to Vec::new() + \
+         per-element push growth. See #2114 / D8-02 + #833 / #831.",
+        stats.max_bytes
+    );
+}
+
+/// #4617 — tangent pre-size gate (#4206). Parses the same 1000-vertex FO4
+/// BSTriShape twice, once with `VF_VERTEX` only and once with the full
+/// `VF_VERTEX | VF_NORMALS | VF_TANGENTS` tangent space, and bounds what the
+/// tangent-carrying mesh costs *over* the plain one.
+///
+/// Two things differ from the sibling gates above. The dhat fixtures never set
+/// `VF_TANGENTS`, so `decode_bs_vertex_stream`'s conditional pre-size never
+/// ran under a heap bound and a revert to `Vec::new()` stayed green. And the
+/// bound is on `total_blocks` / `total_bytes`, not `max_*`: growing a `Vec`
+/// by push-doubling only adds transient blocks, so the peak is set by the
+/// final capacity either way and barely moves. The count is 1000, not a power
+/// of two, so doubling overshoots (1024 entries) rather than landing on it.
+///
+/// Measured 2026-09-25 (`total_blocks` / `total_bytes`):
+///
+/// | tangent_space | pre-sized     | tangents reverted to `Vec::new()` |
+/// |---------------|---------------|-----------------------------------|
+/// | false         | 17 / 48 504   | 17 / 48 504                       |
+/// | true          | 19 / 64 632   | 27 / 81 336                       |
+/// | difference    | +2 / +16 128  | +10 / +32 832                     |
+///
+/// The bounds sit midway between the two differences, so the gate trips on
+/// the revert and tolerates a few allocations from the test harness's own
+/// threads on the other side (a parallel run has been seen to add ~2 blocks
+/// to one of the two measurements).
+#[cfg(feature = "dhat-heap")]
+fn parse_fo4_tangent_space_vertices_presizes_the_tangent_vec() {
+    let measure = |tangent_space: bool| {
+        let nif_bytes = build_fo4_packed_vertex_nif(1000, tangent_space);
+        let _profiler = dhat::Profiler::builder().testing().build();
+        let scene = parse_nif(&nif_bytes).expect("synthetic FO4 tangent-space NIF should parse");
+        let stats = dhat::HeapStats::get();
+        assert_eq!(scene.blocks.len(), 1, "fixture has one BSTriShape block");
+        (stats.total_blocks, stats.total_bytes)
+    };
+    let (plain_blocks, plain_bytes) = measure(false);
+    let (tangent_blocks, tangent_bytes) = measure(true);
+
+    let extra_blocks = tangent_blocks.saturating_sub(plain_blocks);
+    let extra_bytes = tangent_bytes.saturating_sub(plain_bytes);
+    assert!(
+        extra_blocks <= 6,
+        "tangent-space mesh allocated {extra_blocks} more blocks than the same mesh \
+         without tangents (measured +2 pre-sized, +10 when reverted) — \
+         decode_bs_vertex_stream likely lost its conditional tangent pre-size and is \
+         growing by push-doubling. See #4206 / #4617."
+    );
+    assert!(
+        extra_bytes < 24 * 1024,
+        "tangent-space mesh allocated {extra_bytes} more bytes than the same mesh \
+         without tangents (measured +16128 pre-sized, +32832 when reverted) — \
+         decode_bs_vertex_stream likely lost its conditional tangent pre-size and is \
+         growing by push-doubling. See #4206 / #4617."
+    );
+}
+
+/// Minimal v20.2.0.7 NiPSysSphereEmitter body — 77 bytes:
+/// modifier base(13) + emitter base 14×f32(56) + volume object ref(4) +
+/// sphere radius(4). Mirrors `parse_sphere_emitter_consumes_full_block`.
+fn ni_psys_sphere_emitter_block() -> Vec<u8> {
+    let mut d = Vec::new();
+    // NiPSysModifierBase: name=-1 (string index), order, target_ref=-1, active
+    w32(&mut d, 0xFFFFFFFF); // name (none)
+    w32(&mut d, 0); // order
+    w32(&mut d, 0xFFFFFFFF); // target_ref (-1)
+    w8(&mut d, 1); // active
+                   // Emitter base — 14 floats (nif.xml order), zeroed.
+    for _ in 0..14 {
+        wf32(&mut d, 0.0);
+    }
+    w32(&mut d, 0xFFFFFFFF); // volume emitter object ref (-1)
+    wf32(&mut d, 1.5); // sphere radius
+    d
+}
+
+/// Build a Skyrim SE NIF with three blocks: NiNode root, a BSTriShape
+/// child, and an (unparented) NiPSysSphereEmitter. `parse_nif` walks
+/// every declared block regardless of scene-graph connectivity, so the
+/// emitter is exercised even though no NiParticleSystem owns it.
+fn build_skyrim_se_geometry_particle_nif() -> Vec<u8> {
+    let mut nif = Vec::new();
+    nif.extend_from_slice(b"Gamebryo File Format, Version 20.2.0.7\n");
+    w32(&mut nif, 0x14020007); // version
+    w8(&mut nif, 1); // little-endian
+    w32(&mut nif, 12); // user_version
+    let num_blocks: u32 = 3;
+    w32(&mut nif, num_blocks);
+    w32(&mut nif, 100); // bsver (Skyrim SE)
+    wshort(&mut nif, "ByroRedux Test"); // author
+    wshort(&mut nif, ""); // process_script
+    wshort(&mut nif, ""); // export_script
+
+    // Block type table: NiNode, BSTriShape, NiPSysSphereEmitter.
+    w16(&mut nif, 3);
+    wsstr(&mut nif, "NiNode");
+    wsstr(&mut nif, "BSTriShape");
+    wsstr(&mut nif, "NiPSysSphereEmitter");
+    // Block type indices: block i → type i.
+    for i in 0..num_blocks {
+        w16(&mut nif, i as u16);
+    }
+    // Block sizes — patched after each block is appended.
+    let block_sizes_offset = nif.len();
+    for _ in 0..num_blocks {
+        w32(&mut nif, 0);
+    }
+    // String table: one string ("Scene Root", the NiNode name).
+    w32(&mut nif, 1);
+    w32(&mut nif, 10);
+    wsstr(&mut nif, "Scene Root");
+    w32(&mut nif, 0); // num_groups
+
+    let patch_size = |nif: &mut Vec<u8>, idx: usize, size: u32| {
+        let off = block_sizes_offset + idx * 4;
+        nif[off..off + 4].copy_from_slice(&size.to_le_bytes());
+    };
+
+    // Block 0 — NiNode root, one child (the BSTriShape, block 1).
+    let b0 = nif.len();
+    w32(&mut nif, 0); // name = string 0 ("Scene Root")
+    w32(&mut nif, 0); // num_extra_data
+    w32(&mut nif, 0xFFFFFFFF); // controller_ref
+    w32(&mut nif, 0x0E); // flags
+    for _ in 0..3 {
+        wf32(&mut nif, 0.0); // translation
+    }
+    for row in 0..3 {
+        for col in 0..3 {
+            wf32(&mut nif, if row == col { 1.0 } else { 0.0 });
+        }
+    }
+    wf32(&mut nif, 1.0); // scale
+    w32(&mut nif, 0xFFFFFFFF); // collision_ref
+    w32(&mut nif, 1); // num_children
+    w32(&mut nif, 1); // child[0] → block 1 (BSTriShape)
+    w32(&mut nif, 0); // num_effects
+    let s0 = (nif.len() - b0) as u32;
+    patch_size(&mut nif, 0, s0);
+
+    // Block 1 — BSTriShape.
+    let b1 = nif.len();
+    nif.extend_from_slice(&bs_tri_shape_block());
+    let s1 = (nif.len() - b1) as u32;
+    patch_size(&mut nif, 1, s1);
+
+    // Block 2 — NiPSysSphereEmitter.
+    let b2 = nif.len();
+    nif.extend_from_slice(&ni_psys_sphere_emitter_block());
+    let s2 = (nif.len() - b2) as u32;
+    patch_size(&mut nif, 2, s2);
+
+    nif
+}
+
+/// #1381 — geometry + particle allocation-bound gate. Parse a Skyrim SE
+/// NIF carrying a BSTriShape and a NiPSysSphereEmitter under dhat and
+/// assert the parser stays within a generous heap budget, so a future
+/// regression in the geometry / particle block parsers' allocation
+/// discipline (the #832 / #833 / #408 family) fails at CI cadence rather
+/// than only under audit-cadence grep.
+#[cfg(feature = "dhat-heap")]
+fn parse_skyrim_se_geometry_particle_stays_within_heap_budget() {
+    let nif_bytes = build_skyrim_se_geometry_particle_nif();
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let scene = parse_nif(&nif_bytes).expect("synthetic geometry+particle NIF should parse");
+    let stats = dhat::HeapStats::get();
+
+    assert_eq!(
+        scene.blocks.len(),
+        3,
+        "fixture declares NiNode + BSTriShape + NiPSysSphereEmitter"
+    );
+
+    // Measured 15 blocks / ~1.5 KB on 2026-06-21 (three minimal blocks).
+    // Same loose-headroom philosophy as the headline gate: pin at ~8×
+    // measured so the gate catches an order-of-magnitude regression (a
+    // per-element push loop or a dropped read_pod_vec re-appearing in the
+    // geometry/particle path) without churning on refactors.
+    assert!(
+        stats.max_blocks < 120,
+        "max_blocks regression: {} >= 120 (measured ~15) — a geometry/particle \
+         block parser likely re-introduced an or_insert(name.to_string()) / \
+         per-element push pattern. See #1381 / #1247 + the audit-nif Dim 6 \
+         checklist.",
+        stats.max_blocks
+    );
+    assert!(
+        stats.max_bytes < 12 * 1024,
+        "max_bytes regression: {} >= 12288 (measured ~1.5 KB) — a geometry/\
+         particle block parser likely dropped a read_pod_vec for a \
+         per-element push loop. See #1381 / #1247 + the audit-nif Dim 6 \
+         checklist.",
+        stats.max_bytes
+    );
+}
+
+// ── #3691 — skinning allocation-family coverage ────────────────────
+
+fn ni_transform_identity(buf: &mut Vec<u8>) {
+    for row in 0..3 {
+        for col in 0..3 {
+            wf32(buf, if row == col { 1.0 } else { 0.0 });
+        }
+    }
+    for _ in 0..3 {
+        wf32(buf, 0.0);
+    }
+    wf32(buf, 1.0);
+}
+
+/// Populated modern `NiSkinData`: two bones, each carrying eight vertex
+/// weights. This keeps the parser's bone and per-bone weight allocations on
+/// the measured path instead of letting a zero-bone fixture pass vacuously.
+fn ni_skin_data_block() -> Vec<u8> {
+    let mut d = Vec::new();
+    ni_transform_identity(&mut d); // skin transform
+    w32(&mut d, 2); // num_bones
+    w8(&mut d, 1); // has vertex weights
+
+    for bone in 0..2u16 {
+        ni_transform_identity(&mut d); // bone skin transform
+        for _ in 0..3 {
+            wf32(&mut d, 0.0); // bounding-sphere center
+        }
+        wf32(&mut d, 1.0); // bounding-sphere radius
+        w16(&mut d, 8); // num_vertices
+        for vertex in 0..8u16 {
+            w16(&mut d, vertex);
+            wf32(&mut d, if vertex == bone { 1.0 } else { 0.0 });
+        }
+    }
+    d
+}
+
+/// Populated modern `NiSkinPartition`: one strip-authored partition with
+/// eight vertices, two bones, and four triangles. The strip branch is
+/// intentional — it exercises the #3691 pre-sized de-strip output vector.
+fn ni_skin_partition_block() -> Vec<u8> {
+    let mut d = Vec::new();
+    w32(&mut d, 1); // num_partitions
+    w16(&mut d, 8); // num_vertices
+    w16(&mut d, 4); // num_triangles
+    w16(&mut d, 2); // num_bones
+    w16(&mut d, 1); // num_strips
+    w16(&mut d, 2); // num_weights_per_vertex
+    w16(&mut d, 0); // bones[0]
+    w16(&mut d, 1); // bones[1]
+    w8(&mut d, 1); // has vertex map
+    for vertex in 0..8u16 {
+        w16(&mut d, vertex);
+    }
+    w8(&mut d, 1); // has vertex weights
+    for vertex in 0..8u16 {
+        wf32(&mut d, if vertex % 2 == 0 { 1.0 } else { 0.0 });
+        wf32(&mut d, if vertex % 2 == 1 { 1.0 } else { 0.0 });
+    }
+    w16(&mut d, 6); // one six-index strip => four triangles
+    w8(&mut d, 1); // has faces
+    for vertex in 0..6u16 {
+        w16(&mut d, vertex);
+    }
+    w8(&mut d, 1); // has bone indices
+    for vertex in 0..8u8 {
+        d.extend_from_slice(&[vertex % 2, (vertex + 1) % 2]);
+    }
+    d
+}
+
+/// Build a v20.2 / BSVER 34 NIF carrying both legacy skinning blocks.
+/// `parse_nif` dispatches every declared block, so the blocks need no mesh
+/// wrapper to exercise their parser allocations.
+fn build_skin_blocks_nif() -> Vec<u8> {
+    let mut nif = Vec::new();
+    nif.extend_from_slice(b"Gamebryo File Format, Version 20.2.0.7\n");
+    w32(&mut nif, 0x14020007); // version 20.2.0.7
+    w8(&mut nif, 1); // little-endian
+    w32(&mut nif, 12); // user_version
+    let num_blocks: u32 = 2;
+    w32(&mut nif, num_blocks);
+    w32(&mut nif, 34); // BSVER = FO3/FNV; keeps the legacy partition layout
+    wshort(&mut nif, "ByroRedux Test"); // author
+    wshort(&mut nif, ""); // process_script
+    wshort(&mut nif, ""); // export_script
+    w16(&mut nif, 2); // block type count
+    wsstr(&mut nif, "NiSkinData");
+    wsstr(&mut nif, "NiSkinPartition");
+    w16(&mut nif, 0); // block 0 -> NiSkinData
+    w16(&mut nif, 1); // block 1 -> NiSkinPartition
+
+    let block_sizes_offset = nif.len();
+    w32(&mut nif, 0);
+    w32(&mut nif, 0);
+    w32(&mut nif, 0); // string table: num_strings
+    w32(&mut nif, 0); // string table: max_string_length
+    w32(&mut nif, 0); // num_groups
+
+    let skin_data_start = nif.len();
+    nif.extend_from_slice(&ni_skin_data_block());
+    let skin_data_size = (nif.len() - skin_data_start) as u32;
+    nif[block_sizes_offset..block_sizes_offset + 4].copy_from_slice(&skin_data_size.to_le_bytes());
+
+    let partition_start = nif.len();
+    nif.extend_from_slice(&ni_skin_partition_block());
+    let partition_size = (nif.len() - partition_start) as u32;
+    nif[block_sizes_offset + 4..block_sizes_offset + 8]
+        .copy_from_slice(&partition_size.to_le_bytes());
+    nif
+}
+
+/// #3691 — populated skinning allocation-bound gate. This fixture covers
+/// `NiSkinData`'s per-bone/weight vectors and `NiSkinPartition`'s strip
+/// triangle output, so a future `Vec::new()` regression in either path is
+/// measured by the same dhat CI job as the sibling parser fixtures.
+#[cfg(feature = "dhat-heap")]
+fn parse_skin_blocks_stays_within_heap_budget() {
+    let nif_bytes = build_skin_blocks_nif();
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let scene = parse_nif(&nif_bytes).expect("synthetic skin-block NIF should parse");
+    let stats = dhat::HeapStats::get();
+
+    assert_eq!(scene.blocks.len(), 2, "fixture declares both skin blocks");
+    assert!(
+        stats.max_blocks < 220,
+        "max_blocks regression: {} >= 220 — skinning parser likely reintroduced an unreserved vector growth site. See #3691 / #833 / #831.",
+        stats.max_blocks
+    );
+    assert!(
+        stats.max_bytes < 24 * 1024,
+        "max_bytes regression: {} >= 24576 — skinning parser allocation family exceeded its bound. See #3691 / #1247.",
+        stats.max_bytes
+    );
+}

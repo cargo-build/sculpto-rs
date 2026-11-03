@@ -1,0 +1,31 @@
+[package]
+name = "cloth-viewer"
+version = "0.1.0"
+license = "GPL-3.0-only"
+edition = "2021"
+
+[dependencies]
+bevy = { version = "=0.17.3", default-features = false, features = [
+    "animation",
+    "bevy_animation",
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_gltf",
+    "bevy_image",
+    "bevy_log",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_scene",
+    "bevy_camera",
+    "bevy_light",
+    "bevy_mesh",
+    "bevy_shader",
+    "png",
+    "raw_vulkan_init",
+    "debug",
+    "std",
+    "multi_threaded",
+] }
+
+[profile.dev]
+opt-level = 1

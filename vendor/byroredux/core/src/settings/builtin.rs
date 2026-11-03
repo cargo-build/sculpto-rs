@@ -1,0 +1,192 @@
+//! The settings the engine always registers.
+//!
+//! Lives in `core` rather than in the debug-UI crate that used to own it, so
+//! the launcher can build the identical registry without linking
+//! `egui-ash-renderer` — and therefore Vulkan. That is the whole mechanism
+//! behind "one model, two skins" (`docs/engine/launcher.md` §4): the launcher
+//! and the in-game menu render the same [`SettingEntry`] values and submit the
+//! same [`SettingChange`](super::SettingChange) back, differing only in widgets.
+//!
+//! Nothing here may reference a renderer, window, or UI type. The values are
+//! plain data; the ID constants are the stable contract between whoever
+//! registers a setting and whoever applies it.
+
+use super::{SettingChoice, SettingEntry, SettingsError, SettingsRegistry};
+
+/// Stable registry key for the overlay's own scale control. Other engine
+/// modules can register settings beside it without depending on this crate.
+pub const OVERLAY_SCALE_SETTING_ID: &str = "interface.overlay_scale";
+
+/// Stable keys for the player-facing HUD and camera settings.
+pub const SHOW_CROSSHAIR_SETTING_ID: &str = "interface.show_crosshair";
+pub const SHOW_PROMPTS_SETTING_ID: &str = "interface.show_prompts";
+pub const SHOW_VITALS_SETTING_ID: &str = "interface.show_vitals";
+pub const SHOW_OBJECTIVES_SETTING_ID: &str = "interface.show_objectives";
+pub const FOV_SETTING_ID: &str = "gameplay.field_of_view";
+
+/// Stable registry key for the temporal reconstruction path. The value is the
+/// same spec string the `r.upscaler` console command and the `--upscaler` /
+/// `--fsr-quality` CLI pair accept, so all three routes share one grammar and
+/// the binary parses it in exactly one place.
+pub const UPSCALER_SETTING_ID: &str = "render.upscaler";
+/// #6196 — width of the height-based terrain layer blend's transition band,
+/// in normalised height units. 0 disables height blending.
+pub const TERRAIN_HEIGHT_BLEND_BAND_SETTING_ID: &str = "render.terrain_height_blend_band";
+/// Default band: the transition depth of the height-blend formulation this
+/// implements (Mishkinis, "Advanced Terrain Texture Splatting", 2013, whose
+/// listing uses `depth = 0.2`). A starting point to tune by eye, not a
+/// measured property of any game's data.
+pub const TERRAIN_HEIGHT_BLEND_BAND_DEFAULT: f32 = 0.2;
+/// #6197 — relief amplitude of the near-camera terrain parallax, in metres
+/// (the renderer works in world units; the host converts once, where the
+/// setting is broadcast). 0 disables the effect.
+pub const TERRAIN_PARALLAX_DEPTH_SETTING_ID: &str = "render.terrain_parallax_depth_m";
+/// A few centimetres of relief: stones standing proud of the dirt between
+/// them without reading as geometry. A starting point to tune by eye — the
+/// source height maps are normalised per texture, so no game's data fixes it.
+pub const TERRAIN_PARALLAX_DEPTH_DEFAULT_M: f32 = 0.08;
+/// #6197 — camera distance, in metres, where terrain parallax has faded to
+/// plain shading (it starts fading at half of it). 0 disables the effect.
+pub const TERRAIN_PARALLAX_RANGE_SETTING_ID: &str = "render.terrain_parallax_range_m";
+pub const TERRAIN_PARALLAX_RANGE_DEFAULT_M: f32 = 20.0;
+
+/// Distance softening of the near terrain toward the look of the distant LOD
+/// ring: 0 = off, 1 = soften from about a fifth of the ring out. The host maps
+/// it to the camera distance at which the near terrain is fully softened.
+pub const TERRAIN_LOD_SOFTEN_SETTING_ID: &str = "render.terrain_lod_soften";
+/// A starting point to tune by eye: the baked LOD diffuse is a fixed, much
+/// lower resolution than the tiled splat layers, so the join reads as a step
+/// in detail unless the near terrain's detail gives way first.
+pub const TERRAIN_LOD_SOFTEN_DEFAULT: f32 = 0.5;
+
+/// Register settings owned by the overlay itself. The binary calls this while
+/// assembling the universal [`SettingsRegistry`]; renderer, audio, input, and
+/// gameplay modules can add their own entries through the same API over time.
+pub fn register_builtin_settings(registry: &mut SettingsRegistry) -> Result<(), SettingsError> {
+    registry.register(SettingEntry::slider(
+        FOV_SETTING_ID,
+        "Gameplay",
+        "Field of view",
+        "Vertical camera field of view. Applies immediately without rebuilding the renderer.",
+        // Match `Camera::default()` so merely loading the settings registry
+        // does not change the established view or benchmark framing.
+        45.0,
+        45.0,
+        110.0,
+        1.0,
+        "°",
+    ))?;
+    registry.register(SettingEntry::slider(
+        OVERLAY_SCALE_SETTING_ID,
+        "Interface",
+        "UI scale",
+        "Scale the HUD, pause menu, settings, and developer overlay.",
+        1.0,
+        0.75,
+        2.0,
+        0.05,
+        "×",
+    ))?;
+    registry.register(SettingEntry::toggle(
+        SHOW_CROSSHAIR_SETTING_ID,
+        "Interface",
+        "Show crosshair",
+        "Keep a small reticle at screen center while controlling the world.",
+        true,
+    ))?;
+    registry.register(SettingEntry::toggle(
+        SHOW_PROMPTS_SETTING_ID,
+        "Interface",
+        "Show interaction prompts",
+        "Show the active key and action when an object can be used.",
+        true,
+    ))?;
+    registry.register(SettingEntry::toggle(
+        SHOW_VITALS_SETTING_ID,
+        "Interface",
+        "Show vitals bars",
+        "Show the player's health and resource bars during gameplay.",
+        true,
+    ))?;
+    registry.register(SettingEntry::toggle(
+        SHOW_OBJECTIVES_SETTING_ID,
+        "Interface",
+        "Show objective text",
+        "Show active quest objectives while gameplay owns input.",
+        true,
+    ))?;
+    registry.register(SettingEntry::choice(
+        UPSCALER_SETTING_ID,
+        "Rendering",
+        "Upscaler",
+        "Temporal reconstruction path. FSR renders the scene below output \
+         resolution and reconstructs it; TAA renders at native resolution. \
+         Switching rebuilds every render-resolution target and resets \
+         temporal history.",
+        // Must match `UpscalerMode::default()` and the CLI's no-flag default;
+        // `App::new` overwrites this from the parsed config at startup anyway,
+        // but a divergent literal here would show the wrong entry for the one
+        // frame before that happens.
+        "fsr3/quality",
+        vec![
+            SettingChoice::new("taa", "TAA (native resolution)"),
+            SettingChoice::new("fsr3/native-aa", "FSR 3.1 — Native AA"),
+            SettingChoice::new("fsr3/quality", "FSR 3.1 — Quality"),
+            SettingChoice::new("fsr3/balanced", "FSR 3.1 — Balanced"),
+            SettingChoice::new("fsr3/performance", "FSR 3.1 — Performance"),
+        ],
+    ))?;
+    registry.register(SettingEntry::slider(
+        TERRAIN_HEIGHT_BLEND_BAND_SETTING_ID,
+        "Rendering",
+        "Terrain height-blend band",
+        "Where two terrain layers overlap, the one standing higher wins inside \
+         this transition band (normalised height). Smaller is sharper; 0 turns \
+         height blending off and restores the plain weight blend.",
+        TERRAIN_HEIGHT_BLEND_BAND_DEFAULT,
+        0.0,
+        1.0,
+        0.01,
+        "",
+    ))?;
+    registry.register(SettingEntry::slider(
+        TERRAIN_PARALLAX_DEPTH_SETTING_ID,
+        "Rendering",
+        "Terrain parallax depth",
+        "Relief amplitude of the near-camera terrain parallax, in metres: how \
+         far the lowest parts of the ground sink below the highest. The \
+         surface is only shifted per pixel, not displaced, so ray-traced \
+         shadows and reflections keep the flat ground. 0 turns it off.",
+        TERRAIN_PARALLAX_DEPTH_DEFAULT_M,
+        0.0,
+        0.3,
+        0.005,
+        " m",
+    ))?;
+    registry.register(SettingEntry::slider(
+        TERRAIN_PARALLAX_RANGE_SETTING_ID,
+        "Rendering",
+        "Terrain parallax range",
+        "Camera distance at which terrain parallax has faded to plain \
+         shading; it starts fading at half this distance. Shorter is \
+         cheaper. 0 turns it off.",
+        TERRAIN_PARALLAX_RANGE_DEFAULT_M,
+        0.0,
+        60.0,
+        1.0,
+        " m",
+    ))?;
+    registry.register(SettingEntry::slider(
+        TERRAIN_LOD_SOFTEN_SETTING_ID,
+        "Rendering",
+        "Terrain distance softening",
+        "Softens the detail of full-detail terrain as it approaches the \
+         distant LOD ring, so the join reads as distance rather than a step \
+         in sharpness. Higher starts earlier; 0 turns it off.",
+        TERRAIN_LOD_SOFTEN_DEFAULT,
+        0.0,
+        1.0,
+        0.05,
+        "",
+    ))
+}

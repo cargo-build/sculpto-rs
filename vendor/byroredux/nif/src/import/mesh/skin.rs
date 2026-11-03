@@ -1,0 +1,909 @@
+//! Skinning data extraction (issue #151).
+//!
+//! `extract_skin_ni_tri_shape` / `extract_skin_bs_tri_shape`, partition /
+//! palette remap, bone-pose flattening, sparse-weight densification.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const UNASSIGNED_BODY_PART: u16 = u16::MAX;
+
+fn canonical_triangle(mut triangle: [u32; 3]) -> [u32; 3] {
+    triangle.sort_unstable();
+    triangle
+}
+
+fn triangle_body_parts(scene: &NifScene, skin_idx: usize, final_indices: &[u32]) -> Vec<u16> {
+    let Some(inst) = scene.get_as::<BsDismemberSkinInstance>(skin_idx) else {
+        return Vec::new();
+    };
+    let Some(partition_idx) = inst.base.skin_partition_ref.index() else {
+        return Vec::new();
+    };
+    let Some(partition) = scene.get_as::<NiSkinPartition>(partition_idx) else {
+        return Vec::new();
+    };
+    if inst.partitions.len() != partition.partitions.len() {
+        return Vec::new();
+    }
+
+    // #3360 — the same index-space question as #3355, and it must be
+    // answered the same way or the two halves disagree.
+    //
+    // These keys are looked up against `final_indices`, which
+    // `try_reconstruct_sse_geometry` produces. Before #3355 both sides
+    // applied the identical wrong `vertex_map` remap and skipped the
+    // identical triangles, so they agreed and body parts landed on the
+    // (mis-indexed) survivors — self-cancelling. Fixing either side alone
+    // makes every lookup miss, every entry fall to `UNASSIGNED_BODY_PART`,
+    // and the trailing guard return `Vec::new()` — at which point
+    // `hide_skin_partitions` stops hiding anything and every NPC renders
+    // bare body skin through their armour, with `cargo test` and the
+    // parse-rate gate both still green.
+    //
+    // Gated on the partition, not the game: `global_vertex_data` is the
+    // exact SSE marker `NiSkinPartition::parse` already computes. The remap
+    // stays correct for Oblivion/FO3/FNV, where nifly's `bMappedIndices`
+    // defaults to `true` and partition triangles genuinely are vertex_map-
+    // local (`extract_skin_ni_tri_shape` routes those here too).
+    let triangles_are_global = partition.global_vertex_data.is_some();
+
+    let mut by_triangle = HashMap::new();
+    for (body_info, part) in inst.partitions.iter().zip(&partition.partitions) {
+        for triangle in &part.triangles {
+            let mut global = [0u32; 3];
+            let mut valid = true;
+            for (dst, &local) in global.iter_mut().zip(triangle) {
+                if triangles_are_global || part.vertex_map.is_empty() {
+                    *dst = local as u32;
+                } else if let Some(&mapped) = part.vertex_map.get(local as usize) {
+                    *dst = mapped as u32;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                by_triangle
+                    .entry(canonical_triangle(global))
+                    .or_insert(body_info.body_part);
+            }
+        }
+    }
+
+    let mapped: Vec<u16> = final_indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|triangle| {
+            by_triangle
+                .get(&canonical_triangle([triangle[0], triangle[1], triangle[2]]))
+                .copied()
+                .unwrap_or(UNASSIGNED_BODY_PART)
+        })
+        .collect();
+    if mapped.iter().any(|&part| part != UNASSIGNED_BODY_PART) {
+        mapped
+    } else {
+        Vec::new()
+    }
+}
+
+use crate::blocks::bs_geometry::{BSGeometry, BSGeometryMeshData, BoneWeight};
+use crate::blocks::node::NiNode;
+use crate::blocks::skin::{
+    BsDismemberSkinInstance, BsSkinBoneData, BsSkinInstance, NiSkinData, NiSkinInstance,
+    NiSkinPartition,
+};
+use crate::blocks::tri_shape::{BsTriShape, NiTriShape};
+use crate::scene::NifScene;
+use crate::types::{BlockRef, NiPoint3, NiTransform};
+
+use super::super::{ImportedBone, ImportedSkin};
+
+pub fn extract_skin_ni_tri_shape(
+    scene: &NifScene,
+    shape: &NiTriShape,
+    num_vertices: usize,
+    final_indices: &[u32],
+) -> Option<ImportedSkin> {
+    let skin_idx = shape.skin_instance_ref.index()?;
+
+    // Accept either NiSkinInstance or BSDismemberSkinInstance (the
+    // Bethesda extension with body-part flags). #1659 — capture the
+    // dismemberment partitions (empty for plain NiSkinInstance) so
+    // ImportedSkin::body_part_flags isn't silently dropped.
+    let (bone_refs, skeleton_root_ref, data_ref, body_part_flags) =
+        if let Some(inst) = scene.get_as::<NiSkinInstance>(skin_idx) {
+            (
+                inst.bone_refs.as_slice(),
+                inst.skeleton_root_ref,
+                inst.data_ref,
+                Vec::new(),
+            )
+        } else {
+            let inst = scene.get_as::<BsDismemberSkinInstance>(skin_idx)?;
+            (
+                inst.base.bone_refs.as_slice(),
+                inst.base.skeleton_root_ref,
+                inst.base.data_ref,
+                inst.partitions.clone(),
+            )
+        };
+
+    let data = scene.get_as::<NiSkinData>(data_ref.index()?)?;
+    if data.bones.len() != bone_refs.len() {
+        log::debug!(
+            "NiSkinData bone count ({}) != NiSkinInstance bone_refs count ({})",
+            data.bones.len(),
+            bone_refs.len(),
+        );
+        return None;
+    }
+
+    // Resolve bone names (the interpolator refers to bones by index
+    // into this vec, so the order must match NiSkinInstance.bone_refs).
+    let bones = build_imported_bones(scene, bone_refs, data)?;
+    let skeleton_root = resolve_node_name(scene, skeleton_root_ref);
+
+    // Build dense per-vertex weight tables.
+    let (mut vertex_bone_indices, mut vertex_bone_weights) =
+        densify_sparse_weights(num_vertices, data);
+    // #5389 sibling — the classic NiSkinData channel carries bone
+    // indices into the same `bone_refs` list; bound it by the same
+    // rule so the render-side palette invariant holds for every
+    // producer, not just the ones #4268 touched.
+    decline_unbounded_packed_indices(
+        &mut vertex_bone_indices,
+        &mut vertex_bone_weights,
+        bone_refs.len(),
+    );
+
+    // M41.0 Phase 1b.x — surface NiSkinData::skinTransform (the global
+    // per-skin transform). Bethesda body NIFs ship this with a non-
+    // identity cyclic-permutation rotation that the runtime palette
+    // composes as the outermost factor. See OpenMW
+    // `riggeometry.cpp:175-208`.
+    let global_skin_transform = ni_transform_to_yup_matrix(&data.skin_transform);
+    let triangle_body_parts = triangle_body_parts(scene, skin_idx, final_indices);
+
+    Some(ImportedSkin {
+        bones,
+        skeleton_root,
+        vertex_bone_indices,
+        vertex_bone_weights,
+        global_skin_transform,
+        body_part_flags,
+        triangle_body_parts,
+    })
+}
+
+/// Extract `ImportedSkin` for a BSTriShape via `skin_ref`. Walks the
+/// skin instance for bone list + bind-inverse transforms, then copies
+/// the parsed per-vertex weights + indices from the packed vertex
+/// buffer (VF_SKINNED, issue #177).
+///
+/// Handles both:
+///   - NiSkinInstance (Skyrim LE BSTriShape) via NiSkinData
+///   - BSSkin::Instance (Skyrim SE / FO4+) via BSSkin::BoneData
+pub fn extract_skin_bs_tri_shape(
+    scene: &NifScene,
+    shape: &BsTriShape,
+    final_indices: &[u32],
+) -> Option<ImportedSkin> {
+    let skin_idx = shape.skin_ref.index()?;
+    let triangle_body_parts = triangle_body_parts(scene, skin_idx, final_indices);
+
+    // Per-vertex weights come from the BSTriShape vertex buffer
+    // (VF_SKINNED) — already decoded at parse time (#177). The
+    // packed bone indices already address the skin's global bone list.
+    // Only the separate NiSkinPartition.bone_indices channel is local
+    // to a partition palette. Remapping the packed channel a second time
+    // (#613/#2577) corrupts influences; see widen_packed_bone_indices.
+    // #638 — Skyrim SE NPC bodies (and any BSTriShape whose `data_size
+    // == 0`) ship per-vertex skin data only in the partition's
+    // `SseSkinGlobalBuffer`, not on the inline arrays. Pre-fix
+    // `shape.bone_weights.clone()` returned an empty Vec on those
+    // meshes and every vertex hit the renderer's rigid fallback
+    // (`wsum < 0.001` in `triangle.vert:151`), rendering NPCs in
+    // bind pose. Fall back to the decoded global-buffer payload
+    // when the inline arrays are empty.
+    let (mut vertex_bone_weights, mut vertex_bone_indices) = if shape.bone_weights.is_empty() {
+        match decode_sse_skin_payload(scene, shape) {
+            Some((weights, raw_indices)) => (weights, widen_packed_bone_indices(&raw_indices)),
+            None => (Vec::new(), widen_packed_bone_indices(&shape.bone_indices)),
+        }
+    } else {
+        (
+            shape.bone_weights.clone(),
+            widen_packed_bone_indices(&shape.bone_indices),
+        )
+    };
+    // #2467 / REN-D9-NEW-01 — the packed-half path is pure pass-through
+    // (no renormalise, no zero fallback), unlike the classic
+    // `densify_sparse_weights` path. Enforce the same invariant here so
+    // a decoded all-zero quad can't reach the GPU. See
+    // [`bind_unweighted_to_bone_zero`].
+    bind_unweighted_to_bone_zero(&mut vertex_bone_indices, &mut vertex_bone_weights);
+
+    // Skyrim LE path: NiSkinInstance + NiSkinData (bone list + bind transforms).
+    // Borrow bone_refs instead of cloning — they're only iterated. #279 D5-11.
+    // #1659 — capture BSDismemberSkinInstance's partitions alongside.
+    let (bone_refs_slice, skeleton_root_ref, data_ref, body_part_flags) =
+        if let Some(inst) = scene.get_as::<NiSkinInstance>(skin_idx) {
+            (
+                inst.bone_refs.as_slice(),
+                inst.skeleton_root_ref,
+                inst.data_ref,
+                Vec::new(),
+            )
+        } else if let Some(inst) = scene.get_as::<BsDismemberSkinInstance>(skin_idx) {
+            (
+                inst.base.bone_refs.as_slice(),
+                inst.base.skeleton_root_ref,
+                inst.base.data_ref,
+                inst.partitions.clone(),
+            )
+        } else {
+            (&[] as &[_], BlockRef::NULL, BlockRef::NULL, Vec::new())
+        };
+    if !bone_refs_slice.is_empty() {
+        let data = scene.get_as::<NiSkinData>(data_ref.index()?)?;
+        if data.bones.len() != bone_refs_slice.len() {
+            return None;
+        }
+        let bones = build_imported_bones(scene, bone_refs_slice, data)?;
+        // #5389 — #4268's rule for the packed BSTriShape channel (this
+        // covers the inline arrays AND the SSE global-buffer payload,
+        // which merge above): an index at or above the mesh's own bone
+        // count reads a reused or unallocated palette slot's stale
+        // matrix, the exact invariant render/skinned.rs documents.
+        // Decline the whole weight set — never clamp.
+        decline_unbounded_packed_indices(
+            &mut vertex_bone_indices,
+            &mut vertex_bone_weights,
+            bone_refs_slice.len(),
+        );
+        let skeleton_root = resolve_node_name(scene, skeleton_root_ref);
+        let global_skin_transform = ni_transform_to_yup_matrix(&data.skin_transform);
+        return Some(ImportedSkin {
+            bones,
+            skeleton_root,
+            vertex_bone_indices,
+            vertex_bone_weights,
+            global_skin_transform,
+            body_part_flags,
+            triangle_body_parts,
+        });
+    }
+
+    // Skyrim SE / FO4+ path: BSSkin::Instance + BSSkin::BoneData.
+    if let Some(inst) = scene.get_as::<BsSkinInstance>(skin_idx) {
+        let bone_data = scene.get_as::<BsSkinBoneData>(inst.bone_data_ref.index()?)?;
+        if bone_data.bones.len() != inst.bone_refs.len() {
+            return None;
+        }
+        let mut bones = Vec::with_capacity(inst.bone_refs.len());
+        for (i, bone_ref) in inst.bone_refs.iter().enumerate() {
+            let name = resolve_node_name(scene, *bone_ref)
+                .unwrap_or_else(|| Arc::from(format!("Bone{}", i)));
+            let bt = &bone_data.bones[i];
+            bones.push(ImportedBone {
+                name,
+                bind_inverse: bs_bone_to_inverse_matrix(bt),
+                bounding_sphere: bt.bounding_sphere,
+            });
+        }
+        // #5389 — same bound on the FO4/SSE arm; see the NiSkin arm's
+        // note. Vanilla census: 0 out-of-range influences across all
+        // 8 FO4 mesh BA2s (23,099 skinned meshes), so this is
+        // defense-in-depth for mods and malformed files.
+        decline_unbounded_packed_indices(
+            &mut vertex_bone_indices,
+            &mut vertex_bone_weights,
+            inst.bone_refs.len(),
+        );
+        let skeleton_root = resolve_node_name(scene, inst.skeleton_root_ref);
+        // BSSkin (FO4+/Skyrim SE) doesn't carry a per-skin global
+        // transform; identity is the right default per OpenMW's
+        // FO4-mesh fallback comment at NifFile.cpp:2600-2602
+        // ("FO4 meshes do not have this transform").
+        return Some(ImportedSkin {
+            bones,
+            skeleton_root,
+            vertex_bone_indices,
+            vertex_bone_weights,
+            global_skin_transform: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            // BSSkin::Instance (FO4+/Skyrim SE) carries no dismemberment
+            // partitions of its own — those live on NiSkinInstance /
+            // BsDismemberSkinInstance, handled above. See #1659.
+            body_part_flags: Vec::new(),
+            triangle_body_parts,
+        });
+    }
+
+    None
+}
+
+/// Convert Starfield `BSGeometry`'s per-vertex `skin_weights` (already
+/// grouped by vertex — outer index is the vertex, inner list holds up to
+/// `weights_per_vert` [`BoneWeight`] entries) into the engine's fixed
+/// `[u16; 4]` bone-index / `[f32; 4]` weight per-vertex arrays. Mirrors
+/// `extract_skin_bs_tri_shape`'s FO4 `BsTriShape` contract: keeps the top
+/// 4 contributions by weight (zero-padding when fewer), decodes the u16
+/// NORM weight (`/ 65535.0`), and renormalizes via
+/// [`crate::blocks::tri_shape::renormalize_skin_weights`] so NORM
+/// quantization drift doesn't accumulate on the GPU skinning path.
+///
+/// Returns empty vecs — the engine's existing "no per-vertex skin data"
+/// sentinel (see `nif_loader.rs`'s `vertex_bone_indices.is_empty()`
+/// rigid-fallback gate) — when `skin_weights.len()` doesn't match
+/// `num_vertices`: a mismatch means the mesh-data table and the geometry
+/// it's paired with disagree on vertex count, and guessing which vertex
+/// maps to which weight row would silently mis-skin the mesh rather than
+/// fail safe. See #2613.
+fn convert_bs_geometry_skin_weights(
+    mesh_data: &BSGeometryMeshData,
+    num_vertices: usize,
+    bone_count: usize,
+) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+    if mesh_data.weights_per_vert == 0
+        || mesh_data.skin_weights.is_empty()
+        || mesh_data.skin_weights.len() != num_vertices
+    {
+        return (Vec::new(), Vec::new());
+    }
+    // #4268 — the render side's palette contract (render/skinned.rs)
+    // relies on every producer bounding its per-vertex bone indices by
+    // the mesh's own bone count at import time; an unbounded index
+    // reads a reused or unallocated palette slot's stale matrix. Vanilla
+    // retail Starfield never authors one, but a malformed or hostile
+    // .mesh could. Decline the whole skin — never clamp — per the
+    // crate's skip-don't-guess convention: a wrong-bone clamp silently
+    // deforms, while an empty array degrades to the bind pose.
+    if mesh_data
+        .skin_weights
+        .iter()
+        .flatten()
+        .any(|bw| bw.bone_index as usize >= bone_count)
+    {
+        log::warn!(
+            "BSGeometry skin: per-vertex bone index >= bone count ({bone_count}) — \
+             declining skin weights (bind pose) rather than guessing a bone"
+        );
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut indices = Vec::with_capacity(num_vertices);
+    let mut weights = Vec::with_capacity(num_vertices);
+    for vertex_weights in &mesh_data.skin_weights {
+        let mut sorted: Vec<&BoneWeight> = vertex_weights.iter().collect();
+        // Descending by raw u16 weight — exact integer order, no NaN
+        // concerns from comparing the decoded f32.
+        sorted.sort_by_key(|bone| std::cmp::Reverse(bone.weight));
+
+        let mut idx = [0u16; 4];
+        let mut w = [0.0f32; 4];
+        for (slot, bw) in sorted.into_iter().take(4).enumerate() {
+            idx[slot] = bw.bone_index;
+            w[slot] = bw.weight as f32 / 65535.0;
+        }
+        weights.push(crate::blocks::tri_shape::renormalize_skin_weights(w));
+        indices.push(idx);
+    }
+    // #2467 — `renormalize_skin_weights` returns an all-zero quad
+    // unchanged (its `sum <= 1e-6` early-out), so the same zero-weight
+    // gap the FO4 `BsTriShape` path has applies here. Enforce the
+    // bone-0 invariant before the arrays leave this function.
+    bind_unweighted_to_bone_zero(&mut indices, &mut weights);
+    (indices, weights)
+}
+
+/// Extract `ImportedSkin` for a Starfield `BSGeometry` via `skin_instance_ref`.
+/// Resolves the linked `BSSkin::Instance` + `BSSkin::BoneData` and builds the
+/// engine-side bone list with bind-inverse transforms, then decodes
+/// `mesh_data.skin_weights` into per-vertex bone indices/weights via
+/// [`convert_bs_geometry_skin_weights`]. See #2613 — pre-fix these were
+/// hardcoded empty on the stale premise that the BSGeometry parser didn't
+/// surface per-vertex skin data yet; `skin_weights` has been fully decoded
+/// since #873, just never plumbed through here (#1827 closed on that same
+/// stale premise).
+///
+/// Mirrors the FO4+ BSSkin path in `extract_skin_bs_tri_shape` — only
+/// the geometry container differs.
+/// The shape's own `SkinAttach` bone-name list, when it carries one that
+/// matches the skin's bone count.
+///
+/// #3930 — Starfield authors a skin's bone identities in two
+/// complementary channels: either `BsSkinInstance::bone_refs` point at
+/// real nodes, or they are all NULL and the names live in a `SkinAttach`
+/// extra-data block hanging off the same `BSGeometry`, stored as inline
+/// length-prefixed `NiString`s. That inline storage is why they never
+/// reach the header string table — and why #3549 concluded the identity
+/// "is not in the file at all", which is true of the table but false of
+/// the file.
+///
+/// A per-shape structural walk over `Meshes01` + `MeshesPatch` +
+/// `FaceMeshes` + `ShatteredSpace - Main01` measured the split: of 21,222
+/// skinned `BSGeometry` shapes, 18,990 (89.5%) have all-NULL `bone_refs`,
+/// and *every one* of those carries a `SkinAttach` on its own shape whose
+/// entry count equals the `BsSkinBoneData` bone count — 18,990 of 18,990,
+/// zero mismatches. In the 2,232-shape control group where `bone_refs` do
+/// resolve, the `SkinAttach` entries are blank instead. The channels are
+/// alternatives, and `minibota_security.nif` proves the choice is made
+/// **per entry**, not per list: `attach = ["", "COM", "", ""]` against
+/// `resolved = ["C_Chassis", "C_Body", "C_Axle", "C_Base"]`.
+///
+/// Count agreement is required and the whole list declined on a mismatch,
+/// mirroring the decline discipline the geometric solver already follows:
+/// a `SkinAttach` of the wrong length is evidence the block means
+/// something this reader does not understand, not licence to zip it
+/// against the bones positionally.
+fn skin_attach_bone_names(
+    scene: &NifScene,
+    extra_data_refs: &[BlockRef],
+    expected_len: usize,
+) -> Option<Vec<String>> {
+    for ref_idx in extra_data_refs {
+        let Some(idx) = ref_idx.index() else {
+            continue;
+        };
+        let Some(block) = scene.blocks.get(idx) else {
+            continue;
+        };
+        let Some(ed) = block
+            .as_any()
+            .downcast_ref::<crate::blocks::extra_data::NiExtraData>()
+        else {
+            continue;
+        };
+        let Some(names) = ed.skin_attach_bones.as_ref() else {
+            continue;
+        };
+        if names.len() != expected_len {
+            log::debug!(
+                "BSGeometry skin: SkinAttach name count ({}) != bone count ({}); declining",
+                names.len(),
+                expected_len,
+            );
+            continue;
+        }
+        return Some(names.clone());
+    }
+    None
+}
+
+/// #4270 (SF-2026-09-11-D2-03) — true when a resolved `SkinAttach` name
+/// list already has a non-empty entry for every bone, meaning the
+/// per-entry precedence loop in [`extract_skin_bs_geometry`] can never
+/// fall through to the geometric external-skeleton solve for any index.
+/// `None` (no `SkinAttach`, or a length mismatch — see
+/// [`skin_attach_bone_names`]) never counts as covering.
+pub fn attach_names_cover_every_bone(attach_names: Option<&[String]>) -> bool {
+    attach_names.is_some_and(|names| names.iter().all(|n| !n.is_empty()))
+}
+
+pub fn extract_skin_bs_geometry(
+    scene: &NifScene,
+    shape: &BSGeometry,
+    mesh_data: &BSGeometryMeshData,
+    resolver: Option<&dyn crate::import::MeshResolver>,
+) -> Option<ImportedSkin> {
+    let skin_idx = shape.skin_instance_ref.index()?;
+
+    let inst = scene.get_as::<BsSkinInstance>(skin_idx)?;
+    let bone_data = scene.get_as::<BsSkinBoneData>(inst.bone_data_ref.index()?)?;
+    if bone_data.bones.len() != inst.bone_refs.len() {
+        log::debug!(
+            "BSGeometry skin: BsSkinBoneData bone count ({}) != BsSkinInstance bone_refs count ({})",
+            bone_data.bones.len(),
+            inst.bone_refs.len(),
+        );
+        return None;
+    }
+    // #3549 — Starfield apparel and body meshes carry ALL-NULL `bone_refs`:
+    // 78,587 of 107,717 refs (73%) across 68,459 vanilla NIFs, with every ref
+    // null on 3,738 of 5,896 skins. The identity is not in the file at all
+    // (its header string table holds only `ExportScene`, `BSX`, the mesh name
+    // and material paths), so `resolve_node_name` returned `None` and the
+    // `Bone{i}` fallback below manufactured placeholders that could never
+    // match a skeleton — every SF NPC and every piece of apparel in bind
+    // pose. Recover the names from the external skeleton by solving the
+    // per-file bind offset; `resolve_external_bone_names` declines unless a
+    // unique offset matches every bone, and a decline leaves the historical
+    // fallback in place.
+    // #3930 — the authored names, when the shape carries them. This is the
+    // primary source: it is exact, count-checked, and needs no external
+    // skeleton, no tolerance and no decline path. The geometric solver
+    // below stays exactly where it was, as the last resort before
+    // `Bone{i}` — this only moves it behind the data.
+    let attach_names =
+        skin_attach_bone_names(scene, &shape.av.net.extra_data_refs, bone_data.bones.len());
+    // #4270 (SF-2026-09-11-D2-03) — skip the geometric solve entirely when
+    // `attach_names` already covers every bone: per the per-entry
+    // precedence loop below, a fully-populated `attach_names` means no
+    // index will ever fall through to `external_names`, so solving for it
+    // is pure discarded work. Measured 18,990/18,990 (100%) of the
+    // all-NULL `bone_refs` cohort this branch exists for already satisfies
+    // that condition (#3930's doc comment above). Any entry left blank
+    // still triggers the solve, unchanged.
+    let external_names = if inst.bone_refs.iter().all(|r| r.index().is_none())
+        && !attach_names_cover_every_bone(attach_names.as_deref())
+    {
+        resolver.and_then(|r| {
+            let binds: Vec<[f32; 3]> = bone_data
+                .bones
+                .iter()
+                .map(super::skeleton::bind_world_position)
+                .collect();
+            super::skeleton::resolve_external_bone_names(&binds, r)
+        })
+    } else {
+        None
+    };
+
+    let mut bones = Vec::with_capacity(inst.bone_refs.len());
+    for (i, bone_ref) in inst.bone_refs.iter().enumerate() {
+        // Per-entry precedence (#3930): an authored `SkinAttach` name wins,
+        // but a blank entry falls through to the node ref, because a single
+        // list can mix the two channels.
+        let name = attach_names
+            .as_ref()
+            .map(|n| n[i].as_str())
+            .filter(|n| !n.is_empty())
+            .map(Arc::from)
+            .or_else(|| resolve_node_name(scene, *bone_ref))
+            .or_else(|| external_names.as_ref().map(|n| n[i].clone()))
+            .unwrap_or_else(|| Arc::from(format!("Bone{}", i)));
+        let bt = &bone_data.bones[i];
+        bones.push(ImportedBone {
+            name,
+            bind_inverse: bs_bone_to_inverse_matrix(bt),
+            bounding_sphere: bt.bounding_sphere,
+        });
+    }
+    let skeleton_root = resolve_node_name(scene, inst.skeleton_root_ref);
+    // #4268 — `bone_refs.len()` is the palette bound; it equals
+    // `bone_data.bones.len()` by the count check at the top of this fn.
+    let (vertex_bone_indices, vertex_bone_weights) =
+        convert_bs_geometry_skin_weights(mesh_data, mesh_data.vertices.len(), inst.bone_refs.len());
+    // BSSkin (FO4+/Skyrim SE/Starfield) doesn't carry a per-skin global
+    // transform; identity matches the OpenMW FO4-mesh fallback.
+    Some(ImportedSkin {
+        bones,
+        skeleton_root,
+        vertex_bone_indices,
+        vertex_bone_weights,
+        global_skin_transform: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        // BSGeometry's BsSkinInstance carries no dismemberment
+        // partitions — see #1659.
+        body_part_flags: Vec::new(),
+        triangle_body_parts: Vec::new(),
+    })
+}
+
+/// #5389 — #4268's decline rule applied to the BSTriShape packed
+/// channel: any per-vertex bone index at or above the mesh's own bone
+/// count empties BOTH arrays (the mesh falls back to bind pose) instead
+/// of deforming through whatever stale matrix sits in the palette slot
+/// the index happens to reach. Never clamps — a wrong-bone clamp
+/// silently deforms.
+fn decline_unbounded_packed_indices(
+    indices: &mut Vec<[u16; 4]>,
+    weights: &mut Vec<[f32; 4]>,
+    bone_count: usize,
+) {
+    if indices
+        .iter()
+        .flatten()
+        .any(|&index| index as usize >= bone_count)
+    {
+        log::warn!(
+            "skin: per-vertex bone index >= bone count ({bone_count}) — \
+             declining skin weights (bind pose) rather than guessing a bone (#4268 rule)"
+        );
+        indices.clear();
+        weights.clear();
+    }
+}
+
+/// Packed BSTriShape / SSE global-buffer indices already address the
+/// NiSkinInstance bone list. Widen without applying a partition palette.
+/// NiSkinPartition's *separate* bone_indices array is partition-local.
+///
+/// nifly NifFile::OptimizeFor converts local partition indices into global
+/// vertex.weightBones; UpdateSkinPartitions copies that packed channel to
+/// skinPart->vertData unchanged while building local indices separately.
+/// https://github.com/ousnius/nifly/blob/master/src/NifFile.cpp
+/// Installed SSE Draugr/body/hand data independently confirms agreement
+/// between raw packed indices and expanded partition indices. The former
+/// #613/#2577 remap changed 4,893 of 11,669 weighted lanes in that sample.
+pub fn widen_packed_bone_indices(bone_indices: &[[u8; 4]]) -> Vec<[u16; 4]> {
+    bone_indices
+        .iter()
+        .map(|indices| indices.map(u16::from))
+        .collect()
+}
+
+/// Resolve `shape.skin_ref` → `NiSkinPartition` → `SseSkinGlobalBuffer`
+/// and decode the per-vertex skin payload (4 × half-float weights +
+/// 4 × u8 skin-global bone indices). Returns `None` when the
+/// shape doesn't go through the global-buffer path or the buffer is
+/// missing / malformed.
+///
+/// The caller widens the packed indices without partition remapping.
+/// Decoded SSE skin payload: per-vertex `(weights, skin-global bone
+/// indices)`, returned by [`decode_sse_skin_payload`].
+pub type SseSkinPayload = (Vec<[f32; 4]>, Vec<[u8; 4]>);
+
+pub fn decode_sse_skin_payload(scene: &NifScene, shape: &BsTriShape) -> Option<SseSkinPayload> {
+    let skin_idx = shape.skin_ref.index()?;
+    let partition_ref = if let Some(inst) = scene.get_as::<NiSkinInstance>(skin_idx) {
+        inst.skin_partition_ref
+    } else {
+        let inst = scene.get_as::<BsDismemberSkinInstance>(skin_idx)?;
+        inst.base.skin_partition_ref
+    };
+    let partition_idx = partition_ref.index()?;
+    let partition = scene.get_as::<crate::blocks::skin::NiSkinPartition>(partition_idx)?;
+    let buffer = partition.global_vertex_data.as_ref()?;
+    // BSDynamicTriShape keeps positions outside the partition buffer,
+    // so its descriptor legitimately has VF_VERTEX clear even though
+    // the packed skin lanes are present (#2576). Use the same
+    // shape-aware decoder as geometry reconstruction.
+    let decoded = super::sse_recon::decode_sse_shape_buffer(buffer, shape)?;
+    if decoded.bone_weights.is_empty() {
+        // Buffer was decoded but VF_SKINNED was clear — nothing to
+        // hand back. The caller treats this the same as "no payload"
+        // and falls through to the empty-arrays branch.
+        return None;
+    }
+    Some((decoded.bone_weights, decoded.bone_indices))
+}
+
+/// Build `ImportedBone`s from a NiSkinInstance bone list and NiSkinData
+/// bone entries. The two inputs must have matching lengths (checked by
+/// the caller). Applies Z-up → Y-up conversion to each bind transform.
+pub fn build_imported_bones(
+    scene: &NifScene,
+    bone_refs: &[BlockRef],
+    data: &NiSkinData,
+) -> Option<Vec<ImportedBone>> {
+    let mut bones = Vec::with_capacity(bone_refs.len());
+    for (i, bone_ref) in bone_refs.iter().enumerate() {
+        let name =
+            resolve_node_name(scene, *bone_ref).unwrap_or_else(|| Arc::from(format!("Bone{}", i)));
+        let bone = &data.bones[i];
+        bones.push(ImportedBone {
+            name,
+            bind_inverse: ni_transform_to_yup_matrix(&bone.skin_transform),
+            bounding_sphere: bone.bounding_sphere,
+        });
+    }
+    Some(bones)
+}
+
+/// Resolve a BlockRef pointing to a NiNode to the node's name.
+/// Returns `None` if the ref is null, the block isn't a NiNode, or the
+/// node has no name.
+pub fn resolve_node_name(scene: &NifScene, node_ref: BlockRef) -> Option<Arc<str>> {
+    let idx = node_ref.index()?;
+    let node = scene.get_as::<NiNode>(idx)?;
+    node.av.net.name.clone()
+}
+
+/// Convert a NiTransform to a column-major 4x4 matrix with the Y-up
+/// basis change applied. NiSkinData stores the bind-inverse already —
+/// we just need to reorder rows/columns for glam's column-major layout
+/// and convert Gamebryo Z-up to engine Y-up (90° rotation around X).
+pub fn ni_transform_to_yup_matrix(t: &NiTransform) -> [[f32; 4]; 4] {
+    // Z-up → Y-up basis change matrix C (row vectors for NiMatrix3 style):
+    //   C = [[1, 0, 0], [0, 0, 1], [0, -1, 0]]
+    // For a NiTransform (R, t, s) in Z-up, the Y-up equivalent is:
+    //   R' = C * R * C^T
+    //   t' = C * t
+    //   s  = s
+    let r = &t.rotation.rows;
+    let tx = t.translation.x;
+    let ty = t.translation.y;
+    let tz = t.translation.z;
+
+    // C * R: row-major multiply. C has rows [1,0,0], [0,0,1], [0,-1,0].
+    //   cr[0][j] = r[0][j]
+    //   cr[1][j] = r[2][j]
+    //   cr[2][j] = -r[1][j]
+    let cr = [
+        [r[0][0], r[0][1], r[0][2]],
+        [r[2][0], r[2][1], r[2][2]],
+        [-r[1][0], -r[1][1], -r[1][2]],
+    ];
+    // (C*R) * C^T: columns of C^T are the rows of C.
+    //   cr_ct[i][0] = cr[i][0]
+    //   cr_ct[i][1] = cr[i][2]
+    //   cr_ct[i][2] = -cr[i][1]
+    let rr = [
+        [cr[0][0], cr[0][2], -cr[0][1]],
+        [cr[1][0], cr[1][2], -cr[1][1]],
+        [cr[2][0], cr[2][2], -cr[2][1]],
+    ];
+    // C * t — translation swap through the coord SoT (#1617, bit-identical).
+    // The `cr`/`rr` matrix basis-change above is the rotation-similarity
+    // analog (C·R·Cᵀ), a deliberate parallel — not the position swap.
+    let tt = byroredux_core::math::coord::zup_to_yup_pos([tx, ty, tz]);
+
+    // Pack into column-major 4x4 with uniform scale baked in.
+    let s = t.scale;
+    [
+        [rr[0][0] * s, rr[1][0] * s, rr[2][0] * s, 0.0],
+        [rr[0][1] * s, rr[1][1] * s, rr[2][1] * s, 0.0],
+        [rr[0][2] * s, rr[1][2] * s, rr[2][2] * s, 0.0],
+        [tt[0], tt[1], tt[2], 1.0],
+    ]
+}
+
+/// Build a bind-inverse matrix from a BSSkin::BoneData bone entry.
+/// The row-major 3x3 rotation + translation + scale layout mirrors
+/// NiTransform, so we reuse the same conversion.
+pub fn bs_bone_to_inverse_matrix(b: &crate::blocks::skin::BsSkinBoneTrans) -> [[f32; 4]; 4] {
+    let t = NiTransform {
+        rotation: crate::types::NiMatrix3 { rows: b.rotation },
+        translation: NiPoint3 {
+            x: b.translation[0],
+            y: b.translation[1],
+            z: b.translation[2],
+        },
+        scale: b.scale,
+    };
+    ni_transform_to_yup_matrix(&t)
+}
+
+/// Threshold below which a vertex's four bone weights are treated as
+/// "unweighted". Matches the `wsum < 0.001` branch both
+/// `crates/renderer/shaders/triangle.vert` and
+/// `crates/renderer/shaders/skin_vertices.comp` take, so the import-side
+/// invariant and the shader-side guard agree on where the cliff is.
+pub const UNWEIGHTED_VERTEX_EPSILON: f32 = 0.001;
+
+/// Bind every all-zero weight quad to bone 0 at full weight, matching
+/// the fallback [`densify_sparse_weights`] has always applied on the
+/// classic `NiSkinData` path.
+///
+/// #2467 / REN-D9-NEW-01. The packed-half Skyrim SE / FO4 / Starfield
+/// paths decode per-vertex weights straight out of the vertex buffer
+/// with no renormalise and no zero fallback, so an all-zero quad reaches
+/// the GPU unmodified. There the two skinning shaders **disagree**:
+/// `triangle.vert` substitutes the instance's world matrix (correct
+/// placement for raster), while `skin_vertices.comp` substitutes
+/// identity — and the skinned BLAS it feeds is instanced into the TLAS
+/// with an IDENTITY transform because its vertices are already absolute
+/// world space. A single zero-weight vertex therefore drags that
+/// entity's BLAS AABB from the actor's bounding box out to the world
+/// origin: in an exterior cell, a ~10^5-unit sliver that every shadow /
+/// reflection / GI ray must intersect-test, presenting as an
+/// unexplained RT perf cliff with raster showing nothing wrong.
+///
+/// Binding to bone 0 (rather than leaving zeros for the shaders to
+/// paper over) keeps the vertex inside the actor under *both* paths and
+/// makes the shaders' defensive branches unreachable on imported
+/// content. Returns the number of vertices rebound, for callers that
+/// want to log the gap.
+///
+/// Trailing entries of the longer vector are left alone — a
+/// weights/indices length mismatch is the caller's contract violation,
+/// not something to silently paper over here.
+pub fn bind_unweighted_to_bone_zero(indices: &mut [[u16; 4]], weights: &mut [[f32; 4]]) -> usize {
+    let mut rebound = 0;
+    for (idx, w) in indices.iter_mut().zip(weights.iter_mut()) {
+        // NaN weights sum to NaN, which fails `< EPSILON` and would slip
+        // through; test the finite sum explicitly so a corrupt payload
+        // is rebound rather than propagated.
+        let sum = w[0] + w[1] + w[2] + w[3];
+        if sum.is_finite() && sum >= UNWEIGHTED_VERTEX_EPSILON {
+            continue;
+        }
+        *idx = [0, 0, 0, 0];
+        *w = [1.0, 0.0, 0.0, 0.0];
+        rebound += 1;
+    }
+    rebound
+}
+
+/// Densify sparse per-bone weight lists to per-vertex `[bone_idx; 4]` +
+/// `[weight; 4]` arrays. Keeps the 4 highest contributions per vertex
+/// and re-normalizes so the weights sum to 1.0.
+///
+/// Vertices with no bone contribution get `([0, 0, 0, 0], [1, 0, 0, 0])`
+/// which binds them to bone 0 with full weight — safer than all-zeros
+/// which would collapse to the origin during matrix palette skinning.
+pub fn densify_sparse_weights(
+    num_vertices: usize,
+    data: &NiSkinData,
+) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+    // Per-vertex sorted top-4 contributions. Initialized to
+    // (u16::MAX, 0.0) so missing slots are obviously invalid until
+    // we replace them. Pre-#613 the slot type was `u8` and any
+    // NiSkinData with > 256 bones silently dropped every weight
+    // past index 255 — same semantic gap as the BsTriShape side
+    // that #613 fixes; widening the type covers both paths.
+    const VACANT: u16 = u16::MAX;
+    let mut per_vertex: Vec<[(u16, f32); 4]> = vec![[(VACANT, 0.0f32); 4]; num_vertices];
+
+    for (bone_idx, bone) in data.bones.iter().enumerate() {
+        // NiSkinData carries the global bone list directly — index
+        // is a u16 with no partition splitting. Cap at u16::MAX so
+        // the sentinel above stays distinguishable.
+        let bone_u16 = if bone_idx < VACANT as usize {
+            bone_idx as u16
+        } else {
+            continue;
+        };
+        for vw in &bone.vertex_weights {
+            let v = vw.vertex_index as usize;
+            if v >= num_vertices {
+                continue;
+            }
+            let slots = &mut per_vertex[v];
+
+            // Find the slot with the smallest current weight; replace
+            // it if our weight is larger. This runs O(4) per weight
+            // entry which is negligible for typical meshes.
+            let (min_slot, min_weight) = slots
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    a.1 .1
+                        .partial_cmp(&b.1 .1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, s)| (i, s.1))
+                .unwrap_or((0, 0.0));
+
+            if vw.weight > min_weight {
+                slots[min_slot] = (bone_u16, vw.weight);
+            }
+        }
+    }
+
+    let mut vertex_bone_indices = Vec::with_capacity(num_vertices);
+    let mut vertex_bone_weights = Vec::with_capacity(num_vertices);
+
+    for slots in &per_vertex {
+        let total: f32 = slots
+            .iter()
+            .filter(|(b, _)| *b != VACANT)
+            .map(|(_, w)| *w)
+            .sum();
+
+        if total <= f32::EPSILON {
+            // No contribution — bind to bone 0 so matrix palette
+            // skinning doesn't collapse the vertex to the origin.
+            vertex_bone_indices.push([0, 0, 0, 0]);
+            vertex_bone_weights.push([1.0, 0.0, 0.0, 0.0]);
+            continue;
+        }
+
+        let inv = 1.0 / total;
+        let mut idx = [0u16; 4];
+        let mut w = [0.0f32; 4];
+        for (i, (b, weight)) in slots.iter().enumerate() {
+            if *b != VACANT {
+                idx[i] = *b;
+                w[i] = *weight * inv;
+            }
+        }
+        vertex_bone_indices.push(idx);
+        vertex_bone_weights.push(w);
+    }
+
+    (vertex_bone_indices, vertex_bone_weights)
+}

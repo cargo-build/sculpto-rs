@@ -1,0 +1,456 @@
+//! Stable, load-order-independent record identity.
+//!
+//! Legacy Gamebryo/Creation Engine Form IDs encode the plugin's load-order
+//! slot in the upper 8 bits — meaning the same record gets a different ID
+//! depending on what other plugins are loaded. This module replaces that
+//! with a two-layer scheme:
+//!
+//! - **[`FormIdPair`]** — the canonical identity: `(PluginId, LocalFormId)`.
+//!   Stable across sessions, serialized to saves and manifests.
+//! - **[`FormId`]** — a runtime handle interned via [`FormIdPool`].
+//!   Integer comparison, O(1). Same pattern as
+//!   [`FixedString`](crate::string::FixedString) / [`StringPool`](crate::string::StringPool).
+//!
+//! Legacy Form IDs are converted at load time by deriving a deterministic
+//! [`PluginId`] from the plugin filename (UUID v5), then pairing it with
+//! the 24-bit local ID. After conversion there is no distinction between
+//! legacy and Redux-native plugins.
+
+use crate::ecs::components::FormIdComponent;
+use crate::ecs::resource::Resource;
+use crate::ecs::storage::EntityId;
+use crate::ecs::QueryRead;
+use rustc_hash::FxHashMap;
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+use uuid::Uuid;
+
+/// Fixed UUID v5 namespace for deriving [`PluginId`] from legacy filenames.
+/// Generated once, used everywhere — ensures the same .esm always maps to
+/// the same PluginId regardless of load order or session.
+const PLUGIN_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x67, 0x61, 0x6d, 0x65, // "game"
+    0x62, 0x79, // "by"
+    0x72, 0x6f, // "ro"
+    0x2d, 0x72, // "-r"
+    0x65, 0x64, 0x75, 0x78, // "edux"
+    0x21, 0x00, // "!\0"
+]);
+
+// ── Runtime handle ──────────────────────────────────────────────────────
+
+/// Runtime form identifier. Integer comparison, O(1).
+///
+/// Never stored in saves — this is a session-local handle into
+/// [`FormIdPool`]. Use [`FormIdPair`] for anything that must survive
+/// across sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FormId(u64);
+
+// ── Stable identity types ───────────────────────────────────────────────
+
+/// Content-addressed plugin identifier.
+///
+/// For legacy files: deterministic UUID v5 derived from the filename,
+/// so `Skyrim.esm` always produces the same `PluginId` regardless of
+/// load order.
+///
+/// For Redux-native plugins: declared UUID in the plugin manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PluginId(pub u128);
+
+// `PluginId` is a 128-bit UUID; `serde_json::Value`'s number type tops out
+// at `u64`, so a raw-number derive fails with "number out of range" for any
+// real plugin id. Serialise as a fixed 32-char lowercase hex string instead
+// — Value-safe and human-legible in a save dump.
+#[cfg(feature = "inspect")]
+impl serde::Serialize for PluginId {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&format!("{:032x}", self.0))
+    }
+}
+
+#[cfg(feature = "inspect")]
+impl<'de> serde::Deserialize<'de> for PluginId {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = <std::string::String as serde::Deserialize>::deserialize(de)?;
+        u128::from_str_radix(&s, 16)
+            .map(PluginId)
+            .map_err(|e| serde::de::Error::custom(format!("invalid PluginId hex '{s}': {e}")))
+    }
+}
+
+impl PluginId {
+    /// Derive a deterministic `PluginId` from a legacy plugin filename.
+    ///
+    /// Uses UUID v5 with a fixed engine namespace so the same filename
+    /// always produces the same identity.
+    ///
+    /// ```
+    /// # use byroredux_core::form_id::PluginId;
+    /// let a = PluginId::from_filename("Skyrim.esm");
+    /// let b = PluginId::from_filename("Skyrim.esm");
+    /// assert_eq!(a, b);
+    ///
+    /// let c = PluginId::from_filename("Dawnguard.esm");
+    /// assert_ne!(a, c);
+    /// ```
+    pub fn from_filename(name: &str) -> Self {
+        let uuid = Uuid::new_v5(&PLUGIN_NAMESPACE, name.as_bytes());
+        Self(uuid.as_u128())
+    }
+
+    /// Create a `PluginId` from an existing UUID (for native plugin manifests).
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid.as_u128())
+    }
+
+    /// Convert back to a [`Uuid`]. Test-only — pins the `from_uuid`
+    /// round trip (#6192).
+    #[cfg(test)]
+    pub fn as_uuid(&self) -> Uuid {
+        Uuid::from_u128(self.0)
+    }
+}
+
+/// A record's identity within its originating plugin.
+///
+/// For legacy files this is the lower 24 bits of the original Form ID.
+/// For Redux-native plugins this is assigned by the plugin author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct LocalFormId(pub u32);
+
+/// The canonical, load-order-independent identity of a record.
+///
+/// This is what gets written to save files and plugin manifests.
+/// At runtime it is interned into a [`FormId`] via [`FormIdPool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct FormIdPair {
+    pub plugin: PluginId,
+    pub local: LocalFormId,
+}
+
+/// Reserved `FormIdPair` for the player character body — the one entity
+/// in the engine with no corresponding plugin-authored record, so it
+/// can't get a `FormIdPair` the normal way (deriving from a legacy
+/// filename or a native plugin's declared UUID).
+///
+/// `PluginId::from_filename`'s UUID v5 derivation can never produce
+/// `u128::MAX`: RFC 4122 fixes the version nibble to `0101` and the
+/// variant bits to `10`, so at least two bits of every v5 UUID are
+/// never `1`. A native plugin manifest could in principle declare this
+/// exact UUID, but that would require deliberately colliding with a
+/// reserved engine sentinel — not a real-world risk.
+///
+/// Attaching a `FormIdComponent` built from this pair to the player
+/// body (see `byroredux::scene::setup_scene`) makes the player a normal
+/// remappable entity for the M45.1 live-load `old -> live` remap
+/// (`build_form_id_remap` in `byroredux-save`) — the same mechanism
+/// every NPC's `FormIdComponent` already uses. Without it, any
+/// persistable component landing on the player body (inventory,
+/// equipment, actor values) is captured to disk but silently dropped on
+/// every live load, because `build_form_id_remap` has no pair to match
+/// it against. See #1846 / SAVE-03.
+pub const PLAYER_FORM_ID_PAIR: FormIdPair = FormIdPair {
+    plugin: PluginId(u128::MAX),
+    local: LocalFormId(1),
+};
+
+// ── Runtime interning pool ──────────────────────────────────────────────
+
+/// Maps [`FormIdPair`] ↔ [`FormId`]. Same pattern as
+/// [`StringPool`](crate::string::StringPool) /
+/// [`FixedString`](crate::string::FixedString).
+///
+/// Register as a global [`Resource`] on the [`World`](crate::ecs::world::World):
+///
+/// `text`, not `ignore` (#3348): `world` is not in scope here, so this can
+/// never compile — under `ignore` it was still *built* by
+/// `cargo test -- --ignored` and failed there, reddening the sweep.
+/// ```text
+/// world.insert_resource(FormIdPool::new());
+/// ```
+pub struct FormIdPool {
+    to_runtime: HashMap<FormIdPair, FormId>,
+    to_pair: Vec<FormIdPair>,
+    /// Lazily rebuilt `local → entity` index behind [`Self::entity_with_local`] (#6338).
+    entity_index: Mutex<EntityIndex>,
+}
+
+/// What [`FormIdPool::entity_with_local`] was last built from, and the result.
+#[derive(Default)]
+struct EntityIndex {
+    /// `(FormIdComponent structural generation, pool length)` of the build; `None` before the first.
+    key: Option<(u64, usize)>,
+    by_local: FxHashMap<u32, EntityId>,
+}
+
+impl FormIdPool {
+    pub fn new() -> Self {
+        Self {
+            to_runtime: HashMap::new(),
+            to_pair: Vec::new(),
+            entity_index: Mutex::default(),
+        }
+    }
+
+    /// Intern a [`FormIdPair`], returning its runtime [`FormId`].
+    /// If the pair was already interned, returns the existing handle.
+    pub fn intern(&mut self, pair: FormIdPair) -> FormId {
+        if let Some(&id) = self.to_runtime.get(&pair) {
+            return id;
+        }
+        let id = FormId(self.to_pair.len() as u64);
+        self.to_pair.push(pair);
+        self.to_runtime.insert(pair, id);
+        id
+    }
+
+    /// Resolve a runtime [`FormId`] back to its canonical [`FormIdPair`].
+    pub fn resolve(&self, id: FormId) -> Option<&FormIdPair> {
+        self.to_pair.get(id.0 as usize)
+    }
+
+    /// The plugin-local value of a runtime [`FormId`]: `resolve(id).local.0`. This is the
+    /// "global form id" the record index, the script ledgers and every FormID-keyed save
+    /// table are keyed by (the loader remaps a record's FormID into the load order before it
+    /// is interned), so each reader of it goes through here rather than spelling the walk
+    /// again (#6351).
+    pub fn local_of(&self, id: FormId) -> Option<u32> {
+        self.resolve(id).map(|pair| pair.local.0)
+    }
+
+    /// Look up a [`FormIdPair`] without interning it.
+    /// Returns `None` if the pair has never been interned.
+    pub fn get(&self, pair: &FormIdPair) -> Option<FormId> {
+        self.to_runtime.get(pair).copied()
+    }
+
+    /// The entity whose [`FormIdComponent`] resolves to plugin-local value `local`, or `None`.
+    ///
+    /// Answered from an index built once per `FormIdComponent` membership change instead of
+    /// scanning every tagged entity per call (about 4 µs at 2 k entities, 65–131 µs at 30–60 k;
+    /// #6338): the Flee / UseWeapon package systems resolve a target per actor per frame, and a
+    /// target that lives in another cell would otherwise cost a full miss scan every frame. The
+    /// key is the storage's structural generation (the component opts into `TRACK_CHANGES`, so
+    /// insert, overwrite, removal, batch despawn and clear all move it) plus this pool's length;
+    /// `FormIdComponent` is never mutated in place. A duplicate `local` resolves to the first
+    /// entity in storage order, exactly as the scan did.
+    ///
+    /// The interior [`Mutex`] is a leaf: nothing else is acquired while it is held.
+    pub fn entity_with_local(
+        &self,
+        members: &QueryRead<'_, FormIdComponent>,
+        local: u32,
+    ) -> Option<EntityId> {
+        let key = (members.storage().structural_generation(), self.len());
+        let mut index = self
+            .entity_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if index.key != Some(key) {
+            index.by_local.clear();
+            for (entity, form) in members.iter() {
+                if let Some(local) = self.local_of(form.0) {
+                    index.by_local.entry(local).or_insert(entity);
+                }
+            }
+            index.key = Some(key);
+        }
+        index.by_local.get(&local).copied()
+    }
+
+    /// What the current index build was keyed on (tests pin that a repeat lookup reuses it).
+    #[cfg(test)]
+    fn entity_index_key(&self) -> Option<(u64, usize)> {
+        self.entity_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .key
+    }
+
+    /// Number of interned form IDs.
+    pub fn len(&self) -> usize {
+        self.to_pair.len()
+    }
+
+    /// Returns `true` if no form IDs have been interned.
+    pub fn is_empty(&self) -> bool {
+        self.to_pair.is_empty()
+    }
+}
+
+impl Default for FormIdPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Resource for FormIdPool {}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ecs::World;
+
+    // ── entity index (#6338) ────────────────────────────────────────────
+
+    fn world_with_pool() -> World {
+        let mut world = World::new();
+        world.register::<FormIdComponent>();
+        world.insert_resource(FormIdPool::new());
+        world
+    }
+
+    fn place(world: &mut World, local: u32) -> EntityId {
+        let pair = FormIdPair {
+            plugin: PluginId::from_filename("Skyrim.esm"),
+            local: LocalFormId(local),
+        };
+        let handle = world.resource_mut::<FormIdPool>().intern(pair);
+        let entity = world.spawn();
+        world.insert(entity, FormIdComponent(handle));
+        entity
+    }
+
+    #[test]
+    fn entity_with_local_reuses_its_build_until_the_membership_moves() {
+        let mut world = world_with_pool();
+        let a = place(&mut world, 0x10);
+        let lookup = |world: &World, local: u32| {
+            let members = world.query::<FormIdComponent>().unwrap();
+            world
+                .resource::<FormIdPool>()
+                .entity_with_local(&members, local)
+        };
+        assert_eq!(lookup(&world, 0x10), Some(a));
+        let built = world.resource::<FormIdPool>().entity_index_key();
+        assert!(built.is_some(), "the first lookup builds the index");
+        for _ in 0..3 {
+            assert_eq!(
+                lookup(&world, 0x99),
+                None,
+                "a miss is answered from the same build"
+            );
+        }
+        assert_eq!(
+            world.resource::<FormIdPool>().entity_index_key(),
+            built,
+            "no rebuild without a change"
+        );
+        let b = place(&mut world, 0x20);
+        assert_eq!(lookup(&world, 0x20), Some(b), "a spawn re-keys the index");
+        assert_ne!(world.resource::<FormIdPool>().entity_index_key(), built);
+        world.despawn(a);
+        assert_eq!(lookup(&world, 0x10), None, "a despawn re-keys it again");
+    }
+
+    // ── PluginId ────────────────────────────────────────────────────────
+
+    #[test]
+    fn plugin_id_from_filename_deterministic() {
+        let a = PluginId::from_filename("Skyrim.esm");
+        let b = PluginId::from_filename("Skyrim.esm");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_filenames_different_plugin_ids() {
+        let a = PluginId::from_filename("Skyrim.esm");
+        let b = PluginId::from_filename("Dawnguard.esm");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn plugin_id_uuid_round_trip() {
+        let original = PluginId::from_filename("Fallout4.esm");
+        let uuid = original.as_uuid();
+        let restored = PluginId::from_uuid(uuid);
+        assert_eq!(original, restored);
+    }
+
+    // ── FormIdPool ──────────────────────────────────────────────────────
+
+    fn test_pair(plugin_name: &str, local: u32) -> FormIdPair {
+        FormIdPair {
+            plugin: PluginId::from_filename(plugin_name),
+            local: LocalFormId(local),
+        }
+    }
+
+    #[test]
+    fn local_of_is_the_resolved_pairs_local_value() {
+        let mut pool = FormIdPool::new();
+        let id = pool.intern(test_pair("Skyrim.esm", 0x0001_4D8A));
+        assert_eq!(pool.local_of(id), Some(0x0001_4D8A));
+        assert_eq!(
+            pool.local_of(FormId(99)),
+            None,
+            "an id that was never interned"
+        );
+    }
+
+    #[test]
+    fn intern_same_pair_returns_same_id() {
+        let mut pool = FormIdPool::new();
+        let pair = test_pair("Skyrim.esm", 0x000014);
+        let a = pool.intern(pair);
+        let b = pool.intern(pair);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_pairs_different_ids() {
+        let mut pool = FormIdPool::new();
+        let a = pool.intern(test_pair("Skyrim.esm", 0x000014));
+        let b = pool.intern(test_pair("Skyrim.esm", 0x000015));
+        let c = pool.intern(test_pair("Dawnguard.esm", 0x000014));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn resolve_round_trips() {
+        let mut pool = FormIdPool::new();
+        let pair = test_pair("Skyrim.esm", 0xABC);
+        let id = pool.intern(pair);
+        let resolved = pool.resolve(id).unwrap();
+        assert_eq!(*resolved, pair);
+    }
+
+    #[test]
+    fn get_without_interning() {
+        let mut pool = FormIdPool::new();
+        let pair = test_pair("Skyrim.esm", 0x001);
+        assert!(pool.get(&pair).is_none());
+
+        let id = pool.intern(pair);
+        assert_eq!(pool.get(&pair), Some(id));
+
+        let other = test_pair("Skyrim.esm", 0x002);
+        assert!(pool.get(&other).is_none());
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let mut pool = FormIdPool::new();
+        assert!(pool.is_empty());
+        assert_eq!(pool.len(), 0);
+
+        pool.intern(test_pair("Skyrim.esm", 0x001));
+        assert!(!pool.is_empty());
+        assert_eq!(pool.len(), 1);
+
+        pool.intern(test_pair("Skyrim.esm", 0x002));
+        assert_eq!(pool.len(), 2);
+
+        // Re-interning doesn't grow.
+        pool.intern(test_pair("Skyrim.esm", 0x001));
+        assert_eq!(pool.len(), 2);
+    }
+}

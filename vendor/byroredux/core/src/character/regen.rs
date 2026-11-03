@@ -1,0 +1,705 @@
+//! Pool regeneration (CHARAL) — Fatigue/Magicka per-second rates and the
+//! Fallout ActionPoints lane (#6350), driven by a **fixed 60 Hz tick**
+//! decoupled from the variable per-frame rate. Live today for FO3/FNV
+//! ActionPoints only; the Fatigue/Magicka lanes are inert (no Fallout load
+//! order resolves those AVIFs, and Oblivion has no wired ruleset, #3768).
+//!
+//! ## Why fixed-timestep
+//!
+//! Every regen rate sourced so far (`docs/engine/charal-oblivion-ruleset.md`)
+//! is expressed as points **per real-time second**, not per-frame — applying
+//! `rate × frame_dt` directly would make regen frame-rate-dependent (a 30 fps
+//! run and a 144 fps run would heal at different *simulated* rates due to
+//! floating-point step-size differences accumulating differently). The fix is
+//! the same one [`crates/physics`] already uses for its own fixed-step
+//! simulation: accumulate the variable frame `dt` into a resource and drain
+//! it in fixed `POOL_REGEN_DT` (1/60 s) increments, with a substep cap so a
+//! hitch or a load stall can't dump minutes of regen into a single frame.
+//! This is the **first CHARAL system** to need this — every other CHARAL
+//! consumer (`derived_value`, `affliction_tick_system`) is stateless /
+//! evaluated on demand, not time-integrated.
+//!
+//! ## Sourced formulas (classic Oblivion, 2006 Gamebryo — Remastered's
+//! diverging regen math is out of scope, matching
+//! [`super::tes::oblivion_health_gain_per_level`])
+//!
+//! * **Fatigue**: flat `10`/sec — `fFatigueReturnBase=10.0`,
+//!   `fFatigureReturnMult=0.0` (the Endurance term ships at coefficient zero
+//!   in vanilla).
+//! * **Health**: **no passive regen at all** — deliberately not modeled here.
+//! * **Magicka**: `(Willpower × 0.02 + 0.75) × (MaxMagicka / 100)`. Stunted
+//!   Magicka (Atronach birthsign / *Astral Vapors* disease / one Shivering
+//!   Isles item) zeroes this entirely, but no status-effect component exists
+//!   yet to carry that flag anywhere in the engine — [`magicka_regen_per_sec`]
+//!   accepts a `stunted` parameter so the *formula* is complete, but
+//!   [`pool_regen_tick_system`] always passes `false` today. Revisit once a
+//!   status-effect component exists (same "mechanism ahead of its data"
+//!   deferral already used for `affliction`'s real threshold tables).
+
+use super::components::CharacterLevel;
+use super::derived::DerivedScope;
+use super::ruleset::CharacterRuleset;
+use crate::ecs::components::ActorValues;
+use crate::ecs::resource::Resource;
+use crate::ecs::world::World;
+
+/// Fixed regen tick — 60 Hz. Matches `crates/physics::PHYSICS_DT`, the only
+/// other fixed-timestep precedent in the engine.
+pub const POOL_REGEN_DT: f32 = 1.0 / 60.0;
+
+/// Spiral-of-death guard: caps how many 60 Hz ticks a single frame can catch
+/// up on (a load/hitch shouldn't dump a large batch of regen at once).
+///
+/// **Not** a mirror of `crates/physics`'s substep cap, despite the shared
+/// accumulator shape (#2953). That cap is `5`; this one is `8`, so after a
+/// hitch the two fixed clocks catch up at different rates — regen advances up
+/// to ~133 ms of simulated pool time in one frame where physics advances at
+/// most ~83 ms. The clamp bodies are otherwise identical; this constant is the
+/// only divergence.
+///
+/// The `8` has no recorded rationale in the introducing commit and no capture
+/// document specifies it (it is an engine tuning choice, not a game rule), so
+/// it is left as-is rather than "corrected" to `5` on the strength of a stale
+/// comment. `crates/core` cannot depend on `crates/physics` (the dependency
+/// runs the other way), so this can only ever be a hand-copy — which is
+/// exactly how it drifted. Any future attempt to genuinely unify the two
+/// clocks needs a shared home for the constant, not a comment asserting
+/// parity.
+///
+/// Also unlike physics, regen has no wall-clock escape hatch: `crates/physics`
+/// carries a second guard (`SUBSTEP_TIME_BUDGET`) that abandons substeps when
+/// the step itself runs long. Regen has no analogue, so this count is its only
+/// bound.
+const MAX_REGEN_SUBSTEPS: u32 = 8;
+
+/// Fatigue's flat per-second regen rate (`fFatigueReturnBase`) — vanilla
+/// Oblivion's Endurance coefficient (`fFatigueReturnMult`) is `0.0`, so this
+/// is the whole formula, not an approximation.
+pub const FATIGUE_REGEN_PER_SEC: f32 = 10.0;
+
+/// Magicka regen's Willpower coefficient (`fMagickaReturnMult`).
+pub const MAGICKA_REGEN_WILLPOWER_COEFF: f32 = 0.02;
+/// Magicka regen's bias term (`fMagickaReturnBase`).
+pub const MAGICKA_REGEN_BASE: f32 = 0.75;
+
+/// `(Willpower × 0.02 + 0.75) × (MaxMagicka / 100)`, or `0.0` while
+/// `stunted` (Stunted Magicka — see module docs for why this is always
+/// `false` from the tick system today).
+#[must_use]
+pub fn magicka_regen_per_sec(willpower: f32, max_magicka: f32, stunted: bool) -> f32 {
+    if stunted || max_magicka <= 0.0 {
+        return 0.0;
+    }
+    (willpower * MAGICKA_REGEN_WILLPOWER_COEFF + MAGICKA_REGEN_BASE) * (max_magicka / 100.0)
+}
+
+/// Cross-frame accumulator driving the fixed 60 Hz regen tick — a `Resource`,
+/// one global clock shared by every actor (mirrors `PhysicsWorld`'s single
+/// accumulator field, not a per-entity one).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolRegenAccumulator {
+    accumulator: f32,
+}
+
+impl Resource for PoolRegenAccumulator {}
+
+impl PoolRegenAccumulator {
+    /// Advance by the frame's variable `dt`, returning how many complete
+    /// `POOL_REGEN_DT` ticks have now elapsed (0 on a very short frame).
+    /// Clamps the internal accumulator to `MAX_REGEN_SUBSTEPS ×
+    /// POOL_REGEN_DT` first, so a hitch/load stall can't produce an
+    /// unbounded catch-up.
+    pub fn advance(&mut self, frame_dt: f32) -> u32 {
+        self.accumulator += frame_dt.max(0.0);
+        let max_acc = MAX_REGEN_SUBSTEPS as f32 * POOL_REGEN_DT;
+        if self.accumulator > max_acc {
+            self.accumulator = max_acc;
+        }
+        let ticks = (self.accumulator / POOL_REGEN_DT).floor() as u32;
+        self.accumulator -= ticks as f32 * POOL_REGEN_DT;
+        ticks
+    }
+}
+
+/// Per-game resolved AVIF ids the regen tick needs — a `Resource`.
+///
+/// **Inserted in production for FO3/FNV only** (#6350):
+/// `build_vats_model` (`byroredux/src/npc_spawn.rs`) returns it with the
+/// [`ActionPointsRegen`] lane, and the cell loader installs it on the first
+/// cell load. Every other game takes [`pool_regen_tick_system`]'s `let … else`
+/// early return, and on FO3/FNV the Fatigue/Magicka/Willpower ids are `0`
+/// (no actor carries AV 0, so those lanes stay inert).
+///
+/// Oblivion once had a `tes::oblivion_pool_regen_config` constructor for
+/// this; it was deleted under #3848 because it had zero call sites
+/// anywhere, tests included, and cannot acquire one until Oblivion gets a
+/// pre-`AVIF` actor-value resolver (#3768). `git show` recovers it if a
+/// wiring pass wants the Fatigue/Magicka/Willpower EditorID set back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PoolRegenConfig {
+    pub fatigue_avif: u32,
+    pub magicka_avif: u32,
+    pub willpower_avif: u32,
+    /// #6350 — the Fallout ActionPoints lane. `None` on the TES games
+    /// (and on any Fallout load whose AP AVIF failed to resolve, which
+    /// disables regen rather than force-populating a zero entry — the
+    /// same degraded rule the fatigue lane's per-actor `get` check
+    /// applies below).
+    pub action_points: Option<ActionPointsRegen>,
+}
+
+impl Resource for PoolRegenConfig {}
+
+/// #6350 — ActionPoints regen on the same fixed 60 Hz tick as Fatigue.
+///
+/// The authored GMST (`fActionPointsRestoreRate`) differs in both value
+/// and unit across the two games that author it: FO3 ships `4` — per
+/// second — while FNV ships `0.06` — per frame, the source of the
+/// 30-vs-60 fps regen divergence FNV inherited from FO3's engine. On
+/// this fixed tick the per-frame semantics convert once, at install,
+/// to `0.06 × 60 = 3.6` per second: the deterministic 60 Hz behaviour,
+/// not the bug.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActionPointsRegen {
+    pub avif: u32,
+    /// Points per second, already unit-normalized by the installer
+    /// (see [`VatsModel::ap_regen_per_second`]).
+    pub per_second: f32,
+}
+
+/// The fixed-60Hz regen tick. Registered as an ordinary variable-`dt` system
+/// (same signature every scheduler system uses); internally drains
+/// [`PoolRegenAccumulator`] and applies `rate × elapsed` to every actor that
+/// carries the configured pools — actors missing [`PoolRegenConfig`]'s AVIF
+/// ids (a different game, or an entity that isn't a full actor) are simply
+/// skipped, not force-populated with a zero entry.
+///
+/// Gated on **two** resources, not one (#2950), and — since #3483 — on
+/// exactly those two:
+///
+/// * [`PoolRegenConfig`] — per-game resolved AVIF ids, arriving only with
+///   Oblivion's wiring (blocked on the pre-AVIF actor-value resolver,
+///   #3768). Not "when a live [`CharacterRuleset`] lands" — four games
+///   have carried one since #3170/#3848 with no config following, because
+///   the config is Oblivion-shaped (#4460).
+/// * [`PoolRegenAccumulator`] — the cross-frame clock, inserted unconditionally
+///   at boot (`byroredux/src/boot/world.rs`, `build_world`).
+///
+/// Both are `try_resource` lookups and `World` does **not** default-insert, so
+/// a missing accumulator silently returns at the second line — indistinguishable
+/// from "no game loaded" at a glance. The accumulator is armed at boot precisely
+/// so the config is the only outstanding precondition.
+///
+/// [`CharacterRuleset`] is **not** a third gate (#3483). It is read only by
+/// the Magicka branch, to decide whether the max-Magicka row is
+/// actor-general; Fatigue's rate is the flat [`FATIGUE_REGEN_PER_SEC`]
+/// constant and reads no ruleset row at all. Acquiring it as a hard
+/// precondition made a load that resolved the regen AVIFs but no ruleset
+/// lose *both* pools silently — the same failure mode #2950 was filed for,
+/// but undocumented, since this docstring listed only the two gates above.
+/// The acquire stays here (before the [`ActorValues`] query) rather than
+/// moving inside the loop: that order is the one half of the #3441
+/// lock-order pair this system is responsible for holding.
+///
+/// Also a no-op if less than one 60 Hz tick has elapsed.
+pub fn pool_regen_tick_system(world: &World, frame_dt: f32) {
+    let Some(config_guard) = world.try_resource::<PoolRegenConfig>() else {
+        return;
+    };
+    // Copy out and drop the guard immediately (#2153, corrected by #3444) —
+    // `PoolRegenConfig` is `Copy`, so nothing downstream needs the resource
+    // lock itself, only its three AVIF ids. Holding it across the
+    // `CharacterRuleset` acquire below built a 3-deep stack
+    // (`PoolRegenConfig` -> `CharacterRuleset` -> `ActorValues`) whose only
+    // correctness argument was "this system is registered exclusive" — true
+    // today, but unstated here and not enforced by the lock order itself.
+    // Dropping it here reduces the hold-stack to 2 for the rest of the
+    // function, matching how `accumulator` is already dropped before
+    // `elapsed` is used.
+    //
+    // #3444 — a bound `let config = *config;` SHADOWS the old binding; it
+    // does not move or drop the `ResourceRead` guard, so the guard's `Drop`
+    // (the thing that actually calls `lock_tracker::untrack`) still ran at
+    // end-of-function-scope, leaving the real hold-stack at 3 despite the
+    // comment above claiming 2. A distinctly-named `config_guard` binding
+    // lets `drop(config_guard)` name (and actually drop) it explicitly,
+    // mirroring `accumulator`'s own `drop(accumulator);` a few lines below.
+    let config = *config_guard;
+    drop(config_guard);
+    let Some(mut accumulator) = world.try_resource_mut::<PoolRegenAccumulator>() else {
+        return;
+    };
+    let ticks = accumulator.advance(frame_dt);
+    drop(accumulator);
+    if ticks == 0 {
+        return;
+    }
+    let elapsed = ticks as f32 * POOL_REGEN_DT;
+
+    // #3483 — optional, not a gate. `None` disables only the scoped-max
+    // lookup below, which already has a `base_max` fallback for the
+    // player-only rows it declines; Fatigue is unaffected either way.
+    let ruleset = world.try_resource::<CharacterRuleset>();
+    let Some(mut avs_q) = world.query_mut::<ActorValues>() else {
+        return;
+    };
+    for (entity, avs) in avs_q.iter_mut() {
+        // #4104 (D4-02) — the scoped-max lookup below evaluates a
+        // `DerivedStatFormula` that may read `DerivedInput::LEVEL`; the
+        // entity's own level, not a hardcoded stand-in, is what that
+        // formula needs. A single-component `world.get` (not a paired
+        // query) so an `ActorValues`-only world — no entity has
+        // `CharacterLevel` at all, e.g. every regen test fixture but the
+        // one this fix added — degrades to the documented `1` fallback
+        // instead of no-oping the whole system for want of a storage that
+        // was never going to exist.
+        let level = world.get::<CharacterLevel>(entity).map_or(1, |cl| cl.level);
+        if avs.get(config.fatigue_avif).is_some() {
+            avs.restore(config.fatigue_avif, FATIGUE_REGEN_PER_SEC * elapsed);
+        }
+        // #6350 — the AP lane: flat per-second restore on the same tick,
+        // actors without the AV simply skip it. VATS needs no special
+        // case here: the mode freezes world dt (Phase 3b), and a frozen
+        // accumulator advances zero ticks — regen pauses inside VATS for
+        // free, matching vanilla.
+        if let Some(ap) = config.action_points {
+            if avs.get(ap.avif).is_some() {
+                avs.restore(ap.avif, ap.per_second * elapsed);
+            }
+        }
+        if let Some(base_max) = avs.get(config.magicka_avif).map(|av| av.base) {
+            let willpower = avs.current(config.willpower_avif);
+            // #2932 — honour `DerivedScope`, which `derived_value`
+            // deliberately does NOT enforce (it is a caller contract; the
+            // sibling consumer in `scripting/condition.rs` checks it). This
+            // loop runs over EVERY entity carrying `ActorValues`, and
+            // Oblivion's max-Magicka formula is `.player_only()` precisely
+            // because NPCs ship baked pool values. Evaluating it here gave
+            // every NPC a regen rate derived from the player-only
+            // `2 × Intelligence` curve instead of its own baked base.
+            //
+            // Actor-general rows still resolve through the ruleset; player-
+            // only ones fall back to the actor's own base layer, which is the
+            // value the formula exists to approximate. The old
+            // `.unwrap_or(0.0)` was the same gap seen from the other side: an
+            // actor with a populated Magicka pool but no matching row
+            // regenerated nothing at all.
+            let scoped_max = ruleset.as_ref().and_then(|ruleset| {
+                ruleset
+                    .derived_formula(config.magicka_avif)
+                    .filter(|f| f.scope == DerivedScope::ActorGeneral)
+                    .and_then(|_| ruleset.derived_value(config.magicka_avif, avs, level))
+            });
+            let max_magicka = scoped_max.unwrap_or(base_max);
+            let rate = magicka_regen_per_sec(willpower, max_magicka, false);
+            avs.restore(config.magicka_avif, rate * elapsed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// #6350 — the ActionPoints lane restores on the same fixed tick at
+    /// the unit-normalized per-second rate, skips actors without the AV,
+    /// and stays inert when the lane is `None` (the TES games).
+    #[test]
+    fn action_points_regen_restores_at_the_normalized_rate() {
+        const AP: u32 = 0x2A;
+        let mut world = World::new();
+        world.insert_resource(PoolRegenConfig {
+            fatigue_avif: 0x01,
+            magicka_avif: 0x10,
+            willpower_avif: 0x11,
+            action_points: Some(ActionPointsRegen {
+                avif: AP,
+                // FNV's authored 0.06 per frame, normalized to per-second.
+                per_second: 3.6,
+            }),
+        });
+        world.insert_resource(PoolRegenAccumulator::default());
+        let entity = world.spawn();
+        let mut avs = ActorValues::default();
+        avs.set_base(AP, 95.0);
+        avs.apply_damage(AP, 95.0);
+        world.insert(entity, avs);
+        // One second of frames -> 60 ticks -> exactly per_second restored.
+        for _ in 0..60 {
+            pool_regen_tick_system(&world, POOL_REGEN_DT);
+        }
+        let restored = world.get::<ActorValues>(entity).unwrap().current(AP);
+        assert!(
+            (restored - 3.6).abs() < 1e-3,
+            "one second restores per_second: got {restored}"
+        );
+
+        // An actor without the AV is skipped, not populated.
+        let other = world.spawn();
+        world.insert(other, ActorValues::default());
+        for _ in 0..60 {
+            pool_regen_tick_system(&world, POOL_REGEN_DT);
+        }
+        assert!(world.get::<ActorValues>(other).unwrap().get(AP).is_none());
+    }
+
+    /// Regression for #2932 — the tick must honour `DerivedScope`.
+    ///
+    /// `derived_value` deliberately does not enforce scope (it is a caller
+    /// contract), and this system runs over EVERY entity with `ActorValues`.
+    /// Oblivion's max-Magicka row is `.player_only()` because NPCs ship baked
+    /// pools, so evaluating it here derived every NPC's regen rate from the
+    /// player-only curve. A player-only row must now fall back to the actor's
+    /// own base layer instead.
+    #[test]
+    fn magicka_regen_ignores_player_only_rows_and_uses_the_actors_base() {
+        use crate::character::derived::{DerivedInput, DerivedStatFormula};
+        use crate::character::ruleset::CharacterRuleset;
+        use crate::ecs::components::ActorValues;
+
+        const MAGICKA: u32 = 0x10;
+        const WILLPOWER: u32 = 0x11;
+        const INT: u32 = 0x12;
+
+        // Baked NPC pool of 50, and a player-only row that would compute a
+        // very different max (2 x Intelligence = 200).
+        let mut rs = CharacterRuleset::new(crate::character::leveling::LevelingModel::FNV);
+        rs.push_derived(
+            MAGICKA,
+            DerivedStatFormula::affine(DerivedInput::actor_value(INT), 2.0, 0.0).player_only(),
+        );
+
+        let mut world = World::new();
+        world.insert_resource(rs);
+        world.insert_resource(PoolRegenConfig {
+            fatigue_avif: 0x01,
+            magicka_avif: MAGICKA,
+            willpower_avif: WILLPOWER,
+            action_points: None,
+        });
+        world.insert_resource(PoolRegenAccumulator::default());
+        let e = world.spawn();
+        let mut avs = ActorValues::from_pairs([(MAGICKA, 50.0), (WILLPOWER, 30.0), (INT, 100.0)]);
+        // Drain the pool so `restore` has room to move.
+        avs.apply_damage(MAGICKA, 40.0);
+        world.insert(e, avs);
+
+        pool_regen_tick_system(&world, POOL_REGEN_DT * 2.0);
+
+        let got = world.get::<ActorValues>(e).unwrap().current(MAGICKA);
+        // rate = (30*0.02 + 0.75) * (base_max/100) = 1.35 * 0.5 = 0.675/s.
+        // Two fixed ticks = 2/60 s -> ~0.0225 restored on top of 10.0.
+        let expected_base_driven = 10.0 + 1.35 * (50.0 / 100.0) * (POOL_REGEN_DT * 2.0);
+        assert!(
+            (got - expected_base_driven).abs() < 1e-4,
+            "player-only max-Magicka row must NOT drive NPC regen; expected the \
+             actor's own base (50) to set the rate, got {got} (base-driven \
+             would be {expected_base_driven}); a 200 max would give a ~4x rate \
+             (#2932)"
+        );
+    }
+
+    /// Regression for #4104 (D4-02). The scoped-max lookup evaluates an
+    /// actor-general `DerivedStatFormula` that can read `DerivedInput::LEVEL`
+    /// — before this fix, `derived_value` was always called with a hardcoded
+    /// `1`, discarding the entity's own `CharacterLevel`. Two entities with
+    /// the same base pool but different levels must regen toward different
+    /// max-Magicka values once the formula reads level.
+    #[test]
+    fn magicka_regen_uses_the_entitys_own_character_level() {
+        use crate::character::components::CharacterLevel;
+        use crate::character::derived::{DerivedInput, DerivedStatFormula};
+        use crate::character::ruleset::CharacterRuleset;
+        use crate::ecs::components::ActorValues;
+
+        const MAGICKA: u32 = 0x10;
+        const WILLPOWER: u32 = 0x11;
+
+        // Actor-general (no `.player_only()`), max = 10 * LEVEL — chosen so
+        // the two entities' formulas diverge sharply if level is honoured,
+        // and are identical (both level 1) if the old hardcoded value leaks.
+        let mut rs = CharacterRuleset::new(crate::character::leveling::LevelingModel::FNV);
+        rs.push_derived(
+            MAGICKA,
+            DerivedStatFormula::affine(DerivedInput::LEVEL, 10.0, 0.0),
+        );
+
+        let mut world = World::new();
+        world.insert_resource(rs);
+        world.insert_resource(PoolRegenConfig {
+            fatigue_avif: 0x01,
+            magicka_avif: MAGICKA,
+            willpower_avif: WILLPOWER,
+            action_points: None,
+        });
+        world.insert_resource(PoolRegenAccumulator::default());
+
+        let low = world.spawn();
+        world.insert(low, CharacterLevel { level: 1, xp: 0 });
+        let mut avs_low = ActorValues::from_pairs([(MAGICKA, 5.0), (WILLPOWER, 0.0)]);
+        avs_low.apply_damage(MAGICKA, 4.0);
+        world.insert(low, avs_low);
+
+        let high = world.spawn();
+        world.insert(high, CharacterLevel { level: 20, xp: 0 });
+        let mut avs_high = ActorValues::from_pairs([(MAGICKA, 5.0), (WILLPOWER, 0.0)]);
+        avs_high.apply_damage(MAGICKA, 4.0);
+        world.insert(high, avs_high);
+
+        pool_regen_tick_system(&world, POOL_REGEN_DT * 2.0);
+
+        let got_low = world.get::<ActorValues>(low).unwrap().current(MAGICKA);
+        let got_high = world.get::<ActorValues>(high).unwrap().current(MAGICKA);
+        // rate = (0*0.02 + 0.75) * (max/100); max = 10*level.
+        let elapsed = POOL_REGEN_DT * 2.0;
+        let expected_low = 1.0 + 0.75 * (10.0 / 100.0) * elapsed;
+        let expected_high = 1.0 + 0.75 * (200.0 / 100.0) * elapsed;
+        assert!(
+            (got_low - expected_low).abs() < 1e-4,
+            "level-1 entity: expected {expected_low}, got {got_low}"
+        );
+        assert!(
+            (got_high - expected_high).abs() < 1e-4,
+            "level-20 entity: expected {expected_high}, got {got_high} — if \
+             this equals the level-1 result instead, the entity's own \
+             CharacterLevel is not reaching derived_value (#4104)"
+        );
+        assert!(
+            (got_high - got_low).abs() > 1e-4,
+            "level-1 and level-20 entities must regen toward different maxima"
+        );
+    }
+
+    /// Regression for #2953. `MAX_REGEN_SUBSTEPS` (8) is deliberately NOT the
+    /// physics substep cap (5), and `crates/core` cannot depend on
+    /// `crates/physics` to enforce that — so the only thing standing between
+    /// the two constants is this file's doc comment. A comment claiming
+    /// parity while the values differ is what this guards against; it caused
+    /// the original finding.
+    #[test]
+    fn substep_cap_does_not_claim_to_mirror_physics() {
+        let src = include_str!("regen.rs");
+        let doc_start = src
+            .find("Spiral-of-death guard")
+            .expect("the MAX_REGEN_SUBSTEPS doc block must still exist");
+        let doc_end = src[doc_start..]
+            .find("const MAX_REGEN_SUBSTEPS")
+            .expect("the doc block must still precede the constant")
+            + doc_start;
+        let doc = &src[doc_start..doc_end];
+
+        assert!(
+            !doc.contains("Mirrors `crates/physics::MAX_SUBSTEPS`"),
+            "MAX_REGEN_SUBSTEPS is 8 and crates/physics::MAX_SUBSTEPS is 5 — \
+             a doc comment asserting they mirror each other is false (#2953). \
+             If the two are ever genuinely unified, give the constant a shared \
+             home rather than re-adding the claim."
+        );
+        assert!(
+            doc.contains("**Not** a mirror"),
+            "the divergence from the physics substep cap must stay stated \
+             explicitly — it is the only record that 8 vs 5 is known, not a \
+             typo (#2953)"
+        );
+        assert_eq!(
+            MAX_REGEN_SUBSTEPS, 8,
+            "value change needs its own rationale"
+        );
+    }
+
+    use super::*;
+
+    /// Regression for #2153 / #3444. The hold-stack at the `ActorValues`
+    /// acquire was `{PoolRegenConfig, CharacterRuleset, ActorValues}` — 3
+    /// deep, correct only because the system happens to be registered
+    /// exclusive. #2153's own fix used `let config = *config;` — a
+    /// SHADOWING assignment that does not move or drop the old
+    /// `ResourceRead` guard, so the real hold-stack silently stayed at 3
+    /// despite the adjacent comment claiming 2 (#3444: Rust's drop
+    /// semantics are the whole argument here, so a plain text-order check
+    /// against the shadowing line — the pre-fix version of this test —
+    /// cannot actually verify the guard is dropped, only that some line
+    /// with that text exists earlier in the file). Source-order check
+    /// (mirrors `substep_cap_does_not_claim_to_mirror_physics` above) so a
+    /// future edit can't silently re-widen the stack back to 3 OR
+    /// reintroduce the shadowing mistake.
+    #[test]
+    fn config_guard_is_dropped_before_the_ruleset_acquire() {
+        let src = include_str!("regen.rs");
+        let guard_drop = src
+            .find("drop(config_guard);")
+            .expect("PoolRegenConfig's guard must be explicitly dropped, not shadowed (#3444)");
+        let ruleset_acquire = src
+            .find("try_resource::<CharacterRuleset>")
+            .expect("the CharacterRuleset acquire must still exist");
+        assert!(
+            guard_drop < ruleset_acquire,
+            "PoolRegenConfig's guard must be explicitly dropped before the \
+             CharacterRuleset acquire, keeping the hold-stack at 2 instead \
+             of 3 (#2153 / #3444)"
+        );
+    }
+
+    #[test]
+    fn magicka_regen_matches_formula_and_gates_on_stunted() {
+        // Willpower 30, MaxMagicka 100 → (30×0.02+0.75)×1 = 1.35/sec.
+        assert!((magicka_regen_per_sec(30.0, 100.0, false) - 1.35).abs() < 1e-6);
+        // Same inputs, Stunted Magicka active → 0.
+        assert_eq!(magicka_regen_per_sec(30.0, 100.0, true), 0.0);
+        // No Magicka pool at all → 0, not a divide-by-zero artifact.
+        assert_eq!(magicka_regen_per_sec(30.0, 0.0, false), 0.0);
+    }
+
+    #[test]
+    fn accumulator_ticks_at_sixty_hz_and_caps_catchup() {
+        let mut acc = PoolRegenAccumulator::default();
+        // A single 1/60s frame yields exactly one tick, no leftover.
+        assert_eq!(acc.advance(POOL_REGEN_DT), 1);
+        assert_eq!(acc.advance(0.0), 0, "no time passed, no extra tick");
+        // A big hitch (10 simulated seconds) is capped at MAX_REGEN_SUBSTEPS.
+        let mut acc = PoolRegenAccumulator::default();
+        assert_eq!(acc.advance(10.0), MAX_REGEN_SUBSTEPS);
+        // The capped remainder doesn't roll over into extra ticks next frame.
+        assert_eq!(acc.advance(0.0), 0);
+    }
+
+    #[test]
+    fn accumulator_carries_fractional_time_across_frames() {
+        let mut acc = PoolRegenAccumulator::default();
+        // Two half-tick frames should yield one tick total, not zero.
+        assert_eq!(acc.advance(POOL_REGEN_DT / 2.0), 0);
+        assert_eq!(acc.advance(POOL_REGEN_DT / 2.0), 1);
+    }
+
+    #[test]
+    fn tick_system_applies_fatigue_and_magicka_regen() {
+        use crate::character::attribute::AttributeSet;
+        use crate::character::skill::SkillSet;
+        use crate::character::{DerivedInput, DerivedStatFormula, LevelingModel};
+        use crate::ecs::world::World;
+
+        const FATIGUE: u32 = 0x90;
+        const MAGICKA: u32 = 0x91;
+        const WILLPOWER: u32 = 0x92;
+        const INTELLIGENCE: u32 = 0x93;
+
+        let mut world = World::new();
+        world.insert_resource(PoolRegenConfig {
+            fatigue_avif: FATIGUE,
+            magicka_avif: MAGICKA,
+            willpower_avif: WILLPOWER,
+            action_points: None,
+        });
+        world.insert_resource(PoolRegenAccumulator::default());
+
+        let mut rs = CharacterRuleset::new(LevelingModel::OBLIVION)
+            .with_attributes(AttributeSet::TES_CLASSIC)
+            .with_skills(SkillSet::OBLIVION);
+        // Magicka = 2×Intelligence, matching oblivion_magicka_formula.
+        rs.push_derived(
+            MAGICKA,
+            DerivedStatFormula::affine(DerivedInput::actor_value(INTELLIGENCE), 2.0, 0.0),
+        );
+        world.insert_resource(rs);
+
+        let mut avs = ActorValues::new();
+        avs.set_base(FATIGUE, 50.0);
+        avs.apply_damage(FATIGUE, 20.0); // current = 30
+        avs.set_base(MAGICKA, 100.0);
+        avs.apply_damage(MAGICKA, 50.0); // current = 50, MaxMagicka via formula = 2×40 = 80
+        avs.set_base(WILLPOWER, 30.0);
+        avs.set_base(INTELLIGENCE, 40.0);
+        let entity = world.spawn();
+        world.insert(entity, avs);
+
+        // One full second (60 ticks) of regen.
+        for _ in 0..60 {
+            pool_regen_tick_system(&world, POOL_REGEN_DT);
+        }
+
+        let q = world.query::<ActorValues>().unwrap();
+        let avs = q.get(entity).unwrap();
+        // Fatigue: +10/sec for 1s = +10 damage restored → current 40.
+        assert!((avs.current(FATIGUE) - 40.0).abs() < 1e-3);
+        // Magicka: rate = (30×0.02+0.75)×(80/100) = 1.35×0.8 = 1.08/sec.
+        let expected_magicka = 50.0 + 1.08;
+        assert!(
+            (avs.current(MAGICKA) - expected_magicka).abs() < 1e-2,
+            "got {}",
+            avs.current(MAGICKA)
+        );
+    }
+
+    #[test]
+    fn tick_system_is_a_noop_without_config() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        let mut avs = ActorValues::from_pairs([(0x01, 100.0), (0x10, 80.0)]);
+        avs.apply_damage(0x01, 50.0);
+        avs.apply_damage(0x10, 40.0);
+        world.insert(entity, avs);
+        // No PoolRegenConfig inserted — must neither panic nor regenerate.
+        for _ in 0..60 {
+            pool_regen_tick_system(&world, POOL_REGEN_DT);
+        }
+        let q = world.query::<ActorValues>().unwrap();
+        let avs = q.get(entity).unwrap();
+        assert_eq!(avs.current(0x01), 50.0);
+        assert_eq!(avs.current(0x10), 40.0);
+    }
+
+    /// Regression for #3483. `CharacterRuleset` used to be acquired as a
+    /// hard precondition ahead of the actor loop, but only the Magicka
+    /// branch reads it — Fatigue's rate is a flat constant
+    /// (`fFatigueReturnMult` ships at `0.0`, so `FATIGUE_REGEN_PER_SEC`
+    /// *is* the formula). A world holding both documented gates but no
+    /// ruleset therefore regenerated neither pool, silently.
+    ///
+    /// Magicka must still regenerate here, via the same `base_max`
+    /// fallback #2932 already installed for player-only rows: "no ruleset"
+    /// and "no actor-general row for this AVIF" are the same situation
+    /// from the branch's point of view.
+    #[test]
+    fn both_pools_regenerate_without_a_character_ruleset() {
+        const FATIGUE: u32 = 0x01;
+        const MAGICKA: u32 = 0x10;
+        const WILLPOWER: u32 = 0x11;
+
+        let mut world = World::new();
+        world.insert_resource(PoolRegenConfig {
+            fatigue_avif: FATIGUE,
+            magicka_avif: MAGICKA,
+            willpower_avif: WILLPOWER,
+            action_points: None,
+        });
+        world.insert_resource(PoolRegenAccumulator::default());
+        // Deliberately NO CharacterRuleset.
+        let entity = world.spawn();
+        let mut avs =
+            ActorValues::from_pairs([(FATIGUE, 100.0), (MAGICKA, 80.0), (WILLPOWER, 30.0)]);
+        avs.apply_damage(FATIGUE, 50.0);
+        avs.apply_damage(MAGICKA, 40.0);
+        world.insert(entity, avs);
+
+        // One full second (60 ticks).
+        for _ in 0..60 {
+            pool_regen_tick_system(&world, POOL_REGEN_DT);
+        }
+
+        let q = world.query::<ActorValues>().unwrap();
+        let avs = q.get(entity).unwrap();
+        assert!(
+            (avs.current(FATIGUE) - 60.0).abs() < 1e-3,
+            "flat Fatigue regen reads no ruleset row and must not be gated on \
+             one; expected 50 + 10/s = 60, got {} (#3483)",
+            avs.current(FATIGUE)
+        );
+        // rate = (30×0.02 + 0.75) × (80/100) = 1.08/sec, off the actor's own
+        // base — the same value #2932's player-only fallback produces.
+        assert!(
+            (avs.current(MAGICKA) - (40.0 + 1.08)).abs() < 1e-2,
+            "Magicka must fall back to the actor's base max when no ruleset \
+             is loaded, got {}",
+            avs.current(MAGICKA)
+        );
+    }
+}

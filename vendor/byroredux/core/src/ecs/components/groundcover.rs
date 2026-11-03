@@ -1,0 +1,661 @@
+//! EXAL ground cover — canonical types (Phase 0).
+//!
+//! Implements the type layer of [`docs/engine/exal-groundcover.md`]. Ground
+//! cover is the vegetation stratum sitting on the terrain surface: grass,
+//! ferns, moss, low scrub. Trees and harvestable `FLOR` flora are explicitly
+//! *not* ground cover (design §10) and keep their own authorities.
+//!
+//! # Placement is not in this file, and not in this engine's data
+//!
+//! This is the one exterior category where EXAL deliberately does not
+//! reproduce the source engines. Bethesda maps a `GRAS` record onto an `LTEX`
+//! landscape texture and scatters on a fixed per-cell grid wherever that
+//! texture is painted, which is *why* vanilla grass reads as patches: density
+//! is keyed to texture identity, so it steps hard exactly where one splat layer
+//! stops. The design's counter is a continuous density field evaluated per
+//! candidate point on the GPU (§3), with per-game data demoted to a **palette
+//! hint only** (§7).
+//!
+//! So: a [`GroundCoverSpecies`] is the engine's own blade species, selected by
+//! climate. A `GRAS` record does not contribute one (design §12.12, decided
+//! 2026-09-13): a census of the vanilla records' models across four games found
+//! every one is a card clump or an opaque mesh rather than a blade, and that
+//! grass cannot be told from ferns or shrubs by model content. `GRAS` records
+//! belong to the authored-model tier instead, which draws each record's own
+//! model. Their density and placement fields stay ignored either way; anyone
+//! reaching for `GRAS.density` to "finish the port" should read §1 first.
+//!
+//! # What Phase 0 covers
+//!
+//! Types, the palette, the wind field, and the affinity contract — all pure
+//! CPU and unit-testable. The density field itself lives in GLSL and only
+//! there (§3, "Where the evaluation lives"): a Rust mirror would be a second
+//! source of truth for a formula that must match exactly, which this codebase
+//! has already been burned by. Rust owns the *parameters*; GLSL owns the
+//! formula.
+
+use crate::ecs::resource::Resource;
+
+/// Linear RGB. Matches the convention in [`super::water`] — raw monitor-space
+/// floats, never sRGB-decoded (see the colour-space note in `material.rs`).
+pub type Rgb = [f32; 3];
+
+/// Per-climate weighting for species selection.
+///
+/// The density field picks among a palette's species by weight × local
+/// conditions, so species transitions come out as gradients rather than
+/// boundaries — the same anti-patch principle as §1, applied one level up.
+///
+/// Values are relative, not normalised: a species with `temperate: 2.0` is
+/// twice as likely as one with `1.0` in temperate conditions, and `0.0` means
+/// "never here".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClimateWeights {
+    pub temperate: f32,
+    pub arid: f32,
+    pub alpine: f32,
+    pub wetland: f32,
+}
+
+impl ClimateWeights {
+    /// Equal presence everywhere. The right default for a species with no
+    /// authored climate information, since suppressing it entirely would be a
+    /// stronger claim than the data supports.
+    pub const UNIFORM: Self = Self {
+        temperate: 1.0,
+        arid: 1.0,
+        alpine: 1.0,
+        wetland: 1.0,
+    };
+
+    /// Weight for `climate`, used by the scatter pass's species draw.
+    pub fn weight_for(&self, climate: Climate) -> f32 {
+        match climate {
+            Climate::Temperate => self.temperate,
+            Climate::Arid => self.arid,
+            Climate::Alpine => self.alpine,
+            Climate::Wetland => self.wetland,
+        }
+    }
+}
+
+impl Default for ClimateWeights {
+    fn default() -> Self {
+        Self::UNIFORM
+    }
+}
+
+/// Coarse climate bucket a worldspace resolves to.
+///
+/// Deliberately only four. This is a *vegetation* classification, not a weather
+/// one — it exists to bias species selection, and finer buckets would need
+/// authored data no source game provides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Climate {
+    Temperate,
+    Arid,
+    Alpine,
+    Wetland,
+}
+
+/// Ground-cover affinity for a landscape layer whose name matches no keyword.
+///
+/// Deliberately low-but-nonzero. Zero would make an unrecognised layer a hard
+/// vegetation hole — reintroducing the boolean-boundary artifact the whole
+/// design exists to remove — while a high default would carpet asphalt in any
+/// game whose naming we have not seen.
+///
+/// Lives here rather than beside the keyword table in
+/// `byroredux::groundcover_translate` (#4054) so the keyword lookup and the
+/// terrain fill read one number. Post-#4903 the *unpainted* ground no longer
+/// consumes it: the BTXT base has a real LTEX with its own authored
+/// affinity (the bin crate's `TerrainCoverInputs::base_affinity`), and the
+/// shader's fabricated-default substitution — with its GLSL re-export —
+/// was removed with it (#5177).
+pub const DEFAULT_COVER_AFFINITY: f32 = 0.15;
+
+/// Sentinel `water_height` meaning "this terrain cell has no water plane".
+///
+/// §3's `moisture` term must resolve to 1.0 here, not 0.0 and not an undefined
+/// distance: in a pure product one undefined factor takes the whole field, and
+/// the failure mode is an entire worldspace with no ground cover and nothing
+/// in the log. A sentinel rather than an `Option` because the value crosses
+/// into GLSL, which has neither.
+pub const NO_WATER_HEIGHT: f32 = -1.0e30;
+
+/// `GpuGroundCoverCell::terrain_tile_slot` sentinel: the cell has no splat
+/// terrain, so §12.3's ground-colour coupling has no layer textures to
+/// sample (#4056). A valid slot index can be 0, which is why "absent" is
+/// not 0. Lives in core rather than on the renderer's GPU record because
+/// the GLSL mirror reaches shaders through `shader_constants_data.rs`,
+/// which can only name core items.
+pub const GROUNDCOVER_NO_TERRAIN_TILE: u32 = u32::MAX;
+
+/// `(mean, coefficient of variation)` of a uniform draw over `range`: the mean
+/// at the midpoint and `σ = (max − min) / √12`, so a log-normal built from it
+/// reproduces the spread of the uniform it replaces (#6201).
+pub const fn moment_matched_length(range: (f32, f32)) -> (f32, f32) {
+    /// `1 / √12`, the standard deviation of a unit-width uniform.
+    const UNIFORM_SIGMA_PER_WIDTH: f32 = 0.288_675_13;
+    let mean = (range.0 + range.1) * 0.5;
+    (mean, (range.1 - range.0) * UNIFORM_SIGMA_PER_WIDTH / mean)
+}
+
+/// One kind of ground cover in a worldspace's palette.
+///
+/// Field-for-field the design's §7 shape. Every field is a *rendering* or
+/// *selection* property; none of them is placement, by construction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundCoverSpecies {
+    /// Blade height range in Gamebryo units. The scatter seed picks within it,
+    /// so a patch has natural height variance rather than a uniform lawn.
+    pub height_range: (f32, f32),
+    /// Average blade length in Gamebryo units — the centre the per-blade draw
+    /// is distributed around (#6201). [`Self::height_range`] stays as the hard
+    /// clamp (and the reach bound the host sizes cover tests from); this is
+    /// where within it a typical blade of the species sits.
+    ///
+    /// Not a sourced botanical figure: the built-in species carry
+    /// [`moment_matched_length`] of their own `height_range`, i.e. exactly the
+    /// first two moments the uniform draw it replaces already had, so only the
+    /// distribution's *shape* changes. Barre, Turner & Escobar-Gutiérrez 2015
+    /// (§13) establishes that leaf length varies within a species and with leaf
+    /// rank, but publishes no within-sward spread to replace the placeholder.
+    pub blade_length_mean: f32,
+    /// Per-blade variation of blade length as a coefficient of variation
+    /// (σ / mean), `0.0` = every blade the mean. The draw is log-normal with
+    /// this mean and CV (positive and right-skewed, the shape reported for
+    /// sward heights, §13), clamped to [`Self::height_range`]. See
+    /// [`Self::blade_length_mean`] for the provenance of the number.
+    pub blade_length_cv: f32,
+    /// Blade width range in Gamebryo units.
+    pub width_range: (f32, f32),
+    /// Base → tip colour: **the plant's own colour variation, and nothing
+    /// else**.
+    ///
+    /// Until #4057 this baked a dark base as a stand-in for self-shadowing —
+    /// the doc comment said so. §12.1's contact occlusion now computes that
+    /// term from the density field, and the two compound: a gradient that
+    /// still carried the fake would put the real occlusion on top of it and
+    /// the base of every blade would go black. So the bases below were lifted
+    /// to what a grass sheath actually is — slightly paler and warmer than the
+    /// lamina, not three stops darker.
+    pub colour_gradient: [Rgb; 2],
+    // NOTE: these are display-space (sRGB-encoded) colours as an artist picks
+    // them, NOT linear albedo; the renderer decodes them at the GPU boundary
+    // (`render/groundcover.rs`). Used raw as linear albedo a 0.5 tip is ~2x
+    // brighter than real grass reflectance (~0.05-0.15), which is what made
+    // blades glow against the terrain.
+    /// Colour of light **transmitted through** the blade (§12.2, #4057).
+    ///
+    /// Cannot be derived from [`Self::colour_gradient`]: chlorophyll absorbs
+    /// blue and red on the way in *and* on the way out, but a single thin
+    /// leaf leaks far more red in transmission than it returns in reflection,
+    /// which is why backlit vegetation reads warmer and more saturated than
+    /// the same leaf lit from the front rather than simply brighter.
+    pub transmission_colour: Rgb,
+    /// Strength of the grazing sheen lobe (§12.6, #4057), `0.0` = matte.
+    ///
+    /// Blades carry a waxy cuticle, and a meadow with the sun low and ahead
+    /// of you goes silver because of it. The *index* of that cuticle is a
+    /// constant (see `GROUNDCOVER_SHEEN_F0`); what varies per species is how
+    /// much intact cuticle there is — a dry summer grass silvers more than a
+    /// green reed, which is the ordering the defaults below use.
+    pub sheen: f32,
+    /// Resistance to wind bend, `0.0` = limp, `1.0` = rigid. Feeds the Bezier
+    /// control-point displacement in the blade vertex shader (§8).
+    pub bend_stiffness: f32,
+    /// How strongly this species responds to the terrain affinity term (§3).
+    /// A species with low affinity appears only where the ground strongly
+    /// supports cover; a high-affinity one spreads onto marginal ground.
+    pub cover_affinity: f32,
+    /// How far this species' colour gradient is pulled toward the terrain
+    /// albedo underneath it, at the blade base (§12.3, #4056).
+    ///
+    /// `0.0` leaves vegetation and ground as two unrelated surfaces — the
+    /// vanilla look, where grass sits *on* the terrain rather than growing out
+    /// of it. `1.0` makes every species the colour of its dirt and the palette
+    /// stops meaning anything. §11.8 lists the calibration as an open
+    /// question; the default here is the low end of "visible", deliberately,
+    /// because the failure mode of too much is a worldspace with no species
+    /// identity left and the failure mode of too little is the status quo.
+    ///
+    /// Landed with its consumer rather than ahead of it, per §12's own rule:
+    /// three invented scalars in a canonical type is how a placeholder becomes
+    /// the value nobody revisits.
+    pub ground_coupling: f32,
+    /// Relative presence per climate.
+    pub climate_weight: ClimateWeights,
+}
+
+impl GroundCoverSpecies {
+    /// The built-in temperate grass.
+    ///
+    /// Guarantees that a game supplying no vegetation data at all still renders
+    /// organic ground cover, which is the stated "generic" requirement (§7
+    /// precedence 3). Sizes are in Gamebryo units, where an exterior cell is
+    /// 4096 across and a human is ~128 tall — so a 9–21 unit blade is
+    /// shin-height. (It was 6–14, ankle-height, and read as stubble; raised
+    /// 1.5x on review, with the width raised 1.25x so the taller blade does not
+    /// turn into a needle.)
+    pub const DEFAULT_TEMPERATE: Self = Self {
+        // The earlier 6–14 BU envelope made the fully populated near field
+        // read as isolated sprouts at player height. A temperate sward needs
+        // enough vertical and projected area for its four-ribbon tuft to
+        // The fallback stays deliberately short: isolated procedural ribbons
+        // must resolve as cover before the authored card LOD takes over.
+        //
+        // Retuned 11–26 / 1.2–2.35 (1.25x taller, 1.35x wider) on a "Skyrim
+        // grass needs way more volume" review: at the 9–21 / 0.9–1.75 envelope
+        // the near field read as thin separate needles over bare ground. More
+        // projected blade area per blade fills the sward without touching the
+        // scatter's candidate budget or the blade arena sizes.
+        height_range: (11.0, 26.0),
+        blade_length_mean: moment_matched_length((11.0, 26.0)).0,
+        blade_length_cv: moment_matched_length((11.0, 26.0)).1,
+        width_range: (1.2, 2.35),
+        // Base is the sheath: paler and a touch warmer than the lamina. It is
+        // NOT a darkened tip — see the field's doc and §12.1. Keep the
+        // fallback deliberately olive rather than the old saturated yellow
+        // green: Skyrim's many GRAS records do not yet supply their authored
+        // mesh tier, so this one procedural species is what the player sees
+        // across a whole temperate exterior. The previous hue read as bright
+        // green needles on dark moss/rock at normal play distance instead of
+        // vegetation growing out of the terrain.
+        colour_gradient: [[0.26, 0.34, 0.10], [0.34, 0.43, 0.15]],
+        // Preserve the warmer back-lit response, but prevent it from turning
+        // the untextured fallback into fluorescent lines under an overcast
+        // directional light.
+        transmission_colour: [0.36, 0.42, 0.08],
+        sheen: 0.32,
+        bend_stiffness: 0.35,
+        cover_affinity: 1.0,
+        ground_coupling: 0.25,
+        climate_weight: ClimateWeights::UNIFORM,
+    };
+
+    /// Sparse arid scrub — shorter, wider, stiffer, and yellowed.
+    pub const DEFAULT_ARID: Self = Self {
+        height_range: (6.0, 13.5),
+        blade_length_mean: moment_matched_length((6.0, 13.5)).0,
+        blade_length_cv: moment_matched_length((6.0, 13.5)).1,
+        width_range: (1.1, 2.25),
+        colour_gradient: [[0.40, 0.36, 0.14], [0.52, 0.46, 0.24]],
+        transmission_colour: [0.62, 0.46, 0.12],
+        // Dry standing grass is most of what silvers in a low sun; a green
+        // sward's cuticle is softened by the water in the blade under it.
+        sheen: 0.70,
+        bend_stiffness: 0.65,
+        cover_affinity: 0.7,
+        // Arid scrub sits in sparse cover on exposed ground, so far more of
+        // what the eye reads near its base is the ground itself.
+        ground_coupling: 0.45,
+        climate_weight: ClimateWeights {
+            temperate: 0.4,
+            arid: 2.0,
+            alpine: 0.1,
+            wetland: 0.1,
+        },
+    };
+
+    /// True if every numeric field is finite and every range is ordered.
+    ///
+    /// Species can arrive from parsed `GRAS` records, so a malformed record
+    /// must not be able to push a NaN into the blade shader — a non-finite
+    /// height silently removes the blade from the raster with no diagnostic.
+    pub fn is_well_formed(&self) -> bool {
+        let ranges_ok = self.height_range.0 > 0.0
+            && self.height_range.1 >= self.height_range.0
+            && self.width_range.0 > 0.0
+            && self.width_range.1 >= self.width_range.0;
+        let finite = [
+            self.height_range.0,
+            self.height_range.1,
+            self.width_range.0,
+            self.width_range.1,
+            self.blade_length_mean,
+            self.blade_length_cv,
+            self.bend_stiffness,
+            self.cover_affinity,
+            self.ground_coupling,
+            self.sheen,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && self
+                .colour_gradient
+                .iter()
+                .flatten()
+                .chain(self.transmission_colour.iter())
+                .all(|c| c.is_finite() && *c >= 0.0);
+        // The mean sits inside the clamp it is drawn within; a mean outside
+        // it would pin every blade to one end.
+        let length_ok = (self.height_range.0..=self.height_range.1)
+            .contains(&self.blade_length_mean)
+            && self.blade_length_cv >= 0.0;
+        ranges_ok
+            && finite
+            && length_ok
+            && self.bend_stiffness >= 0.0
+            && self.cover_affinity >= 0.0
+            && self.sheen >= 0.0
+            && (0.0..=1.0).contains(&self.ground_coupling)
+    }
+}
+
+/// The species set a worldspace resolves to, plus its climate bucket.
+///
+/// Never empty: [`Self::resolve`] falls back to the built-in default so the
+/// scatter pass has no empty-palette branch to get wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundCoverPalette {
+    pub species: Vec<GroundCoverSpecies>,
+    pub climate: Climate,
+}
+
+impl GroundCoverPalette {
+    /// Build a palette, dropping malformed species and substituting the
+    /// built-in default if nothing usable survives.
+    pub fn resolve(mut species: Vec<GroundCoverSpecies>, climate: Climate) -> Self {
+        species.retain(|s| s.is_well_formed());
+        if species.is_empty() {
+            species.push(match climate {
+                Climate::Arid => GroundCoverSpecies::DEFAULT_ARID,
+                _ => GroundCoverSpecies::DEFAULT_TEMPERATE,
+            });
+        }
+        Self { species, climate }
+    }
+
+    /// Total selection weight in this palette's climate. Zero when every
+    /// species is excluded from the climate — the caller then draws uniformly
+    /// rather than dividing by zero.
+    pub fn total_weight(&self) -> f32 {
+        self.species
+            .iter()
+            .map(|s| s.climate_weight.weight_for(self.climate))
+            .sum()
+    }
+}
+
+impl Default for GroundCoverPalette {
+    fn default() -> Self {
+        Self::resolve(Vec::new(), Climate::Temperate)
+    }
+}
+
+impl Resource for GroundCoverPalette {}
+
+/// How an authored-model record's water distance applies (§12.12 Phase C,
+/// #4413). Read in xEdit's zero-based "Unit from water type" order, which is
+/// the only numbering the vanilla data fits (see `GrasRecord::
+/// water_distance_application`). The two `Either - At Most Above/Below`
+/// variants (6, 7) have no vanilla use and no documented meaning, so the
+/// translate boundary drops a record that authors them rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverWaterRule {
+    /// At least `distance` above the water plane (or anywhere dry-land when
+    /// the cell has no water).
+    AboveAtLeast,
+    /// Above the water plane, by at most `distance`.
+    AboveAtMost,
+    /// Submerged by at least `distance`.
+    BelowAtLeast,
+    /// Submerged by at most `distance`.
+    BelowAtMost,
+    /// At least `distance` from the water plane, either side.
+    EitherAtLeast,
+    /// Within `distance` of the water plane, either side.
+    EitherAtMost,
+}
+
+impl CoverWaterRule {
+    /// The rule for an authored zero-based code, `None` for an unsupported one.
+    pub const fn from_authored(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::AboveAtLeast),
+            1 => Some(Self::AboveAtMost),
+            2 => Some(Self::BelowAtLeast),
+            3 => Some(Self::BelowAtMost),
+            4 => Some(Self::EitherAtLeast),
+            5 => Some(Self::EitherAtMost),
+            _ => None,
+        }
+    }
+
+    /// The code the placement shader switches on — the same zero-based order.
+    pub const fn gpu_code(self) -> u32 {
+        match self {
+            Self::AboveAtLeast => 0,
+            Self::AboveAtMost => 1,
+            Self::BelowAtLeast => 2,
+            Self::BelowAtMost => 3,
+            Self::EitherAtLeast => 4,
+            Self::EitherAtMost => 5,
+        }
+    }
+}
+
+/// One authored ground-cover model — a `GRAS` record, translated (§12.12
+/// Phase C, #4413). Every record draws its own model, whatever it depicts:
+/// grass cards, rocks, ferns, leaf decals and kelp alike.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthoredCoverRecord {
+    pub form_id: u32,
+    pub editor_id: String,
+    /// Model path relative to `Data\Meshes\`.
+    pub model_path: String,
+    pub climate_weight: ClimateWeights,
+    /// Share of grid points that grow this record, `0.0..=1.0`.
+    pub density: f32,
+    pub water_rule: CoverWaterRule,
+    /// Units from the water plane the rule measures.
+    pub water_distance: f32,
+    /// Per-instance scale variation, a fraction of the model's size.
+    pub height_range: f32,
+    /// Per-instance placement jitter around its grid point, in units.
+    pub position_range: f32,
+    /// Scale all three axes, rather than height alone.
+    pub uniform_scaling: bool,
+    /// Tilt the model onto the terrain normal.
+    pub fit_to_slope: bool,
+    /// The model's authored height, when the record carries one.
+    pub nominal_height: Option<f32>,
+}
+
+/// The worldspace's authored-model tier: its records and the grid their
+/// candidates sit on. Absent when the game authors no grass grid spacing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthoredCover {
+    pub records: Vec<AuthoredCoverRecord>,
+    /// Spacing of the candidate grid, in units.
+    pub grid_spacing: f32,
+    /// The worldspace climate the records are weighted for.
+    pub climate: Climate,
+    /// Whether the load order's landscape textures name any of `records`
+    /// (`LTEX.GNAM`, #4906). When they do, a record grows only on ground
+    /// whose textures list it; when none does — a load order that authors no
+    /// texture→grass links at all — the cover falls back to placing every
+    /// record by climate everywhere rather than growing nothing.
+    pub localised: bool,
+    /// Process-unique identity of this translation, from
+    /// [`AuthoredCover::next_generation`]. Consumers that derive per-frame
+    /// data from the records key their cache on it instead of re-deriving
+    /// every frame (#4922): a new worldspace's cover is a new generation.
+    pub generation: u64,
+}
+
+impl AuthoredCover {
+    /// A generation no earlier `AuthoredCover` in this process carried.
+    pub fn next_generation() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// The authored density of the ground a landscape texture lists
+    /// (`LTEX.GNAM`): the chance that at least one of its placeable `GRAS`
+    /// records grows at a point, `1 - prod(1 - density_r)` — the same union the
+    /// authored-model tier's lane rate uses, so both tiers read one authored
+    /// truth. Records that are not placeable (no `DATA`, no model, a water rule
+    /// that drops them, zero density) do not appear in `records` and so
+    /// contribute nothing; an empty list is `0.0` — authored "no grass here".
+    ///
+    /// `records` is FormID-sorted, so each membership test is a binary search.
+    pub fn union_density(&self, grasses: &[u32]) -> f32 {
+        let none_grow: f32 = grasses
+            .iter()
+            .filter_map(|form_id| {
+                self.records
+                    .binary_search_by_key(form_id, |record| record.form_id)
+                    .ok()
+            })
+            .map(|at| 1.0 - self.records[at].density.clamp(0.0, 1.0))
+            .product();
+        (1.0 - none_grow).clamp(0.0, 1.0)
+    }
+}
+
+impl Resource for AuthoredCover {}
+
+/// Per-weather ground-cover colour multiplier (§12, Phase 5 remainder; #4057).
+///
+/// Oblivion's `WTHR.HNAM` carries a `grassDimmer` alongside `sunlightDimmer`
+/// and `treeDimmer` — a colour multiplier the source engine applies at the
+/// grass-generator stage, *before* scene lighting. It is the one authored
+/// per-weather control this design's palette has a use for.
+///
+/// **It is a resource, not a palette field, and that is the whole point.**
+/// [`GroundCoverPalette`] resolves once when a worldspace is entered; folding
+/// the dimmer in there would freeze it at whichever weather happened to be
+/// active on entry, so an overcast sward would stay overcast through a whole
+/// day cycle. This rides the slot `weather_system` already writes
+/// [`WindField`] into, and is re-read every frame.
+///
+/// `1.0` — the neutral value and the default — is what every non-Oblivion
+/// game gets: `HNAM` is Oblivion-only, and FNV / FO3 / Skyrim+ weather ships
+/// no equivalent. A game with no authored dimmer must render exactly as it
+/// did before this existed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundCoverDimmer(pub f32);
+
+impl GroundCoverDimmer {
+    /// No tint change. The value every game without an authored `HNAM` uses.
+    pub const NEUTRAL: Self = Self(1.0);
+
+    /// Clamp an authored value into a range that cannot blank or blow out the
+    /// stratum.
+    ///
+    /// Vanilla Oblivion authors this in `[0, 1]` and mostly near 1; a mod (or
+    /// a misparse) is the only way a wild value arrives, and an unclamped one
+    /// multiplies straight into blade albedo. The ceiling is above 1 because
+    /// a weather brightening its grass is a legitimate authored effect, and
+    /// the floor is above 0 because "this weather has no grass" is not.
+    pub fn from_authored(value: f32) -> Self {
+        if !value.is_finite() {
+            return Self::NEUTRAL;
+        }
+        Self(value.clamp(0.05, 4.0))
+    }
+}
+
+impl Default for GroundCoverDimmer {
+    fn default() -> Self {
+        Self::NEUTRAL
+    }
+}
+
+impl Resource for GroundCoverDimmer {}
+
+/// Canonical wind, translated from `WTHR`'s wind-speed byte (§8).
+///
+/// The blade shader samples a continuous 2D flow-noise field advected along
+/// `direction`, so neighbouring blades bend *together* — travelling gust waves
+/// across a meadow rather than per-blade jitter, which is most of what sells
+/// grass as a living surface. Wind here is deliberately neither simulated nor
+/// collided; interaction is out of scope (§10).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindField {
+    /// Unit horizontal direction in the engine's XZ plane — the way the
+    /// wind **blows toward**, as `(x, z)`: `[1, 0]` blows east, `[0, 1]`
+    /// game-north. One frame, one sense, declared once (#4729 — the five
+    /// consumers used to disagree): grass gust waves roll and blades lean
+    /// along +direction, SpeedTree crowns lean and their gust waves travel
+    /// along +direction, wind drag pushes floating bodies along
+    /// +direction, and the water weather-scroll term moves ripples
+    /// downwind. Normalised on construction.
+    pub direction: [f32; 2],
+    /// Base speed, canonical units per second.
+    pub speed: f32,
+    /// Peak additional speed at gust crest.
+    pub gust_amplitude: f32,
+    /// Gust cycles per second.
+    pub gust_frequency: f32,
+}
+
+impl WindField {
+    /// Dead calm. Blades stand upright with only their seed-derived lean.
+    pub const CALM: Self = Self {
+        direction: [1.0, 0.0],
+        speed: 0.0,
+        gust_amplitude: 0.0,
+        gust_frequency: 0.0,
+    };
+
+    /// Translate `WTHR`'s wind-speed byte into a canonical field.
+    ///
+    /// `wind_speed` is the raw 0–255 record byte; `direction` need not be
+    /// normalised or non-zero. Gusts scale super-linearly with base speed
+    /// because still air is genuinely steady while strong wind is turbulent —
+    /// a constant gust ratio makes calm weather shimmer.
+    pub fn from_weather_byte(wind_speed: u8, direction: [f32; 2]) -> Self {
+        let normalised = f32::from(wind_speed) / 255.0;
+        let speed = normalised * MAX_WIND_SPEED;
+        Self {
+            direction: normalise_or_east(direction),
+            speed,
+            gust_amplitude: speed * (0.25 + 0.55 * normalised),
+            gust_frequency: 0.15 + 0.45 * normalised,
+        }
+    }
+
+    /// True when every field is finite and the direction is unit-length.
+    ///
+    /// The renderer hard-fails non-finite environment values (EX-05), so the
+    /// translation boundary is where a bad value has to be caught.
+    pub fn is_well_formed(&self) -> bool {
+        let finite = self.direction.iter().all(|v| v.is_finite())
+            && self.speed.is_finite()
+            && self.gust_amplitude.is_finite()
+            && self.gust_frequency.is_finite();
+        let len_sq = self.direction[0] * self.direction[0] + self.direction[1] * self.direction[1];
+        finite && (len_sq - 1.0).abs() < 1e-3 && self.speed >= 0.0
+    }
+}
+
+impl Default for WindField {
+    fn default() -> Self {
+        Self::CALM
+    }
+}
+
+impl Resource for WindField {}
+
+/// Canonical speed at `wind_speed == 255`.
+///
+/// Calibration parameter, not a measured constant — see §11.3, which pins the
+/// density field's numbers with real-cell telemetry rather than unit tests.
+/// Chosen so a mid-range byte produces visible but not frantic motion at the
+/// blade scale above.
+pub const MAX_WIND_SPEED: f32 = 220.0;
+
+fn normalise_or_east(v: [f32; 2]) -> [f32; 2] {
+    let len_sq = v[0] * v[0] + v[1] * v[1];
+    if !len_sq.is_finite() || len_sq < 1e-12 {
+        return [1.0, 0.0];
+    }
+    let inv = len_sq.sqrt().recip();
+    [v[0] * inv, v[1] * inv]
+}
+
+#[cfg(test)]
+#[path = "groundcover_tests.rs"]
+mod tests;

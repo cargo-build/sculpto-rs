@@ -1,0 +1,516 @@
+//! Derived actor-value formulas (CHARAL).
+//!
+//! Bethesda derived stats — Health, Action Points, Carry Weight, Melee
+//! Damage, Critical Chance, Unarmed Damage, XP multiplier — are all
+//! computed from a small bilinear expression over **at most two** inputs
+//! (a SPECIAL attribute or skill actor value, or the character level):
+//!
+//! ```text
+//! output = round( bias + cₐ·A + c_b·B + cross·A·B )   then clamped to a cap
+//! ```
+//!
+//! Every formula captured across FO3 / FNV / FO4 (see
+//! `docs/engine/charal-fo4-ruleset.md` + `charal-fnv-fo3-ruleset.md`) fits
+//! this one shape — the most complex is FO4 Health
+//! (`floor(77.5 + 4.5·END + 2.5·L + 0.5·L·END)`), which needs the cross
+//! term; the rest are affine. So a single fixed-layout [`DerivedStatFormula`]
+//! covers the whole derived-stat surface with **no expression tree, no heap,
+//! no per-game branching** — the per-game seam is data (the coefficients),
+//! not code.
+//!
+//! ## Efficiency
+//!
+//! [`DerivedStatFormula`] is `Copy` and 36 bytes; a per-game
+//! [`super::CharacterRuleset`] holds a flat `Vec` of them. [`eval`] is ~5
+//! FMAs + one branch + one `clamp` — no allocation, no virtual dispatch.
+//!
+//! ## Chaining
+//!
+//! An input is identified by **AVIF FormID**, so a derived stat can read
+//! *another* actor value — a skill, not just an attribute (FNV Unarmed
+//! Damage ← Unarmed skill ← SPECIAL). The deriver must therefore populate
+//! base attributes + skills into [`ActorValues`] **before** evaluating
+//! derived formulas that depend on them; chaining is resolved by that
+//! ordering, not by the formula type.
+//!
+//! ## Percentage convention
+//!
+//! A percentage-valued output (Critical Chance, the FO3/FNV
+//! [`Affliction`](super::resistance::Affliction) resistances) is always
+//! **0–100**, never 0.0–1.0. `damage_multiplier`
+//! ([`super::resistance`]) fixes this as the one convention by dividing by
+//! `100.0`, so every percentage row must be written in the coefficients
+//! that land there — `Luck·1` capped `10`, not `Luck·0.01` capped `0.10`
+//! (#2936: Critical Chance shipped as the latter for a while, silently a
+//! hundredfold off the resistances it shares a table with, because nothing
+//! records which convention a source document's "×1%" phrasing became in
+//! code). There is no type-level enforcement of this — a formula whose
+//! output is conceptually a percentage looks identical to one that
+//! isn't — so a new percentage-valued row must be written on the 0–100
+//! scale by hand, and cite this paragraph in its comment.
+//!
+//! [`eval`]: DerivedStatFormula::eval
+
+use crate::ecs::components::ActorValues;
+
+/// One input to a [`DerivedStatFormula`], packed into 4 bytes.
+///
+/// A bare `u32` with two reserved sentinels, so a two-input formula stays
+/// `Copy` and cache-tight (no enum tag/padding):
+/// * `0` — **unused** (the FormID `0` is the null form, never a real AV).
+/// * `u32::MAX` — the character **level** (never a plausible FormID).
+/// * anything else — an actor value by its **global-space AVIF FormID**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedInput(u32);
+
+impl DerivedInput {
+    /// Contributes nothing (coefficient is multiplied by `0.0`).
+    pub const UNUSED: Self = Self(0);
+    /// Reads the character level rather than an actor value.
+    pub const LEVEL: Self = Self(u32::MAX);
+
+    /// An actor value by global-space AVIF FormID.
+    pub const fn actor_value(avif_form_id: u32) -> Self {
+        debug_assert!(
+            avif_form_id != 0 && avif_form_id != u32::MAX,
+            "DerivedInput actor values must be non-null AVIF FormIDs"
+        );
+        Self(avif_form_id)
+    }
+
+    /// Resolve to a numeric value against the actor's state. `use_base`
+    /// reads the AV's `base` layer only (excludes permanent/temporary mods
+    /// and damage) — e.g. Skyrim Carry Weight, which explicitly excludes
+    /// Fortify Stamina; every other derived stat reads `current()`.
+    #[inline]
+    fn read(self, avs: &ActorValues, level: u16, use_base: bool) -> f32 {
+        match self.0 {
+            0 => 0.0,
+            u32::MAX => f32::from(level),
+            avif if use_base => avs.get(avif).map_or(0.0, |v| v.base),
+            avif => avs.current(avif),
+        }
+    }
+}
+
+/// Rounding applied to a formula's raw value before the cap clamp. The
+/// rounding mode is per-row sourced, not a blanket rule: only FO4 Health is
+/// captured with an explicit floor (`charal-fo4-ruleset.md`: `TotalHP =
+/// floor(...)`); the FO3/FNV Health capture states no mode, so those rows
+/// ship [`RoundMode::None`] (exact — and identity for their integer
+/// END/level domain). Unarmed Damage's ceil (`ceil((10 + Unarmed)/20)`) is
+/// sourced on FO3/FNV (`charal-fnv-fo3-ruleset.md`). Don't copy a mode onto
+/// a new row because "Bethesda obviously rounds" — ship `None` unless the
+/// capture states one (#4451).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum RoundMode {
+    /// No rounding (the value is used as-is). The correct default: most
+    /// rows' captures state no mode, and inventing one is the #4451 class.
+    #[default]
+    None,
+    /// `floor` — FO4 Health only (the one capture-sourced floor).
+    Floor,
+    /// `ceil` — FO3/FNV Unarmed Damage.
+    Ceil,
+}
+
+/// How the consumer applies a formula's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum DerivedOutput {
+    /// The result **is** the actor value (Health, AP, Carry Weight …).
+    #[default]
+    Absolute,
+    /// The result is a **multiplier** applied at use against a base — e.g.
+    /// FO4 Melee Damage `×(1 + STR/10)`, the XP multiplier `×(1 + 0.03·INT)`.
+    /// `eval` returns the multiplier; the combat / XP system multiplies.
+    Multiplier,
+}
+
+/// Which actors a formula applies to.
+///
+/// `fAVD`-prefixed stats (Carry Weight, Melee Damage) derive identically for
+/// every actor; Health and Action Points are flagged "player only" by the
+/// wiki — NPCs ship *baked* values (FO4 `DNAM`) or derive them on a different
+/// path, so the player formula must **not** be applied to them. A consumer
+/// that computes a derived stat for an arbitrary entity checks this before
+/// trusting the result. (Fits in `DerivedStatFormula`'s existing padding —
+/// costs nothing extra.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum DerivedScope {
+    /// Applies to any actor.
+    #[default]
+    ActorGeneral,
+    /// Applies only to the player character.
+    PlayerOnly,
+}
+
+/// A per-game derived-stat formula: `round(bias + cₐ·A + c_b·B + cross·A·B)`
+/// clamped to `[floor, cap]`. Fixed 36-byte `Copy` layout — see the module
+/// docs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DerivedStatFormula {
+    /// Constant term.
+    pub bias: f32,
+    /// First input and its coefficient.
+    pub a: DerivedInput,
+    pub coeff_a: f32,
+    /// Second input and its coefficient (`UNUSED` for single-input stats).
+    pub b: DerivedInput,
+    pub coeff_b: f32,
+    /// Coefficient of the `A·B` cross term (`0.0` when absent). Only
+    /// FO4 Health uses it (`0.5·L·END`).
+    pub cross: f32,
+    /// Lower clamp (`f32::NEG_INFINITY` = unfloored). #2939 — every shipped
+    /// formula but the FO3/FNV negative-bias resistances (`(gov − 1)·k`,
+    /// [`super::resistance::Affliction::fo3_fnv_resistance_formula`]) has a
+    /// non-negative bias and reads `0.0` for an absent input by design, so
+    /// this only ever engages for those two rows: a governing AV that is
+    /// absent or genuinely `0` would otherwise evaluate outside the sourced
+    /// attribute domain (a negative resistance percentage).
+    pub floor: f32,
+    /// Upper clamp (`f32::INFINITY` = uncapped). Shipped caps: FO3 AP
+    /// `85`, FNV AP `95`, Critical Chance `10`, FO3/FNV resistances `85`
+    /// ([`super::resistance::Affliction::resist_cap`]).
+    ///
+    /// #3766 — the examples here used to read "Critical Chance 0.10, FO4
+    /// VATS 0.95". Both were wrong, and wrong in the way that matters:
+    /// `0.10` is precisely the fractional value #2936 removed when it moved
+    /// every percentage row onto the 0–100 convention (`fallout.rs` ships
+    /// `capped(10.0)`), and this doc is the nearest reference an
+    /// implementer of a new percentage row reads — the module docstring
+    /// above says in as many words that the convention has **no type-level
+    /// enforcement** and must be written on the 0–100 scale by hand, so
+    /// demonstrating the opposite with a concrete number is the 100×-off
+    /// footgun #2936 existed to close. `FO4 VATS 0.95` named no shipped row
+    /// at all: `fallout4_ruleset` registers exactly three (Health / AP /
+    /// Carry Weight), which `ROSTER_CASES`' `derived_rows: Some(3)` pins.
+    pub cap: f32,
+    /// Rounding before the clamp.
+    pub round: RoundMode,
+    /// Absolute value vs multiplier.
+    pub kind: DerivedOutput,
+    /// Player-only vs actor-general (see [`DerivedScope`]). Free — fits in
+    /// the struct's alignment padding.
+    pub scope: DerivedScope,
+    /// Bit 0 / bit 1: read input `a` / `b` from its AV's `base` layer
+    /// instead of `current()` (see [`Self::a_from_base`]). The struct's last
+    /// spare padding byte (see `formula_is_thirty_six_bytes_and_copy`).
+    base_reads: u8,
+}
+
+const READ_A_FROM_BASE: u8 = 0b01;
+const READ_B_FROM_BASE: u8 = 0b10;
+
+impl DerivedStatFormula {
+    /// `bias + coeff·input` — the common single-input affine stat
+    /// (AP, Carry Weight, Critical Chance, Melee Damage …).
+    pub const fn affine(input: DerivedInput, coeff: f32, bias: f32) -> Self {
+        Self {
+            bias,
+            a: input,
+            coeff_a: coeff,
+            b: DerivedInput::UNUSED,
+            coeff_b: 0.0,
+            cross: 0.0,
+            floor: f32::NEG_INFINITY,
+            cap: f32::INFINITY,
+            round: RoundMode::None,
+            kind: DerivedOutput::Absolute,
+            scope: DerivedScope::ActorGeneral,
+            base_reads: 0,
+        }
+    }
+
+    /// `bias + coeff_a·a + coeff_b·b + cross·a·b` — the two-input form
+    /// (FO3/FNV/FO4 Health off Endurance + level).
+    pub const fn bilinear(
+        a: DerivedInput,
+        coeff_a: f32,
+        b: DerivedInput,
+        coeff_b: f32,
+        cross: f32,
+        bias: f32,
+    ) -> Self {
+        Self {
+            bias,
+            a,
+            coeff_a,
+            b,
+            coeff_b,
+            cross,
+            floor: f32::NEG_INFINITY,
+            cap: f32::INFINITY,
+            round: RoundMode::None,
+            kind: DerivedOutput::Absolute,
+            scope: DerivedScope::ActorGeneral,
+            base_reads: 0,
+        }
+    }
+
+    /// Set the upper clamp (chainable).
+    pub const fn capped(mut self, cap: f32) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Set the lower clamp (chainable) — #2939, the FO3/FNV negative-bias
+    /// resistances. Named apart from [`Self::floored`] (which is a
+    /// *rounding* mode, not a clamp) to keep the two unmistakably different
+    /// operations from reading like the same word.
+    pub const fn clamped_below(mut self, floor: f32) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// Floor the result before clamping (chainable) — Health.
+    pub const fn floored(mut self) -> Self {
+        self.round = RoundMode::Floor;
+        self
+    }
+
+    /// Ceil the result before clamping (chainable) — Unarmed Damage.
+    pub const fn ceiled(mut self) -> Self {
+        self.round = RoundMode::Ceil;
+        self
+    }
+
+    /// Mark the output a multiplier (chainable) — Melee Damage, XP mult.
+    pub const fn as_multiplier(mut self) -> Self {
+        self.kind = DerivedOutput::Multiplier;
+        self
+    }
+
+    /// Mark the formula player-only (chainable) — Health, Action Points
+    /// (NPCs ship baked values / derive differently).
+    pub const fn player_only(mut self) -> Self {
+        self.scope = DerivedScope::PlayerOnly;
+        self
+    }
+
+    /// Read input `a` from its AV's `base` layer only, excluding permanent/
+    /// temporary modifiers and damage (chainable) — Skyrim Carry Weight,
+    /// which the source states explicitly excludes Fortify Stamina. Every
+    /// other derived stat built so far reads `current()` (the default);
+    /// FO4 Health is confirmed correct doing so ("health rescales
+    /// dynamically with any Endurance / level change — no permanent/
+    /// temporary split for player HP", `charal-fo4-ruleset.md`). The rest
+    /// are unaudited on this question but not known to be wrong — this
+    /// method exists because Skyrim Carry Weight positively needs it, not
+    /// because anything else was found broken.
+    pub const fn a_from_base(mut self) -> Self {
+        self.base_reads |= READ_A_FROM_BASE;
+        self
+    }
+
+    /// Read input `b` from its AV's `base` layer only (chainable) — see
+    /// [`Self::a_from_base`].
+    pub const fn b_from_base(mut self) -> Self {
+        self.base_reads |= READ_B_FROM_BASE;
+        self
+    }
+
+    /// Evaluate against an actor's [`ActorValues`] + level. Reads each input
+    /// (AV by FormID, or the level), folds the bilinear expression, rounds,
+    /// then clamps to `[floor, cap]`. Inputs absent from `avs` read `0.0`
+    /// (the Bethesda absent-AV default), so a partially-populated actor
+    /// degrades gracefully rather than panicking.
+    #[inline]
+    pub fn eval(&self, avs: &ActorValues, level: u16) -> f32 {
+        let a = self
+            .a
+            .read(avs, level, self.base_reads & READ_A_FROM_BASE != 0);
+        let b = self
+            .b
+            .read(avs, level, self.base_reads & READ_B_FROM_BASE != 0);
+        let raw = self.bias + self.coeff_a * a + self.coeff_b * b + self.cross * a * b;
+        let rounded = match self.round {
+            RoundMode::None => raw,
+            RoundMode::Floor => raw.floor(),
+            RoundMode::Ceil => raw.ceil(),
+        };
+        rounded.max(self.floor).min(self.cap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stand-in global-space AVIF FormIDs for the SPECIAL + a skill. The
+    // formula type is agnostic to their values — real ids come from the
+    // parsed AVIF set.
+    const STR: u32 = 0x05;
+    const END: u32 = 0x07;
+    const AGI: u32 = 0x0A;
+    const LUCK: u32 = 0x0B;
+    const UNARMED: u32 = 0x2C;
+
+    fn av(input: u32) -> DerivedInput {
+        DerivedInput::actor_value(input)
+    }
+
+    /// Build an `ActorValues` from `(avif, base)` pairs.
+    fn avs(pairs: &[(u32, f32)]) -> ActorValues {
+        ActorValues::from_pairs(pairs.iter().copied())
+    }
+
+    #[test]
+    fn formula_is_thirty_six_bytes_and_copy() {
+        // Efficiency guard: fixed layout, no heap — the round/kind/scope/
+        // base_reads u8 flags pack into 4 bytes with zero padding (7 f32/
+        // u32-sized fields × 4 bytes + 4 packed u8 flags = 32; #2939 added
+        // `floor`, one more f32, for 36).
+        assert_eq!(std::mem::size_of::<DerivedStatFormula>(), 36);
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<DerivedStatFormula>();
+        // Scope defaults to actor-general; `player_only` flips it.
+        let f = DerivedStatFormula::affine(DerivedInput::LEVEL, 1.0, 0.0);
+        assert_eq!(f.scope, DerivedScope::ActorGeneral);
+        assert_eq!(f.player_only().scope, DerivedScope::PlayerOnly);
+    }
+
+    #[test]
+    fn fo4_health_bilinear_with_floor_matches_wiki() {
+        // floor(77.5 + 4.5·END + 2.5·L + 0.5·L·END); END 2, L 2 → 93.5 → 93.
+        let f = DerivedStatFormula::bilinear(av(END), 4.5, DerivedInput::LEVEL, 2.5, 0.5, 77.5)
+            .floored();
+        assert_eq!(f.eval(&avs(&[(END, 2.0)]), 2), 93.0);
+        // END 5, L 1 → floor(77.5+22.5+2.5+2.5)=floor(105)=105.
+        assert_eq!(f.eval(&avs(&[(END, 5.0)]), 1), 105.0);
+    }
+
+    #[test]
+    fn fnv_and_fo3_health_match_wiki() {
+        // FNV: 100 + 20·END + 5·(L−1) = 95 + 20·END + 5·L. END 5, L 1 → 200.
+        let fnv = DerivedStatFormula::bilinear(av(END), 20.0, DerivedInput::LEVEL, 5.0, 0.0, 95.0);
+        assert_eq!(fnv.eval(&avs(&[(END, 5.0)]), 1), 200.0);
+        assert_eq!(fnv.eval(&avs(&[(END, 10.0)]), 30), 445.0); // 95+200+150
+                                                               // FO3: 90 + 20·END + 10·L. END 5, L 1 → 200.
+        let fo3 = DerivedStatFormula::bilinear(av(END), 20.0, DerivedInput::LEVEL, 10.0, 0.0, 90.0);
+        assert_eq!(fo3.eval(&avs(&[(END, 5.0)]), 1), 200.0);
+    }
+
+    #[test]
+    fn action_points_affine_with_cap() {
+        // FO4: 60 + 10·AGI (uncapped). AGI 5 → 110.
+        let fo4 = DerivedStatFormula::affine(av(AGI), 10.0, 60.0);
+        assert_eq!(fo4.eval(&avs(&[(AGI, 5.0)]), 1), 110.0);
+        // FO3: 65 + 2·AGI, cap 85. AGI 5 → 75; AGI 20 → 105 → clamped 85.
+        let fo3 = DerivedStatFormula::affine(av(AGI), 2.0, 65.0).capped(85.0);
+        assert_eq!(fo3.eval(&avs(&[(AGI, 5.0)]), 1), 75.0);
+        assert_eq!(fo3.eval(&avs(&[(AGI, 20.0)]), 1), 85.0, "cap clamps");
+        // FNV: 65 + 3·AGI, cap 95. AGI 5 → 80.
+        let fnv = DerivedStatFormula::affine(av(AGI), 3.0, 65.0).capped(95.0);
+        assert_eq!(fnv.eval(&avs(&[(AGI, 5.0)]), 1), 80.0);
+    }
+
+    #[test]
+    fn carry_weight_affine() {
+        // FO3/FNV: 150 + 10·STR; FO4: 200 + 10·STR.
+        let cw_fo3 = DerivedStatFormula::affine(av(STR), 10.0, 150.0);
+        let cw_fo4 = DerivedStatFormula::affine(av(STR), 10.0, 200.0);
+        assert_eq!(cw_fo3.eval(&avs(&[(STR, 6.0)]), 1), 210.0);
+        assert_eq!(cw_fo4.eval(&avs(&[(STR, 6.0)]), 1), 260.0);
+    }
+
+    #[test]
+    fn melee_damage_additive_vs_multiplier() {
+        // FO3/FNV Melee Damage: 0.5·STR (additive). STR 5 → 2.5.
+        let fo3 = DerivedStatFormula::affine(av(STR), 0.5, 0.0);
+        assert_eq!(fo3.eval(&avs(&[(STR, 5.0)]), 1), 2.5);
+        assert_eq!(fo3.kind, DerivedOutput::Absolute);
+        // FO4 Melee Damage: ×(1 + 0.1·STR) (multiplier). STR 10 → 2.0×.
+        let fo4 = DerivedStatFormula::affine(av(STR), 0.1, 1.0).as_multiplier();
+        assert_eq!(fo4.eval(&avs(&[(STR, 10.0)]), 1), 2.0);
+        assert_eq!(fo4.kind, DerivedOutput::Multiplier);
+    }
+
+    #[test]
+    fn critical_chance_capped_and_xp_multiplier() {
+        // FO3/FNV Critical Chance: Luck·1 (0–100 percentage scale, #2936 —
+        // matches Affliction resistance's convention, not a 0.0–1.0
+        // fraction), cap 10. Luck 5 → 5; 15 → 10 (capped).
+        let crit = DerivedStatFormula::affine(av(LUCK), 1.0, 0.0).capped(10.0);
+        assert!((crit.eval(&avs(&[(LUCK, 5.0)]), 1) - 5.0).abs() < 1e-6);
+        assert!(
+            (crit.eval(&avs(&[(LUCK, 15.0)]), 1) - 10.0).abs() < 1e-6,
+            "cap"
+        );
+        // FO4 XP multiplier: ×(1 + 0.03·INT). INT 10 → 1.30×.
+        let xp = DerivedStatFormula::affine(av(0x09), 0.03, 1.0).as_multiplier();
+        assert!((xp.eval(&avs(&[(0x09, 10.0)]), 1) - 1.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_from_base_ignores_temporary_mods() {
+        // Skyrim Carry Weight: 250 + 0.5·BaseStamina, explicitly excluding
+        // Fortify Stamina (a temporary_mod).
+        let carry_weight = DerivedStatFormula::affine(av(0x30), 0.5, 250.0).a_from_base();
+        let mut stamina_100 = avs(&[(0x30, 100.0)]);
+        assert_eq!(carry_weight.eval(&stamina_100, 1), 300.0);
+        // A Fortify Stamina potion (+50 temporary) must NOT move Carry Weight.
+        stamina_100.mod_temporary(0x30, 50.0);
+        assert_eq!(
+            carry_weight.eval(&stamina_100, 1),
+            300.0,
+            "temporary Stamina must not affect base-derived Carry Weight"
+        );
+        // But an ordinary (current()-reading) formula on the same AV DOES move.
+        let hypothetical_current_reader = DerivedStatFormula::affine(av(0x30), 0.5, 250.0);
+        assert_eq!(hypothetical_current_reader.eval(&stamina_100, 1), 325.0);
+    }
+
+    #[test]
+    fn unarmed_damage_ceils_off_a_skill_av() {
+        // FO3/FNV Unarmed Damage: ceil((10 + Unarmed)/20) = ceil(0.5 + 0.05·U).
+        // Governed by the Unarmed *skill* AV — proves chaining off a non-attribute.
+        let f = DerivedStatFormula::affine(av(UNARMED), 0.05, 0.5).ceiled();
+        assert_eq!(f.eval(&avs(&[(UNARMED, 90.0)]), 1), 5.0);
+        assert_eq!(f.eval(&avs(&[(UNARMED, 100.0)]), 1), 6.0);
+        assert_eq!(f.eval(&avs(&[(UNARMED, 0.0)]), 1), 1.0, "ceil(0.5) = 1");
+    }
+
+    #[test]
+    fn absent_input_reads_zero() {
+        // An actor missing the input AV degrades to the bias, not a panic.
+        let f = DerivedStatFormula::affine(av(STR), 10.0, 200.0);
+        assert_eq!(f.eval(&ActorValues::new(), 1), 200.0);
+    }
+
+    /// #2939 — `clamped_below` is the generic mechanism the FO3/FNV
+    /// negative-bias resistances (`super::resistance::Affliction::
+    /// fo3_fnv_resistance_formula`) build on; pin it directly, independent
+    /// of that call site. Defaults to unfloored (`f32::NEG_INFINITY`) so
+    /// every formula built before this fix is unaffected.
+    #[test]
+    fn clamped_below_floors_without_disturbing_the_cap() {
+        let unfloored = DerivedStatFormula::affine(av(STR), -1.0, -1.0);
+        assert_eq!(
+            unfloored.eval(&avs(&[(STR, 5.0)]), 1),
+            -6.0,
+            "no floor by default"
+        );
+
+        let floored = unfloored.clamped_below(0.0);
+        assert_eq!(
+            floored.eval(&avs(&[(STR, 5.0)]), 1),
+            0.0,
+            "clamps below zero"
+        );
+        assert_eq!(
+            floored.eval(&avs(&[(STR, 0.0)]), 1),
+            0.0,
+            "input at the exact floor stays at the floor, not below it"
+        );
+
+        // Floor and cap compose — a value the floor doesn't reach still
+        // respects the upper clamp.
+        let floored_and_capped = DerivedStatFormula::affine(av(STR), 1.0, 0.0)
+            .clamped_below(0.0)
+            .capped(10.0);
+        assert_eq!(floored_and_capped.eval(&avs(&[(STR, 50.0)]), 1), 10.0);
+    }
+}

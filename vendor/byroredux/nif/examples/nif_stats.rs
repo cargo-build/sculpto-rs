@@ -1,0 +1,760 @@
+//! nif_stats — walk a NIF source and report parse statistics.
+//!
+//! Usage:
+//!   cargo run -p byroredux-nif --example nif_stats -- <path> [flags]
+//!
+//! `<path>` may be:
+//!   - a single `.nif` file
+//!   - a directory containing `.nif` files (recursed)
+//!   - a `.bsa` archive (all internal `.nif` entries are extracted)
+//!
+//! Output flags:
+//!   `--tsv`           Emit machine-readable per-type histogram on stdout
+//!                     (`<type>\t<parsed>\t<unknown>`). Suppresses the
+//!                     human-readable summary. Used as the source of
+//!                     truth by the per-block-baseline regression test.
+//!   `--unknown-only`  In the human-readable summary, only show types
+//!                     where `unknown > 0` — i.e. types that the
+//!                     dispatch table claims to know but that landed on
+//!                     the recovery path on at least one instance.
+//!                     Highlights regressions; suppresses the bulk of
+//!                     fully-parsed type rows.
+//!   `--all`           Disable the top-20 caps on the human-readable
+//!                     "Unparsed types" and "Block type histogram"
+//!                     sections. Without this, a FO4-specific block
+//!                     type that always falls into NiUnknown recovery
+//!                     can hide in the long tail past row 20. See #601.
+//!                     "Types with partial unknown" is always printed
+//!                     uncapped — it's the most direct R3 signal.
+//!   `--min-count N`   Trim every histogram to entries with `total >=
+//!                     N` (default 0). Combine with `--all` to surface
+//!                     the long tail without flooding the summary.
+//!
+//! Per-block-type histogram (R3 — `parsed` vs `unknown`):
+//!   #2323 (FO3-D2-02) — the two branches key on DIFFERENT names, they
+//!   do NOT share one "header-advertised type" key as an earlier version
+//!   of this doc claimed. A block that falls into the `NiUnknown`
+//!   recovery path (under-consumed parser via `block_size` seek, runtime
+//!   size cache, `oblivion_skip_sizes` hint, or dispatch-table miss)
+//!   contributes to `unknown[<header-advertised type name>]` — the name
+//!   preserved on the `NiUnknown` placeholder. A block that dispatches
+//!   to a real parser contributes to `parsed[block.block_type_name()]`
+//!   — the **parsed Rust struct's** name, a fixed per-type string set at
+//!   the `impl_ni_object!` invocation site, NOT the on-disk header string.
+//!
+//!   For most types these coincide, so a regressed parser that starts
+//!   under-consuming shows as `parsed: N->N-k` on the type's key while a
+//!   new `unknown[type]` key appears. But several parsers register a
+//!   shared *alias* struct name: ~28 `NiPSys*Modifier` header types all
+//!   report `block_type_name() == "NiPSysBlock"` (and 5 emitter types
+//!   report `"NiPSysEmitter"`), so their `parsed` counts AGGREGATE into
+//!   one bucket that never appears in any NIF header table — same
+//!   collapse `BSSegmentedTriShape`/`NiTriStrips` → `NiTriShape`,
+//!   `BSFadeNode` → `NiNode`, and `Lighting30ShaderProperty` →
+//!   `BSShaderPPLightingProperty` hit. The regression is still CAUGHT —
+//!   a regressed member lands in a distinct `unknown[<header name>]` key
+//!   — but a composition shift *within* a collapsed family (one member's
+//!   dispatch arm silently reroutes to another's) can leave the
+//!   aggregate `parsed` count byte-identical, hiding a "parses
+//!   differently" regression rather than a "stops parsing" one. Per-type
+//!   resolution on the `parsed` side is deferred: `NifScene` does not
+//!   carry per-block header-advertised type names today.
+//!
+//!   #4265 (OB-D6-01) — this histogram does NOT mirror
+//!   `tests/common::PerBlockHistogram` (#1883 / NIF-D3-001) byte-for-byte,
+//!   despite an earlier version of this doc claiming it did.
+//!   `PerBlockHistogram` keys on the header-advertised **wire name**
+//!   (the #3326 fix); this tool's `parsed` bucket keys on
+//!   `block.block_type_name()`, the parsed/dispatched Rust struct name —
+//!   exactly the alias-collapsing key described two paragraphs up. The
+//!   two histograms answer different questions (wire-name census vs.
+//!   dispatch-target census) and will legitimately disagree on any
+//!   collapsed alias family; do not diff their TSVs directly as if they
+//!   used the same key.
+//!
+//!   A type with `parsed=N>0, unknown=M>0` is the regression signal R3
+//!   cares about: dispatch can parse this type, but at least one
+//!   instance in the corpus failed.
+//!
+//! Exit code is non-zero when the clean-parse rate drops below the default
+//! gate ([`DEFAULT_MIN_SUCCESS_RATE`], currently 1.0). Not every vanilla
+//! archive parses 100% clean — some carry a residual FaceGen / stream-drift
+//! truncation tail. The authoritative per-game clean-parse floors live in
+//! the ROADMAP compatibility matrix; run those archives with
+//! `NIF_STATS_MIN_SUCCESS_RATE=<0.0..=1.0>` set to the matrix floor.
+//! Override likewise for modded content where partial coverage is expected.
+
+use byroredux_bsa::{Ba2Archive, BsaArchive};
+use byroredux_nif::blocks::NiUnknown;
+use byroredux_nif::parse_nif;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Default clean-parse gate. Kept strict at 1.0: a drop on an archive that
+/// parses fully clean is a regression, so the tool fails loud by default.
+/// Archives with a residual truncation tail parse below 1.0 and REQUIRE an
+/// explicit `NIF_STATS_MIN_SUCCESS_RATE` override set to their ROADMAP
+/// compatibility-matrix floor, or they trip a false "below threshold"
+/// failure. The floors live in the ROADMAP matrix (and move as the parser
+/// improves — e.g. FO4 Meshes/MeshesExtra reached 100% clean by 2026-06-14,
+/// #1457), so this comment deliberately does NOT hardcode per-game numbers.
+///
+/// There is no ROADMAP sentence asserting a single universal parse rate;
+/// the prior comment quoted one that never existed. See issue #487 for the
+/// gate-tightening rationale and #1452 for this correction.
+const DEFAULT_MIN_SUCCESS_RATE: f64 = 1.0;
+
+fn min_success_rate() -> f64 {
+    std::env::var("NIF_STATS_MIN_SUCCESS_RATE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|r| (0.0..=1.0).contains(r))
+        .unwrap_or(DEFAULT_MIN_SUCCESS_RATE)
+}
+
+/// #839 / SK-D5-NEW-05 — per-block stream-drift budget. The legacy
+/// gate inspected `clean == total` at the **NIF** level, leaving
+/// per-block realignments invisible — e.g. Skyrim Meshes0 reporting
+/// `100.00% clean / recovered: 0` despite 67+ `consumed != block_size`
+/// events fired in the parse log.
+///
+/// The drift histogram populated on `NifScene.drift_histogram` (#939)
+/// now feeds an opt-in cap: when the env var is set, the walk-level
+/// aggregate must stay at-or-below the value or the binary exits
+/// non-zero. Default is `u64::MAX` (no gating) so existing scripts
+/// keep working; CI / regression runs set it to `0` for strict
+/// vanilla-content checks. Setting `1` etc. lets known-noisy paths
+/// pass while still catching net-new drift.
+fn max_drift_events() -> u64 {
+    std::env::var("NIF_STATS_MAX_DRIFT_EVENTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Per-block-type counts. `parsed` is dispatch-table success; `unknown`
+/// is the count of blocks that landed on the `NiUnknown` recovery path
+/// while still advertising this type in the header.
+#[derive(Debug, Default, Clone, Copy)]
+struct BlockCounts {
+    parsed: usize,
+    unknown: usize,
+}
+
+impl BlockCounts {
+    fn total(&self) -> usize {
+        self.parsed + self.unknown
+    }
+}
+
+struct Stats {
+    total: usize,
+    /// Parses that returned Ok with a complete scene graph.
+    clean: usize,
+    /// Parses that returned Ok but with `scene.truncated == true`.
+    /// Tracked separately from `clean` because they represent silent
+    /// data loss (one or more blocks dropped). See #393.
+    truncated: usize,
+    /// Sum of `dropped_block_count` across every truncated scene —
+    /// gives a rough "blocks lost" telemetry figure.
+    dropped_blocks: usize,
+    /// Examples of truncated files (path, dropped count), capped for
+    /// the summary output.
+    truncated_examples: Vec<(String, usize)>,
+    /// Per-header-type histogram with `parsed` vs `unknown` split.
+    block_histogram: BTreeMap<String, BlockCounts>,
+    /// Per-block-type stream-drift histogram aggregated across every
+    /// scene in the walk. `drift_histogram[type][n]` is the total count
+    /// of drift events of magnitude `n = declared - consumed` over the
+    /// whole walk. Surfaces via `--drift-histogram`. See #939.
+    drift_histogram: BTreeMap<String, BTreeMap<i64, u64>>,
+    /// Grouped by the first line of the error message.
+    failure_groups: BTreeMap<String, Vec<String>>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            total: 0,
+            clean: 0,
+            truncated: 0,
+            dropped_blocks: 0,
+            truncated_examples: Vec::new(),
+            block_histogram: BTreeMap::new(),
+            drift_histogram: BTreeMap::new(),
+            failure_groups: BTreeMap::new(),
+        }
+    }
+
+    /// Fold one parse's per-block-type drift histogram into the
+    /// walk-level aggregate. See #939.
+    fn record_drift(&mut self, scene_drift: &BTreeMap<String, BTreeMap<i64, u32>>) {
+        for (type_name, per_type) in scene_drift {
+            let entry = self.drift_histogram.entry(type_name.clone()).or_default();
+            for (&drift, &count) in per_type {
+                *entry.entry(drift).or_insert(0) += count as u64;
+            }
+        }
+    }
+
+    /// Walk a parsed scene and accumulate per-block-type counts, keyed
+    /// as described in the module doc (#2323 — the two branches use
+    /// DIFFERENT keys, not one shared "header-advertised type"). A
+    /// block that downcasts to `NiUnknown` contributes to `unknown[its
+    /// preserved type_name]`; otherwise it contributes to
+    /// `parsed[block_type_name()]`. Centralised here so success and
+    /// truncated paths share identical attribution logic.
+    fn record_blocks<'a>(
+        &mut self,
+        blocks: impl Iterator<Item = &'a Box<dyn byroredux_nif::blocks::NiObject>>,
+    ) {
+        for block in blocks {
+            let entry = match block.as_any().downcast_ref::<NiUnknown>() {
+                Some(unknown) => {
+                    let key = unknown.type_name.as_ref();
+                    let bucket = self.block_histogram.entry(key.to_string()).or_default();
+                    bucket.unknown += 1;
+                    continue;
+                }
+                None => self
+                    .block_histogram
+                    .entry(block.block_type_name().to_string())
+                    .or_default(),
+            };
+            entry.parsed += 1;
+        }
+    }
+
+    fn record_success<'a>(
+        &mut self,
+        blocks: impl Iterator<Item = &'a Box<dyn byroredux_nif::blocks::NiObject>>,
+    ) {
+        self.total += 1;
+        self.clean += 1;
+        self.record_blocks(blocks);
+    }
+
+    /// A truncated scene still contributes block histogram data (the
+    /// partial parse is useful for telemetry), but does NOT count
+    /// toward the clean-parse rate used by the exit-code gate. See #393.
+    fn record_truncated<'a>(
+        &mut self,
+        path: String,
+        dropped: usize,
+        blocks: impl Iterator<Item = &'a Box<dyn byroredux_nif::blocks::NiObject>>,
+    ) {
+        self.total += 1;
+        self.truncated += 1;
+        self.dropped_blocks += dropped;
+        if self.truncated_examples.len() < 20 {
+            self.truncated_examples.push((path, dropped));
+        }
+        self.record_blocks(blocks);
+    }
+
+    fn record_failure(&mut self, path: String, err: String) {
+        self.total += 1;
+        // Group errors by their first line — avoids per-file message noise.
+        let group_key = err.lines().next().unwrap_or(&err).to_string();
+        self.failure_groups.entry(group_key).or_default().push(path);
+    }
+
+    /// Clean-parse rate — the exit-code gate metric. Truncated files
+    /// count as failures because they represent silent data loss.
+    fn success_rate(&self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.clean as f64 / self.total as f64
+        }
+    }
+
+    /// Sum of `unknown` counts across every type. This is the
+    /// per-block-type recovery surface, distinct from the file-level
+    /// clean/truncated/failed counters above.
+    fn total_unknown_blocks(&self) -> usize {
+        self.block_histogram.values().map(|c| c.unknown).sum()
+    }
+
+    /// Sum of every drift event across every type — the per-block
+    /// surface that the legacy `clean == total` gate cannot see (#839).
+    /// One drift event = one block parser returned `Ok` but consumed
+    /// a number of bytes that disagreed with the header's `block_size`,
+    /// requiring stream realignment. See #939 for the underlying
+    /// `NifScene.drift_histogram` data source.
+    fn total_drift_events(&self) -> u64 {
+        self.drift_histogram
+            .values()
+            .flat_map(|inner| inner.values())
+            .sum()
+    }
+
+    /// Number of types where dispatch succeeded for some instances but
+    /// the recovery path absorbed others. Most direct R3 signal.
+    fn types_with_partial_unknown(&self) -> usize {
+        self.block_histogram
+            .values()
+            .filter(|c| c.parsed > 0 && c.unknown > 0)
+            .count()
+    }
+
+    /// Print the per-block-type stream-drift histogram aggregated
+    /// across every parsed file. Rows are sorted by total drift-event
+    /// count (descending). For each type, the per-drift-value
+    /// distribution is shown as `drift=+N×count` pairs, sorted by
+    /// `|drift|` then sign. See #939.
+    fn print_drift_histogram(&self, show_all: bool) {
+        println!();
+        if self.drift_histogram.is_empty() {
+            println!("─── Drift histogram ──────────────────────────────────────────");
+            println!(
+                "  No drift detected (every block parser consumed exactly its declared block_size)"
+            );
+            return;
+        }
+
+        // Per-type totals — drives the row ordering.
+        let mut by_total: Vec<(&String, u64, &BTreeMap<i64, u64>)> = self
+            .drift_histogram
+            .iter()
+            .map(|(name, per_type)| {
+                let total: u64 = per_type.values().sum();
+                (name, total, per_type)
+            })
+            .collect();
+        by_total.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+        let total_events: u64 = by_total.iter().map(|(_, t, _)| *t).sum();
+        let total_types = by_total.len();
+        println!(
+            "─── Drift histogram ({} events across {} type(s)) ─────────",
+            total_events, total_types
+        );
+        let limit = if show_all { by_total.len() } else { 20 };
+        for (name, total, per_type) in by_total.iter().take(limit) {
+            // Show drifts ordered by |drift| (worst first) so a +20
+            // outlier appears ahead of the common +1 / -1 noise.
+            let mut entries: Vec<(i64, u64)> = per_type.iter().map(|(&d, &c)| (d, c)).collect();
+            entries.sort_by(|a, b| b.0.abs().cmp(&a.0.abs()).then_with(|| a.0.cmp(&b.0)));
+            let dist = entries
+                .iter()
+                .map(|(d, c)| format!("drift={:+}×{}", d, c))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  {:>8}  {:<40}  {}", total, name, dist);
+        }
+        if by_total.len() > limit {
+            println!(
+                "  ... and {} more type(s) (use --all to show)",
+                by_total.len() - limit
+            );
+        }
+    }
+
+    fn print(&self, unknown_only: bool, show_all: bool, min_count: usize) {
+        let failures = self.total - self.clean - self.truncated;
+        println!();
+        println!("─── Parse stats ──────────────────────────────────────────────");
+        println!("  total:     {:>6}", self.total);
+        println!(
+            "  clean:     {:>6}  ({:.2}%)",
+            self.clean,
+            self.success_rate() * 100.0
+        );
+        println!(
+            "  truncated: {:>6}  ({} blocks dropped)",
+            self.truncated, self.dropped_blocks
+        );
+        println!("  failures:  {:>6}", failures);
+        println!(
+            "  recovered: {:>6}  ({} types with partial unknown)",
+            self.total_unknown_blocks(),
+            self.types_with_partial_unknown()
+        );
+
+        if !self.block_histogram.is_empty() {
+            // Sort by total descending for the human-readable summary;
+            // ties broken by parsed-only descending so well-behaved
+            // types group together. The TSV mode keeps the BTreeMap's
+            // alphabetical order — that's stable across runs and
+            // diff-friendly for the baseline regression test.
+            let mut sorted: Vec<(&String, &BlockCounts)> = self.block_histogram.iter().collect();
+            sorted.sort_by(|a, b| {
+                b.1.total()
+                    .cmp(&a.1.total())
+                    .then_with(|| b.1.parsed.cmp(&a.1.parsed))
+            });
+
+            // Always print the regression-signal block first: types
+            // where dispatch sometimes succeeds and sometimes falls
+            // into the recovery path. Always uncapped — this is the
+            // most direct R3 signal and there are usually only a
+            // handful even on a full-archive sweep.
+            let partial: Vec<&(&String, &BlockCounts)> = sorted
+                .iter()
+                .filter(|(_, c)| c.parsed > 0 && c.unknown > 0 && c.total() >= min_count)
+                .collect();
+            if !partial.is_empty() {
+                println!();
+                println!("─── Types with partial unknown (regression signals) ───────────");
+                println!("  {:>8} {:>8}  type", "parsed", "unknown");
+                for (name, counts) in &partial {
+                    println!("  {:>8} {:>8}  {}", counts.parsed, counts.unknown, name);
+                }
+            }
+
+            // Pure-unknown types: dispatch table doesn't know them at
+            // all. Not regressions — usually new types or legacy
+            // edge-cases — but useful telemetry for parser priorities.
+            // Top-20 cap by default; `--all` uncaps. See #601 — without
+            // this, a FO4-specific block type that always falls into
+            // NiUnknown can hide in the long tail past row 20.
+            let pure_unknown: Vec<&(&String, &BlockCounts)> = sorted
+                .iter()
+                .filter(|(_, c)| c.parsed == 0 && c.unknown > 0 && c.total() >= min_count)
+                .collect();
+            if !pure_unknown.is_empty() {
+                println!();
+                println!("─── Unparsed types (no dispatch entry) ────────────────────────");
+                println!("  {:>8}  type", "unknown");
+                let limit = if show_all { pure_unknown.len() } else { 20 };
+                for (name, counts) in pure_unknown.iter().take(limit) {
+                    println!("  {:>8}  {}", counts.unknown, name);
+                }
+                if pure_unknown.len() > limit {
+                    println!(
+                        "  ... and {} more pure-unknown types (use --all to show)",
+                        pure_unknown.len() - limit
+                    );
+                }
+            }
+
+            if !unknown_only {
+                let filtered: Vec<&(&String, &BlockCounts)> = sorted
+                    .iter()
+                    .filter(|(_, c)| c.total() >= min_count)
+                    .collect();
+                let header = if show_all {
+                    "─── Block type histogram (full) ────────────────────────────────"
+                } else {
+                    "─── Block type histogram (top 20 by total) ────────────────────"
+                };
+                println!();
+                println!("{}", header);
+                println!("  {:>8} {:>8}  type", "parsed", "unknown");
+                let limit = if show_all { filtered.len() } else { 20 };
+                for (name, counts) in filtered.iter().take(limit) {
+                    println!("  {:>8} {:>8}  {}", counts.parsed, counts.unknown, name);
+                }
+                if filtered.len() > limit {
+                    println!(
+                        "  ... and {} more types (use --all to show)",
+                        filtered.len() - limit
+                    );
+                }
+                let trimmed = sorted.len() - filtered.len();
+                if trimmed > 0 {
+                    println!(
+                        "  ({} distinct block types; {} below --min-count {})",
+                        sorted.len(),
+                        trimmed,
+                        min_count,
+                    );
+                } else {
+                    println!("  ({} distinct block types)", sorted.len());
+                }
+            }
+        }
+
+        if !self.truncated_examples.is_empty() {
+            println!();
+            println!("─── Truncated scenes (sample) ─────────────────────────────────");
+            for (path, dropped) in &self.truncated_examples {
+                println!("  dropped {} blocks  {}", dropped, path);
+            }
+            if self.truncated > self.truncated_examples.len() {
+                println!(
+                    "  ... and {} more truncated",
+                    self.truncated - self.truncated_examples.len()
+                );
+            }
+        }
+
+        if !self.failure_groups.is_empty() {
+            println!();
+            println!("─── Failure groups ────────────────────────────────────────────");
+            let mut groups: Vec<(&String, &Vec<String>)> = self.failure_groups.iter().collect();
+            groups.sort_by_key(|group| std::cmp::Reverse(group.1.len()));
+            for (msg, paths) in groups {
+                println!("  ({} files) {}", paths.len(), msg);
+                for p in paths.iter().take(3) {
+                    println!("    - {}", p);
+                }
+                if paths.len() > 3 {
+                    println!("    ... and {} more", paths.len() - 3);
+                }
+            }
+        }
+    }
+
+    /// Emit `<type>\t<parsed>\t<unknown>` per line in the BTreeMap's
+    /// alphabetical order. Stable across runs — used by the per-block
+    /// baseline regression test as the comparison source. Header line
+    /// (`# nif_stats per-block histogram, total=N files`) makes
+    /// hand-inspection of checked-in baselines easier.
+    fn print_tsv(&self) {
+        println!(
+            "{}",
+            byroredux_nif::corpus::per_block_tsv_header(
+                self.total,
+                Some((self.clean, self.truncated)),
+            )
+        );
+        for (name, counts) in &self.block_histogram {
+            println!("{}\t{}\t{}", name, counts.parsed, counts.unknown);
+        }
+    }
+}
+
+fn process_bytes(stats: &mut Stats, label: String, bytes: &[u8]) {
+    match parse_nif(bytes) {
+        Ok(scene) => {
+            // Fold drift independent of clean / truncated routing —
+            // a clean parse can still carry drift entries when a parser
+            // returns Ok with consumed != block_size. See #939.
+            stats.record_drift(&scene.drift_histogram);
+            // #568 — a non-zero `recovered_blocks` means at least one
+            // block fell into the NiUnknown recovery path (parser
+            // misalignment like #546, or an unknown dispatch type).
+            // Route through `record_truncated` so the clean-parse gate
+            // doesn't hide these. `dropped_block_count` is authoritative
+            // for genuine truncations; we add `recovered_blocks` to it
+            // so the telemetry line reports every lost / placeholdered
+            // block in one figure.
+            let non_clean_blocks = scene.dropped_block_count + scene.recovered_blocks;
+            if scene.truncated || scene.recovered_blocks > 0 {
+                stats.record_truncated(label, non_clean_blocks, scene.blocks.iter());
+            } else {
+                stats.record_success(scene.blocks.iter());
+            }
+        }
+        Err(e) => {
+            stats.record_failure(label, e.to_string());
+        }
+    }
+}
+
+fn process_file(stats: &mut Stats, path: &Path) {
+    match std::fs::read(path) {
+        Err(e) => {
+            stats.record_failure(path.display().to_string(), format!("read: {e}"));
+        }
+        Ok(bytes) => {
+            process_bytes(stats, path.display().to_string(), &bytes);
+        }
+    }
+}
+
+fn process_dir(stats: &mut Stats, root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipping unreadable directory: {:?}", dir);
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            // #5440 — the one corpus definition, as archive mode uses: a loose
+            // extracted tree holds `.bto` / `.btr` LOD meshes too.
+            if byroredux_nif::corpus::is_nif_entry(&path.to_string_lossy()) {
+                process_file(stats, &path);
+            }
+        }
+    }
+}
+
+fn process_bsa(stats: &mut Stats, path: &Path) -> Result<(), String> {
+    let archive = BsaArchive::open(path).map_err(|e| format!("open BSA: {e}"))?;
+    eprintln!("opened {} ({} files)", path.display(), archive.file_count());
+    let nif_files: Vec<String> = archive
+        .list_files()
+        .iter()
+        .filter(|p| byroredux_nif::corpus::is_nif_entry(p))
+        .map(|s| s.to_string())
+        .collect();
+    eprintln!("  → {} .nif entries", nif_files.len());
+    for (i, nif_path) in nif_files.iter().enumerate() {
+        if i > 0 && i.is_multiple_of(500) {
+            eprintln!("  progress: {}/{}", i, nif_files.len());
+        }
+        match archive.extract(nif_path) {
+            Ok(bytes) => process_bytes(stats, nif_path.clone(), &bytes),
+            Err(e) => stats.record_failure(nif_path.clone(), format!("extract: {e}")),
+        }
+    }
+    Ok(())
+}
+
+fn process_ba2(stats: &mut Stats, path: &Path) -> Result<(), String> {
+    let archive = Ba2Archive::open(path).map_err(|e| format!("open BA2: {e}"))?;
+    eprintln!(
+        "opened {} (BA2 v{} {:?}, {} files)",
+        path.display(),
+        archive.version(),
+        archive.variant(),
+        archive.file_count()
+    );
+    let nif_files: Vec<String> = archive
+        .list_files()
+        .iter()
+        .filter(|p| byroredux_nif::corpus::is_nif_entry(p))
+        .map(|s| s.to_string())
+        .collect();
+    eprintln!("  → {} .nif entries", nif_files.len());
+    for (i, nif_path) in nif_files.iter().enumerate() {
+        if i > 0 && i.is_multiple_of(500) {
+            eprintln!("  progress: {}/{}", i, nif_files.len());
+        }
+        match archive.extract(nif_path) {
+            Ok(bytes) => process_bytes(stats, nif_path.clone(), &bytes),
+            Err(e) => stats.record_failure(nif_path.clone(), format!("extract: {e}")),
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    // Optional env_logger init so --verbose parse messages surface.
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .try_init();
+
+    let mut path_arg: Option<String> = None;
+    let mut tsv = false;
+    let mut unknown_only = false;
+    let mut show_all = false;
+    let mut drift_only = false;
+    let mut min_count: usize = 0;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tsv" => tsv = true,
+            "--unknown-only" => unknown_only = true,
+            "--all" => show_all = true,
+            "--drift-histogram" => drift_only = true,
+            "--min-count" => {
+                let Some(val) = args.next() else {
+                    eprintln!("--min-count requires a value");
+                    std::process::exit(2);
+                };
+                match val.parse::<usize>() {
+                    Ok(n) => min_count = n,
+                    Err(_) => {
+                        eprintln!("invalid --min-count value: {}", val);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: nif_stats <path> [--tsv] [--unknown-only] [--all] [--drift-histogram] [--min-count N]"
+                );
+                eprintln!("  <path>             .nif file, directory, .bsa, or .ba2");
+                eprintln!("  --tsv              emit machine-readable per-type histogram");
+                eprintln!("  --unknown-only     human summary: skip fully-parsed types");
+                eprintln!("  --all              uncap top-20 unparsed/histogram tables (#601)");
+                eprintln!(
+                    "  --drift-histogram  emit only per-block-type stream-drift table (#939)"
+                );
+                eprintln!("  --min-count N      trim entries with total < N");
+                std::process::exit(0);
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag: {}", other);
+                std::process::exit(2);
+            }
+            other => {
+                if path_arg.is_some() {
+                    eprintln!("unexpected positional argument: {}", other);
+                    std::process::exit(2);
+                }
+                path_arg = Some(other.to_string());
+            }
+        }
+    }
+    let Some(path_arg) = path_arg else {
+        eprintln!("usage: nif_stats <path> [--tsv] [--unknown-only] [--all] [--min-count N]");
+        eprintln!("  <path> may be a .nif file, a directory, a .bsa, or a .ba2 archive");
+        std::process::exit(2);
+    };
+    let path = PathBuf::from(path_arg);
+
+    let mut stats = Stats::new();
+
+    if !path.exists() {
+        eprintln!("path does not exist: {:?}", path);
+        std::process::exit(2);
+    }
+
+    if path.is_file() {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "bsa" => {
+                if let Err(e) = process_bsa(&mut stats, &path) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(2);
+                }
+            }
+            "ba2" => {
+                if let Err(e) = process_ba2(&mut stats, &path) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(2);
+                }
+            }
+            _ => process_file(&mut stats, &path),
+        }
+    } else if path.is_dir() {
+        process_dir(&mut stats, &path);
+    }
+
+    if tsv {
+        stats.print_tsv();
+    } else if drift_only {
+        stats.print_drift_histogram(show_all);
+    } else {
+        stats.print(unknown_only, show_all, min_count);
+    }
+
+    let threshold = min_success_rate();
+    if stats.total > 0 && stats.success_rate() < threshold {
+        eprintln!(
+            "\nparse success rate {:.2}% is below the {:.2}% threshold",
+            stats.success_rate() * 100.0,
+            threshold * 100.0
+        );
+        std::process::exit(1);
+    }
+
+    // #839 / SK-D5-NEW-05 — per-block drift budget. Opt-in via env
+    // var; default `u64::MAX` skips the check entirely so existing
+    // scripts are unaffected. CI / regression runs that want strict
+    // vanilla-content gating set `NIF_STATS_MAX_DRIFT_EVENTS=0`.
+    let drift_budget = max_drift_events();
+    let drift_total = stats.total_drift_events();
+    if stats.total > 0 && drift_total > drift_budget {
+        eprintln!(
+            "\nper-block stream-drift events ({}) exceed budget ({}) — \
+             see `--drift-histogram` for the per-type breakdown",
+            drift_total, drift_budget,
+        );
+        std::process::exit(1);
+    }
+}

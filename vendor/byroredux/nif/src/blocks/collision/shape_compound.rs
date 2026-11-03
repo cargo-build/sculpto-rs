@@ -1,0 +1,236 @@
+//! Compound / wrapper collision shapes.
+//!
+//! ConvexVerts, List, Transform, MoppBvTree, ConvexList — shapes that wrap or
+//! aggregate other shapes.
+
+use crate::impl_ni_object;
+use crate::stream::NifStream;
+use crate::types::BlockRef;
+use std::io;
+
+use super::{read_havok_material, read_vec4};
+
+/// bhkConvexVerticesShape — convex hull from vertex set.
+#[derive(Debug)]
+pub struct BhkConvexVerticesShape {
+    pub material: u32,
+    pub radius: f32,
+    pub vertices: Vec<[f32; 4]>,
+    pub normals: Vec<[f32; 4]>,
+}
+
+impl BhkConvexVerticesShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        // Two bhkWorldObjCInfoProperty structs (12 bytes each)
+        stream.skip(24)?;
+        // #981 — bulk-read `[f32; 4]` arrays via `read_ni_color4_array`
+        // (POD `[f32; 4]` is the same on-disk layout `read_vec4` used).
+        let num_vertices = stream.read_u32_le()? as usize;
+        let vertices = stream.read_ni_color4_array(num_vertices)?;
+        let num_normals = stream.read_u32_le()? as usize;
+        let normals = stream.read_ni_color4_array(num_normals)?;
+        Ok(Self {
+            material,
+            radius,
+            vertices,
+            normals,
+        })
+    }
+}
+
+/// bhkListShape — compound shape with sub-shapes.
+#[derive(Debug)]
+pub struct BhkListShape {
+    pub sub_shape_refs: Vec<BlockRef>,
+    pub material: u32,
+    pub filters: Vec<u32>,
+}
+
+impl BhkListShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num_sub_shapes = stream.read_u32_le()?;
+        let mut sub_shape_refs = stream.allocate_vec_sized::<BlockRef>(num_sub_shapes)?;
+        for _ in 0..num_sub_shapes {
+            sub_shape_refs.push(stream.read_block_ref()?);
+        }
+        let material = read_havok_material(stream)?;
+        // Two bhkWorldObjCInfoProperty structs (12 bytes each)
+        stream.skip(24)?;
+        // #981 — bulk-read filter u32 array.
+        let num_filters = stream.read_u32_le()? as usize;
+        let filters = stream.read_u32_array(num_filters)?;
+        Ok(Self {
+            sub_shape_refs,
+            material,
+            filters,
+        })
+    }
+}
+
+/// bhkTransformShape / bhkConvexTransformShape — wraps a shape with a 4x4 transform.
+#[derive(Debug)]
+pub struct BhkTransformShape {
+    pub shape_ref: BlockRef,
+    pub material: u32,
+    pub radius: f32,
+    pub transform: [[f32; 4]; 4],
+}
+
+impl BhkTransformShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let shape_ref = stream.read_block_ref()?;
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        stream.skip(8)?; // unused
+        let mut transform = [[0.0f32; 4]; 4];
+        for row in &mut transform {
+            for val in row.iter_mut() {
+                *val = stream.read_f32_le()?;
+            }
+        }
+        Ok(Self {
+            shape_ref,
+            material,
+            radius,
+            transform,
+        })
+    }
+}
+
+/// bhkMoppBvTreeShape — MOPP BVH wrapping a shape collection.
+/// MOPP bytecode is stored opaquely (Rapier builds its own BVH).
+#[derive(Debug)]
+pub struct BhkMoppBvTreeShape {
+    pub shape_ref: BlockRef,
+    pub mopp_data: Vec<u8>,
+    pub origin: [f32; 4],
+    pub scale: f32,
+}
+
+impl BhkMoppBvTreeShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let shape_ref = stream.read_block_ref()?; // bhkBvTreeShape
+        stream.skip(12)?; // unused
+        let scale = stream.read_f32_le()?;
+        let data_size = stream.read_u32_le()? as usize;
+        // hkpMoppCode.Offset — nif.xml `since="10.1.0.0"`. Absent on the
+        // rare v10.0.1.0 Oblivion Havok content (#1329); reading it there
+        // over-read 16 bytes and cascaded the sizeless stream.
+        let origin = if stream.version().has_mopp_offset() {
+            read_vec4(stream)?
+        } else {
+            [0.0; 4]
+        };
+        // Build Type: only for BSVER > 34 (Skyrim+; FO3/FNV is 34).
+        // nif.xml gates this on `#BS_GT_FO3#` (pure BSVER), so read the
+        // file's bsver directly — a `variant()` helper misfires on the
+        // 35..=82 `Unknown` corner and (per #1511) answers a collision-era
+        // question with a NiGeometry shader-refs helper. See #1839.
+        if stream.bsver() > crate::version::bsver::FO3_FNV {
+            let _build_type = stream.read_u8()?;
+        }
+        let mopp_data = stream.read_bytes(data_size)?;
+        Ok(Self {
+            shape_ref,
+            mopp_data,
+            origin,
+            scale,
+        })
+    }
+}
+
+/// `bhkConvexListShape` — FO3-only composite shape holding N convex
+/// sub-shapes with a shared padding radius. nif.xml line 6835.
+/// Constraints enforced by the Havok engine (not by this parser):
+/// sub-shapes must all be convex and share the same `Radius` value.
+///
+/// Layout:
+/// ```text
+///   num_sub_shapes(u32) + sub_shapes[Ref × N]
+///   + HavokMaterial(4, since FO3 strips the pre-10.0.1.2 Unknown Int)
+///   + radius(f32) + unknown_int_1(u32) + unknown_float_1(f32)
+///   + child_shape_property(12)  [bhkWorldObjCInfoProperty]
+///   + use_cached_aabb(u8) + closest_point_min_distance(f32)
+///   = 37 + 4×N bytes
+/// ```
+#[derive(Debug)]
+pub struct BhkConvexListShape {
+    pub sub_shapes: Vec<BlockRef>,
+    pub material: u32,
+    pub radius: f32,
+    pub use_cached_aabb: bool,
+    pub closest_point_min_distance: f32,
+}
+
+impl BhkConvexListShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num_sub_shapes = stream.read_u32_le()?;
+        // #2523 — BlockRef is a plain u32 newtype, size_of-aware bound applies.
+        let mut sub_shapes = stream.allocate_vec_sized::<BlockRef>(num_sub_shapes)?;
+        for _ in 0..num_sub_shapes {
+            sub_shapes.push(stream.read_block_ref()?);
+        }
+        // #4164 — use the shared helper like every sibling shape parser
+        // in this file, instead of a raw `read_u32_le()`. Zero behavioral
+        // change today (this block type's version scope never reaches the
+        // helper's pre-10.0.1.2 Unknown-Int gate), but keeps this parser
+        // from silently diverging if that gate's range ever moves.
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        let _unknown_int_1 = stream.read_u32_le()?;
+        let _unknown_float_1 = stream.read_f32_le()?;
+        stream.skip(12)?; // bhkWorldObjCInfoProperty (3 × u32)
+        let use_cached_aabb = stream.read_u8()? != 0;
+        let closest_point_min_distance = stream.read_f32_le()?;
+        Ok(Self {
+            sub_shapes,
+            material,
+            radius,
+            use_cached_aabb,
+            closest_point_min_distance,
+        })
+    }
+}
+
+/// `bhkConvexSweepShape` — early-Havok (NIF 10.0.1.0) convex shape that
+/// sweeps a wrapped convex `Shape` by `Radius`. nif.xml line 3117
+/// (`inherit="bhkConvexShapeBase"`, which carries no on-disk fields).
+/// Read order cross-checked against openmw `physics.cpp`
+/// `bhkConvexSweepShape::read`: `Shape(Ref) + Material(HavokMaterial)
+/// + Radius(f32) + Unknown(Vector3, skipped)`.
+///
+/// Appears in a handful of vanilla Oblivion meshes (handscythe01,
+/// oar01). Oblivion v10.0.1.0 NIFs carry no `block_sizes` table, so an
+/// undispatched block here cannot be skipped and truncates the rest of
+/// the file — discarding all following render geometry (#1329).
+#[derive(Debug)]
+pub struct BhkConvexSweepShape {
+    pub shape_ref: BlockRef,
+    pub material: u32,
+    pub radius: f32,
+}
+
+impl BhkConvexSweepShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let shape_ref = stream.read_block_ref()?;
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        stream.skip(12)?; // Unknown Vector3
+        Ok(Self {
+            shape_ref,
+            material,
+            radius,
+        })
+    }
+}
+
+impl_ni_object!(
+    BhkConvexVerticesShape => "bhkConvexVerticesShape",
+    BhkListShape => "bhkListShape",
+    BhkTransformShape => "bhkTransformShape",
+    BhkMoppBvTreeShape => "bhkMoppBvTreeShape",
+    BhkConvexListShape => "bhkConvexListShape",
+    BhkConvexSweepShape => "bhkConvexSweepShape",
+);

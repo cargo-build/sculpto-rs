@@ -1,0 +1,343 @@
+//! Tests for `material_path_capture_tests` extracted from ../mesh.rs (refactor stage A).
+//!
+//! Same qualified path preserved (`material_path_capture_tests::FOO`).
+
+use super::*;
+use crate::blocks::shader::is_material_reference;
+use crate::blocks::tri_shape::BsTriShape;
+use crate::blocks::tri_shape::BsTriShapeKind;
+use crate::scene::NifScene;
+use crate::types::{BlockRef, NiPoint3, NiTransform};
+
+use super::super::ImportedMesh;
+use crate::blocks::base::{NiAVObjectData, NiObjectNETData};
+use crate::blocks::shader::{BSEffectShaderProperty, BSLightingShaderProperty, ShaderTypeData};
+use std::sync::Arc;
+
+fn net_with_name(name: &str) -> NiObjectNETData {
+    NiObjectNETData {
+        name: Some(Arc::from(name)),
+        extra_data_refs: Vec::new(),
+        controller_ref: BlockRef::NULL,
+    }
+}
+
+fn minimal_lighting_shader_named(name: &str) -> BSLightingShaderProperty {
+    BSLightingShaderProperty {
+        shader_type: 0,
+        net: net_with_name(name),
+        material_reference: true,
+        shader_flags_1: 0,
+        shader_flags_2: 0,
+        sf1_crcs: Vec::new(),
+        sf2_crcs: Vec::new(),
+        uv_offset: [0.0, 0.0],
+        uv_scale: [1.0, 1.0],
+        texture_set_ref: BlockRef::NULL,
+        emissive_color: [0.0; 3],
+        emissive_multiple: 1.0,
+        root_material_path: None,
+        texture_clamp_mode: 3,
+        alpha: 1.0,
+        refraction_strength: 0.0,
+        glossiness: 80.0,
+        specular_color: [1.0; 3],
+        specular_strength: 1.0,
+        lighting_effect_1: 0.0,
+        lighting_effect_2: 0.0,
+        subsurface_rolloff: 0.0,
+        rimlight_power: 0.0,
+        backlight_power: 0.0,
+        grayscale_to_palette_scale: 1.0,
+        fresnel_power: 5.0,
+        wetness: None,
+        luminance: None,
+        do_translucency: false,
+        translucency: None,
+        texture_arrays: Vec::new(),
+        shader_type_data: ShaderTypeData::None,
+        starfield_tail: Vec::new(),
+    }
+}
+
+fn minimal_effect_shader_named(name: &str) -> BSEffectShaderProperty {
+    BSEffectShaderProperty {
+        net: net_with_name(name),
+        material_reference: true,
+        shader_flags_1: 0,
+        shader_flags_2: 0,
+        sf1_crcs: Vec::new(),
+        sf2_crcs: Vec::new(),
+        uv_offset: [0.0, 0.0],
+        uv_scale: [1.0, 1.0],
+        source_texture: String::new(),
+        texture_clamp_mode: 3,
+        lighting_influence: 0,
+        env_map_min_lod: 0,
+        falloff_start_angle: 1.0,
+        falloff_stop_angle: 1.0,
+        falloff_start_opacity: 0.0,
+        falloff_stop_opacity: 0.0,
+        refraction_power: 0.0,
+        base_color: [0.0; 4],
+        base_color_scale: 1.0,
+        soft_falloff_depth: 0.0,
+        greyscale_texture: String::new(),
+        env_map_texture: String::new(),
+        normal_texture: String::new(),
+        env_mask_texture: String::new(),
+        env_map_scale: 1.0,
+        reflectance_texture: String::new(),
+        lighting_texture: String::new(),
+        emittance_color: [0.0; 3],
+        emit_gradient_texture: String::new(),
+        luminance: None,
+        starfield_tail: Vec::new(),
+    }
+}
+
+/// Build a renderable `BsTriShape` (one triangle, three vertices)
+/// bound to a shader block at `shader_idx`. Keeps the shape non-
+/// empty so `extract_bs_tri_shape` returns `Some`.
+fn renderable_shape(shader_idx: u32) -> BsTriShape {
+    BsTriShape {
+        av: NiAVObjectData {
+            net: NiObjectNETData {
+                name: None,
+                extra_data_refs: Vec::new(),
+                controller_ref: BlockRef::NULL,
+            },
+            flags: 0,
+            transform: NiTransform::default(),
+            properties: Vec::new(),
+            collision_ref: BlockRef::NULL,
+        },
+        center: NiPoint3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        radius: 0.0,
+        skin_ref: BlockRef::NULL,
+        shader_property_ref: BlockRef(shader_idx),
+        alpha_property_ref: BlockRef::NULL,
+        vertex_desc: 0,
+        num_triangles: 1,
+        num_vertices: 3,
+        vertices: vec![
+            NiPoint3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            NiPoint3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            NiPoint3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+        ],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        normals: Vec::new(),
+        vertex_colors: Vec::new(),
+        triangles: vec![[0, 1, 2]],
+        bone_weights: Vec::new(),
+        bone_indices: Vec::new(),
+        tangents: Vec::new(),
+        kind: BsTriShapeKind::Plain,
+        data_size: 0,
+    }
+}
+
+/// Import the shape and return both the `ImportedMesh` and the engine
+/// `StringPool` so tests asserting on resolved texture / material paths
+/// can call `pool.resolve` (#609 / D6-NEW-01).
+fn import(
+    scene: &NifScene,
+    shape: &BsTriShape,
+) -> (ImportedMesh, byroredux_core::string::StringPool) {
+    let mut pool = byroredux_core::string::StringPool::new();
+    let mesh = extract_bs_tri_shape(scene, shape, &NiTransform::default(), &mut pool)
+        .expect("renderable shape must produce ImportedMesh");
+    (mesh, pool)
+}
+
+/// Resolve a path handle through the engine `StringPool`. The pool
+/// lowercases on intern (Gamebryo `GlobalStringTable` semantic); test
+/// assertions therefore compare against the canonical lowercase form.
+fn resolved_path(
+    pool: &byroredux_core::string::StringPool,
+    sym: Option<byroredux_core::string::FixedString>,
+) -> Option<&str> {
+    sym.and_then(|s| pool.resolve(s))
+}
+
+#[test]
+fn bgsm_on_lighting_shader_still_captured() {
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(minimal_lighting_shader_named(
+        "Materials\\Architecture\\WhiterunStone.BGSM",
+    )));
+    let (mesh, pool) = import(&scene, &renderable_shape(0));
+    assert_eq!(
+        resolved_path(&pool, mesh.material.material_path),
+        Some("materials\\architecture\\whiterunstone.bgsm")
+    );
+}
+
+#[test]
+fn bgem_on_effect_shader_is_captured() {
+    // #434 — pre-fix, only BSLightingShaderProperty was inspected.
+    // FO4 laser rifle beam binds a `BSEffectShaderProperty` whose
+    // `net.name` ends in `.bgem`.
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(minimal_effect_shader_named(
+        "Materials\\Weapons\\LaserRifle\\LaserBeam.BGEM",
+    )));
+    let (mesh, pool) = import(&scene, &renderable_shape(0));
+    assert_eq!(
+        resolved_path(&pool, mesh.material.material_path),
+        Some("materials\\weapons\\laserrifle\\laserbeam.bgem")
+    );
+}
+
+#[test]
+fn bgsm_on_effect_shader_also_captured() {
+    // Occasionally artists bind a `.bgsm` to a BSEffect shader —
+    // the engine treats the suffix as advisory, not gating.
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(minimal_effect_shader_named(
+        "Materials\\Statics\\Sign01.BGSM",
+    )));
+    let (mesh, pool) = import(&scene, &renderable_shape(0));
+    assert_eq!(
+        resolved_path(&pool, mesh.material.material_path),
+        Some("materials\\statics\\sign01.bgsm")
+    );
+}
+
+#[test]
+fn non_material_name_returns_none() {
+    let mut scene = NifScene::default();
+    scene
+        .blocks
+        .push(Box::new(minimal_effect_shader_named("FxGlowEdge01")));
+    let (mesh, _pool) = import(&scene, &renderable_shape(0));
+    assert!(mesh.material.material_path.is_none());
+}
+
+#[test]
+fn lighting_shader_name_takes_priority() {
+    // If a BsTriShape's shader_property_ref points at a
+    // BSLightingShaderProperty (the canonical case), the shared
+    // extractor surfaces its BGSM name. The deterministic dispatch
+    // order is preserved by the shared implementation.
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(minimal_lighting_shader_named(
+        "Materials\\Primary.BGSM",
+    )));
+    let (mesh, pool) = import(&scene, &renderable_shape(0));
+    assert_eq!(
+        resolved_path(&pool, mesh.material.material_path),
+        Some("materials\\primary.bgsm")
+    );
+}
+
+/// #1183 — when `net.name` is a non-material editor label, the importer
+/// must fall back to the BSLightingShaderProperty `Root Material` sidecar
+/// for the BGSM/BGEM/MAT capture. Mirrors what Starfield content may
+/// author when the editor stores the path on the Root Material slot
+/// instead of `net.name`.
+#[test]
+fn lighting_shader_root_material_fallback_when_name_is_editor_label() {
+    let mut shader = minimal_lighting_shader_named("Material_Slot_01");
+    shader.material_reference = false;
+    shader.root_material_path = Some(Arc::from("materials\\fallback.bgsm"));
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(shader));
+    let (mesh, pool) = import(&scene, &renderable_shape(0));
+    assert_eq!(
+        resolved_path(&pool, mesh.material.material_path),
+        Some("materials\\fallback.bgsm"),
+        "root_material_path must back-fill material_path when net.name is a non-material editor label"
+    );
+}
+
+/// #1183 sibling — when both `net.name` and `Root Material` are material
+/// references, `net.name` wins (it's the legacy authoring path; Root
+/// Material is the fallback).
+#[test]
+fn lighting_shader_name_beats_root_material() {
+    let mut shader = minimal_lighting_shader_named("materials\\primary.bgsm");
+    shader.material_reference = false;
+    shader.root_material_path = Some(Arc::from("materials\\fallback.bgsm"));
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(shader));
+    let (mesh, pool) = import(&scene, &renderable_shape(0));
+    assert_eq!(
+        resolved_path(&pool, mesh.material.material_path),
+        Some("materials\\primary.bgsm"),
+        "net.name must take priority over root_material_path when both are material refs"
+    );
+}
+
+/// #1183 sibling — when `net.name` is an editor label AND Root Material
+/// is also a non-material editor label, no material_path is captured.
+/// Confirms the fallback runs through the same `is_material_reference`
+/// suffix gate.
+#[test]
+fn lighting_shader_non_material_root_material_is_ignored() {
+    let mut shader = minimal_lighting_shader_named("Material_Slot_01");
+    shader.material_reference = false;
+    shader.root_material_path = Some(Arc::from("not_a_material_ref"));
+    let mut scene = NifScene::default();
+    scene.blocks.push(Box::new(shader));
+    let (mesh, _pool) = import(&scene, &renderable_shape(0));
+    assert!(
+        mesh.material.material_path.is_none(),
+        "non-material root_material_path must not be captured"
+    );
+}
+
+#[test]
+fn material_path_from_name_helper_accepts_both_suffixes() {
+    let mut pool = byroredux_core::string::StringPool::new();
+    assert_eq!(
+        material_path_from_name(Some("x/y/z.bgem"), &mut pool).and_then(|s| pool.resolve(s)),
+        Some("x/y/z.bgem")
+    );
+    // StringPool lowercases on intern, so `.BGSM` round-trips as `.bgsm`.
+    assert_eq!(
+        material_path_from_name(Some("x/y/z.BGSM"), &mut pool).and_then(|s| pool.resolve(s)),
+        Some("x/y/z.bgsm")
+    );
+    assert_eq!(material_path_from_name(Some("plain_name"), &mut pool), None);
+    assert_eq!(material_path_from_name(None, &mut pool), None);
+}
+
+#[test]
+fn mat_suffix_recognised_case_insensitively() {
+    assert!(is_material_reference("materials\\test.mat"));
+    assert!(is_material_reference("materials\\test.MAT"));
+    assert!(is_material_reference("materials\\test.Mat"));
+    assert!(!is_material_reference("materials\\test.matx"));
+    assert!(!is_material_reference("mat"));
+    assert!(!is_material_reference(""));
+}
+
+#[test]
+fn mat_captured_via_material_path_from_name() {
+    let mut pool = byroredux_core::string::StringPool::new();
+    assert!(
+        material_path_from_name(Some("materials\\foo.mat"), &mut pool).is_some(),
+        ".mat suffix should be treated as a material reference"
+    );
+    assert!(
+        material_path_from_name(Some("materials\\foo.MAT"), &mut pool).is_some(),
+        ".MAT suffix (uppercase) should be treated as a material reference"
+    );
+}

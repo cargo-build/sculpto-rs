@@ -1,0 +1,1213 @@
+//! `BSShaderTextureSet` slot → canonical texture role, in one place.
+//!
+//! #2695 (NIFAL-D8-04) — this table used to exist twice. The NIF importer
+//! resolved slots per `BSLightingShaderType`, while the REFR texture overlay
+//! (`byroredux::cell_loader::refr`) resolved the *same* NIF slot indices
+//! through a fixed shader-type-agnostic table. They already disagreed on four
+//! slots, so an `XTXR` swap on a FaceTint / SkinTint / MultiLayerParallax
+//! placement landed in a different canonical role than the identical slot read
+//! from the mesh's own texture set — an override changed shading *semantics*,
+//! not just the texture. Worse, a fix to one table silently failed to reach the
+//! other.
+//!
+//! Both sites now call [`slot_to_role`]. The overlay recovers `shader_type`
+//! from the cached import ([`crate::import::ImportedMaterial::shader_type`]),
+//! which is why that field exists.
+//!
+//! ## Starfield / FO76 scope
+//!
+//! Starfield and FO76 `BSGeometry` materials deliberately do not enter this
+//! table: their authored texture roles come from the BGSM/BGEM material
+//! records (and Starfield's materialsbeta CDB), not a Skyrim-family
+//! `BSShaderTextureSet`. A zero Starfield hit here is therefore an explicit
+//! format boundary, not an unmeasured routing gap.
+//!
+//! ## The disagreements this resolves
+//!
+//! | slot | importer (was) | overlay (was) | now |
+//! |---|---|---|---|
+//! | 2, types 4/5/6 | tint | emissive | **tint** |
+//! | 3, type 4 | detail | height | **detail** |
+//! | 4/5, types 5/6 | skipped | env / env-mask | **skipped** |
+//! | 7, type 11 | parked | specular | **parked** |
+//!
+//! The importer's reading wins in every case: each arm is backed by measured
+//! occupancy across vanilla `Skyrim - Meshes0.bsa` (see the per-arm notes
+//! below and #2693 / #2694 / #2742), whereas the overlay's flat table was
+//! never evidence-driven — it mirrored `TextureSet`'s field order.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Canonical destination for a `BSShaderTextureSet` slot.
+///
+/// Deliberately a subset of `MaterialTextureSet`'s roles: only the ones a NIF
+/// texture-set slot can actually name. Roles fed from BGSM/BGEM or synthesized
+/// elsewhere (`dark`, `flow`, `decals`, …) are not reachable from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureRole {
+    BaseColor,
+    Normal,
+    /// Glow / emissive map.
+    Emissive,
+    /// Skin- or hair-tint mask (`*_sk.dds`).
+    Tint,
+    /// Complexion / surface detail map. NOT a parallax height field.
+    Detail,
+    /// Parallax / POM height field.
+    Height,
+    /// FO4/FO76 greyscale-to-palette gradient lookup.
+    GreyscaleLut,
+    Environment,
+    EnvironmentMask,
+    /// MultiLayerParallax inner layer (subsurface).
+    InnerLayer,
+    /// Standalone specular intensity/colour, on model-space-normal materials.
+    Specular,
+    /// #4424 — the FO4 smoothness/spec-strength map (`_s.dds`, BC5): the
+    /// same resource BGSM names `smooth_spec_texture`. Slot 7 and the BGSM
+    /// field are two sources for one file, so both route here and
+    /// first-wins dedupes them; the previous `Specular` routing multiplied
+    /// a two-channel BC5 texture into the specular RGB colour (zeroing its
+    /// blue channel on 45,974 measured shapes).
+    SmoothSpec,
+    /// Skyrim soft/rim-light mask from texture-set slot 2.
+    LightingMask,
+    /// Skyrim back-light map from texture-set slot 7.
+    BackLighting,
+    /// FO4 wrinkle/expression-crease normal map, tint-family shader types
+    /// only. See #2999.
+    Wrinkle,
+}
+
+/// `BSLightingShaderType` values this table branches on. Named so the arms
+/// read as intent rather than as magic numbers.
+pub mod bs_lighting {
+    /// Face Tint — vanilla Skyrim head meshes.
+    pub const FACE_TINT: u32 = 4;
+    /// Skin Tint.
+    pub const SKIN_TINT: u32 = 5;
+    /// Hair Tint.
+    pub const HAIR_TINT: u32 = 6;
+    /// Multi-Layer Parallax.
+    pub const MULTI_LAYER_PARALLAX: u32 = 11;
+    /// Eye environment map.
+    pub const EYE_ENVMAP: u32 = 16;
+}
+
+/// Per-game `BSShaderTextureSet` slot vocabulary.
+///
+/// This is kept beside the table rather than inferred from shader-type values:
+/// FO76 reuses several numbers for different meanings, and FO4 changes slot
+/// semantics without changing the enum at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TextureSlotLayout {
+    #[default]
+    Skyrim,
+    Fallout4,
+    Fallout76,
+    Starfield,
+}
+
+impl TextureSlotLayout {
+    pub const fn from_bsver(bsver: u32) -> Self {
+        if bsver >= crate::version::bsver::STARFIELD {
+            Self::Starfield
+        } else if bsver >= crate::version::bsver::FO76 {
+            Self::Fallout76
+        } else if bsver >= crate::version::bsver::FALLOUT4 {
+            Self::Fallout4
+        } else {
+            Self::Skyrim
+        }
+    }
+}
+
+/// All non-slot inputs required to interpret a texture-set entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureSlotContext {
+    pub layout: TextureSlotLayout,
+    /// Canonical Skyrim-numbered shader type, after
+    /// [`canonical_shader_type`] has translated the source enum.
+    pub shader_type: u32,
+    pub glow_map: bool,
+    pub model_space_normals: bool,
+    pub soft_lighting: bool,
+    pub rim_lighting: bool,
+    pub back_lighting: bool,
+}
+
+/// Translate a source shader-type integer into the canonical numbering used by
+/// `Material.material_kind` and the slot table.
+///
+/// `BSShaderType155` is not the Skyrim/FO4 enum: 3/4/5/12 mean
+/// FaceTint/SkinTint/HairTint/EyeEnvmap rather than
+/// Parallax/FaceTint/SkinTint/TreeAnim. Terrain (17) has no canonical Skyrim
+/// material kind and no renderer branch, so it deliberately degrades to
+/// Default instead of masquerading as Skyrim Cloud.
+///
+/// **Applies to Starfield as well as FO76 (#3364).** Which enum an integer came
+/// from is decided by the *parser* boundary, not by the slot-table layout tag:
+/// `BSLightingShaderProperty::parse_with_size` sends everything at
+/// `bsver >= FO76 (155)` through `parse_fo76_plus`, and Starfield is
+/// `bsver >= 172`, so its `shader_type` is decoded by
+/// `parse_shader_type_data_fo76` and is a `BSShaderType155` value.
+/// `TextureSlotLayout::from_bsver` splits `Starfield` off from `Fallout76` for
+/// the *slot* table, and keying this translation on that narrower tag would
+/// leave Starfield's raw types falling through untranslated to be read as
+/// Skyrim numbers. `normalize_shader_type` masks 4 and 5 (their payload
+/// variants carry the tag), but 3 / 12 / 17 parse to `ShaderTypeData::None`
+/// and would not — a Starfield FaceTint (3) *would* reach the slot table as
+/// Skyrim Parallax and bind the head's detail map as a POM height field, the
+/// exact failure #2694 fixed for Skyrim, **for a Starfield type-3 property
+/// with a `BSShaderTextureSet`**.
+///
+/// **This guard is currently forward-compat, not a fix for an observed
+/// misroute.** #3364 was filed code-read-only ("no Starfield install on this
+/// machine to census"); a corpus census over all six vanilla Starfield mesh
+/// archives (2026-08-31, `_tmp_sf_facetint_census`, 60,816 NIFs, 2,564 full
+/// non-stub `BSLightingShaderProperty` blocks at bsver ≥ 172) found **zero**
+/// with a resolved `BSShaderTextureSet` carrying any non-empty slot — this
+/// module's header claim holds: Starfield content authors its texture roles
+/// through BGSM/BGEM/the materialsbeta CDB, not this table. Keep the guard on
+/// the same boundary the parser used in case mod content or a future vanilla
+/// asset does carry one.
+pub const fn canonical_shader_type(layout: TextureSlotLayout, raw: u32) -> u32 {
+    if matches!(
+        layout,
+        TextureSlotLayout::Fallout76 | TextureSlotLayout::Starfield
+    ) {
+        match raw {
+            3 => bs_lighting::FACE_TINT,
+            4 => bs_lighting::SKIN_TINT,
+            5 => bs_lighting::HAIR_TINT,
+            12 => bs_lighting::EYE_ENVMAP,
+            17 => 0,
+            _ => raw,
+        }
+    } else {
+        raw
+    }
+}
+
+static UNROUTED_AUTHORED_SLOTS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+const fn layout_index(layout: TextureSlotLayout) -> usize {
+    match layout {
+        TextureSlotLayout::Skyrim => 0,
+        TextureSlotLayout::Fallout4 => 1,
+        TextureSlotLayout::Fallout76 => 2,
+        TextureSlotLayout::Starfield => 3,
+    }
+}
+
+/// Process-lifetime count, per game layout and raw slot, of non-empty NIF
+/// texture bindings which reached no canonical role. This makes future table
+/// gaps observable to corpus probes instead of silently disappearing like the
+/// pre-#3085 FO76 slot-6 bindings.
+pub fn unrouted_texture_slot_bindings(layout: TextureSlotLayout, slot: u32) -> u64 {
+    if slot >= 8 {
+        return 0;
+    }
+    UNROUTED_AUTHORED_SLOTS[layout_index(layout) * 8 + slot as usize].load(Ordering::Relaxed)
+}
+
+pub(crate) fn record_unrouted_texture_slot(context: TextureSlotContext, slot: u32) {
+    if slot >= 8 {
+        return;
+    }
+    let count = UNROUTED_AUTHORED_SLOTS[layout_index(context.layout) * 8 + slot as usize]
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    if count.is_power_of_two() {
+        log::debug!(
+            "unrouted authored BSShaderTextureSet bindings for {:?} slot {}: {count} (latest type {})",
+            context.layout,
+            slot,
+            context.shader_type,
+        );
+    }
+}
+
+/// Resolve one `BSShaderTextureSet` slot to its canonical role.
+///
+/// `None` means the slot has **no** canonical destination for this shader
+/// type, and the caller must drop it rather than guess. Three distinct reasons
+/// produce `None`, all deliberate:
+///
+/// * **Not authored.** Types 5/6 declare no slot 4/5 (their tint is a colour
+///   field, not a texture). Vanilla leaves them empty, but a mis-exported NIF
+///   with a stray slot-4 string would otherwise bind a spurious env cube
+///   (#1350).
+/// * **Feature-gated role.** Skyrim slot 2 can be a soft/rim mask and slot 7
+///   can be a back-lighting map. They route only when the matching shader flag
+///   is authored, so an unrelated populated slot cannot silently change lobes.
+/// * **Owned by another subsystem.** Slot 6 on FaceTint is the per-NPC baked
+///   FaceGen tint. Routing it to `BaseColor` here would silently pre-empt the
+///   FaceGen path (#2095), which overrides diffuse from the *actor's* form id.
+///
+/// `model_space_normals` gates slot 7 on Skyrim only. FO4 authors specular in
+/// slot 7 regardless of that flag (#2998), while the shipped FO76 corpus puts
+/// specular in slot 6: 1,616 of 1,664 populated bindings use an `_s.dds`
+/// suffix, across all five FO76 shader types observed (#3085).
+/// FaceTint (4) / SkinTint (5) / HairTint (6) — the three Skyrim shader types
+/// whose slot 2 carries an `*_sk.dds` skin/hair mask rather than a glow map.
+const fn is_tint_family(shader_type: u32) -> bool {
+    matches!(
+        shader_type,
+        bs_lighting::FACE_TINT | bs_lighting::SKIN_TINT | bs_lighting::HAIR_TINT
+    )
+}
+
+/// A *second* role the same slot legitimately fills, or `None` when the slot
+/// serves only the role [`slot_to_role`] returned.
+///
+/// `MaterialTextureSet` models one slot as at most one role, which is right
+/// everywhere except Skyrim's slot 2. nif.xml describes that slot as
+/// `Glow(SLSF2_Glow_Map)/Skin/Hair/Rim light(SLSF2_Rim_Lighting)` — it
+/// attributes the slot to the skin/hair mask **and** to rim light in the same
+/// breath — and SLSF2 bit 25 is literally named *"Use Soft Lighting Map"*
+/// (`nif.xml:6434`), so a set gate asserts a map exists. On the tint family
+/// both are true of one texture at once: #2694 measured `*_sk.dds` in slot 2
+/// on 3158/3158 vanilla FaceTint properties, and #3068 records that Skyrim
+/// multiplexes this slot between Glow_Map, Soft_Lighting and Rim_Lighting.
+///
+/// #3458 — before this, [`slot_to_role`] returned `Tint` and stopped, so the
+/// gate crossed the NIFAL boundary while its mask did not: on 4054 of the
+/// 8058 vanilla soft-lighting properties (50.3% — every FaceGen head and every
+/// skin-tinted body) `triangle.frag` fell back to an unauthored `vec3(1.0)`
+/// and `bethesdaDiffuseLightFactor` applied the wrapped lobe at full weight
+/// across the whole surface. Binding the second role here keeps the decision
+/// at the boundary, which is where NIFAL requires it — the shader's unit
+/// default now remains reachable only for the BGSM lane, which genuinely
+/// authors no companion texture.
+pub fn slot_to_colocated_role(context: TextureSlotContext, slot: u32) -> Option<TextureRole> {
+    match (context.layout, slot) {
+        // #4431 — Skyrim only. Starfield used to ride this arm, but #3900
+        // moved Starfield onto FO76's slot vocabulary (one canonical
+        // boundary must not hold two rival vocabularies for one game) and
+        // did not update this sibling: for
+        // Starfield it still returned `LightingMask` on tint-family slot 2
+        // where FO76 returns `None`. The arm could not fire (soft/rim
+        // lighting is computed only for the Skyrim layout, and #3900's
+        // census found 0 Starfield `BSShaderTextureSet` blocks), but a
+        // future soft-lighting capture would have silently taken the
+        // Skyrim co-location. `apply_bs_lighting_shader` gates
+        // `soft_lighting`/`rim_lighting` on the Skyrim layout, so the
+        // context cannot even express it for Starfield.
+        (TextureSlotLayout::Skyrim, 2)
+            if is_tint_family(context.shader_type)
+                && (context.soft_lighting || context.rim_lighting) =>
+        {
+            Some(TextureRole::LightingMask)
+        }
+        _ => None,
+    }
+}
+
+/// #4422 — the detail-combine neutral for the classic `NiTexturingProperty`
+/// MODULATE2X route: an encoded-space sample of 128/255 leaves the surface
+/// unchanged (`sample / neutral = 1.0`), reproducing the DX9 fixed-function
+/// `D3DTOP_MODULATE2X` blend the slot was authored against. Canonical value
+/// lives on the core `Material`; re-exported here so the producer route and
+/// the GPU-side constant share one home.
+pub const DETAIL_NEUTRAL_MODULATE2X: f32 =
+    byroredux_core::ecs::components::material::DETAIL_NEUTRAL_MODULATE2X;
+
+/// #4422 — the detail-combine neutral for the Skyrim FaceGen FaceTint route.
+/// Vanilla's own no-detail texture (`textures\actors\character\male\
+/// blankdetailmap.dds`, plus the Argonian/Khajiit copies) is a uniform
+/// (65, 64, 65)/255 — HALF the classic MODULATE2X neutral — so the head
+/// shader's combine is centred on 0.25 encoded, not 0.5. Every authored
+/// complexion map clusters around the same value (shape-weighted encoded
+/// luma: 3140 of 3149 detail textures in [0.2, 0.3)). Producers of the
+/// Detail role on FaceTint heads must declare this neutral so the shader's
+/// `albedo *= detailSample / detailNeutral` divides to 1.0 on the vanilla
+/// blank map instead of the ≈0.106 multiplier the old `×2`-on-sRGB combine
+/// produced.
+pub const DETAIL_NEUTRAL_FACE_TINT: f32 =
+    byroredux_core::ecs::components::material::DETAIL_NEUTRAL_FACE_TINT;
+
+/// The encoded-space detail-combine neutral this material's Detail role was
+/// resolved under. One canonical parameter, two producer values: the shader
+/// divides by whatever the NIFAL boundary declares and carries no per-game
+/// or per-shader-type branch of its own.
+pub fn detail_neutral_for(context: TextureSlotContext) -> f32 {
+    if matches!(
+        (context.layout, context.shader_type),
+        (TextureSlotLayout::Skyrim, bs_lighting::FACE_TINT)
+    ) {
+        DETAIL_NEUTRAL_FACE_TINT
+    } else {
+        DETAIL_NEUTRAL_MODULATE2X
+    }
+}
+
+/// #3900 (SF-2026-09-05-D8-01) — **Starfield shares FO76's slot vocabulary
+/// here, matching [`canonical_shader_type`].**
+///
+/// This file used to give two different answers for the same game:
+/// `canonical_shader_type` grouped Starfield with FO76, while the arms below
+/// grouped it with Skyrim on slots 2, 3, 6 and 7. Neither grouping cited any
+/// Starfield evidence. One canonical translation boundary holding two rival
+/// vocabularies for one game is the exact condition #2695's single-table rule
+/// exists to prevent.
+///
+/// Settled by census, not by argument (the no-guessing rule), and the census
+/// answer is stronger than "the disputed slots are empty": **shipped Starfield
+/// carries no `BSShaderTextureSet` blocks at all.** Measured over the four
+/// installed mesh archives — `Meshes01`, `Meshes02`, `MeshesPatch`,
+/// `FaceMeshes` — 69,741 NIFs parsed, **0** texture-set blocks, therefore 0
+/// bindings on every slot. Starfield binds its textures through `.mat` /
+/// `materialsbeta.cdb` paths on `BSGeometry` instead. The same census run
+/// against `Skyrim - Meshes0.bsa` reports 57,414 texture sets with the
+/// distributions the arms below already document (slot 2 `_sk.dds`×7,334;
+/// slot 7 `_s.dds`×3,599), so the zero is a real absence, not a broken probe.
+/// Reproduce with `cargo run --release -p byroredux-nif --example
+/// sf_slot_census -- <archive>...`.
+///
+/// So no Starfield corpus data can decide this, and the arms below are
+/// unreachable on shipped content — they are a **defensive default for
+/// mod-authored or future content**, chosen on the two arguments that do
+/// exist and that agree with each other:
+///
+/// 1. **The parser boundary.** `BSLightingShaderProperty::parse_with_size`
+///    dispatches `bsver >= FO76 (155)` to `parse_fo76_plus`; Starfield is
+///    bsver 172, so it is literally read by the FO76 parser. Grouping it with
+///    Skyrim in the role table meant the byte layout and the slot vocabulary
+///    disagreed about which game this is.
+/// 2. **The measured FO76 readings** are the ones the Skyrim grouping
+///    implicitly rejected: slot 3 is a greyscale LUT rather than POM height,
+///    and slot 6 is specular (1,616 of 1,664 occupants `_s.dds`, #3085). A
+///    guess that contradicts measurement is worse than one that follows it.
+///
+/// If Starfield content occupying these slots ever appears, re-run the census
+/// and let the data override this default — that is the point of recording the
+/// n here.
+pub fn slot_to_role(context: TextureSlotContext, slot: u32) -> Option<TextureRole> {
+    let shader_type = context.shader_type;
+    let tint_family = is_tint_family(shader_type);
+
+    match (context.layout, slot) {
+        (_, 0) => Some(TextureRole::BaseColor),
+        (_, 1) => Some(TextureRole::Normal),
+
+        // Slot 2 is polymorphic. The tint family puts its skin/hair mask here;
+        // everything else puts a glow map.
+        //
+        // #2694 — FaceTint (4) belongs with SkinTint (5): every vanilla
+        // FaceTint property carries an `*_sk.dds` here (3158/3158 in
+        // `Skyrim - Meshes0.bsa`). It was previously excluded, so every vanilla
+        // head bound its skin-tint mask as a GLOW map — latent only because
+        // `emissive_color` is black, one authored value away from glowing
+        // faces. HairTint (6) is included on the same evidence (`_sk` on all 16
+        // of the 10 815 HairTint properties that populate the slot).
+        (TextureSlotLayout::Skyrim, 2) => {
+            if tint_family {
+                Some(TextureRole::Tint)
+            } else if context.glow_map {
+                Some(TextureRole::Emissive)
+            } else if context.soft_lighting || context.rim_lighting {
+                Some(TextureRole::LightingMask)
+            } else {
+                // Skyrim multiplexes slot 2 between Glow_Map, Soft_Lighting,
+                // and Rim_Lighting. With no matching flag it must not become
+                // self-illumination or a lighting mask (#3068).
+                None
+            }
+        }
+        // #4430 — the one slot-2 arm that ignores `context.glow_map`, and
+        // deliberately so until a source for FO4's real rule exists: the
+        // census says the NIF bit is unreliable in BOTH directions.
+        // `Fallout4 - Meshes.ba2` + `MeshesExtra.ba2`, non-tint
+        // `BSLightingShaderProperty` with slot 2 populated:
+        //
+        // | `Glow_Map` | emissive authored | count |
+        // |---|---|---|
+        // | clear | no  | 2,493 (inert) |
+        // | clear | yes | 137 — 116 genuine `_g.dds` glow maps (Glowing
+        // |       |     | Ones, the Mirelurk Queen), 20 `_d.dds` diffuses
+        // |       |     | (Institute terminal screens, lit floor lamps), 1
+        // |       |     | `ColorWhiteUtility` |
+        // | set   | no / yes | 3,254 / 5,951 |
+        //
+        // Gating on the bit as Skyrim does (#3068) would strip the mask from
+        // those 116 glow maps; routing without it (today) masks emission with
+        // a diffuse on the 20. BGSM v<=2 has its own `glowmap` bool beside
+        // `glow_texture` (65 false — 5 of them `emit_enabled` — vs 249 true
+        // across Materials + the three DLC mains), which the merge does not
+        // read either. Open: does FO4's lit shader sample slot 2 without
+        // `Glow_Map`, and does BGSM `glowmap` override the NIF bit?
+        (TextureSlotLayout::Fallout4, 2) => {
+            if tint_family {
+                Some(TextureRole::Tint)
+            } else {
+                Some(TextureRole::Emissive)
+            }
+        }
+        (TextureSlotLayout::Fallout76 | TextureSlotLayout::Starfield, 2) => {
+            if tint_family {
+                Some(TextureRole::Tint)
+            } else if context.glow_map {
+                Some(TextureRole::Emissive)
+            } else {
+                None
+            }
+        }
+
+        // #2694 — nif.xml calls slot 3 "Height/Parallax" generically, but every
+        // vanilla FaceTint puts a *detail* map there
+        // (`MaleHeadDetail_Rough01.dds`, 3149/3158). Feeding that to the height
+        // role made `triangle.frag` ray-march POM over a face complexion map —
+        // its POM branch gates only on `parallaxMapIndex != 0u`, with no
+        // material-kind check.
+        (TextureSlotLayout::Skyrim, 3) => match shader_type {
+            bs_lighting::FACE_TINT => Some(TextureRole::Detail),
+            _ => Some(TextureRole::Height),
+        },
+        // FO4/FO76 slot 3 is the greyscale-to-palette gradient, not a POM
+        // height field. FO4 ships it on 31,303 properties (#2997).
+        (
+            TextureSlotLayout::Fallout4
+            | TextureSlotLayout::Fallout76
+            | TextureSlotLayout::Starfield,
+            3,
+        ) => Some(TextureRole::GreyscaleLut),
+
+        // #1350 — types 4/5/6 declare no TS slot 4/5 on Skyrim; skip
+        // explicitly so a stray authored string cannot bind an env cube.
+        // FaceTint's slots 4/5 are absent on 100% of vanilla Skyrim
+        // properties. **This occupancy claim is Skyrim-only — see the FO4
+        // arm below, #2999.**
+        (
+            TextureSlotLayout::Skyrim | TextureSlotLayout::Starfield | TextureSlotLayout::Fallout76,
+            4,
+        ) => (!tint_family).then_some(TextureRole::Environment),
+        (
+            TextureSlotLayout::Skyrim | TextureSlotLayout::Starfield | TextureSlotLayout::Fallout76,
+            5,
+        ) => (!tint_family).then_some(TextureRole::EnvironmentMask),
+
+        // #2999 — FO4 slots 4/5 ARE routinely authored on FaceTint/SkinTint/
+        // HairTint heads, unlike Skyrim. Measured on `Fallout4 - Meshes.ba2`
+        // type-4 FaceTint properties (n=1,229): slot 4 50.7% non-empty, all
+        // genuine environment cubemaps
+        // (`Shared/Cubemaps/mipblur_DefaultOutside1_dielectric.dds`); slot 5
+        // 79.8% non-empty, all `_n` wrinkle/crease normals
+        // (`BaseFemaleHeadWrinkles_n.DDS`, `HeadWrinkles_n.dds`,
+        // `Gen2SkinHeadCrease_n.dds`, `SupermutantHeadCrease_n.dds`).
+        // `MeshesExtra` reproduces both. Slot 4 is unconditionally
+        // Environment regardless of shader type — non-tint FO4 types carry
+        // it too, same as Skyrim's non-tint case. Slot 5 is Wrinkle only on
+        // the tint family; non-tint FO4 types (e.g. type 1) measured `_m`
+        // mask entries there, matching the ordinary EnvironmentMask role.
+        (TextureSlotLayout::Fallout4, 4) => Some(TextureRole::Environment),
+        (TextureSlotLayout::Fallout4, 5) => {
+            if tint_family {
+                Some(TextureRole::Wrinkle)
+            } else {
+                Some(TextureRole::EnvironmentMask)
+            }
+        }
+
+        // #2693 — the inner layer is slot **6**, not 7. nif.xml contradicts
+        // itself (its enum prose says "Layer(TS7)", its field table says slot 6
+        // = "Subsurface for Multilayer Parallax"); the field table wins on
+        // shipped data — slot 6 is non-empty on 607/607 type-11 properties in
+        // `Skyrim - Meshes0.bsa` while slot 7 holds tint maps on 370.
+        //
+        // FaceTint slot 6 is the baked FaceGen tint — see this fn's doc for why
+        // it is deliberately unrouted.
+        (TextureSlotLayout::Skyrim | TextureSlotLayout::Fallout4, 6) => match shader_type {
+            bs_lighting::MULTI_LAYER_PARALLAX => Some(TextureRole::InnerLayer),
+            _ => None,
+        },
+        // Measured over 95,041 FO76 NIFs from the five installed mesh BA2s:
+        // 1,664 bindings, 1,616 `_s.dds`; slot 6 is specular, not Skyrim's
+        // multilayer inner texture (#3085). Starfield rides this arm rather
+        // than the Skyrim one above — see this fn's doc (#3900); it has no
+        // shipped occupancy of its own to measure.
+        (TextureSlotLayout::Fallout76 | TextureSlotLayout::Starfield, 6) => {
+            Some(TextureRole::Specular)
+        }
+
+        // Slot 7 is an authored back-lighting map when that feature flag is
+        // set; otherwise it is the alternate specular on model-space-normal
+        // materials, independent of shader type (#2742).
+        (TextureSlotLayout::Skyrim, 7) => {
+            if context.back_lighting {
+                Some(TextureRole::BackLighting)
+            } else {
+                match (shader_type, context.model_space_normals) {
+                    (bs_lighting::MULTI_LAYER_PARALLAX, _) => None,
+                    (_, true) => Some(TextureRole::Specular),
+                    (_, false) => None,
+                }
+            }
+        }
+        // #4424 — FO4 slot 7 holds the smoothness/spec-strength map: the
+        // SAME file the property's BGSM names as `smooth_spec_texture`
+        // (45,974 of 46,382 measured slot-7+BGSM shapes agree on the file
+        // after normalisation; all but one of the corpus's sampled `_s.dds`
+        // are BC5). Routing it to the smooth-spec role makes the two
+        // sources agree and lets first-wins dedupe them. The old
+        // `Specular` routing (#2998) fed the same two-channel texture to
+        // the specular-COLOUR multiply, forcing `specColor.b = 0` and
+        // tinting every direct highlight warm. The channel-layout question
+        // for the gloss sampler itself remains open (#4424's "Open
+        // question") — the gloss path is NOT touched here.
+        (TextureSlotLayout::Fallout4, 7) => Some(TextureRole::SmoothSpec),
+        (TextureSlotLayout::Fallout76 | TextureSlotLayout::Starfield, 7) => None,
+
+        (_, _) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bs_lighting;
+    use super::*;
+
+    /// #4422 — the detail-combine neutral is declared by the producer
+    /// route, at the NIFAL boundary, and the two live values are pinned to
+    /// the evidence: 65/255 is the measured vanilla `blankdetailmap.dds`
+    /// texel (uniform (65, 64, 65) across 65 536 texels), 128/255 is the
+    /// classic MODULATE2X neutral. The shader divides the raw-view sample
+    /// by whatever this returns, so a FaceTint head carrying the vanilla
+    /// blank map multiplies its albedo by exactly 1.0 — the contract the
+    /// audit issue asked to pin CPU-side.
+    #[test]
+    fn detail_neutral_follows_the_producer_route() {
+        // FaceTint slot 3 → Detail: the FaceGen combine neutral.
+        assert_eq!(
+            detail_neutral_for(skyrim(bs_lighting::FACE_TINT, false, false)),
+            DETAIL_NEUTRAL_FACE_TINT
+        );
+        // 65/255 IS the measured vanilla neutral: `sample / neutral` at
+        // the authored blank texel is 1.0 (allow f32 epsilon).
+        let sample = 65.0f32 / 255.0;
+        assert!(
+            (sample / DETAIL_NEUTRAL_FACE_TINT - 1.0).abs() < 1e-6,
+            "vanilla blank detail texel must divide to an albedo multiplier of 1.0"
+        );
+
+        // Every other producer keeps the classic MODULATE2X neutral —
+        // including non-tint Skyrim types and every other layout.
+        assert_eq!(
+            detail_neutral_for(skyrim(0, false, false)),
+            DETAIL_NEUTRAL_MODULATE2X
+        );
+        let fo4 = TextureSlotContext {
+            layout: TextureSlotLayout::Fallout4,
+            shader_type: bs_lighting::FACE_TINT,
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        assert_eq!(detail_neutral_for(fo4), DETAIL_NEUTRAL_MODULATE2X);
+        // And the constants themselves are the documented ratios.
+        assert_eq!(DETAIL_NEUTRAL_FACE_TINT, 65.0 / 255.0);
+        assert_eq!(DETAIL_NEUTRAL_MODULATE2X, 128.0 / 255.0);
+    }
+
+    fn skyrim(shader_type: u32, glow_map: bool, model_space_normals: bool) -> TextureSlotContext {
+        TextureSlotContext {
+            layout: TextureSlotLayout::Skyrim,
+            shader_type,
+            glow_map,
+            model_space_normals,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        }
+    }
+
+    /// The four slots where the importer and the REFR overlay disagreed
+    /// (#2695). Each asserts the *importer's* evidence-backed reading, which
+    /// is the one that wins.
+    #[test]
+    fn resolves_the_four_table_disagreements_the_importer_way() {
+        // slot 2 on the tint family → Tint, not Emissive.
+        for ty in [
+            bs_lighting::FACE_TINT,
+            bs_lighting::SKIN_TINT,
+            bs_lighting::HAIR_TINT,
+        ] {
+            assert_eq!(
+                slot_to_role(skyrim(ty, false, false), 2),
+                Some(TextureRole::Tint),
+                "shader_type {ty} slot 2 must be the skin/hair tint mask"
+            );
+        }
+        // slot 3 on FaceTint → Detail, not Height (POM over a face otherwise).
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::FACE_TINT, false, false), 3),
+            Some(TextureRole::Detail)
+        );
+        // slots 4/5 on the tint family → nothing, not env/env-mask.
+        for ty in [
+            bs_lighting::FACE_TINT,
+            bs_lighting::SKIN_TINT,
+            bs_lighting::HAIR_TINT,
+        ] {
+            assert_eq!(slot_to_role(skyrim(ty, false, false), 4), None);
+            assert_eq!(slot_to_role(skyrim(ty, false, false), 5), None);
+        }
+        // slot 7 on MultiLayerParallax → nothing (back lighting), even with MSN.
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::MULTI_LAYER_PARALLAX, false, true), 7,),
+            None
+        );
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::MULTI_LAYER_PARALLAX, false, false), 7,),
+            None
+        );
+    }
+
+    /// The ordinary path is unchanged — this is what the overwhelming majority
+    /// of content takes, and the fix must not disturb it.
+    #[test]
+    fn default_shader_type_keeps_the_conventional_mapping() {
+        let ty = 0; // Default
+        let context = skyrim(ty, true, false);
+        assert_eq!(slot_to_role(context, 0), Some(TextureRole::BaseColor));
+        assert_eq!(slot_to_role(context, 1), Some(TextureRole::Normal));
+        assert_eq!(slot_to_role(context, 2), Some(TextureRole::Emissive));
+        assert_eq!(slot_to_role(context, 3), Some(TextureRole::Height));
+        assert_eq!(slot_to_role(context, 4), Some(TextureRole::Environment));
+        assert_eq!(slot_to_role(context, 5), Some(TextureRole::EnvironmentMask));
+        assert_eq!(slot_to_role(context, 6), None);
+    }
+
+    #[test]
+    fn skyrim_slot_two_requires_the_glow_map_flag() {
+        assert_eq!(
+            slot_to_role(skyrim(0, false, false), 2),
+            None,
+            "a Glow_Map-clear soft/rim mask must not land in emissive (#3068)"
+        );
+        assert_eq!(
+            slot_to_role(skyrim(0, true, false), 2),
+            Some(TextureRole::Emissive)
+        );
+    }
+
+    #[test]
+    fn skyrim_feature_flags_route_soft_rim_and_back_lighting_maps() {
+        let mut context = skyrim(0, false, false);
+        context.soft_lighting = true;
+        assert_eq!(slot_to_role(context, 2), Some(TextureRole::LightingMask));
+
+        context.soft_lighting = false;
+        context.rim_lighting = true;
+        assert_eq!(slot_to_role(context, 2), Some(TextureRole::LightingMask));
+
+        context.rim_lighting = false;
+        context.back_lighting = true;
+        assert_eq!(slot_to_role(context, 7), Some(TextureRole::BackLighting));
+    }
+
+    /// #3458 — the test above builds its context with `skyrim(0, ..)`, i.e.
+    /// shader type 0, which is exactly the arm that already routed correctly.
+    /// The tint family (4/5/6) carries 50.3% of the vanilla soft-lighting
+    /// content and takes the `Tint` branch first, so it needs the colocated
+    /// binding to reach `LightingMask` at all.
+    #[test]
+    fn tint_family_slot_two_fills_both_tint_and_lighting_mask_when_gated() {
+        for ty in [
+            bs_lighting::FACE_TINT,
+            bs_lighting::SKIN_TINT,
+            bs_lighting::HAIR_TINT,
+        ] {
+            // Gate clear: slot 2 is the tint mask and nothing else, so the
+            // shader's unit default is not silently standing in for a map
+            // that was never authored.
+            let context = skyrim(ty, false, false);
+            assert_eq!(slot_to_role(context, 2), Some(TextureRole::Tint));
+            assert_eq!(
+                slot_to_colocated_role(context, 2),
+                None,
+                "type {ty}: an ungated tint slot must not claim a lighting mask"
+            );
+
+            // Soft_Lighting set: the same texture is both. The primary role
+            // stays Tint so #2694's routing is untouched.
+            let mut soft = context;
+            soft.soft_lighting = true;
+            assert_eq!(slot_to_role(soft, 2), Some(TextureRole::Tint));
+            assert_eq!(
+                slot_to_colocated_role(soft, 2),
+                Some(TextureRole::LightingMask),
+                "type {ty}: SLSF2 bit 25 asserts a soft-lighting map exists"
+            );
+
+            // Rim_Lighting alone does the same — nif.xml names slot 2 for
+            // rim light explicitly.
+            let mut rim = context;
+            rim.rim_lighting = true;
+            assert_eq!(
+                slot_to_colocated_role(rim, 2),
+                Some(TextureRole::LightingMask),
+                "type {ty}: SLSF2 bit 26 routes slot 2 to the rim mask"
+            );
+        }
+    }
+
+    /// The colocation is Skyrim slot 2 only — it must not widen to other
+    /// slots, other layouts, or non-tint shader types (those already reach
+    /// `LightingMask` as their primary role and would double-bind).
+    #[test]
+    fn colocated_lighting_mask_is_confined_to_the_tint_family_slot_two() {
+        let mut non_tint = skyrim(0, false, false);
+        non_tint.soft_lighting = true;
+        assert_eq!(slot_to_role(non_tint, 2), Some(TextureRole::LightingMask));
+        assert_eq!(slot_to_colocated_role(non_tint, 2), None);
+
+        let mut tint = skyrim(bs_lighting::SKIN_TINT, false, false);
+        tint.soft_lighting = true;
+        for slot in [0u32, 1, 3, 4, 5, 6, 7] {
+            assert_eq!(
+                slot_to_colocated_role(tint, slot),
+                None,
+                "slot {slot} must not colocate"
+            );
+        }
+
+        let mut fo4 = tint;
+        fo4.layout = TextureSlotLayout::Fallout4;
+        assert_eq!(
+            slot_to_colocated_role(fo4, 2),
+            None,
+            "the BGSM lane authors no companion texture — its unit default is correct"
+        );
+
+        // #4431 — the Skyrim-only confinement is explicit on every
+        // non-Skyrim layout, not just FO4: #3900 moved Starfield onto
+        // FO76's slot vocabulary, and a future soft-lighting capture must
+        // not silently take the Skyrim co-location through a stale arm.
+        for layout in [TextureSlotLayout::Starfield, TextureSlotLayout::Fallout76] {
+            let mut other = tint;
+            other.layout = layout;
+            assert_eq!(
+                slot_to_colocated_role(other, 2),
+                None,
+                "{layout:?} must not take the Skyrim slot-2 co-location"
+            );
+        }
+    }
+
+    /// #2693 — inner layer is slot 6 on type 11, and slot 6 is inert elsewhere.
+    #[test]
+    fn multi_layer_parallax_inner_layer_is_slot_six() {
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::MULTI_LAYER_PARALLAX, false, false), 6,),
+            Some(TextureRole::InnerLayer)
+        );
+        assert_eq!(slot_to_role(skyrim(0, false, false), 6), None);
+        // Type 11 still takes env/env-mask at 4/5.
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::MULTI_LAYER_PARALLAX, false, false), 4,),
+            Some(TextureRole::Environment)
+        );
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::MULTI_LAYER_PARALLAX, false, false), 5,),
+            Some(TextureRole::EnvironmentMask)
+        );
+    }
+
+    /// #2742 — slot 7 is specular only under model-space normals, and that is
+    /// shader-type independent (SkinTint included, which #1350 had dropped).
+    #[test]
+    fn slot_seven_is_specular_only_under_model_space_normals() {
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::SKIN_TINT, false, true), 7),
+            Some(TextureRole::Specular)
+        );
+        assert_eq!(
+            slot_to_role(skyrim(bs_lighting::SKIN_TINT, false, false), 7),
+            None
+        );
+        assert_eq!(
+            slot_to_role(skyrim(0, false, true), 7),
+            Some(TextureRole::Specular)
+        );
+        assert_eq!(slot_to_role(skyrim(0, false, false), 7), None);
+    }
+
+    /// #2999 — FO4 FaceTint/SkinTint/HairTint slots 4/5 must land in
+    /// Environment / Wrinkle, not skip (the Skyrim-measured #1350
+    /// occupancy claim does not hold on FO4). Non-tint FO4 shader types
+    /// keep the ordinary Environment/EnvironmentMask reading at 4/5,
+    /// matching the measured type-1 `_m` mask entries at slot 5.
+    #[test]
+    fn fo4_tint_family_routes_slots_four_and_five_to_cubemap_and_wrinkle() {
+        for ty in [
+            bs_lighting::FACE_TINT,
+            bs_lighting::SKIN_TINT,
+            bs_lighting::HAIR_TINT,
+        ] {
+            let context = TextureSlotContext {
+                layout: TextureSlotLayout::Fallout4,
+                shader_type: ty,
+                glow_map: false,
+                model_space_normals: false,
+                soft_lighting: false,
+                rim_lighting: false,
+                back_lighting: false,
+            };
+            assert_eq!(
+                slot_to_role(context, 4),
+                Some(TextureRole::Environment),
+                "FO4 shader_type {ty} slot 4 must be the environment cubemap (#2999)"
+            );
+            assert_eq!(
+                slot_to_role(context, 5),
+                Some(TextureRole::Wrinkle),
+                "FO4 shader_type {ty} slot 5 must be the wrinkle/crease normal (#2999)"
+            );
+        }
+        // Non-tint FO4 shader type keeps the ordinary reading.
+        let non_tint = TextureSlotContext {
+            layout: TextureSlotLayout::Fallout4,
+            shader_type: 0,
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        assert_eq!(slot_to_role(non_tint, 4), Some(TextureRole::Environment));
+        assert_eq!(
+            slot_to_role(non_tint, 5),
+            Some(TextureRole::EnvironmentMask),
+            "non-tint FO4 slot 5 stays EnvironmentMask, matching the measured \
+             type-1 `_m` entries — Wrinkle is tint-family only"
+        );
+        // Skyrim/Starfield/FO76 keep the pre-#2999 skip on the tint family —
+        // this occupancy claim IS accurate there (#1350).
+        for layout in [
+            TextureSlotLayout::Skyrim,
+            TextureSlotLayout::Starfield,
+            TextureSlotLayout::Fallout76,
+        ] {
+            let context = TextureSlotContext {
+                layout,
+                shader_type: bs_lighting::FACE_TINT,
+                glow_map: false,
+                model_space_normals: false,
+                soft_lighting: false,
+                rim_lighting: false,
+                back_lighting: false,
+            };
+            assert_eq!(
+                slot_to_role(context, 4),
+                None,
+                "{layout:?} FaceTint slot 4 must still skip — the #1350 claim holds here"
+            );
+            assert_eq!(
+                slot_to_role(context, 5),
+                None,
+                "{layout:?} FaceTint slot 5 must still skip — the #1350 claim holds here"
+            );
+        }
+    }
+
+    #[test]
+    fn fo4_routes_palette_and_specular_without_skyrim_gates() {
+        let context = TextureSlotContext {
+            layout: TextureSlotLayout::Fallout4,
+            shader_type: 0,
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        assert_eq!(
+            slot_to_role(context, 3),
+            Some(TextureRole::GreyscaleLut),
+            "FO4 slot 3 is a palette gradient, not POM height (#2997)"
+        );
+        assert_eq!(
+            slot_to_role(context, 7),
+            Some(TextureRole::SmoothSpec),
+            "FO4 slot 7 is the BGSM smooth_spec file itself, and must not depend on Model_Space_Normals (#2998 evidence, #4424 rerouting)"
+        );
+    }
+
+    #[test]
+    fn fo76_slot_six_is_specular_and_enum_is_canonicalized() {
+        let context = TextureSlotContext {
+            layout: TextureSlotLayout::Fallout76,
+            shader_type: canonical_shader_type(TextureSlotLayout::Fallout76, 5),
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        assert_eq!(context.shader_type, bs_lighting::HAIR_TINT);
+        assert_eq!(
+            slot_to_role(context, 6),
+            Some(TextureRole::Specular),
+            "the measured FO76 `_s.dds` slot must reach a canonical role (#3085)"
+        );
+        assert_eq!(
+            canonical_shader_type(TextureSlotLayout::Fallout76, 3),
+            bs_lighting::FACE_TINT
+        );
+        assert_eq!(
+            canonical_shader_type(TextureSlotLayout::Fallout76, 4),
+            bs_lighting::SKIN_TINT
+        );
+        assert_eq!(
+            canonical_shader_type(TextureSlotLayout::Fallout76, 12),
+            bs_lighting::EYE_ENVMAP
+        );
+        assert_eq!(canonical_shader_type(TextureSlotLayout::Fallout76, 17), 0);
+    }
+
+    /// #3364 — Starfield's `shader_type` is a `BSShaderType155` value, exactly
+    /// like FO76's, because the parser routes every `bsver >= FO76 (155)`
+    /// stream (Starfield is 172+) through `parse_fo76_plus` /
+    /// `parse_shader_type_data_fo76`. The translation must therefore key on the
+    /// same boundary the parser used, not on the narrower `Fallout76` slot-table
+    /// tag it used to check.
+    #[test]
+    fn starfield_shader_type_is_canonicalized_like_fo76() {
+        for (raw, want, label) in [
+            (3u32, bs_lighting::FACE_TINT, "FaceTint"),
+            (4, bs_lighting::SKIN_TINT, "SkinTint"),
+            (5, bs_lighting::HAIR_TINT, "HairTint"),
+            (12, bs_lighting::EYE_ENVMAP, "EyeEnvmap"),
+            (17, 0, "Terrain degrades to Default"),
+        ] {
+            assert_eq!(
+                canonical_shader_type(TextureSlotLayout::Starfield, raw),
+                want,
+                "Starfield 155-enum {raw} ({label}) must translate the same way \
+                 as FO76's; untranslated it is read as a Skyrim shader type"
+            );
+            assert_eq!(
+                canonical_shader_type(TextureSlotLayout::Starfield, raw),
+                canonical_shader_type(TextureSlotLayout::Fallout76, raw),
+                "Starfield and FO76 share one wire enum — their translations \
+                 must not diverge"
+            );
+        }
+    }
+
+    /// The concrete misroute #3364 describes: an untranslated Starfield
+    /// FaceTint (155 type 3) is read as Skyrim Parallax and binds slot 3 as a
+    /// POM height field instead of a face map.
+    ///
+    /// #3900 changed the *destination* but not the hazard. Starfield now rides
+    /// FO76's slot vocabulary (see `slot_to_role`'s doc for the census), where
+    /// slot 3 is the greyscale-to-palette gradient rather than Skyrim's
+    /// FaceTint-detail special case. Both readings prevent the thing #3364 was
+    /// written to prevent — `triangle.frag` ray-marching POM over a face — and
+    /// the FO76 one is the measured reading: over `SeventySix - Meshes.ba2` +
+    /// `MeshesExtra.ba2` (113,205 texture sets), slot 3 carries 4,474 bindings
+    /// of which just **3** are `_p` height maps. What this test still pins,
+    /// unchanged, is the translation that makes any of it reachable:
+    /// `canonical_shader_type` must turn Starfield's raw 3 into `FACE_TINT`
+    /// rather than leaving it to be read as Skyrim's `Parallax`.
+    #[test]
+    fn starfield_face_tint_is_translated_and_never_binds_slot_three_as_height() {
+        let context = TextureSlotContext {
+            layout: TextureSlotLayout::Starfield,
+            shader_type: canonical_shader_type(TextureSlotLayout::Starfield, 3),
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        assert_eq!(
+            context.shader_type,
+            bs_lighting::FACE_TINT,
+            "the #3364 translation is the load-bearing half: untranslated, raw 3 \
+             reads as Skyrim's Parallax type"
+        );
+        let role = slot_to_role(context, 3);
+        assert_ne!(
+            role,
+            Some(TextureRole::Height),
+            "a Starfield FaceTint head must never bind slot 3 as a POM height \
+             field — that is the #2694 / #3364 failure mode (POM ray-marched \
+             over a face complexion map)"
+        );
+        assert_eq!(
+            role,
+            Some(TextureRole::GreyscaleLut),
+            "Starfield shares FO76's slot vocabulary as of #3900, where slot 3 \
+             is the greyscale-to-palette gradient"
+        );
+    }
+
+    /// #3900 (SF-2026-09-05-D8-01) — the SIBLING invariant: this file must give
+    /// exactly ONE answer per game about which slot vocabulary it uses.
+    ///
+    /// `canonical_shader_type` groups Starfield with FO76 (both go through
+    /// `BSLightingShaderProperty::parse_fo76_plus`, `bsver >= 155`). Before
+    /// this, `slot_to_role` groups Starfield with Skyrim on slots 2, 3, 6 and
+    /// 7 — one canonical translation boundary holding two rival vocabularies
+    /// for one game, the exact condition #2695's single-table rule exists to
+    /// prevent. Pin the two halves together: for every slot and every context
+    /// shape the arms branch on, Starfield must resolve identically to FO76.
+    #[test]
+    fn starfield_resolves_every_slot_identically_to_fo76() {
+        let shader_types = [
+            bs_lighting::FACE_TINT,
+            bs_lighting::SKIN_TINT,
+            bs_lighting::HAIR_TINT,
+            bs_lighting::MULTI_LAYER_PARALLAX,
+            0,
+            1,
+        ];
+        for &shader_type in &shader_types {
+            for flags in 0..32u8 {
+                let ctx = |layout| TextureSlotContext {
+                    layout,
+                    shader_type,
+                    glow_map: flags & 1 != 0,
+                    model_space_normals: flags & 2 != 0,
+                    soft_lighting: flags & 4 != 0,
+                    rim_lighting: flags & 8 != 0,
+                    back_lighting: flags & 16 != 0,
+                };
+                for slot in 0..8u32 {
+                    assert_eq!(
+                        slot_to_role(ctx(TextureSlotLayout::Starfield), slot),
+                        slot_to_role(ctx(TextureSlotLayout::Fallout76), slot),
+                        "slot {slot} (shader_type {shader_type}, flags {flags:#07b}): \
+                         Starfield and FO76 must share one slot vocabulary — they \
+                         share one parser (`parse_fo76_plus`) and \
+                         `canonical_shader_type` already groups them (#3900)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half of the same invariant: the grouping must not have been
+    /// achieved by flattening every game into one table. Skyrim and FO4 keep
+    /// their own measured readings, so a change that "fixes" #3900 by making
+    /// all four layouts identical fails here.
+    #[test]
+    fn the_pre_fo76_layouts_keep_their_own_vocabulary() {
+        let ctx = |layout| TextureSlotContext {
+            layout,
+            shader_type: 0,
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        // Skyrim slot 6 is the multilayer inner texture (None for non-MLP),
+        // FO76/Starfield slot 6 is measured specular (#3085).
+        assert_eq!(slot_to_role(ctx(TextureSlotLayout::Skyrim), 6), None);
+        assert_eq!(
+            slot_to_role(ctx(TextureSlotLayout::Starfield), 6),
+            Some(TextureRole::Specular),
+        );
+        // Skyrim slot 3 is Height for non-FaceTint; FO4/FO76/Starfield is the
+        // greyscale-to-palette gradient.
+        assert_eq!(
+            slot_to_role(ctx(TextureSlotLayout::Skyrim), 3),
+            Some(TextureRole::Height),
+        );
+        assert_eq!(
+            slot_to_role(ctx(TextureSlotLayout::Fallout4), 3),
+            Some(TextureRole::GreyscaleLut),
+        );
+    }
+
+    /// Layouts below the 155 boundary must keep passing the raw value through —
+    /// widening the guard must not reach back into Skyrim / FO4, whose integers
+    /// really are `BSLightingShaderType`.
+    #[test]
+    fn pre_fo76_layouts_are_not_translated() {
+        for layout in [TextureSlotLayout::Skyrim, TextureSlotLayout::Fallout4] {
+            for raw in [0u32, 3, 4, 5, 12, 17] {
+                assert_eq!(
+                    canonical_shader_type(layout, raw),
+                    raw,
+                    "{layout:?} numbers are already canonical and must pass through"
+                );
+            }
+        }
+    }
+
+    /// Out-of-range slots resolve to `None` rather than panicking — the REFR
+    /// overlay feeds this a raw `XTXR` slot index straight from the ESM.
+    #[test]
+    fn out_of_range_slots_are_none() {
+        for slot in [8u32, 9, 64, u32::MAX] {
+            assert_eq!(slot_to_role(skyrim(0, false, true), slot), None);
+        }
+    }
+
+    #[test]
+    fn unrouted_authored_bindings_are_counted_per_layout_and_slot() {
+        let context = TextureSlotContext {
+            layout: TextureSlotLayout::Fallout76,
+            shader_type: 0,
+            glow_map: false,
+            model_space_normals: false,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+        };
+        let before = unrouted_texture_slot_bindings(context.layout, 7);
+        record_unrouted_texture_slot(context, 7);
+        assert!(unrouted_texture_slot_bindings(context.layout, 7) > before);
+        assert_eq!(unrouted_texture_slot_bindings(context.layout, 8), 0);
+    }
+
+    /// No slot may resolve to the same role as another for one shader type —
+    /// two slots writing one role means the later silently clobbers the
+    /// earlier, which is the class of bug this table exists to prevent.
+    #[test]
+    fn roles_are_unique_per_shader_type() {
+        for layout in [
+            TextureSlotLayout::Skyrim,
+            TextureSlotLayout::Fallout4,
+            TextureSlotLayout::Fallout76,
+            TextureSlotLayout::Starfield,
+        ] {
+            for ty in [
+                0u32,
+                bs_lighting::FACE_TINT,
+                bs_lighting::SKIN_TINT,
+                bs_lighting::HAIR_TINT,
+                bs_lighting::MULTI_LAYER_PARALLAX,
+                bs_lighting::EYE_ENVMAP,
+            ] {
+                for msn in [false, true] {
+                    let context = TextureSlotContext {
+                        layout,
+                        shader_type: ty,
+                        glow_map: true,
+                        model_space_normals: msn,
+                        soft_lighting: false,
+                        rim_lighting: false,
+                        back_lighting: false,
+                    };
+                    let mut seen = Vec::new();
+                    for slot in 0..8u32 {
+                        if let Some(role) = slot_to_role(context, slot) {
+                            assert!(
+                                !seen.contains(&role),
+                                "{layout:?} shader_type {ty} (msn={msn}) maps two slots to {role:?}"
+                            );
+                            seen.push(role);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

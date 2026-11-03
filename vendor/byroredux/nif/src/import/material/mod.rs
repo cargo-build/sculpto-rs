@@ -1,0 +1,1949 @@
+//! NIF material and texture property extraction.
+
+use crate::blocks::properties::{
+    NiAlphaProperty, NiFlagProperty, NiMaterialProperty, NiStencilProperty, NiTexturingProperty,
+    NiVertexColorProperty, TexDesc,
+};
+use crate::blocks::shader::{
+    BSEffectShaderProperty, BSLightingShaderProperty, BSShaderNoLightingProperty,
+    BSShaderPPLightingProperty, BSShaderPropertyBaseOnly, BSShaderTextureSet, BSSkyShaderProperty,
+    BSWaterShaderProperty, LuminanceParams, ShaderTypeData, SkyShaderProperty,
+    TallGrassShaderProperty, TileShaderProperty, WaterShaderProperty,
+};
+use crate::blocks::texture::NiSourceTexture;
+use crate::blocks::tri_shape::NiTriShape;
+use crate::blocks::NiObject;
+use crate::scene::NifScene;
+use crate::types::BlockRef;
+use byroredux_core::string::{FixedString, StringPool};
+
+use super::mesh::GeomData;
+
+/// Intern a non-empty path through the engine's `StringPool` and return
+/// the resolved [`FixedString`] handle. Empty *and whitespace-only* inputs
+/// collapse to `None` — matches the pre-#609 `Option<String>` semantic where an
+/// empty path field meant "no texture for this slot".
+///
+/// Whitespace-only slot strings (`" "`, `"\t"`) on malformed / broken-exporter
+/// content would otherwise intern to `Some(sym)` and bind the magenta checker
+/// placeholder on the unconditionally-bound diffuse slot (see FO3-1-01 / #1541),
+/// bypassing the `None`→`neutral_fallback()` early-out in the asset provider.
+///
+/// Centralised so every site that pulls a texture-slot name out of a
+/// NIF block routes through one helper — the audit's "store FixedString
+/// instead of String" recommendation reduces to swapping every
+/// `Some(s.to_string())` / `Some(s.clone())` site over to this call.
+/// See #609 / D6-NEW-01.
+#[inline]
+pub(super) fn intern_texture_path(pool: &mut StringPool, path: &str) -> Option<FixedString> {
+    if path.trim().is_empty() {
+        None
+    } else {
+        Some(pool.intern(path))
+    }
+}
+
+mod dedicated_shader;
+mod legacy_properties;
+mod shader_data;
+pub mod slot_role;
+mod walker;
+
+pub use shader_data::ShaderTypeFields;
+pub(crate) use shader_data::{apply_shader_type_data, capture_effect_shader_data};
+pub use slot_role::{
+    canonical_shader_type, slot_to_colocated_role, slot_to_role, unrouted_texture_slot_bindings,
+    TextureRole, TextureSlotContext, TextureSlotLayout,
+};
+// Re-exported only for the per-mod test sibling
+// `shader_type_data_tests.rs` — production callers go through
+// `apply_shader_type_data` instead. Marked `allow(unused_imports)` so
+// non-test builds don't warn about the unused alias.
+#[allow(unused_imports)]
+pub(crate) use shader_data::capture_shader_type_fields;
+pub(crate) use walker::{
+    extract_material_info, extract_material_info_from_refs, extract_vertex_colors,
+};
+
+// Import-side aliases for the named flag constants in
+// `crate::shader_flags`. Kept `pub(super)` so downstream files in the
+// `import` module (`mesh.rs`, `walk.rs`) can reach them without paging
+// through the shared module. The shared constants are documented with
+// per-game semantics so a future refactor can swap callsites onto
+// `GameVariant`-aware lookups (#461 / #437).
+// SLSF1 bits 26 / 27 — `Decal` and `Dynamic_Decal`. The bit positions
+// align byte-exact across FO3/FNV `BSShaderFlags` (`fo3nv_f1`),
+// Skyrim `SkyrimShaderPropertyFlags1` (`skyrim_slsf1`), and FO4
+// `Fallout4ShaderPropertyFlags1` (`fo4_slsf1`) — every era touched in
+// production. We source from `fo4_slsf1` (the most-recent registry)
+// so the FO4 module is not dead-code-only and a future bit drift is
+// caught at compile time below. The cross-era equivalence is proven
+// by the runtime tests at `shader_flags::tests::*`. See #592.
+pub(super) const DECAL_SINGLE_PASS: u32 = crate::shader_flags::fo4_slsf1::DECAL;
+pub(super) const DYNAMIC_DECAL: u32 = crate::shader_flags::fo4_slsf1::DYNAMIC_DECAL;
+
+// Compile-time proof: any future shader-flags reshuffle that breaks
+// cross-era equivalence on the bits this module consumes will fail
+// the build, surfacing the drift before it reaches a renderer
+// regression. Pre-#592 the production path read FO4 properties
+// through Skyrim/FNV-labelled aliases by accident — the bit positions
+// happened to coincide. These const-eval assertions promote the
+// coincidence to a load-bearing invariant.
+const _: () =
+    assert!(crate::shader_flags::fo4_slsf1::DECAL == crate::shader_flags::skyrim_slsf1::DECAL);
+const _: () =
+    assert!(crate::shader_flags::fo4_slsf1::DECAL == crate::shader_flags::fo3nv_f1::DECAL);
+const _: () = assert!(
+    crate::shader_flags::fo4_slsf1::DYNAMIC_DECAL
+        == crate::shader_flags::skyrim_slsf1::DYNAMIC_DECAL
+);
+const _: () = assert!(
+    crate::shader_flags::fo4_slsf1::DYNAMIC_DECAL == crate::shader_flags::fo3nv_f1::DYNAMIC_DECAL
+);
+// FO3/FNV-specific decal bit on flags2 — collides with Skyrim's
+// `Cloud_LOD` on the same bit. Only tested on FO3/FNV `BSShader*Property`
+// paths; Skyrim+ `BSLightingShaderProperty` goes through SLSF1 bits
+// 26/27 only (see #176 closure).
+const ALPHA_DECAL_F2: u32 = crate::shader_flags::fo3nv_f2::ALPHA_DECAL;
+
+/// Shared decal detection across `BSShaderPPLightingProperty` +
+/// `BSShaderNoLightingProperty` (FO3/FNV).
+///
+/// Tests SLSF1 bits 26/27 (`Decal` / `Dynamic_Decal` — these align
+/// numerically across every game-era) AND the FO3/FNV-only
+/// `Alpha_Decal` bit on flags2 (bit 21). The flags2 bit is crucial on
+/// blood-splat NoLighting meshes that don't set the SLSF1 decal bits
+/// (pre-#454 the NoLighting branch had no flags2 check and those
+/// rendered as opaque coplanar quads).
+///
+/// **Must not be called on Skyrim+ or FO4 properties.** Bit 21 of the
+/// second flag word on those games is `Cloud_LOD` (Skyrim) or
+/// `Anisotropic_Lighting` (FO4), NOT a decal bit — using this helper
+/// on `BSLightingShaderProperty` would spuriously classify those
+/// meshes as decals. Modern properties route through
+/// [`is_decal_from_modern_shader_flags`] instead. See #414 / FO4-D3-M1.
+#[inline]
+pub(super) fn is_decal_from_legacy_shader_flags(flags1: u32, flags2: u32) -> bool {
+    flags1 & (DECAL_SINGLE_PASS | DYNAMIC_DECAL) != 0 || flags2 & ALPHA_DECAL_F2 != 0
+}
+
+/// Decal detection for Skyrim+ / FO4 `BSLightingShaderProperty` +
+/// `BSEffectShaderProperty`.
+///
+/// Tests SLSF1 / F4SF1 bits 26/27 (`Decal` / `Dynamic_Decal`) AND, for
+/// FO76 / Starfield content (BSVER >= 132), the union of the
+/// `sf1_crcs` + `sf2_crcs` CRC32 arrays for the corresponding
+/// `BSShaderCRC32::DECAL` / `DYNAMIC_DECAL` identifiers per nif.xml
+/// lines 6532/6533. The legacy u32 fields are written as literal
+/// zeros on BSVER >= 132 (parser branch in `shader.rs:604-608` per
+/// the spec gate `bsver <= 130`), so without the CRC fallback every
+/// FO76+ decal silently lost its flag — see #712 / NIF-D4-01.
+///
+/// `flags2` is unused but kept on the signature for callsite symmetry
+/// with [`is_decal_from_legacy_shader_flags`] and to make a future
+/// FO4 SLSF2 decal addition a one-line change.
+///
+/// The split from [`is_decal_from_legacy_shader_flags`] exists to keep
+/// flags2 bit 21 (`Cloud_LOD` on Skyrim, `Anisotropic_Lighting` on
+/// FO4, `Alpha_Decal` on FO3/FNV — three different semantics on the
+/// same bit) out of the modern decal test. See #414 / FO4-D3-M1.
+#[inline]
+pub(super) fn is_decal_from_modern_shader_flags(
+    flags1: u32,
+    _flags2: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::{contains_any, DECAL, DYNAMIC_DECAL as DD_CRC};
+    if flags1 & (DECAL_SINGLE_PASS | DYNAMIC_DECAL) != 0 {
+        return true;
+    }
+    let targets = [DECAL, DD_CRC];
+    contains_any(sf1_crcs, &targets) || contains_any(sf2_crcs, &targets)
+}
+
+/// Two-sided detection for Skyrim+ / FO4 `BSLightingShaderProperty` +
+/// `BSEffectShaderProperty`.
+///
+/// Tests SLSF2 / F4SF2 bit 4 (`Double_Sided`) AND, for FO76 / Starfield
+/// content (BSVER >= 132), the union of `sf1_crcs` + `sf2_crcs` for
+/// `BSShaderCRC32::TWO_SIDED` per nif.xml line 6524. Same rationale as
+/// [`is_decal_from_modern_shader_flags`] — the legacy u32 fields are
+/// zero on BSVER >= 132. See #712 / NIF-D4-01.
+#[inline]
+pub(super) fn is_two_sided_from_modern_shader_flags(
+    _flags1: u32,
+    flags2: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::{contains_any, TWO_SIDED};
+    if flags2 & SF2_DOUBLE_SIDED != 0 {
+        return true;
+    }
+    contains_any(sf1_crcs, &[TWO_SIDED]) || contains_any(sf2_crcs, &[TWO_SIDED])
+}
+
+/// Test a Skyrim+ / FO4 `BSEffectShaderProperty` flag bit against
+/// both the typed-flag word and the FO76 / Starfield CRC32 list union
+/// (#890 / SK-D4-NEW-04). Sites that need to capture one of the four
+/// `BSEffect`-relevant bits route through this — the per-bit wrappers
+/// [`is_soft_effect_from_modern_shader_flags`] /
+/// [`is_palette_color_from_modern_shader_flags`] /
+/// [`is_palette_alpha_from_modern_shader_flags`] /
+/// [`is_effect_lit_from_modern_shader_flags`] keep call sites
+/// self-documenting without paying a runtime cost.
+///
+/// `flags_word` is whichever of `shader_flags_1` / `shader_flags_2`
+/// carries the typed bit position (`mask` chooses which) — the caller
+/// passes the relevant word per the SLSF1/SLSF2 split. `sf1_crcs` and
+/// `sf2_crcs` are the FO76+ CRC32 arrays; the typed-flag word is zero
+/// on BSVER >= 132 so the CRC layer is the only signal there.
+#[inline]
+pub(super) fn modern_effect_shader_bit(
+    flags_word: u32,
+    mask: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+    crc: u32,
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::contains_any;
+    if flags_word & mask != 0 {
+        return true;
+    }
+    contains_any(sf1_crcs, &[crc]) || contains_any(sf2_crcs, &[crc])
+}
+
+/// `SLSF1::Soft_Effect` capture for `BSEffectShaderProperty` — bit 30
+/// of `shader_flags_1` OR `BSShaderCRC32::SOFT_EFFECT` on the SF1/SF2
+/// arrays. See #890.
+#[inline]
+pub(super) fn is_soft_effect_from_modern_shader_flags(
+    flags1: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::SOFT_EFFECT;
+    use crate::shader_flags::skyrim_slsf1;
+    modern_effect_shader_bit(
+        flags1,
+        skyrim_slsf1::SOFT_EFFECT,
+        sf1_crcs,
+        sf2_crcs,
+        SOFT_EFFECT,
+    )
+}
+
+/// `SLSF1::Greyscale_To_PaletteColor` capture — bit 4 of `shader_flags_1`
+/// OR `BSShaderCRC32::GRAYSCALE_TO_PALETTE_COLOR`. nif.xml uses the
+/// American spelling on the CRC32 enum and the British spelling on the
+/// typed flag; we honor both at the constant import sites. See #890.
+#[inline]
+pub(super) fn is_palette_color_from_modern_shader_flags(
+    flags1: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::GRAYSCALE_TO_PALETTE_COLOR;
+    use crate::shader_flags::skyrim_slsf1;
+    modern_effect_shader_bit(
+        flags1,
+        skyrim_slsf1::GREYSCALE_TO_PALETTE_COLOR,
+        sf1_crcs,
+        sf2_crcs,
+        GRAYSCALE_TO_PALETTE_COLOR,
+    )
+}
+
+/// `SLSF1::Greyscale_To_PaletteAlpha` capture — bit 5 of `shader_flags_1`
+/// OR `BSShaderCRC32::GRAYSCALE_TO_PALETTE_ALPHA`. See #890.
+#[inline]
+pub(super) fn is_palette_alpha_from_modern_shader_flags(
+    flags1: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::GRAYSCALE_TO_PALETTE_ALPHA;
+    use crate::shader_flags::skyrim_slsf1;
+    modern_effect_shader_bit(
+        flags1,
+        skyrim_slsf1::GREYSCALE_TO_PALETTE_ALPHA,
+        sf1_crcs,
+        sf2_crcs,
+        GRAYSCALE_TO_PALETTE_ALPHA,
+    )
+}
+
+/// `SLSF2::Effect_Lighting` capture — bit 30 of `shader_flags_2` OR
+/// `BSShaderCRC32::EFFECT_LIGHTING`. See #890.
+#[inline]
+pub(super) fn is_effect_lit_from_modern_shader_flags(
+    flags2: u32,
+    sf1_crcs: &[u32],
+    sf2_crcs: &[u32],
+) -> bool {
+    use crate::shader_flags::bs_shader_crc32::EFFECT_LIGHTING;
+    use crate::shader_flags::skyrim_slsf2;
+    modern_effect_shader_bit(
+        flags2,
+        skyrim_slsf2::EFFECT_LIGHTING,
+        sf1_crcs,
+        sf2_crcs,
+        EFFECT_LIGHTING,
+    )
+}
+
+// NOTE: there is no `SF_DOUBLE_SIDED` on the FO3/FNV
+// `BSShaderPPLightingProperty` / `BSShaderNoLightingProperty` flag
+// pair. Pre-#441 we tested `flags_1 & 0x1000` on both blocks as if
+// that bit meant Double_Sided (the Skyrim/FO4 `SkyrimShaderPropertyFlags2`
+// convention), but on the FO3/FNV `BSShaderFlags` enum that bit is
+// `Unknown_3` — a debug/crash flag with no backface meaning. flags2
+// bit 4 on FO3/FNV is `Refraction_Tint`, also not Double_Sided.
+// Verified against nif.xml lines 6148–6218 (`Fallout3ShaderPropertyFlags1/2`)
+// vs. lines 6407+ / 6479+ for Skyrim and FO4 where the bit semantics
+// actually land.
+//
+// FO3/FNV meshes that want back-face-off rely on `NiStencilProperty`
+// — handled by the fallback at `extract_material_info` below. The
+// Skyrim+ `BSLightingShaderProperty` / `BSEffectShaderProperty` path
+// still uses `flags2 & 0x10` because that is the documented
+// Double_Sided bit on those games.
+//
+// Double_Sided bit on Skyrim+ / FO4 `*ShaderPropertyFlags2`. Only
+// tested on blocks whose game actually carries this semantic (see
+// note above). Sourced from `fo4_slsf2` so the FO4 module is not
+// dead-code-only — bit position aligns with Skyrim and the
+// compile-time assertion below pins the equivalence. See #592.
+const SF2_DOUBLE_SIDED: u32 = crate::shader_flags::fo4_slsf2::DOUBLE_SIDED;
+const _: () = assert!(
+    crate::shader_flags::fo4_slsf2::DOUBLE_SIDED == crate::shader_flags::skyrim_slsf2::DOUBLE_SIDED
+);
+
+/// How a `NiVertexColorProperty` wants per-vertex colors to participate
+/// in shading, mirroring Gamebryo's `NiVertexColorProperty::SourceMode`.
+///
+/// `NiTexturingProperty` / `NiMaterialProperty` meshes can opt out of
+/// vertex-color contribution entirely (`Ignore`) or route it through a
+/// different shader channel (`Emissive`). Pre-#214 the importer always
+/// used vertex colors as diffuse regardless of the stored mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum VertexColorMode {
+    /// `SRC_IGNORE` — the mesh has vertex colors in the data block but
+    /// the material explicitly disables them. Treat as if absent.
+    Ignore = 0,
+    /// `SRC_EMISSIVE` — vertex colors drive per-vertex self-illumination
+    /// rather than diffuse. Gamebryo uses this for flickering torches,
+    /// signs, and glowing effects baked into the geometry.
+    Emissive = 1,
+    /// `SRC_AMB_DIFF` — default / pre-10.0 behavior: vertex colors act
+    /// as per-vertex diffuse + ambient.
+    AmbientDiffuse = 2,
+}
+
+impl VertexColorMode {
+    /// Decode the Gamebryo source-mode u32. Unknown values fall back to
+    /// `AmbientDiffuse` — the value Gamebryo uses when the field is
+    /// missing — so legacy content stays visually unchanged.
+    pub(super) fn from_source_mode(raw: u32) -> Self {
+        match raw {
+            0 => Self::Ignore,
+            1 => Self::Emissive,
+            _ => Self::AmbientDiffuse,
+        }
+    }
+
+    /// Decode the full `NiVertexColorProperty` (vertex_mode, lighting_mode)
+    /// pair into our 1-D `VertexColorMode` axis. See #694 / O4-02.
+    ///
+    /// Gamebryo's lighting equation gates which terms contribute:
+    ///
+    /// * `LIGHTING_E_A_D` (1, default): Emissive + Ambient + Diffuse
+    ///   terms all participate. Vertex color routes per `vertex_mode`.
+    /// * `LIGHTING_E` (0): only the Emissive term contributes — Ambient
+    ///   and Diffuse are dropped from the lighting integral.
+    ///
+    /// When `LIGHTING_E` combines with `SOURCE_AMB_DIFF`, the vertex
+    /// colors feed terms the engine has just dropped — they become
+    /// invisible. Collapse that to `Ignore` so the renderer's PBR
+    /// pipeline skips the (`texColor.rgb * fragColor`) multiplication
+    /// that the fragment shader unconditionally applies. Pre-fix this
+    /// double-counted material colors on the rare LIGHTING_E meshes
+    /// (Oblivion FX / a few statics).
+    ///
+    /// Other (vertex_mode, lighting_mode) combinations either route
+    /// through Emissive (which we already special-case) or are the
+    /// LIGHTING_E_A_D default which keeps the source-mode unchanged.
+    pub(super) fn from_property(vertex_mode: u32, lighting_mode: u32) -> Self {
+        let src = Self::from_source_mode(vertex_mode);
+        // `lighting_mode == 0` is `LIGHTING_E`; any other value (including
+        // missing-field default `1`) is `LIGHTING_E_A_D`.
+        if lighting_mode == 0 && src == Self::AmbientDiffuse {
+            Self::Ignore
+        } else {
+            src
+        }
+    }
+}
+
+/// Material properties extracted from a NiTriShape's property list in a single pass.
+///
+/// Texture-slot path fields hold [`FixedString`] handles into the
+/// engine-wide [`StringPool`] (#609 / D6-NEW-01). Pre-fix every slot
+/// stored an `Option<String>` and re-allocated the path on every
+/// `MaterialInfo::clone` and every cell load — ~50 KB redundant heap
+/// per ~200-mesh interior cell. Now a clone is a refcount + copy of
+/// the symbol handle (4 bytes), and resolving back to a `&str` for the
+/// texture provider is a `pool.resolve()` call away.
+#[derive(Debug)]
+pub(super) struct MaterialInfo {
+    pub texture_path: Option<FixedString>,
+    /// BGSM/BGEM material file reference (FO4+). Present when the
+    /// BSLightingShaderProperty has a non-empty name.
+    pub material_path: Option<FixedString>,
+    pub normal_map: Option<FixedString>,
+    /// Glow / self-illumination texture (NiTexturingProperty slot 4).
+    /// Filled on Oblivion/FO3/FNV meshes where a dedicated emissive
+    /// map supplements or replaces `NiMaterialProperty.emissive`. See #214.
+    pub glow_map: Option<FixedString>,
+    /// Detail overlay texture (NiTexturingProperty slot 2). Blends with
+    /// the base texture at higher frequency; used for terrain detail
+    /// variation and clothing micro-texture.
+    pub detail_map: Option<FixedString>,
+    /// #4422 — the encoded-space sample value that leaves the surface
+    /// unchanged under the detail combine (`albedo *= sample / neutral`).
+    /// Defaults to [`super::slot_role::DETAIL_NEUTRAL_MODULATE2X`] (the
+    /// classic NiTexturingProperty MODULATE2X convention); the FaceTint
+    /// route in `dedicated_shader` stamps
+    /// [`super::slot_role::DETAIL_NEUTRAL_FACE_TINT`] when it routes a
+    /// complexion map into this field, because vanilla's own blank detail
+    /// texture centres that combine at 65/255, not 128/255.
+    pub detail_neutral: f32,
+    /// Specular-mask / gloss texture (NiTexturingProperty slot 3).
+    /// Per-texel specular strength; enables armor highlights masked
+    /// by leather/fabric regions.
+    pub gloss_map: Option<FixedString>,
+    /// Standalone specular-colour/intensity texture. Skyrim model-space
+    /// normal materials reuse `BSShaderTextureSet` slot 7 for this role;
+    /// unlike `gloss_map`, it must not alter roughness.
+    pub specular_map: Option<FixedString>,
+    /// Dark / multiplicative lightmap texture (NiTexturingProperty slot 1).
+    /// Baked shadow/grime modulation on Oblivion interior architecture.
+    /// Applied as `albedo.rgb *= dark_sample.rgb`. See #264.
+    pub dark_map: Option<FixedString>,
+    /// Ordered legacy material-overlay maps from NiTexturingProperty decal
+    /// slots 0..=3. They now feed the shared semantic texture contract
+    /// instead of stopping at the block parser.
+    pub decal_maps: [Option<FixedString>; 4],
+    /// Parallax / height texture (`BSShaderTextureSet` slot 3). FO3/FNV
+    /// architecture relies on this for brick-wall / concrete
+    /// parallax-occlusion mapping, gated on `BSShaderFlags` bit 11
+    /// (`Parallax_Shader_Index_15`) or bit 28 (`Parallax_Occulsion`) —
+    /// see [`Self::legacy_shader_type`] for the *separate* FO3
+    /// `BSShaderType` enum this doc previously conflated these flag
+    /// bits with (#2320: the numbers "3"/"7" here were never a real
+    /// `shader_type` value on either enum). Pre-#452 the importer
+    /// stopped reading at slot 2, so every Pitt / Point Lookout / Hoover
+    /// Dam parallax wall landed flat. See #452 / #2317.
+    pub parallax_map: Option<FixedString>,
+    /// Whether [`Self::parallax_map`]'s height values live in the texture's
+    /// **alpha** channel rather than the usual `.r`.
+    ///
+    /// #3530 — set only by the Oblivion `APPLY_HILIGHT2` route, where
+    /// `parallax_map` is bound to the *normal* map because no separate height
+    /// texture ships (`Oblivion - Textures - Compressed.bsa` has zero
+    /// `_p.dds` entries). Every other producer — `NiTexturingProperty` slot 7,
+    /// `BSShaderTextureSet` slot 3, BGSM `TextureRole::Height` — binds a
+    /// dedicated greyscale height map and leaves this `false`.
+    ///
+    /// The decision belongs here, at the parser→`Material` boundary: the
+    /// render side transports it as a bit on the texture index (the existing
+    /// `NORMAL_ALPHA_SPEC_BIT` mechanism) and never re-derives it.
+    pub parallax_height_in_alpha: bool,
+    /// Environment cubemap (`BSShaderTextureSet` slot 4). Drives the
+    /// glass bottle / power-armor / smooth-metal reflection branch.
+    /// `env_map_scale` is already captured but had no texture route
+    /// until #452.
+    pub env_map: Option<FixedString>,
+    /// Environment-reflection mask (`BSShaderTextureSet` slot 5). Per-
+    /// texel attenuation of the `env_map` reflection — used on armor
+    /// edges and rim highlights so only the polished surface reflects.
+    /// See #452.
+    pub env_mask: Option<FixedString>,
+    /// FO4/FO76 `BSShaderTextureSet` slot 3 palette-gradient lookup.
+    /// Kept separate from `parallax_map`: routing the gradient into height
+    /// makes the renderer ray-march palette data as POM (#2997).
+    pub greyscale_lut_map: Option<FixedString>,
+    /// Normalised `BSLightingShaderType` (#2695) — the value
+    /// `slot_role::slot_to_role` was resolved with, including
+    /// `ShaderTypeData`-derived corrections that the raw numeric type misses.
+    /// Rides through to `ImportedMaterial` so the REFR texture overlay can
+    /// resolve an `XTXR` slot the same way the mesh's own texture set was.
+    /// `0` (Default) when no dedicated BSLightingShaderProperty was seen.
+    pub shader_type: u32,
+    /// FO3/FNV `BSShaderProperty.shader_type` — nif.xml's `BSShaderType`
+    /// enum (`SHADER_TALL_GRASS`=0, `SHADER_DEFAULT`=1, `SHADER_SKY`=10,
+    /// `SHADER_SKIN`=14, `SHADER_UNKNOWN`=15, `SHADER_WATER`=17,
+    /// `SHADER_LIGHTING30`=29, `SHADER_TILE`=32, `SHADER_NOLIGHTING`=33).
+    /// A DIFFERENT enum from [`Self::shader_type`] above — Skyrim's
+    /// `BSLightingShaderType` — despite several numeric values
+    /// overlapping (FO3's `SHADER_SKIN`=14 vs Skyrim's own type 14, for
+    /// instance); the two must never be aliased onto one field. `None`
+    /// when no `BSShaderPPLightingProperty` / `BSShaderNoLightingProperty`
+    /// was seen (Skyrim+ content, or a mesh with no legacy shader
+    /// property at all) — distinct from `Some(0)`
+    /// (`SHADER_TALL_GRASS`, a real authored value). Captured but not
+    /// yet consumed by any renderer dispatch; #2320 closes the parser-
+    /// side drop, a future skin-SSS/sky-fullbright/water-dispatch branch
+    /// is the consumer.
+    pub legacy_shader_type: Option<u32>,
+    /// #4282 — FO4+ wetness envelope / FO76+ luminance quad off the
+    /// bound `BSLightingShaderProperty`, in the core-owned canonical
+    /// shapes. Capture-only: forwarded to `ImportedMaterial` and then
+    /// `Material`; no renderer consumer yet.
+    pub(super) wetness: Option<byroredux_core::ecs::components::material::WetnessShading>,
+    pub(super) luminance: Option<byroredux_core::ecs::components::material::LuminanceShading>,
+    /// Game-specific texture-slot vocabulary used for this material.
+    pub texture_slot_layout: TextureSlotLayout,
+    /// Whether slot 2 is explicitly enabled as a glow map. Skyrim multiplexes
+    /// the same slot with soft/rim masks, so presence alone is insufficient.
+    pub slot2_glow_enabled: bool,
+    /// Skin/hair tint mask from `BSShaderTextureSet` slot 2. FaceGen's baked
+    /// per-NPC slot-6 texture remains owned by the actor-specific path.
+    pub tint_map: Option<FixedString>,
+    /// MultiLayerParallax inner-layer texture (`BSShaderTextureSet`
+    /// slot 6). Sampled beneath the diffuse layer for ice / glass /
+    /// crystal surfaces — paired with `multi_layer_inner_thickness` /
+    /// `multi_layer_inner_layer_scale`. Pre-#563 the importer never
+    /// read the slot, so Dragonborn DLC ice walls and modded glass
+    /// shaders silently lost their inner layer. See nif.xml
+    /// `BSLightingShaderType::MultiLayerParallax` ("Enables …
+    /// Layer(TS7)") and #563.
+    pub inner_layer_map: Option<FixedString>,
+    /// Skyrim slot-2 soft/rim-light mask and slot-7 back-light map.
+    pub lighting_mask_map: Option<FixedString>,
+    pub back_lighting_map: Option<FixedString>,
+    /// FO4 `BSShaderTextureSet` slot 5, tint-family shader types only
+    /// (FaceTint/SkinTint/HairTint) — the wrinkle/expression-crease
+    /// normal map (`*_n.dds`: `BaseFemaleHeadWrinkles_n.DDS`,
+    /// `HeadWrinkles_n.dds`, `Gen2SkinHeadCrease_n.dds`,
+    /// `SupermutantHeadCrease_n.dds`). Measured on `Fallout4 -
+    /// Meshes.ba2` type-4 FaceTint properties: 79.8% non-empty
+    /// (981/1,229), all `_n` normals. Pre-#2999 `slot_to_role` skipped
+    /// slots 4/5 on the tint family for every game — a Skyrim
+    /// occupancy measurement (#1350) generalised to FO4, where it's
+    /// false. Routes to `MaterialTextureSet::wrinkle`, the same
+    /// canonical field the TXST decode path already populates
+    /// (`crates/plugin/src/esm/cell/support.rs`) — this closes the
+    /// NIF-import side of that same destination.
+    pub wrinkle_map: Option<FixedString>,
+    /// How vertex colors should participate in shading. See #214 /
+    /// `VertexColorMode`. Defaults to `AmbientDiffuse` — the value
+    /// Gamebryo uses when the NIF has no `NiVertexColorProperty`.
+    pub vertex_color_mode: VertexColorMode,
+    /// Effective alpha-blend state for the renderer. A material that authors
+    /// both alpha test and blend remains test-only here by default so foliage,
+    /// hair, and fences keep the depth-writing cutout path.
+    pub alpha_blend: bool,
+    /// Raw NiAlphaProperty blend-enable bit, retained when alpha test wins the
+    /// generic pipeline choice. Some legacy glass meshes (including FNV's
+    /// pitchers and drinking glasses) intentionally author both operations;
+    /// [`effective_alpha_blend`] selectively restores blending for meshes that
+    /// are actually classified as glass.
+    pub alpha_blend_authored: bool,
+    /// Source blend factor from NiAlphaProperty flags bits 1–4.
+    /// Maps to Gamebryo's AlphaFunction enum:
+    ///   0=ONE, 1=ZERO, 2=SRC_COLOR, 3=INV_SRC_COLOR, 4=DEST_COLOR,
+    ///   5=INV_DEST_COLOR, 6=SRC_ALPHA, 7=INV_SRC_ALPHA, 8=DEST_ALPHA,
+    ///   9=INV_DEST_ALPHA, 10=SRC_ALPHA_SATURATE.
+    /// Default: 6 (SRC_ALPHA).
+    pub src_blend_mode: u8,
+    /// Destination blend factor from NiAlphaProperty flags bits 5–8.
+    /// Same enum as src_blend_mode. Default: 7 (INV_SRC_ALPHA).
+    pub dst_blend_mode: u8,
+    /// Alpha-tested (cutout) rendering — vertices whose sampled texture
+    /// alpha falls below `alpha_threshold` should be `discard`-ed in the
+    /// fragment shader. Set when NiAlphaProperty.flags has bit 9 (0x200).
+    /// Mutually exclusive with `alpha_blend` in the importer: when a
+    /// material sets both bits (common on Gamebryo foliage and hair),
+    /// alpha-test wins because the discard + depth-write path sorts
+    /// cleanly, while alpha-blend produces z-sort artifacts.
+    pub alpha_test: bool,
+    /// Cutoff threshold for `alpha_test`, in the [0.0, 1.0] range —
+    /// `NiAlphaProperty.threshold` (u8) divided by 255.
+    pub alpha_threshold: f32,
+    /// Alpha test comparison function from `NiAlphaProperty.flags`
+    /// bits 10–12. Maps to Gamebryo's `TestFunction` enum:
+    ///   0=ALWAYS, 1=LESS, 2=EQUAL, 3=LESSEQUAL,
+    ///   4=GREATER, 5=NOTEQUAL, 6=GREATEREQUAL, 7=NEVER.
+    /// Default: 6 (GREATEREQUAL) — keep fragments where alpha >= threshold.
+    pub alpha_test_func: u8,
+    /// True once a `NiAlphaProperty` has been consumed via
+    /// [`apply_alpha_flags`] for this mesh — regardless of whether
+    /// it set `alpha_blend` / `alpha_test`. A NiAlphaProperty with
+    /// `flags=0` is structurally "the shape explicitly authored no
+    /// blending and no test"; treating it as "no NiAlphaProperty was
+    /// consumed" let the parent NiNode's NiAlphaProperty silently
+    /// overwrite it on inherited-property walks. The cascade gate
+    /// now reads this flag instead of `!alpha_blend && !alpha_test`
+    /// so a flags=0 shape property correctly closes the gate. See
+    /// NIF-D4-NEW-05 (audit 2026-05-12).
+    pub alpha_property_consumed: bool,
+    /// True once a legacy FO3/FNV/Oblivion shader property has written
+    /// `texture_clamp_mode` for this mesh via
+    /// `apply_legacy_property_chain`'s direct-then-inherited walk.
+    /// Mirrors `alpha_property_consumed`'s rationale (#2328 /
+    /// FO3-D1-06): `apply_legacy_property_chain` iterates the shape's
+    /// own properties before the parent NiNode's inherited ones so the
+    /// shape's authored value takes priority (#208), but the
+    /// `texture_clamp_mode` writers used a bare `=` with no consumption
+    /// gate — an inherited parent property silently overwrote the
+    /// shape's own value, the opposite of the documented precedence.
+    pub texture_clamp_mode_consumed: bool,
+    /// True once a legacy FO3/FNV/Oblivion shader property has written
+    /// `env_map_scale` for this mesh. Same rationale and fix as
+    /// [`Self::texture_clamp_mode_consumed`] (#2328 / FO3-D1-06).
+    pub env_map_scale_consumed: bool,
+    /// #4237 / FO3-D1-2026-09-11-02 — whether an authored FO3/FNV
+    /// `Window_Environment_Mapping`/`Eye_Environment_Mapping` shader-flag
+    /// bit was seen on this mesh. Previously only fed `env_map_scale`'s
+    /// on/off gate (`legacy_env_map_scale`); a window authored with this
+    /// flag but a non-keyword-matching filename never reached
+    /// `classify_glass_into_material`, so it was misclassified as opaque
+    /// dielectric instead of glass. Same `_consumed` precedence gate as
+    /// `env_map_scale_consumed`.
+    pub window_env_mapping: bool,
+    /// See [`Self::window_env_mapping`].
+    pub window_env_mapping_consumed: bool,
+    /// True once any shader property has written `refraction_strength`
+    /// for this mesh. Same rationale and fix as
+    /// [`Self::texture_clamp_mode_consumed`] — #3514 is #2328's
+    /// remainder: `apply_pp_lighting_property` converted its
+    /// `texture_clamp_mode` and `env_map_scale` writes to consumption
+    /// gates and left the `refraction_strength` write two statements
+    /// below them a bare `=`, so an inherited parent-NiNode property
+    /// still overwrote the shape's own value.
+    ///
+    /// Also set by the Skyrim+ `BSLightingShaderProperty` writer, which
+    /// runs *before* the legacy chain (`extract_material_info_from_refs`)
+    /// — the same "more specific source wins" ordering
+    /// [`Self::texture_clamp_mode_consumed`] enforces.
+    pub refraction_strength_consumed: bool,
+    /// #4235 — bitmask of the texture roles (base, normal, glow) whose
+    /// current path came from a legacy `NiTexturingProperty`. A `BSShader*`
+    /// property's own texture for a marked role replaces it wherever the two
+    /// sit in the property chain, because the bound shader samples its own
+    /// texture set. Bits are private to `legacy_properties.rs`.
+    pub texturing_property_roles: u8,
+    pub two_sided: bool,
+    /// `NiAlphaProperty.flags` bit 13 (0x2000, "No Sorter") — the shape
+    /// author's per-draw instruction to `NiAlphaAccumulator` to skip
+    /// the depth sort and draw in accumulation (file/state-clustered)
+    /// order instead. Census (#3797, 2026-09-02): 74/8032 Oblivion
+    /// meshes set it (concentrated in Ayleid ruin interiors, shipwrecks,
+    /// moss/rubble clutter — `Oblivion - Meshes.bsa`), 0/10989 FO3 and
+    /// 0/14881 FNV. Consumed by the alpha-over sort key's slot 3
+    /// (`byroredux/src/render/mod.rs::draw_sort_key`).
+    pub no_sorter: bool,
+    pub is_decal: bool,
+    /// Object/model-space normal map (vs the default tangent-space). Set
+    /// from the FO4 `F4SF1::Model_Space_Normals` shader-flag bit (or the
+    /// FO76+ CRC) on `BSLightingShaderProperty` when no BGSM overrides it —
+    /// vanilla FO4 sources this from the `.bgsm` (authoritative), so this
+    /// only fires for inline / modded NIFs with no material file. Flows to
+    /// `ImportedMesh::model_space_normals`, where the BGSM merge can still
+    /// upgrade it (OR semantics). See #1592 / FO4-D5-MEDIUM-01.
+    pub model_space_normals: bool,
+    pub emissive_color: [f32; 3],
+    pub emissive_mult: f32,
+    /// Provenance of `emissive_mult` — disambiguates the three NIF
+    /// shader-property classes whose "emissive multiplier" fields all
+    /// flow into the same slot. See
+    /// [`byroredux_core::ecs::components::material::EmissiveSource`].
+    /// Set by the walker at each of the 3 set-sites; defaults to
+    /// `EmissiveSource::None` when no source authored a value.
+    /// #1280 step 4 / canonical material convergence.
+    pub emissive_source: byroredux_core::ecs::components::material::EmissiveSource,
+    pub specular_color: [f32; 3],
+    pub specular_strength: f32,
+    /// Diffuse color from `NiMaterialProperty` (or `[1.0; 3]` default).
+    ///
+    /// Used as the per-vertex color fallback when
+    /// `vertex_color_mode == Ignore` or the mesh has no vertex_colors
+    /// array. Pre-#438 `extract_vertex_colors` walked the property list
+    /// a second time to re-read this value; caching here removes one
+    /// full scan per NiTriShape.
+    pub diffuse_color: [f32; 3],
+    /// True when the mesh has no `NiSpecularProperty` or the property's
+    /// enable flag (bit 0) is set. Many Oblivion/FNV matte surfaces
+    /// (stone walls, plaster, unfinished wood) explicitly disable
+    /// specular via a `NiSpecularProperty { flags: 0 }` block; honoring
+    /// that flag prevents bright specular hotspots that look like
+    /// lighting glitches in the new PBR pipeline.
+    pub specular_enabled: bool,
+    pub glossiness: f32,
+    /// `BSLightingShaderProperty.refraction_strength` — refractive
+    /// distortion magnitude (every BSVER 83+ BSLSP authors this).
+    /// Default 0.0 = no refraction. Renderer dispatch is deferred to
+    /// the Skyrim+ PBR pass paired with the BGSM v>=8 suite (#1147);
+    /// captured here so the silent drop at the importer boundary is
+    /// closed. See #1241 / NIF-DIM4-NEW-01.
+    pub refraction_strength: f32,
+    /// `BSLightingShaderProperty.lighting_effect_1` — Skyrim soft-lighting /
+    /// subsurface-width scalar (BSVER < FO4, gated by `SLSF2_Soft_Lighting`).
+    /// `nifly` names the same wire field `softlighting`
+    /// (`Shaders.cpp:468-471`, same version gate — `User() <= 12 &&
+    /// Stream() < 130` — decoding the same two floats in the same order, so
+    /// the mapping is 1:1); nif.xml agrees on the format default **0.3**
+    /// (range 0..10), not 0.0 — `parse_skyrim` always reads the wire value
+    /// for BSLSP materials, so 0.0 is only reached by non-BSLSP content
+    /// whose `SOFT_LIGHTING` bit is clear anyway. Drives the per-material
+    /// SSS rolloff on skin / soft-cloth / wax surfaces. See #1241.
+    pub lighting_effect_1: f32,
+    /// `BSLightingShaderProperty.lighting_effect_2` — Skyrim **rim-light
+    /// power** (BSVER < FO4, gated by `SLSF2_Rim_Lighting`), **not** a
+    /// backlight strength — Skyrim authors no backlight strength at all.
+    /// `nifly` names the same wire field `rimlightPower`
+    /// (`Shaders.cpp:468-471`); nif.xml agrees on the format default
+    /// **2.0** (range 0..1000). `lighting.glsl`'s `bethesdaRimFactor`
+    /// already reads this correctly as the Skyrim fallback for FO4's
+    /// `rimlight_power` field; `bethesdaBackFactor` deliberately does NOT
+    /// read this field, since there is no separate Skyrim back-light
+    /// strength scalar to read. See #1241.
+    pub lighting_effect_2: f32,
+    /// `BSLightingShaderProperty.subsurface_rolloff` — FO4 BSVER 130–139.
+    /// Per-material SSS rolloff envelope. Default 0.0. See #1241.
+    pub subsurface_rolloff: f32,
+    /// `BSLightingShaderProperty.rimlight_power` — FO4 BSVER 130–139.
+    /// Per-material rim-light exponent (power-armor edge highlight,
+    /// NPC skin rim). Default 0.0. See #1241.
+    pub rimlight_power: f32,
+    /// `BSLightingShaderProperty.backlight_power` — FO4 BSVER 130–139.
+    /// Per-material backlight exponent (paired with `rimlight_power`
+    /// when `< FLT_MAX`). Default 0.0. See #1241.
+    pub backlight_power: f32,
+    /// Authored feature gates from Skyrim SLSF2 or FO4-era material data.
+    pub soft_lighting: bool,
+    pub rim_lighting: bool,
+    pub back_lighting: bool,
+    /// `SLSF1::Greyscale_To_PaletteColor` / `_PaletteAlpha` as authored on a
+    /// **`BSLightingShaderProperty`** (the lit path), captured via the same
+    /// typed-word + CRC32-list union the `BSEffectShaderProperty` arm uses.
+    ///
+    /// #3897 — before this, the palette-remap enable bit had exactly one
+    /// producer: an external BGSM/BGEM merged later by
+    /// `asset_provider::merge_external_material`. The lit path routed the LUT
+    /// *texture* into the `greyscale_lut` role (#2997) but had no way to say
+    /// the remap was enabled, so `MAT_FLAG_EFFECT_PALETTE_COLOR` was never set
+    /// for a lit FO4 material and the shader's palette branch was dead code —
+    /// on 30,166 measured FO4 properties. These two fields are that missing
+    /// producer; they are forwarded onto the `ImportedMaterial` enable triple
+    /// in [`MaterialInfo::into_imported_material`].
+    pub palette_color: bool,
+    pub palette_alpha: bool,
+    /// `BSLightingShaderProperty.grayscale_to_palette_scale` — FO4+
+    /// BSVER >= 130. Modulator on the greyscale→palette LUT remap
+    /// (NPC face tints, gradient-driven palette swaps). Default 1.0
+    /// = no scale — matches
+    /// `BSLightingShaderProperty::material_reference_stub` (the FO4/
+    /// FO76+ material-reference stopcond) and, since #2589, the
+    /// `parse_skyrim` arm too (it never serializes this FO4+-only
+    /// field, so it now constructs the same neutral literal instead of
+    /// the `0.0` it used pre-#2589). #1241 / #2589 (SKY-D7-01).
+    pub grayscale_to_palette_scale: f32,
+    /// `BSLightingShaderProperty.fresnel_power` — FO4+ BSVER >= 130.
+    /// Per-material Schlick exponent for the Fresnel rim term.
+    /// Default 5.0 (standard Schlick exponent) — same three-arm
+    /// agreement as [`Self::grayscale_to_palette_scale`] above.
+    /// #1241 / #2589 (SKY-D7-01).
+    pub fresnel_power: f32,
+    pub uv_offset: [f32; 2],
+    pub uv_scale: [f32; 2],
+    /// Ambient color (RGB) from `NiMaterialProperty.ambient`. Modulates
+    /// the cell's ambient lighting term per material — most authored
+    /// values are `[1.0; 3]` so the field acts as a no-op tint by
+    /// default. Audit `AUDIT_LEGACY_COMPAT_2026-04-10.md` D4-09 / #221.
+    pub ambient_color: [f32; 3],
+    pub alpha: f32,
+    pub env_map_scale: f32,
+    pub has_material_data: bool,
+    /// True only at the two sites that actually assign `specular_color`
+    /// from authored data — `NiMaterialProperty` and
+    /// `BSLightingShaderProperty`. `has_material_data` is a broader
+    /// "some property claimed this material" flag also set by the
+    /// `BSEffectShaderProperty`/`BSSkyShaderProperty`/`BSWaterShaderProperty`
+    /// arms, none of which touch `specular_color` — using it as the
+    /// classifier's authorship signal read those arms' unauthored
+    /// `[1.0, 1.0, 1.0]` struct default as an authored white specular
+    /// tint. See #2352 (SF-D8-01) / #1873.
+    pub specular_authored: bool,
+    /// Set by any property that contributes a UV transform — the
+    /// Skyrim+ shader paths copy `uv_offset` / `uv_scale` directly off
+    /// `BSLightingShaderProperty` / `BSEffectShaderProperty`, while the
+    /// pre-Skyrim path picks the base-slot `TexTransform` on
+    /// `NiTexturingProperty`. Pre-#435 the NiTexturingProperty branch
+    /// gated on `has_material_data`, so a `NiMaterialProperty` listed
+    /// before `NiTexturingProperty` (the common Oblivion / FO3 / FNV
+    /// property order) silently dropped the texture-slot UV transform —
+    /// even though `NiMaterialProperty` carries no UV transform of its
+    /// own, the two flags are orthogonal. See audit
+    /// `AUDIT_NIF_2026-04-18.md` finding N06.
+    pub has_uv_transform: bool,
+    /// Set only by `apply_bs_lighting_shader` — a `BSLightingShaderProperty`
+    /// (Skyrim+) was found for this material. `#1208`'s intent was to stop
+    /// an inherited `NiVertexColorProperty` from overwriting the Skyrim+
+    /// shader-driven `vertex_color_mode` default, but the original fix
+    /// gated on the broader `has_material_data` — which the ordinary
+    /// pre-Skyrim `NiMaterialProperty` arm ALSO sets. Since the property
+    /// chain walks in file order, a `NiMaterialProperty` visited before a
+    /// `NiVertexColorProperty` (the common Oblivion/FO3/FNV property order)
+    /// latched that gate shut too, dropping every legacy vertex-color
+    /// property regardless of direct-vs-inherited status. Same failure
+    /// shape as `has_uv_transform`'s own #435/N06 precedent above. See
+    /// #2457.
+    pub has_bs_lighting_shader: bool,
+    /// Set by the `BSShaderPPLightingProperty` / `BSShaderNoLightingProperty`
+    /// arms — the FO3/FNV *lit* shader pipeline is bound for this material.
+    /// Distinct from `has_bs_lighting_shader`, which is the Skyrim+
+    /// `BSLightingShaderProperty`.
+    ///
+    /// Consumed by the specular-authorship post-pass in
+    /// `walker::extract_material_info_from_refs`: on that pipeline
+    /// `NiMaterialProperty.specular` is vestigial (the engine sourced
+    /// specular from the shader / normal-map alpha), and vanilla FNV
+    /// authors it black essentially everywhere, so copying that zero
+    /// through as *authored* collapses the whole direct-specular lobe.
+    /// See #2553.
+    pub has_legacy_bs_shader: bool,
+    /// Depth test enabled (from NiZBufferProperty). Default: true.
+    pub z_test: bool,
+    /// Depth write enabled (from NiZBufferProperty). Default: true.
+    pub z_write: bool,
+    /// Depth comparison function from `NiZBufferProperty.z_function`.
+    /// Maps to the Gamebryo `TestFunction` enum:
+    /// 0=ALWAYS, 1=LESS, 2=EQUAL, 3=LESSEQUAL, 4=GREATER, 5=NOTEQUAL,
+    /// 6=GREATEREQUAL, 7=NEVER. Default 3 (LESSEQUAL) — matches the
+    /// Gamebryo runtime default and the renderer's pre-#398 hardcoded
+    /// `vk::CompareOp::LESS` (close enough that everything depth-tested
+    /// strictly less still passes equal-depth co-planar geometry as
+    /// LESSEQUAL would). Pre-#398 the value was extracted into
+    /// `MaterialInfo` but never reached the GPU; sky domes / viewmodels
+    /// / glow halos that author non-default depth state z-fought
+    /// against world geometry.
+    pub z_function: u8,
+    /// Forces wireframe rendering (polygon_mode = LINE). Set when a
+    /// `NiWireframeProperty { flags: 1 }` block is present. Oblivion vanilla
+    /// does not ship this; common in FO3/FNV mods. Renderer-side consumption
+    /// (VK_POLYGON_MODE_LINE) is tracked separately.
+    pub wireframe: bool,
+    /// Forces flat shading (no per-vertex normal interpolation). Set when a
+    /// `NiShadeProperty { flags: 0 }` block is present (bit 0 off = flat).
+    /// Used on a handful of Oblivion architectural pieces to fake a faceted
+    /// look. Renderer-side consumption (GLSL `flat` qualifier) is future work.
+    pub flat_shading: bool,
+
+    // ── BSLightingShaderProperty.shader_type dispatch (SK-D3-01) ────
+    // Each variant of `ShaderTypeData` exposes different trailing
+    // fields. Capturing them at import time lets the renderer later
+    // branch on `material_kind` without re-reading the NIF. Renderer-
+    // side dispatch landed with #344 / #562 — see `apply_shader_type_data`
+    // in `shader_data.rs` for which variants are shaded and which are
+    // only packed.
+    /// Raw `BSLightingShaderProperty.shader_type`. Values 0–20 are the
+    /// vanilla Bethesda enum (Default, EnvironmentMap, GlowShader,
+    /// Parallax, FaceTint, SkinTint, HairTint, ParallaxOcc,
+    /// MultiLayerParallax, ..., Dismemberment); 100+ is engine-
+    /// synthesized (MATERIAL_KIND_GLASS, MATERIAL_KIND_EFFECT_SHADER).
+    /// 0 when the shape has no BSLightingShaderProperty (pre-Skyrim).
+    /// Widened to `u32` per #570 (SK-D3-03) — the parser keeps
+    /// `shader_type` as `u32` and the GPU `GpuMaterial.material_kind`
+    /// is `u32`, so narrowing through this struct silently masked
+    /// values ≥ 256. Future Starfield / FO4 DLC variants are now
+    /// safe to plumb without a type-width regression.
+    pub material_kind: u32,
+    /// SkinTint (type 5) — race/character skin color. FO76 variant
+    /// stores alpha in `skin_tint_alpha`.
+    pub skin_tint_color: Option<[f32; 3]>,
+    /// FO76 SkinTint (type 4, BSShaderType155) — alpha channel that
+    /// the Color4 variant of SkinTint carries in addition to RGB.
+    pub skin_tint_alpha: Option<f32>,
+    /// HairTint (type 6) — per-NPC hair color multiplier.
+    pub hair_tint_color: Option<[f32; 3]>,
+    /// EyeEnvmap (type 16) — cubemap reflection strength on eye shapes.
+    pub eye_cubemap_scale: Option<f32>,
+    /// EyeEnvmap left-eye reflection center, in the eye shape's local space,
+    /// Y-up (converted from the authored Z-up at import, #6214).
+    pub eye_left_reflection_center: Option<[f32; 3]>,
+    /// EyeEnvmap right-eye reflection center, shape-local Y-up (#6214).
+    pub eye_right_reflection_center: Option<[f32; 3]>,
+    /// ParallaxOcc (type 7) — height-sample passes (stepping quality).
+    pub parallax_max_passes: Option<f32>,
+    /// ParallaxOcc (type 7) — height-map scale.
+    pub parallax_height_scale: Option<f32>,
+    /// MultiLayerParallax (type 11) — inner layer thickness.
+    pub multi_layer_inner_thickness: Option<f32>,
+    /// MultiLayerParallax (type 11) — refraction scale.
+    pub multi_layer_refraction_scale: Option<f32>,
+    /// MultiLayerParallax (type 11) — inner texture scale u/v.
+    pub multi_layer_inner_layer_scale: Option<[f32; 2]>,
+    /// MultiLayerParallax (type 11) — envmap strength.
+    pub multi_layer_envmap_strength: Option<f32>,
+    /// SparkleSnow (type 14) — packed rgba parameters (rgb color +
+    /// alpha strength).
+    pub sparkle_parameters: Option<[f32; 4]>,
+
+    /// Rich Skyrim+ effect-shader (`BSEffectShaderProperty`) data —
+    /// soft falloff cone, greyscale palette, FO4+/FO76 companion
+    /// textures, lighting influence, etc. `None` for non-effect
+    /// materials. The parser already extracted every field; before
+    /// #345 the importer dropped all but `texture_path`, `emissive_*`
+    /// and `uv_*`. Now they ride through to the renderer (separate
+    /// dispatch hookup tracked at SK-D3-02).
+    pub effect_shader: Option<BsEffectShaderData>,
+
+    /// FO3/FNV `BSShaderNoLightingProperty` soft-falloff cone. Four
+    /// floats pulled from the parsed block when bsver > 26; on older
+    /// Oblivion content they sit at the parser-side defaults. `None`
+    /// when the material has no NoLighting backing.
+    /// Pre-#451 these four fields were silently discarded by the
+    /// importer even though the parser had captured them — FO3 UI
+    /// overlays, VATS crosshair, scope reticles, Pip-Boy glow, heat-
+    /// shimmer planes lost their angular falloff. Renderer dispatch
+    /// is follow-up work (tracked separately alongside the BSEffect
+    /// soft-falloff hookup under SK-D3-02).
+    pub no_lighting_falloff: Option<NoLightingFalloff>,
+    /// `NiStencilProperty` test/write state captured at import time.
+    /// `None` when the material has no `NiStencilProperty`. The
+    /// 95% two-sided-only case lands `Some(state)` with
+    /// `state.enabled = false` — `draw_mode` (consumed via
+    /// `is_two_sided()`) carries the backface-culling intent
+    /// separately. Renderer-side stencil pipeline variants are
+    /// deferred — see [`StencilState`] docs and #337.
+    pub stencil_state: Option<StencilState>,
+    /// Diffuse-slot `TexClampMode` (`0..=3`, see nif.xml's enum) —
+    /// captured from `NiTexturingProperty.base_texture.flags` (Oblivion
+    /// / FO3 / FNV statics) or `BSEffectShaderProperty.texture_clamp_mode`
+    /// (Skyrim+ effects). Default `3 = WRAP_S_WRAP_T` (REPEAT/REPEAT)
+    /// matches Gamebryo's pre-clamp default. Pre-#610 the field was
+    /// dropped at every authoring site; the renderer hardcoded REPEAT
+    /// and CLAMP-authored decals / scope reticles / skybox seams
+    /// rendered with edge bleed. The `BsEffectShaderData` struct
+    /// keeps its own `texture_clamp_mode` for back-compat (effect-
+    /// shader-specific consumers route through that), but
+    /// `extract_material_info` mirrors the value here so the
+    /// importer's per-mesh export needs only one field.
+    pub texture_clamp_mode: u8,
+    /// Set when a Skyrim+ `BSSkyShaderProperty` is the authoritative
+    /// shader for this material — sky-dome / sun-glare / moon / star
+    /// meshes from `meshes/sky/*.nif`. Pre-#977 these meshes silently
+    /// imported with `texture_path = None` and rendered as the magenta
+    /// placeholder because the importer had no consumer for the type.
+    /// The renderer-side dispatch is follow-up work (sky materials must
+    /// bypass scene lighting and treat the diffuse sample as emissive);
+    /// until then the flag rides through as a structural marker.
+    pub is_sky_object: bool,
+    /// Per nif.xml `SkyObjectType`: `0=Texture, 1=Sunglare, 2=Sky,
+    /// 3=Clouds, 5=Stars, 7=Moon/Stars_Mask`. Selects which sky function
+    /// this property fulfills at render time. Zero when [`is_sky_object`]
+    /// is false. See `BSSkyShaderProperty.sky_object_type` in
+    /// `crates/nif/src/blocks/shader.rs`.
+    pub sky_object_type: u32,
+    /// Captured from `BSWaterShaderProperty.water_shader_flags` per
+    /// nif.xml `WaterShaderPropertyFlags`. Bit layout: `0=Displacement,
+    /// 1=LOD, 2=Depth, 3=Actor_In_Water, 4=Actor_In_Water_Is_Moving,
+    /// 5=Underwater, 6=Reflections, 7=Refractions, 8=Vertex_UV,
+    /// 9=Vertex_Alpha_Depth, 10=Procedural, 11=Fog,
+    /// 12=Update_Constants, 13=Cubemap`. Zero when no
+    /// `BSWaterShaderProperty` was bound. Consumed at the translation
+    /// boundary, not the renderer: `WaterMaterial.shader_flags` carries the
+    /// word, and `apply_water_shader_flag_gates`
+    /// (`byroredux/src/material_translate.rs`, since `45f65380`) turns the
+    /// Reflections (6) and Refractions (7) bits into the compact material's
+    /// reflection and refraction controls, which `water.frag` honors. The
+    /// other bits (Displacement, Depth, Fog, Cubemap, …) are preserved but
+    /// still unconsumed; the M38 `WaterPipeline` applies its fixed default
+    /// for them. See `BSWaterShaderProperty` in
+    /// `crates/nif/src/blocks/shader.rs`.
+    ///
+    /// **Skyrim+ only, and by construction — not a wire-up gap.** The
+    /// FO3/FNV `WaterShaderProperty` (nif.xml line 6322) inherits
+    /// `BSShaderProperty` with *zero* fields of its own; the
+    /// `Water Shader Flags` word exists solely on the Skyrim-era
+    /// `BSWaterShaderProperty` (nif.xml line 6705). So the FO3/FNV
+    /// branch in `legacy_properties::apply_misc_shader_properties`
+    /// forwards `env_map_scale` and nothing else because there is
+    /// nothing else on the block — folding the base
+    /// `BSShaderPropertyData::shader_flags_1/2` (`BSShaderFlags`) in
+    /// here would mix two unrelated flag namespaces. #1856.
+    ///
+    /// The value crosses `ImportedMesh` → `translate_material` into the ECS
+    /// `Material`; mesh entities with non-zero flags are promoted to the
+    /// dedicated water pipeline at spawn time. Pinned by
+    /// `water_shader_legacy_tests`. #1856.
+    pub water_shader_flags: u32,
+    /// True for both legacy FO3/FNV `WaterShaderProperty` and Skyrim+
+    /// `BSWaterShaderProperty`. The older block has no dedicated flag word,
+    /// but it still must use the water renderer.
+    pub is_water_shader: bool,
+    /// The FO3/FNV `BSShaderPPLightingProperty` authors the `Hair` bit
+    /// (`fo3nv_f1::HAIR`): this mesh's vertex colours are a hair tint mask
+    /// (#6130).
+    pub fallout_hair: bool,
+}
+
+/// Stencil-test state captured from `NiStencilProperty`. Mirrors the
+/// seven non-`draw_mode` fields the parser reads (`draw_mode` is
+/// consumed separately by `MaterialInfo::two_sided` via
+/// `NiStencilProperty::is_two_sided()`).
+///
+/// **Renderer-side gap (#337):** every pipeline-create site at
+/// `crates/renderer/src/vulkan/pipeline.rs` currently hardcodes
+/// `stencil_test_enable(false)`, and `find_depth_format` prefers
+/// `D32_SFLOAT` (no stencil bits) over the stencil-capable formats.
+/// Wiring stencil pipeline variants therefore needs both a depth-
+/// format flip (gated on a real workload — D32 has better precision
+/// when no consumer needs stencil) AND per-`MaterialKind` pipeline
+/// variants honouring the captured ops. Until that lands, the
+/// captured state rides on `MaterialInfo` so the silent drop at the
+/// importer boundary is closed and a future renderer-side fix has
+/// one grep target. The `>95%`-of-vanilla `NiStencilProperty` usage
+/// for two-sided rendering already works through the `is_two_sided()`
+/// path in the walker (`draw_mode` 0 / 3); this struct covers the
+/// long-tail stencil-masked decals, portals, and shadow volumes
+/// that author the other fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilState {
+    /// `true` when the stencil test is active for this material. The
+    /// 95% two-sided-only case lands `false` here — `draw_mode` is
+    /// what the importer consumes for backface culling.
+    pub enabled: bool,
+    /// Stencil compare function. Maps to Gamebryo's `TestFunction`
+    /// enum (`0=NEVER, 1=LESS, 2=EQUAL, 3=LESSEQUAL, 4=GREATER,
+    /// 5=NOTEQUAL, 6=GREATEREQUAL, 7=ALWAYS`). Default `7=ALWAYS`
+    /// from the parser.
+    pub function: u32,
+    /// Reference value compared against `(stencil_value & mask)`.
+    pub reference: u32,
+    /// Read mask `AND`-ed with both the reference and the stored
+    /// stencil value before comparison.
+    pub mask: u32,
+    /// Action when the stencil test fails. Maps to
+    /// Gamebryo's `Action` enum (`0=KEEP, 1=ZERO, 2=REPLACE,
+    /// 3=INCREMENT, 4=DECREMENT, 5=INVERT`).
+    pub fail_action: u32,
+    /// Action when the stencil test passes but the depth test fails.
+    pub z_fail_action: u32,
+    /// Action when both stencil and depth tests pass.
+    pub pass_action: u32,
+}
+
+/// Soft-falloff cone captured from `BSShaderNoLightingProperty` (FO3/FNV
+/// HUD overlays + UI tiles + scope reticles). Sibling of the richer
+/// [`BsEffectShaderData`] that covers `BSEffectShaderProperty`; the
+/// NoLighting block only emits the four cone scalars plus its file
+/// name (already routed to `MaterialInfo::texture_path`). See #451.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NoLightingFalloff {
+    /// Cos-of-angle where alpha = `start_opacity`.
+    pub start_angle: f32,
+    /// Cos-of-angle where alpha = `stop_opacity`.
+    pub stop_angle: f32,
+    /// Alpha at the start angle.
+    pub start_opacity: f32,
+    /// Alpha at the stop angle.
+    pub stop_opacity: f32,
+}
+
+/// Fields imported from a `BSEffectShaderProperty` block. Only present
+/// on materials backed by an effect shader (VFX surfaces, force fields,
+/// glow-edged shields, Dwemer steam, BGEM-keyed surfaces). See #345 /
+/// audit S4-01.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BsEffectShaderData {
+    /// Soft falloff cone — start angle (cos) where alpha = `start_opacity`.
+    pub falloff_start_angle: f32,
+    /// Soft falloff cone — stop angle (cos) where alpha = `stop_opacity`.
+    pub falloff_stop_angle: f32,
+    pub falloff_start_opacity: f32,
+    pub falloff_stop_opacity: f32,
+    /// Soft-particles depth — fades the surface as it approaches the
+    /// scene depth behind it. 0.0 = no soft-particle effect.
+    pub soft_falloff_depth: f32,
+    /// Greyscale palette / gradient lookup texture (fire / electricity
+    /// gradients reference this). `None` when the effect shader
+    /// supplies an empty path.
+    pub greyscale_texture: Option<String>,
+    /// Environment map texture (FO4+ — BSVER >= 130).
+    pub env_map_texture: Option<String>,
+    /// Normal texture (FO4+ — BSVER >= 130).
+    pub normal_texture: Option<String>,
+    /// Environment mask texture (FO4+ — BSVER >= 130).
+    pub env_mask_texture: Option<String>,
+    /// Environment-map scale (FO4+ — BSVER >= 130).
+    pub env_map_scale: f32,
+    /// FO76 refraction power (BSVER == 155). `None` on pre-FO76.
+    pub refraction_power: Option<f32>,
+    /// Lighting influence 0–255 — how much the scene's directional
+    /// light tints the effect. Carried as raw u8 to avoid lossy
+    /// normalisation; the shader path can divide by 255 when sampling.
+    pub lighting_influence: u8,
+    /// Environment-map minimum mip-level clamp (raw u8).
+    ///
+    /// **No consumer past this struct, deliberately.** Unlike its
+    /// packed-field siblings [`texture_clamp_mode`] (reaches sampler
+    /// selection) and [`lighting_influence`] (reaches `material_flags`),
+    /// this value stops here — no `Material` field, no GPU uniform. All
+    /// 8,116 vanilla Skyrim `BSEffectShaderProperty` blocks author `0`,
+    /// so nothing is lost today; an FO4+ effect material
+    /// that clamps the env-map mip chain would have its authored floor
+    /// silently ignored. Plumb it into `GpuMaterial` alongside
+    /// `soft_falloff_depth` when a real consumer materializes — until then
+    /// this is a capture-with-no-consumer gap, not a `translate_material`
+    /// divergence. See #2582 / SKY-D2-04.
+    pub env_map_min_lod: u8,
+    /// Texture clamp mode: `0=Clamp_S_Clamp_T`, `1=Clamp_S_Wrap_T`,
+    /// `2=Wrap_S_Clamp_T`, `3=Wrap_S_Wrap_T` (the Skyrim default).
+    /// Raw u8 — renderer maps to `vk::SamplerAddressMode` per axis.
+    pub texture_clamp_mode: u8,
+    /// `SLSF1::Soft_Effect` (bit 30) — near-camera depth feathering for
+    /// soft particles (smoke, dust, force-field haze, Dwemer steam).
+    /// Captured via the modern-shader flag + CRC32 fallback path so
+    /// FO76 / Starfield content surfaces it through `sf1_crcs` / `sf2_crcs`.
+    /// Stage 2 (separate issue) wires this into the fragment shader's
+    /// `MATERIAL_KIND_EFFECT_SHADER` branch as a depth-attachment read
+    /// + alpha fade. See #890 / SK-D4-NEW-04.
+    pub effect_soft: bool,
+    /// `SLSF1::Greyscale_To_PaletteColor` (bit 4) — sample
+    /// [`greyscale_texture`] as a colour palette LUT indexed by the
+    /// source-texture luminance instead of using the luminance directly.
+    /// Fire / electricity / magic gradients drive this on Skyrim+ /
+    /// FO4 spell FX. Stage 2 plumbs the palette sample into the
+    /// effect-shader branch. See #890.
+    pub effect_palette_color: bool,
+    /// `SLSF1::Greyscale_To_PaletteAlpha` (bit 5) — same as
+    /// [`effect_palette_color`] but for the alpha channel: the
+    /// [`greyscale_texture`] alpha LUT modulates the surface alpha.
+    /// See #890.
+    pub effect_palette_alpha: bool,
+    /// `SLSF2::Effect_Lighting` (bit 30) — scene-lit `BSEffectShaderProperty`
+    /// surface. Pre-fix the renderer treats every effect shader as
+    /// purely additive; with this bit set the surface should receive
+    /// the cell's directional + ambient light modulated against
+    /// `base_color × base_color_scale`. Stage 2 wires the lit shading.
+    /// See #890.
+    pub effect_lit: bool,
+    /// FO76 reflectance texture (BSVER == 155). Drives the surface's
+    /// metallic / reflectance lookup on FO76 emissive materials.
+    /// Empty path collapses to `None`. Renderer-side consumption is
+    /// follow-up work — capture-only today. See #1205.
+    pub reflectance_texture: Option<String>,
+    /// FO76 lighting texture (BSVER == 155). Per-material lighting
+    /// LUT (similar role to FO76's `_l.dds` channels). Empty path
+    /// collapses to `None`. See #1205.
+    pub lighting_texture: Option<String>,
+    /// FO76 emit gradient texture (BSVER == 155). Drives the
+    /// per-fragment emittance gradient on glow planes / UI overlays.
+    /// Empty path collapses to `None`. See #1205.
+    pub emit_gradient_texture: Option<String>,
+    /// FO76 emittance color `[r, g, b]` (BSVER == 155). Multiplied
+    /// with the emit-gradient lookup; `None` when the parser saw the
+    /// `[0, 0, 0]` Bethesda-default sentinel. See #1205.
+    pub emittance_color: Option<[f32; 3]>,
+    /// FO76 luminance parameters (BSVER == 155). Drives the
+    /// HDR-emittance / exposure-clamp envelope for emissive surfaces.
+    /// `None` on pre-FO76 content where the parser left the slot
+    /// empty. See #1205.
+    pub luminance: Option<LuminanceParams>,
+}
+
+impl Default for BsEffectShaderData {
+    /// Identity effect-shader payload: a no-op falloff cone
+    /// (`angle = opacity = 1.0` collapses the shader's `denom > 0` branch
+    /// to a pass-through) and every flag/texture/soft field cleared. Lets
+    /// non-NIF producers (the FO4 BGEM merge in `asset_provider`) build a
+    /// payload from just the fields a BGEM authors, defaulting the rest.
+    fn default() -> Self {
+        Self {
+            falloff_start_angle: 1.0,
+            falloff_stop_angle: 1.0,
+            falloff_start_opacity: 1.0,
+            falloff_stop_opacity: 1.0,
+            soft_falloff_depth: 0.0,
+            greyscale_texture: None,
+            env_map_texture: None,
+            normal_texture: None,
+            env_mask_texture: None,
+            env_map_scale: 1.0,
+            refraction_power: None,
+            lighting_influence: 255,
+            env_map_min_lod: 0,
+            texture_clamp_mode: 3,
+            effect_soft: false,
+            effect_palette_color: false,
+            effect_palette_alpha: false,
+            effect_lit: false,
+            reflectance_texture: None,
+            lighting_texture: None,
+            emit_gradient_texture: None,
+            emittance_color: None,
+            luminance: None,
+        }
+    }
+}
+
+impl Default for MaterialInfo {
+    fn default() -> Self {
+        Self {
+            texture_path: None,
+            material_path: None,
+            normal_map: None,
+            glow_map: None,
+            detail_map: None,
+            detail_neutral: slot_role::DETAIL_NEUTRAL_MODULATE2X,
+            gloss_map: None,
+            specular_map: None,
+            dark_map: None,
+            decal_maps: [None; 4],
+            parallax_map: None,
+            parallax_height_in_alpha: false,
+            env_map: None,
+            env_mask: None,
+            greyscale_lut_map: None,
+            shader_type: 0,
+            legacy_shader_type: None,
+            wetness: None,
+            luminance: None,
+            texture_slot_layout: TextureSlotLayout::default(),
+            slot2_glow_enabled: false,
+            tint_map: None,
+            inner_layer_map: None,
+            lighting_mask_map: None,
+            back_lighting_map: None,
+            wrinkle_map: None,
+            vertex_color_mode: VertexColorMode::AmbientDiffuse,
+            alpha_blend: false,
+            alpha_blend_authored: false,
+            src_blend_mode: 6, // SRC_ALPHA — Gamebryo default
+            dst_blend_mode: 7, // INV_SRC_ALPHA — Gamebryo default
+            alpha_test: false,
+            alpha_threshold: 0.0,
+            alpha_test_func: 6, // GREATEREQUAL — Gamebryo default
+            alpha_property_consumed: false,
+            texture_clamp_mode_consumed: false,
+            env_map_scale_consumed: false,
+            window_env_mapping: false,
+            window_env_mapping_consumed: false,
+            refraction_strength_consumed: false,
+            texturing_property_roles: 0,
+            two_sided: false,
+            no_sorter: false,
+            is_decal: false,
+            model_space_normals: false,
+            emissive_color: [0.0, 0.0, 0.0],
+            emissive_mult: 0.0,
+            emissive_source: byroredux_core::ecs::components::material::EmissiveSource::None,
+            specular_color: [1.0, 1.0, 1.0],
+            specular_strength: 1.0,
+            diffuse_color: [1.0, 1.0, 1.0],
+            specular_enabled: true,
+            glossiness: 80.0,
+            // BSLightingShaderProperty PBR scalars — defaults mirror
+            // `BSLightingShaderProperty::material_reference_stub`
+            // (function name, not a line number — #2590 / SKY-D7-02:
+            // the prior `shader.rs:739-749` citation had drifted onto
+            // unrelated struct-field docs since the #1279 three-arm
+            // parser split) so the no-author fallback is the same as
+            // the stopcond fallback. Since #2589 (SKY-D7-01), the
+            // `parse_skyrim` arm also agrees on `grayscale_to_
+            // palette_scale`/`fresnel_power` specifically — it used to
+            // construct those two FO4+-only fields as `0.0` instead of
+            // the neutral `1.0`/`5.0` every other arm/stub/default
+            // agrees on. `parse_fo4` / `parse_fo76_plus` read real
+            // authored bytes for every field here, so "the no-author
+            // fallback" only ever applies to `parse_skyrim` and the
+            // stopcond stub. See #1241.
+            refraction_strength: 0.0,
+            lighting_effect_1: 0.0,
+            lighting_effect_2: 0.0,
+            subsurface_rolloff: 0.0,
+            rimlight_power: 0.0,
+            backlight_power: 0.0,
+            soft_lighting: false,
+            rim_lighting: false,
+            back_lighting: false,
+            palette_color: false,
+            palette_alpha: false,
+            grayscale_to_palette_scale: 1.0,
+            fresnel_power: 5.0,
+            uv_offset: [0.0, 0.0],
+            uv_scale: [1.0, 1.0],
+            // Default to white so the per-material ambient term acts as
+            // a no-op tint when the mesh has no `NiMaterialProperty`
+            // (every BSShader path on Skyrim+/FO4 — those inherit the
+            // cell ambient unmodulated).
+            ambient_color: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            env_map_scale: 0.0,
+            has_material_data: false,
+            specular_authored: false,
+            has_uv_transform: false,
+            has_bs_lighting_shader: false,
+            has_legacy_bs_shader: false,
+            z_test: true,
+            z_write: true,
+            z_function: 3, // LESSEQUAL — Gamebryo default
+            wireframe: false,
+            flat_shading: false,
+
+            material_kind: 0,
+            skin_tint_color: None,
+            skin_tint_alpha: None,
+            hair_tint_color: None,
+            eye_cubemap_scale: None,
+            eye_left_reflection_center: None,
+            eye_right_reflection_center: None,
+            parallax_max_passes: None,
+            parallax_height_scale: None,
+            multi_layer_inner_thickness: None,
+            multi_layer_refraction_scale: None,
+            multi_layer_inner_layer_scale: None,
+            multi_layer_envmap_strength: None,
+            sparkle_parameters: None,
+            effect_shader: None,
+            no_lighting_falloff: None,
+            stencil_state: None,
+            // 3 = WRAP_S_WRAP_T per nif.xml — pre-#610 hardcoded
+            // default. Walker overwrites with the diffuse-slot value
+            // when the material's authoring source carries one.
+            texture_clamp_mode: 3,
+            is_sky_object: false,
+            sky_object_type: 0,
+            water_shader_flags: 0,
+            is_water_shader: false,
+            fallout_hair: false,
+        }
+    }
+}
+
+impl MaterialInfo {
+    /// Normalize every game-specific texture source into the public texture
+    /// contract consumed by the asset and renderer layers.
+    pub(super) fn texture_set(
+        &self,
+        pool: &mut byroredux_core::string::StringPool,
+    ) -> super::types::MaterialTextureSet<Option<FixedString>> {
+        fn intern_effect_path(
+            pool: &mut byroredux_core::string::StringPool,
+            path: Option<&str>,
+        ) -> Option<FixedString> {
+            path.filter(|value| !value.is_empty())
+                .map(|value| pool.intern(value))
+        }
+
+        let effect = self.effect_shader.as_ref();
+        super::types::MaterialTextureSet {
+            base_color: self.texture_path,
+            normal: self.normal_map,
+            emissive: self.glow_map,
+            detail: self.detail_map,
+            smooth_spec: self.gloss_map,
+            dark: self.dark_map,
+            height: self.parallax_map,
+            environment: self.env_map,
+            environment_mask: self.env_mask,
+            tint: self.tint_map,
+            inner_layer: self.inner_layer_map,
+            // #4433 — `specular` HAS inline NIF producers: `slot_to_role`
+            // routes FO4 slot 7, FO76 slot 6 and Skyrim MSN slot 7 here, and
+            // `apply_bs_lighting_shader` writes them into `specular_map`
+            // (#2998/#3085). The comment that used to sit above this line
+            // ("inline NIF shaders do not expose them") described the
+            // pre-#2998 world; the roles it still describes are `flow`
+            // (hard-coded `None` below) and the dedicated BGEM v21+ glass
+            // suite, which only the external material merge populates.
+            specular: self.specular_map,
+            lighting_mask: self.lighting_mask_map,
+            back_lighting: self.back_lighting_map,
+            lighting: intern_effect_path(
+                pool,
+                effect.and_then(|data| data.lighting_texture.as_deref()),
+            ),
+            flow: None,
+            // #2999 — was hardcoded `None`: the TXST decode path
+            // (`crates/plugin/src/esm/cell/support.rs`) already
+            // populates `MaterialTextureSet::wrinkle`, but nothing on
+            // the NIF-import side ever read into it, even though
+            // `slot_to_role` now routes FO4 slot 5 (tint family) here.
+            wrinkle: self.wrinkle_map,
+            greyscale_lut: self.greyscale_lut_map.or_else(|| {
+                intern_effect_path(
+                    pool,
+                    effect.and_then(|data| data.greyscale_texture.as_deref()),
+                )
+            }),
+            reflectance: intern_effect_path(
+                pool,
+                effect.and_then(|data| data.reflectance_texture.as_deref()),
+            ),
+            emittance_gradient: intern_effect_path(
+                pool,
+                effect.and_then(|data| data.emit_gradient_texture.as_deref()),
+            ),
+            // Dedicated BGEM v21+ roles are populated only by the external
+            // material merge downstream of this inline-NIF translation.
+            glass_roughness_scratch: None,
+            glass_dirt_overlay: None,
+            decals: self.decal_maps,
+        }
+    }
+
+    /// Resolve the renderer blend path without turning every Gamebryo
+    /// blend+test cutout into a sorted transparent mesh. Glass is the exception:
+    /// its alpha test removes texture coverage holes, while its blend bit
+    /// provides framebuffer transmission whenever bounded refraction escapes.
+    pub(super) fn effective_alpha_blend(
+        &self,
+        mesh_name: Option<&str>,
+        pool: &byroredux_core::string::StringPool,
+    ) -> bool {
+        if self.alpha_blend {
+            return true;
+        }
+        if !self.alpha_blend_authored || !self.alpha_test {
+            return false;
+        }
+
+        let name_is_glass =
+            mesh_name.is_some_and(byroredux_core::ecs::components::material::is_glass_keyword_path);
+        let texture_is_glass = self
+            .texture_path
+            .and_then(|path| pool.resolve(path))
+            .is_some_and(byroredux_core::ecs::components::material::is_glass_keyword_path);
+        name_is_glass || texture_is_glass
+    }
+
+    /// Stage 2 (`feedback_format_translation.md`) — derive PBR
+    /// `(metalness, roughness)` from this MaterialInfo's legacy
+    /// inline-shader data at NIF-import time, so every mesh leaves
+    /// the parser with explicit `metalness_override` /
+    /// `roughness_override` populated. The BGSM merge layer
+    /// downstream (`asset_provider::merge_external_material`)
+    /// overwrites both for BGSM-resolved materials whose specular block
+    /// is enabled, so legacy Oblivion / FO3 / FNV / pre-Skyrim meshes keep
+    /// the values this method writes; BGSM-using FO4 / Skyrim meshes get
+    /// the authored spec-glossiness translation instead. A spec-disabled
+    /// BGSM overwrites only metalness (0.0, #4941) and keeps this method's
+    /// roughness (#4654, #5012).
+    ///
+    /// Single source of truth — delegates to the free fn
+    /// `byroredux_core::ecs::components::material::classify_pbr_keyword`,
+    /// the only surviving PBR classifier. (The per-frame
+    /// `Material::classify_pbr` was removed in the NIFAL refactor; PBR
+    /// now resolves once at the parse-time translate boundary.)
+    pub(super) fn classify_legacy_pbr(
+        &self,
+        pool: &byroredux_core::string::StringPool,
+    ) -> byroredux_core::ecs::components::material::PbrMaterial {
+        let texture_path_str = self.texture_path.and_then(|s| pool.resolve(s));
+        byroredux_core::ecs::components::material::classify_pbr_keyword(
+            byroredux_core::ecs::components::material::PbrClassifierInputs {
+                texture_path: texture_path_str,
+                glossiness: self.glossiness,
+                env_map_scale: self.env_map_scale,
+                has_normal_map: self.normal_map.is_some(),
+                specular_color: self.specular_color,
+                // `specular_authored` is set true only by the
+                // NiMaterialProperty / BSLightingShaderProperty walker
+                // arms, the only ones that populate `specular_color` —
+                // exactly the "was specular actually authored" signal
+                // the classifier needs. See REN-2026-07-04-M01 / #1873
+                // and #2352 (SF-D8-01) — `has_material_data` is a
+                // broader flag also set by arms that never touch
+                // `specular_color`, so it can't be reused here.
+                specular_authored: self.specular_authored,
+                has_gloss_map: self.gloss_map.is_some(),
+            },
+        )
+    }
+
+    /// #2707 (SF-D8-01) — true when every one of the five signals
+    /// [`Self::classify_legacy_pbr`]'s classifier reads is absent: no
+    /// texture path (so no keyword can match), no authored specular, no
+    /// normal map, no gloss map, and `env_map_scale` at or below
+    /// `classify_pbr_keyword`'s own `> 0.3` gate. This is exactly the
+    /// state a Starfield material-reference stub is left in — the walker
+    /// returns at `dedicated_shader.rs` (`apply_bs_lighting_shader` /
+    /// `apply_bs_effect_shader`) before writing a single `MaterialInfo`
+    /// field when `shader.material_reference` is set — so every
+    /// classifier arm falls through to the terminal
+    /// `PbrMaterial { roughness: 0.85, metalness: 0.0 }` for a reason
+    /// indistinguishable from "nothing was ever parsed," not because any
+    /// of those five inputs was genuinely authored-and-absent.
+    ///
+    /// Deliberately NOT `!self.has_material_data`: that flag is set only
+    /// by the dedicated-shader / legacy `NiMaterialProperty` arms and
+    /// exists to resolve walker-arm PRECEDENCE (#2457), not to detect
+    /// "no signal at all" — the FO3/FNV `BSShaderPPLightingProperty`-only
+    /// path (common, texture-bound content with a real `texture_path`)
+    /// never sets `has_material_data`, so gating on it here would ALSO
+    /// suppress a real, meaningfully-derived classification for ordinary
+    /// legacy content, not just the empty Starfield stub this targets.
+    pub(super) fn has_no_pbr_classifier_signal(&self) -> bool {
+        self.texture_path.is_none()
+            && !self.specular_authored
+            && self.normal_map.is_none()
+            && self.gloss_map.is_none()
+            && self.env_map_scale <= 0.3
+    }
+
+    /// Project this `MaterialInfo`'s shader-type fields into the core-owned
+    /// `ShaderTypeFields` bundle carried by `ImportedMaterial`. See #430.
+    pub(super) fn shader_type_fields(&self) -> ShaderTypeFields {
+        ShaderTypeFields {
+            skin_tint_color: self.skin_tint_color,
+            skin_tint_alpha: self.skin_tint_alpha,
+            hair_tint_color: self.hair_tint_color,
+            eye_cubemap_scale: self.eye_cubemap_scale,
+            eye_left_reflection_center: self.eye_left_reflection_center,
+            eye_right_reflection_center: self.eye_right_reflection_center,
+            parallax_max_passes: self.parallax_max_passes,
+            parallax_height_scale: self.parallax_height_scale,
+            multi_layer_inner_thickness: self.multi_layer_inner_thickness,
+            multi_layer_refraction_scale: self.multi_layer_refraction_scale,
+            multi_layer_inner_layer_scale: self.multi_layer_inner_layer_scale,
+            multi_layer_envmap_strength: self.multi_layer_envmap_strength,
+            sparkle_parameters: self.sparkle_parameters,
+        }
+    }
+
+    /// Finish the source-format translation into the single material
+    /// payload shared by every imported mesh representation.
+    pub(super) fn into_imported_material(
+        self,
+        pool: &mut StringPool,
+        mesh_name: Option<&str>,
+    ) -> super::types::ImportedMaterial {
+        let legacy_pbr = self.classify_legacy_pbr(pool);
+        // #2707 (SF-D8-01) — must be read before any field it inspects is
+        // moved out of `self` below.
+        let no_pbr_signal = self.has_no_pbr_classifier_signal();
+        let has_alpha = self.effective_alpha_blend(mesh_name, pool);
+        let textures = self.texture_set(pool);
+        let shader_type_fields = self.shader_type_fields();
+
+        super::types::ImportedMaterial {
+            textures,
+            texture_sources: super::types::MaterialTextureSet::default(),
+            water_shader_flags: self.water_shader_flags,
+            is_water_shader: self.is_water_shader,
+            fallout_hair: self.fallout_hair,
+            material_path: self.material_path,
+            // #4282 — the FO4+/FO76+ wetness/luminance captures cross the
+            // boundary here; `translate_material` forwards them to the
+            // canonical `Material`.
+            wetness: self.wetness,
+            luminance: self.luminance,
+            // #4422 — producer-declared detail-combine neutral (FaceTint
+            // route vs the classic MODULATE2X default).
+            detail_neutral: self.detail_neutral,
+            has_alpha,
+            src_blend_mode: self.src_blend_mode,
+            dst_blend_mode: self.dst_blend_mode,
+            alpha_test: self.alpha_test,
+            alpha_threshold: self.alpha_threshold,
+            alpha_test_func: self.alpha_test_func,
+            two_sided: self.two_sided,
+            no_sorter: self.no_sorter,
+            is_decal: self.is_decal,
+            is_pbr: false,
+            has_translucency: false,
+            model_space_normals: self.model_space_normals,
+            from_bgsm: false,
+            external_material_resolved: false,
+            bgem_glass: false,
+            thin_glass: false,
+            glass_fresnel_color: [1.0; 3],
+            // #3912 — same named canonical default as `MaterialInfo::default`.
+            glass_refraction_scale:
+                byroredux_core::ecs::components::material::DEFAULT_GLASS_REFRACTION_SCALE,
+            glass_blur_scale: byroredux_core::ecs::components::material::DEFAULT_GLASS_BLUR_SCALE,
+            glass_blur_scale_factor: 1.0,
+            // #2609 — the NIF importer never reads an external material file,
+            // so the overrides below are the keyword classifier's guess, not
+            // authored scalars. Consumers gating on "authoritative" must see
+            // false here even when `metalness_override` is `Some`.
+            bgsm_pbr_scalars_authored: false,
+            pbr_classified_at_import: !no_pbr_signal,
+            // #2707 (SF-D8-01) — `None` when `classify_legacy_pbr` had
+            // literally no signal to classify from (the Starfield
+            // material-reference stub case), so `translate_material` seeds
+            // the NaN sentinel and `Material::resolve_pbr`'s backstop
+            // classifier owns the fallback instead of this importer
+            // fabricating one from an empty input set. Every other case —
+            // any real signal present, however partial — keeps its
+            // derived `Some(...)`, unchanged from before.
+            metalness_override: (!no_pbr_signal).then_some(legacy_pbr.metalness),
+            roughness_override: (!no_pbr_signal).then_some(legacy_pbr.roughness),
+            translucency_subsurface_color: [0.0; 3],
+            translucency_transmissive_scale: 0.0,
+            translucency_turbulence: 0.0,
+            translucency_thick_object: false,
+            translucency_mix_albedo: false,
+            parallax_max_passes: self.parallax_max_passes,
+            parallax_height_scale: self.parallax_height_scale,
+            vertex_color_mode: self.vertex_color_mode as u8,
+            texture_clamp_mode: self.texture_clamp_mode,
+            parallax_height_in_alpha: self.parallax_height_in_alpha,
+            emissive_color: self.emissive_color,
+            emissive_mult: self.emissive_mult,
+            emissive_source: self.emissive_source,
+            specular_color: self.specular_color,
+            specular_authored: self.specular_authored,
+            diffuse_color: self.diffuse_color,
+            ambient_color: self.ambient_color,
+            specular_strength: self.specular_strength,
+            glossiness: self.glossiness,
+            refraction_strength: self.refraction_strength,
+            lighting_effect_1: self.lighting_effect_1,
+            lighting_effect_2: self.lighting_effect_2,
+            subsurface_rolloff: self.subsurface_rolloff,
+            rimlight_power: self.rimlight_power,
+            backlight_power: self.backlight_power,
+            soft_lighting: self.soft_lighting,
+            rim_lighting: self.rim_lighting,
+            back_lighting: self.back_lighting,
+            grayscale_to_palette_scale: self.grayscale_to_palette_scale,
+            // #2108 — no BGSM/BGEM has merged yet at this NIF-import stage
+            // (that happens later, in `asset_provider::merge_external_material`).
+            //
+            // #3897 — but the NIF is not silent about the palette remap: a
+            // `BSLightingShaderProperty` authors the enable bit directly as
+            // `SLSF1::Greyscale_To_PaletteColor`/`_PaletteAlpha`, and that
+            // signal IS available here. Treating BGSM/BGEM as the only
+            // producer is what left the lit-path remap unreachable. The
+            // `bgsm_`-prefixed names predate this second producer and are now
+            // source-agnostic: the triple means "the palette remap is enabled,
+            // and in which channel", whoever authored it. What the merge does
+            // with these depends on who wins the texture slot (#4402): the
+            // NIF-won-slot branch ORs onto them (neither side may silently
+            // disable the other's remap, #3898), while a BGSM that wins the
+            // slot outright is authoritative for the bit too, including OFF
+            // (#2108 — the FO4 named material file is the material, and the
+            // NIF's SLSF1 word is a cached copy).
+            bgsm_greyscale_lut_is_alpha: self.palette_alpha,
+            bgsm_greyscale_lut_color: self.palette_color,
+            bgsm_greyscale_lut_enabled: self.palette_color || self.palette_alpha,
+            fresnel_power: self.fresnel_power,
+            uv_offset: self.uv_offset,
+            uv_scale: self.uv_scale,
+            mat_alpha: self.alpha,
+            env_map_scale: self.env_map_scale,
+            window_env_mapping: self.window_env_mapping,
+            z_test: self.z_test,
+            z_write: self.z_write,
+            z_function: self.z_function,
+            effect_shader: self.effect_shader,
+            material_kind: self.material_kind,
+            shader_type: self.shader_type,
+            texture_slot_layout: self.texture_slot_layout,
+            slot2_glow_enabled: self.slot2_glow_enabled,
+            shader_type_fields,
+            no_lighting_falloff: self.no_lighting_falloff,
+            wireframe: self.wireframe,
+            flat_shading: self.flat_shading,
+        }
+    }
+}
+
+pub(super) fn apply_alpha_flags(info: &mut MaterialInfo, alpha: &NiAlphaProperty) {
+    let blend = alpha.flags & 0x001 != 0;
+    let test = alpha.flags & 0x200 != 0;
+    info.alpha_blend_authored = blend;
+    // Extract blend factors regardless of which mode wins — they're
+    // needed if the mesh later ends up blended (e.g., animated alpha).
+    info.src_blend_mode = ((alpha.flags >> 1) & 0xF) as u8; // bits 1–4
+    info.dst_blend_mode = ((alpha.flags >> 5) & 0xF) as u8; // bits 5–8
+    if test {
+        info.alpha_test = true;
+        info.alpha_threshold = alpha.threshold as f32 / 255.0;
+        // Bits 10-12: alpha test comparison function (3 bits, 0–7).
+        info.alpha_test_func = ((alpha.flags & 0x1C00) >> 10) as u8;
+        // Prefer the depth-writing cutout path for the generic case. The mesh
+        // handoff restores authored blending only for glass-classified shapes.
+        info.alpha_blend = false;
+    } else if blend {
+        info.alpha_blend = true;
+    }
+    // #3797 — bit 13 (0x2000, "No Sorter"): the shape author opted this
+    // draw out of NiAlphaAccumulator's depth sort. See [`Self::no_sorter`].
+    info.no_sorter = alpha.flags & 0x2000 != 0;
+    // Mark the property as consumed regardless of whether either bit
+    // fired. A flags=0 NiAlphaProperty is still a valid statement of
+    // intent ("this shape authored no blending"); the cascade gate
+    // checks this flag to avoid letting a parent NiNode's
+    // NiAlphaProperty silently overwrite the shape's choice. See
+    // NIF-D4-NEW-05 (audit 2026-05-12).
+    info.alpha_property_consumed = true;
+}
+
+/// Resolve a `TexDesc` slot on an `NiTexturingProperty` to a texture
+/// filename by following its `source_ref` through the scene's block
+/// table and pulling the filename from the referenced
+/// `NiSourceTexture`. Returns `None` if the slot is empty, the ref
+/// is null, or the source texture has no external filename (embedded
+/// NiPixelData is not supported here — the downstream texture
+/// provider can't resolve those anyway). See issue #131.
+///
+/// The path is interned through the engine's [`StringPool`] (#609 /
+/// D6-NEW-01). Pre-fix this returned `Option<String>` via `to_string`
+/// on an `Arc<str>`; same path mentioned by N meshes in a cell paid
+/// N allocations even though the source was already shared.
+pub(super) fn tex_desc_source_path(
+    scene: &NifScene,
+    desc: Option<&TexDesc>,
+    pool: &mut StringPool,
+) -> Option<FixedString> {
+    let desc = desc?;
+    let src_idx = desc.source_ref.index()?;
+    let src_tex = scene.get_as::<NiSourceTexture>(src_idx)?;
+    let name = src_tex.filename.as_ref()?;
+    intern_texture_path(pool, name)
+}
+
+#[cfg(test)]
+mod alpha_flag_tests;
+
+/// Stage 2 (`feedback_format_translation.md`) regression — every
+/// legacy NIF mesh must leave the parser with explicit
+/// `metalness_override` / `roughness_override` derived from the
+/// shared `classify_pbr_keyword`. The classifier itself is tested in
+/// `byroredux-core::ecs::components::material::tests`; this sibling
+/// pins the MaterialInfo → classifier adapter.
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)] // Tests model staged legacy material translation.
+mod legacy_pbr_translation_tests;
+
+/// #2570 (OBL-D4-04) — the negative direction of the above: deriving
+/// legacy PBR *scalars* must never promote the material onto the Disney
+/// lobe. Pins `is_pbr == false` for external-material-file-less input,
+/// which is what makes `MAT_FLAG_PBR_BSDF` provably 0 for Oblivion.
+#[cfg(test)]
+mod legacy_is_pbr_tests;
+
+/// Regression tests for issue #345 — `BSEffectShaderProperty` rich
+/// material fields used to be dropped on import. The capture path is
+/// covered by direct `capture_effect_shader_data` tests; full
+/// `extract_material_info` coverage requires a synthetic NIF and is
+/// blocked on test infrastructure (`NifScene` doesn't expose enough
+/// mutators to wire one up cheaply). The capture helper is the entire
+/// transform under test — `extract_material_info` just calls it.
+#[cfg(test)]
+mod effect_shader_capture_tests;
+
+/// #1280 step 4 — pin the EmissiveSource discriminator at each of the
+/// three NIF shader-property set-sites (BSLightingShaderProperty →
+/// Lighting, BSEffectShaderProperty → Effect, NiMaterialProperty →
+/// Material). Critical for keeping BSEffect's diffuse-tint-as-emissive
+/// conflation type-visible.
+#[cfg(test)]
+mod emissive_source_tests;
+
+/// Regression tests for issue #343 — exhaustive ShaderTypeData dispatch.
+/// Previously only `EnvironmentMap` reached MaterialInfo; the remaining
+/// 8 variants (SkinTint, Fo76SkinTint, HairTint, ParallaxOcc,
+/// MultiLayerParallax, SparkleSnow, EyeEnvmap, None) were dropped. Each
+/// test exercises one arm of `apply_shader_type_data`.
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)] // Tests seed one discriminator before dispatch.
+mod shader_type_data_tests;
+
+/// Regression tests for issue #214 — NiTexturingProperty secondary slots
+/// and NiVertexColorProperty mode extraction.
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)] // Fixture fields mirror independent texture slots.
+mod secondary_slot_tests;
+
+/// Regression tests for #452 — `BSShaderTextureSet` slots 3/4/5 must
+/// reach the importer via both the FO3/FNV `BSShaderPPLightingProperty`
+/// path and the Skyrim+ `BSLightingShaderProperty` path. Previously
+/// the importer stopped at slot 2 so parallax walls rendered flat and
+/// glass/power-armor env reflections never bound.
+#[cfg(test)]
+mod texture_slot_3_4_5_tests;
+
+/// Regression tests for #441 — `SF_DOUBLE_SIDED = 0x1000` is NOT
+/// Double_Sided on the FO3/FNV `BSShaderFlags` pair. Pre-fix the
+/// importer marked every PPLighting / NoLighting mesh that happened
+/// to set flags1 bit 12 (`Unknown_3`) as two-sided, rendering
+/// foliage / hair / banner cloth with wrong backface culling. The
+/// Skyrim+ `BSLightingShaderProperty` path (flags2 bit 4) is
+/// unaffected.
+#[cfg(test)]
+mod double_sided_tests;
+
+/// Regression tests for #1592 (FO4-D5-MEDIUM-01) — FO4 `BSLightingShaderProperty`
+/// shader-flag bits (model-space-normals / alpha-test) OR'd into MaterialInfo,
+/// gated on the FO4 BSVER so a Skyrim property isn't read with FO4 semantics.
+#[cfg(test)]
+mod fo4_shader_flag_tests;
+
+/// Regression tests for #337 (D4-NEW-01) — `NiStencilProperty` test
+/// state must round-trip into `MaterialInfo.stencil_state` so the
+/// silent drop at the importer boundary is closed. Pre-fix the walker
+/// only consumed `is_two_sided()`; the seven non-`draw_mode` fields
+/// were dropped on the floor. Renderer-side stencil pipeline variants
+/// stay deferred (depth-format dependency + per-`MaterialKind` variant
+/// rollout); see `pipeline.rs`'s cross-reference comments.
+#[cfg(test)]
+mod stencil_state_capture_tests;
+
+/// Regression tests for #977 — Skyrim+ `BSSkyShaderProperty` and
+/// `BSWaterShaderProperty` were parsed cleanly but had no
+/// `scene.get_as::<>` consumer in the walker, so every Skyrim sky NIF
+/// imported with `texture_path = None` and rendered as the magenta
+/// placeholder. The FO3/FNV `SkyShaderProperty` counterpart was wired
+/// by #940; this closes the missing Skyrim-era sibling.
+#[cfg(test)]
+mod sky_water_shader_tests;
+
+/// Regression tests for #976 (NIF-D4-NEW-02) — `BSLightingShaderProperty`
+/// with a `.mat` (Starfield JSON material) or trailing-whitespace name
+/// must populate `material_path` via the shared `material_path_from_name`
+/// helper. Pre-fix the walker used an inline `.bgsm`/`.bgem` suffix check
+/// that dropped all `.mat` references.
+#[cfg(test)]
+mod lighting_shader_mat_tests;
+
+/// Regression tests for #1208 (NIF-D4-NEW-08) — inherited
+/// `NiVertexColorProperty` must not overwrite the Skyrim+ shader-driven
+/// `vertex_color_mode` when `BSLightingShaderProperty` has already
+/// populated `has_material_data`.
+#[cfg(test)]
+mod vertex_color_precedence_tests;
+
+/// Regression tests for #1243 (NIF-DIM4-NEW-02) + #1244 (NIF-DIM4-NEW-03)
+/// — FO3/FNV legacy non-BS shader subclasses must reach `MaterialInfo`.
+/// Covers `WaterShaderProperty` (#1243) and the four
+/// `BSShaderPropertyBaseOnly` subclasses (#1244: Hair / VolumetricFog /
+/// DistantLOD / DistantTree). Sibling to the Skyrim+ `BSWaterShaderProperty`
+/// consumer covered by `sky_water_shader_tests` (#977 closure).
+#[cfg(test)]
+mod water_shader_legacy_tests;
+
+/// Regression tests for #1241 (NIF-DIM4-NEW-01) —
+/// `BSLightingShaderProperty` PBR scalars (`refraction_strength`,
+/// `lighting_effect_1/2`, `subsurface_rolloff`, `rimlight_power`,
+/// `backlight_power`, `grayscale_to_palette_scale`, `fresnel_power`)
+/// must land on `MaterialInfo` and propagate through every mesh
+/// extractor into `ImportedMesh`. Pre-fix the walker captured the
+/// `emissive_*` / `glossiness` / `uv_*` / `alpha` neighbours but
+/// dropped these 7, so the parser's per-BSVER capture investment
+/// (#1175, #115, #403) never surfaced.
+#[cfg(test)]
+mod lighting_shader_pbr_tests;
+
+/// Regression tests for #2321 (FO3-D1-05/D2-01) — FO3/FNV
+/// `BSShaderPPLightingProperty` fire-refraction heat-haze mirroring,
+/// the FO3/FNV sibling of `lighting_shader_pbr_tests`'s Skyrim+ case.
+#[cfg(test)]
+mod fo3nv_fire_refraction_tests;
+
+/// Regression tests for #2328 (FO3-D1-06) — inherited-property
+/// precedence inversion on `texture_clamp_mode`/`env_map_scale`.
+#[cfg(test)]
+mod legacy_property_precedence_tests;
+
+/// Regression tests for #2553 (FNV-D2-01) — a vestigial black
+/// `NiMaterialProperty.specular` on the FO3/FNV lit pipeline is restored
+/// to the unauthored neutral instead of zeroing the direct-specular lobe.
+#[cfg(test)]
+mod legacy_specular_authorship_tests;
+
+#[cfg(test)]
+mod intern_texture_path_tests {
+    use super::intern_texture_path;
+    use byroredux_core::string::StringPool;
+
+    /// Regression test for FO3-1-01 (#1541): empty *and whitespace-only*
+    /// slot strings must collapse to `None` so the diffuse slot falls back
+    /// to the neutral texture instead of binding the magenta checker.
+    #[test]
+    fn whitespace_only_paths_collapse_to_none() {
+        let mut pool = StringPool::new();
+        assert_eq!(intern_texture_path(&mut pool, ""), None);
+        assert_eq!(intern_texture_path(&mut pool, " "), None);
+        assert_eq!(intern_texture_path(&mut pool, "\t"), None);
+        assert_eq!(intern_texture_path(&mut pool, "  \t \n "), None);
+        // A real path is still interned.
+        assert!(intern_texture_path(&mut pool, "textures/foo.dds").is_some());
+    }
+}
+
+/// #3515 (FO4-2026-08-27-D5-02) — `texture_clamp_mode` must carry the SAME
+/// default at all three material tiers.
+///
+/// `MaterialInfo` (the tier the NIF walker fills) always defaulted to `3`
+/// (WRAP_S_WRAP_T), the Gamebryo default #610 established and the value
+/// `resolve_texture` hardcodes for its clamp-unaware variant. The two tiers
+/// below it defaulted to `0` — CLAMP_S_CLAMP_T, the *opposite* end of the
+/// enum — and `Material`'s own doc taught that `0` was correct.
+///
+/// The divergence was inert only by accident of who consumes the default:
+/// `into_imported_material` overwrites the field verbatim, and the
+/// production `ImportedMesh::from_geometry` consumers that keep
+/// `ImportedMaterial::default()` are the untextured fog volumes (the FO4
+/// precombine path is safe only because `into_imported_mesh` reassigns
+/// `mesh.material` immediately afterwards). The next synthetic-geometry
+/// producer to bind a *tiling* texture — distant object LOD, terrain LOD, a
+/// FO4 precombine collision-visual path (the collision sibling files are
+/// `<cell>_physics.nif`, not `_precomb.nif`) — would have got CLAMP/CLAMP on an
+/// atlas, reading as one stretched edge texel per axis.
+#[cfg(test)]
+mod texture_clamp_mode_default_tests {
+    use super::MaterialInfo;
+    use crate::import::types::ImportedMaterial;
+    use byroredux_core::ecs::components::material::Material;
+
+    /// 3 = WRAP_S_WRAP_T per nif.xml's `TexClampMode`.
+    const GAMEBRYO_DEFAULT: u8 = 3;
+
+    #[test]
+    fn all_three_material_tiers_default_to_wrap_s_wrap_t() {
+        assert_eq!(
+            MaterialInfo::default().texture_clamp_mode,
+            GAMEBRYO_DEFAULT,
+            "MaterialInfo is the tier the NIF walker fills and has always used 3"
+        );
+        assert_eq!(
+            ImportedMaterial::default().texture_clamp_mode,
+            GAMEBRYO_DEFAULT,
+            "ImportedMaterial defaulted to 0 (CLAMP_S_CLAMP_T) — the opposite end of the \
+             enum — so a synthetic mesh built through ImportedMesh::from_geometry would \
+             clamp a tiling atlas to one edge texel per axis (#3515)"
+        );
+        assert_eq!(
+            Material::default().texture_clamp_mode,
+            GAMEBRYO_DEFAULT,
+            "the canonical tier must agree with the two above it, and with \
+             resolve_texture's own hardcoded 3"
+        );
+    }
+
+    /// The value is load-bearing documentation as well as behaviour: `0` is
+    /// a real, authored mode (Oblivion architecture trim/signs/banners use
+    /// it via #610), so a reader who trusts the wrong default cannot tell an
+    /// authored CLAMP from an unset field.
+    #[test]
+    fn zero_stays_a_meaningful_authored_value_not_a_sentinel() {
+        let authored = Material {
+            texture_clamp_mode: 0,
+            ..Material::default()
+        };
+        assert_ne!(
+            authored.texture_clamp_mode,
+            Material::default().texture_clamp_mode,
+            "CLAMP_S_CLAMP_T must be distinguishable from the unset default"
+        );
+    }
+}

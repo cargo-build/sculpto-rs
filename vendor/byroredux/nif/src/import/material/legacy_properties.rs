@@ -1,0 +1,1173 @@
+//! FO3/FNV/Oblivion legacy `NiProperty`-chain extraction — split out of
+//! `extract_material_info_from_refs` (#2059) to shrink that 1008-line
+//! orchestrator. Skyrim+ binds material properties via the dedicated
+//! `shader_property_ref` / `alpha_property_ref` fields instead (see
+//! `dedicated_shader.rs`); pre-Skyrim content walks a `NiProperty` list
+//! per shape, so this file drives one loop over that list, calling a
+//! per-property-type helper for every entry in the exact sequence the
+//! monolithic function used to check them in.
+
+use super::*;
+
+/// nif.xml `ApplyMode::APPLY_HILIGHT2` — *"Parallax Flag in some Oblivion
+/// meshes"* (nif.xml's own annotation on the enum option). Gamebryo v3.2
+/// renamed modes 3 and 4 to `APPLY_DEPRECATED`/`APPLY_DEPRECATED2`, so the
+/// Oblivion parallax convention is the value's only surviving meaning.
+/// #3530.
+const APPLY_HILIGHT2: u32 = 4;
+
+fn legacy_env_map_scale(shader_flags_1: u32, env_map_scale: f32) -> f32 {
+    use crate::shader_flags::fo3nv_f1::{
+        ENVIRONMENT_MAPPING, EYE_ENVIRONMENT_MAPPING, WINDOW_ENVIRONMENT_MAPPING,
+    };
+
+    let authored_mask = ENVIRONMENT_MAPPING | EYE_ENVIRONMENT_MAPPING | WINDOW_ENVIRONMENT_MAPPING;
+    if shader_flags_1 & authored_mask != 0 {
+        env_map_scale
+    } else {
+        0.0
+    }
+}
+
+/// #4237 / FO3-D1-2026-09-11-02 — whether either window-specific
+/// environment-mapping bit is authored on this shader property. Narrower
+/// than [`legacy_env_map_scale`]'s gate (which also fires on the plain
+/// `Environment_Mapping` bit): window glass specifically authors
+/// `Window_Environment_Mapping` or `Eye_Environment_Mapping`, and that
+/// distinction is the positive glass signal `classify_glass_into_material`
+/// needs — a generic reflective-but-not-glass surface (polished metal,
+/// power armor) authors plain `Environment_Mapping` instead and must not
+/// be promoted to glass by this signal.
+fn legacy_window_env_mapping(shader_flags_1: u32) -> bool {
+    use crate::shader_flags::fo3nv_f1::{EYE_ENVIRONMENT_MAPPING, WINDOW_ENVIRONMENT_MAPPING};
+    shader_flags_1 & (WINDOW_ENVIRONMENT_MAPPING | EYE_ENVIRONMENT_MAPPING) != 0
+}
+
+/// #4235 — role bits for [`MaterialInfo::texturing_property_roles`].
+const TEXTURING_BASE: u8 = 1 << 0;
+const TEXTURING_NORMAL: u8 = 1 << 1;
+const TEXTURING_GLOW: u8 = 1 << 2;
+/// #4401 — the parallax slot joins the claim scheme: a `BSShader*`'s
+/// authored-POM slot-3 texture displaces a legacy `NiTexturingProperty`
+/// slot-7 path the same way slots 0-2 displace the legacy base/normal/glow.
+const TEXTURING_PARALLAX: u8 = 1 << 3;
+
+/// #4235 — write a shader property's own texture into `slot`.
+///
+/// First writer wins (#208), except over a path a legacy
+/// `NiTexturingProperty` wrote: the bound `BSShader*` samples its own
+/// texture, so it outranks the legacy property for the same role wherever
+/// the two sit in the chain. An empty shader slot never displaces a bound
+/// path.
+///
+/// #4401 — returns whether this call *displaced* a legacy property's path
+/// (the only case where the caller must also re-latch every per-slot
+/// consumer the legacy write owned — today `texture_clamp_mode`, and for
+/// the parallax role the `parallax_max_passes`/`parallax_height_scale`
+/// pair). Pre-fix the displacement fixed the *path* but left those
+/// latched to the displaced legacy property, so the shader's texture was
+/// sampled with the legacy address mode.
+fn claim_shader_texture(
+    slot: &mut Option<FixedString>,
+    texturing_property_roles: &mut u8,
+    role: u8,
+    path: Option<FixedString>,
+) -> bool {
+    if slot.is_none() {
+        *slot = path;
+    } else if *texturing_property_roles & role != 0 && path.is_some() {
+        *slot = path;
+        *texturing_property_roles &= !role;
+        return true;
+    }
+    false
+}
+
+/// Whether a FO3/FNV `BSShaderPPLightingProperty` actually authors POM,
+/// per nif.xml's FO3 `BSShaderFlags` bits 11 (`Parallax_Shader_Index_15`)
+/// and 28 (`Parallax_Occulsion`) — texture-slot-3 presence alone is not
+/// authoring: the slot exists in every `BSShaderTextureSet`, bound or not.
+/// FO3-D1-02 / #2317.
+fn fo3_parallax_authored(shader_flags_1: u32) -> bool {
+    use crate::shader_flags::fo3nv_f1::{PARALLAX, PARALLAX_OCCLUSION};
+    shader_flags_1 & (PARALLAX | PARALLAX_OCCLUSION) != 0
+}
+
+/// Convert a raw FO3/FNV `BSShaderPPLightingProperty.parallax_scale` value
+/// (nif.xml `Parallax Scale`, authoring range 0.0–10.0, schema default 1.0)
+/// to the engine's `heightScale` shader contract (Bethesda brickwork range
+/// 0.02–0.08, "Gamebryo runtime default" 0.04 per
+/// `material_sampling.glsl`'s own doc comment). FO3-D1-02 / #2317.
+///
+/// The 0.04 factor is not a fresh guess: it's the ratio that makes an
+/// unauthored `parallax_scale` (the bsver<=24 no-field fallback of 1.0, or
+/// an authored-but-untouched 1.0) land on exactly the same 0.04 the engine
+/// already treats as "no authoring" everywhere else — `GpuMaterial`'s own
+/// default and the sibling `NiTexturingProperty`-only branch above
+/// (`legacy_properties.rs`'s texture-slot-7 parallax path) both hard-code
+/// 0.04 for the same "authored a parallax texture, no explicit scale"
+/// case. Left un-converted, the bsver<=24 fallback alone was a ~25×
+/// overshoot (1.0 vs the shader's 0.02–0.08 contract), producing texture
+/// swimming at grazing angles.
+fn fo3_parallax_scale_to_height_scale(raw_parallax_scale: f32) -> f32 {
+    const NIF_TO_ENGINE_HEIGHT_SCALE: f32 = 0.04;
+    raw_parallax_scale * NIF_TO_ENGINE_HEIGHT_SCALE
+}
+
+/// FO3/FNV/Oblivion: single pass over shape + inherited properties.
+/// Shape properties first so they take priority (#208). Empty for
+/// BsTriShape (Skyrim+ binds via shader_property_ref only).
+pub(super) fn apply_legacy_property_chain(
+    scene: &NifScene,
+    direct_properties: &[BlockRef],
+    inherited_props: &[BlockRef],
+    pool: &mut StringPool,
+    info: &mut MaterialInfo,
+) {
+    for prop_ref in direct_properties.iter().chain(inherited_props.iter()) {
+        let Some(idx) = prop_ref.index() else {
+            continue;
+        };
+
+        apply_legacy_alpha_property(scene, idx, info);
+        apply_zbuffer_property(scene, idx, info);
+        apply_material_property(scene, idx, info);
+        apply_texturing_property(scene, idx, pool, info);
+        apply_pp_lighting_property(scene, idx, pool, info);
+        apply_no_lighting_property(scene, idx, pool, info);
+        apply_misc_shader_properties(scene, idx, pool, info);
+        apply_base_only_shader_property(scene, idx, info);
+        apply_stencil_property(scene, idx, info);
+        apply_flag_property(scene, idx, info);
+        apply_vertex_color_property(scene, idx, info);
+
+        // #1224 / D4-NEW-02 — NiFogProperty is parsed (see
+        // `crates/nif/src/blocks/properties.rs::NiFogProperty`) but
+        // intentionally NOT dispatched here. Per-node fog overrides
+        // have no landing site on the `Material` ECS component, and
+        // the renderer's fog path reads cell-scope `CellLighting`
+        // exclusively. Adding a per-node fog component + shader
+        // branch for an observed corpus of 1 block in vanilla FO3
+        // is not justified. Documented so future audits don't refile
+        // the gap. The 2026-04-30 audit's claim that NiFog was
+        // "wired (#558 / #607)" referred to the per-node fog ENABLE
+        // bit on inherited-property chains, not the NiFogProperty
+        // record itself.
+    }
+}
+
+/// Legacy `NiAlphaProperty` — the FO3/FNV/Oblivion counterpart to
+/// `dedicated_shader.rs::apply_dedicated_alpha_property` (Skyrim+ binds
+/// alpha via the dedicated ref instead of this property-chain walk).
+fn apply_legacy_alpha_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // #1201 — gate on `alpha_property_consumed`, not on the
+    // `!alpha_blend && !alpha_test` value-shape. A shape that
+    // authors `NiAlphaProperty { flags: 0 }` (explicit "no
+    // blending, no test") leaves both fields false but `apply_
+    // alpha_flags` marks consumption — so the cascade gate must
+    // honour the intent, not just the resulting bit values.
+    // #982 added the data plumbing but the consumer was missed.
+    if !info.alpha_property_consumed {
+        if let Some(alpha) = scene.get_as::<NiAlphaProperty>(idx) {
+            apply_alpha_flags(info, alpha);
+        }
+    }
+}
+
+/// `NiZBufferProperty` — depth test/write mode + comparison function.
+fn apply_zbuffer_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // NiZBufferProperty — depth test/write mode + comparison function (#398).
+    if let Some(zbuf) = scene.get_as::<crate::blocks::properties::NiZBufferProperty>(idx) {
+        info.z_test = zbuf.z_test_enabled;
+        info.z_write = zbuf.z_write_enabled;
+        // Clamp to the 8 Gamebryo TestFunction values; out-of-range
+        // (file corruption / unimplemented variant) falls back to
+        // LESSEQUAL via the Default.
+        if zbuf.z_function < 8 {
+            info.z_function = zbuf.z_function as u8;
+        }
+    }
+}
+
+/// `NiMaterialProperty` — specular/emissive/shininess/alpha for
+/// pre-Skyrim content that has no BSLightingShaderProperty.
+fn apply_material_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // NiMaterialProperty — capture specular/emissive/shininess/alpha.
+    if !info.has_material_data {
+        if let Some(mat) = scene.get_as::<NiMaterialProperty>(idx) {
+            info.diffuse_color = [mat.diffuse.r, mat.diffuse.g, mat.diffuse.b];
+            // #221 — `NiMaterialProperty.ambient` was previously
+            // discarded; the renderer now consumes it as a
+            // per-material modulator on the cell ambient term.
+            info.ambient_color = [mat.ambient.r, mat.ambient.g, mat.ambient.b];
+            info.specular_color = [mat.specular.r, mat.specular.g, mat.specular.b];
+            info.specular_authored = true;
+            info.emissive_color = [mat.emissive.r, mat.emissive.g, mat.emissive.b];
+            info.glossiness = mat.shininess;
+            info.alpha = mat.alpha;
+            info.emissive_mult = mat.emissive_mult;
+            // #1280 step 4 — tag the legacy Oblivion/FO3/FNV source.
+            // #2591 (SKY-D7-03) — gated on non-zero authoring, same as
+            // the BSLightingShaderProperty / BSEffectShaderProperty sites.
+            if byroredux_core::ecs::components::material::emissive_contribution_is_authored(
+                info.emissive_color,
+                info.emissive_mult,
+            ) {
+                info.emissive_source =
+                    byroredux_core::ecs::components::material::EmissiveSource::Material;
+            }
+            info.has_material_data = true;
+        }
+    }
+}
+
+/// `NiTexturingProperty` — up to 8 legacy texture slots (base, normal/
+/// bump, glow, detail, gloss, dark, parallax) plus UV transform + clamp
+/// mode. Pre-Skyrim static-mesh texturing.
+fn apply_texturing_property(
+    scene: &NifScene,
+    idx: usize,
+    pool: &mut StringPool,
+    info: &mut MaterialInfo,
+) {
+    if let Some(tex_prop) = scene.get_as::<NiTexturingProperty>(idx) {
+        // #4235 — each role this property fills is recorded, so a
+        // `BSShader*` texture for the same role can still take it over
+        // (`claim_shader_texture`).
+        if info.texture_path.is_none() {
+            info.texture_path = tex_desc_source_path(scene, tex_prop.base_texture.as_ref(), pool);
+            if info.texture_path.is_some() {
+                info.texturing_property_roles |= TEXTURING_BASE;
+            }
+        }
+        // Oblivion stores tangent-space normal maps in the `bump_texture`
+        // slot (the dedicated `normal_texture` slot landed later in FO3).
+        // Skyrim+ meshes use BSShaderTextureSet handled elsewhere, so
+        // this branch is specifically for pre-Skyrim static meshes.
+        // See issue #131.
+        if info.normal_map.is_none() {
+            info.normal_map = tex_desc_source_path(scene, tex_prop.normal_texture.as_ref(), pool)
+                .or_else(|| tex_desc_source_path(scene, tex_prop.bump_texture.as_ref(), pool));
+            if info.normal_map.is_some() {
+                info.texturing_property_roles |= TEXTURING_NORMAL;
+            }
+        }
+        // Secondary texture slots (#214). NiTexturingProperty has
+        // up to 8 slots — base and normal/bump are consumed above,
+        // the remaining three slots we care about feed separate
+        // shader inputs:
+        //   * glow_texture  → emissive map (self-illumination)
+        //   * detail_texture → high-frequency overlay
+        //   * gloss_texture  → per-texel specular strength mask
+        // We only overwrite if a Skyrim+ BSShader path hasn't
+        // already set them, matching the base/normal policy.
+        if info.glow_map.is_none() {
+            info.glow_map = tex_desc_source_path(scene, tex_prop.glow_texture.as_ref(), pool);
+            if info.glow_map.is_some() {
+                info.texturing_property_roles |= TEXTURING_GLOW;
+            }
+        }
+        if info.detail_map.is_none() {
+            info.detail_map = tex_desc_source_path(scene, tex_prop.detail_texture.as_ref(), pool);
+        }
+        if info.gloss_map.is_none() {
+            info.gloss_map = tex_desc_source_path(scene, tex_prop.gloss_texture.as_ref(), pool);
+        }
+        // Dark / multiplicative lightmap (slot 1). Baked shadow data
+        // on Oblivion interior architecture — `albedo *= dark`. #264.
+        // This is the dark role's ONLY writer, and the role is live on
+        // shipped content: the #4523 full-corpus census (2026-09-20) found
+        // 8 Oblivion meshes setting the slot, zero everywhere else — FO4+
+        // cannot reach this arm at all (no shipped mesh NIF there carries
+        // a `NiTexturingProperty`; BGSM/BGEM has no dark slot). See
+        // `MaterialTextureSet::dark` for the census and pins.
+        if info.dark_map.is_none() {
+            info.dark_map = tex_desc_source_path(scene, tex_prop.dark_texture.as_ref(), pool);
+        }
+        // Parallax height-map (slot 7, v20.2.0.5+). Pre-#450 the
+        // parser consumed + dropped this slot so FO3 meshes that
+        // kept the legacy `NiTexturingProperty` chain alongside a
+        // `BSShaderPPLightingProperty` lost their parallax bake.
+        // Feed the same downstream field as the BSShaderTextureSet
+        // slot 3 path in `apply_pp_lighting_property` so the shader does not need to
+        // distinguish the two sources.
+        if info.parallax_map.is_none() {
+            info.parallax_map =
+                tex_desc_source_path(scene, tex_prop.parallax_texture.as_ref(), pool);
+            // #4401 — record the role so a co-bound `BSShaderPPLighting`'s
+            // authored-POM slot 3 can displace this path (and its default
+            // scalar pair) via the claim scheme, instead of this
+            // first-writer latch winning by chain order alone.
+            if info.parallax_map.is_some() {
+                info.texturing_property_roles |= TEXTURING_PARALLAX;
+            }
+            // #725 / NIF-D4-06 — when a NiTexturingProperty parallax
+            // slot binds WITHOUT a co-bound BSShaderPPLightingProperty
+            // (rare on FO3 / FNV with an Oblivion-style property
+            // chain), the scalar pair stays None and the consumer's
+            // `unwrap_or(0.04, 4.0)` fallback (now resolved once in
+            // `material_translate::translate_material`) compensates.
+            // Setting the engine defaults at the producer-side keeps
+            // the import-side `Option` semantics honest: "Some =
+            // import committed to a value, None = no parallax
+            // authoring at all". Defaults match `GpuMaterial`'s
+            // `parallax_height_scale = 0.04, parallax_max_passes =
+            // 4.0` (`renderer/src/vulkan/material.rs:216-217`).
+            if info.parallax_map.is_some() {
+                // #4263 SIBLING — reference the canonical constants
+                // directly rather than duplicating their literal values;
+                // see the matching APPLY_HILIGHT2 fix below.
+                if info.parallax_max_passes.is_none() {
+                    info.parallax_max_passes = Some(
+                        byroredux_core::ecs::components::material::DEFAULT_PARALLAX_MAX_PASSES,
+                    );
+                }
+                if info.parallax_height_scale.is_none() {
+                    info.parallax_height_scale = Some(
+                        byroredux_core::ecs::components::material::DEFAULT_PARALLAX_HEIGHT_SCALE,
+                    );
+                }
+            }
+        }
+        // #3530 — Oblivion's only authored parallax signal.
+        //
+        // The dedicated parallax slot above is `v20.2.0.5+`, so it does not
+        // exist on Oblivion (v20.0.0.4/5); the other two `parallax_map`
+        // producers are `BSShaderTextureSet` slot 3 (FO3+) and BGSM
+        // `TextureRole::Height` (FO4+). Oblivion's signal is instead
+        // `NiTexturingProperty`'s Apply Mode, which nif.xml annotates
+        // directly: `APPLY_HILIGHT2` is the *"Parallax Flag in some Oblivion
+        // meshes"*, and Gamebryo v3.2 renamed modes 3/4 to
+        // `APPLY_DEPRECATED`/`APPLY_DEPRECATED2`, so it has no surviving
+        // general meaning to collide with. 1,433 properties across 741
+        // distinct vanilla meshes carry it; FNV/FO3/Skyrim are 100 %
+        // `APPLY_MODULATE`, so this branch cannot fire there.
+        //
+        // The height source is the **normal map's alpha channel**:
+        // `Oblivion - Textures - Compressed.bsa` contains zero `_p.dds`
+        // entries, so no separate height texture ships and there is nothing
+        // to synthesise a path for. Binding the normal map into the parallax
+        // slot and flagging the channel reuses the engine's existing
+        // `NORMAL_ALPHA_SPEC_BIT` mechanism verbatim (a high bit on the
+        // texture index telling the shader to sample another slot's alpha),
+        // rather than inventing a second one.
+        //
+        // Deliberately last: a mesh that authored a real parallax slot or
+        // came through a BSShader path keeps it, because `parallax_map` is
+        // already `Some` by here.
+        //
+        // #3596 — the flag is set on the APPLY_HILIGHT2 *intent* alone; the
+        // `info.normal_map` binding below is opportunistic, not a gate.
+        //
+        // Gating on `normal_map` made this route unreachable on 100% of the
+        // corpus it was written for: Oblivion does not put normal maps in
+        // NIF texture slots at all. It resolves them by filename convention
+        // (`<base>_n.dds`, `derive_normal_map_path`, #1303), which happens
+        // DOWNSTREAM of `MaterialInfo` — so at this point the Oblivion
+        // normal map does not exist yet. Measured over
+        // `Oblivion - Meshes.bsa` + `DLCShiveringIsles - Meshes.bsa`: of
+        // 1,430 `APPLY_HILIGHT2` properties, **zero** carry a normal or bump
+        // slot (the whole archive pair has 14 `bump_texture` uses total),
+        // and `parallax_height_in_alpha` was true on 0 of 35,322 imported
+        // meshes. The feature shipped inert.
+        //
+        // So the parser records the decision — "if a height texture ends up
+        // bound for this material, its height is in the alpha channel" — and
+        // the asset provider binds the derived `_n.dds` into the height slot
+        // when it resolves one. The parser still owns the *rule*; only the
+        // texture path, which it cannot know, moves downstream. A mesh that
+        // does author a normal slot (mod content, Skyrim-era conversions)
+        // still binds here, unchanged.
+        if tex_prop.apply_mode == APPLY_HILIGHT2 && info.parallax_map.is_none() {
+            info.parallax_height_in_alpha = true;
+            if let Some(normal) = info.normal_map {
+                info.parallax_map = Some(normal);
+            }
+            // Same engine defaults the slot-7 branch above installs, and
+            // the same pair every consumer's `unwrap_or` already used —
+            // no new constant is introduced for Oblivion. #4263 — reference
+            // the canonical constants directly rather than duplicating
+            // their literal values here: a raw `4.0`/`0.04` is a silent
+            // per-game divergence waiting to happen the moment either
+            // canonical default is retuned downstream in
+            // `Material::resolve_pbr`.
+            if info.parallax_max_passes.is_none() {
+                info.parallax_max_passes =
+                    Some(byroredux_core::ecs::components::material::DEFAULT_PARALLAX_MAX_PASSES);
+            }
+            if info.parallax_height_scale.is_none() {
+                info.parallax_height_scale =
+                    Some(byroredux_core::ecs::components::material::DEFAULT_PARALLAX_HEIGHT_SCALE);
+            }
+        }
+        for (slot, decal) in info
+            .decal_maps
+            .iter_mut()
+            .zip(tex_prop.decal_textures.iter().take(4))
+        {
+            if slot.is_none() {
+                *slot = tex_desc_source_path(scene, Some(decal), pool);
+            }
+        }
+        // Propagate the base slot's UV transform to the shared
+        // `uv_offset` / `uv_scale` fields. The renderer shader applies
+        // them per-vertex to every sampled texture — fine for the
+        // common case where base, detail, glow and parallax share a
+        // UV set, which holds for Oblivion/FO3/FNV static meshes. See
+        // issues #219 and #435. Only overwrite when no shader path
+        // earlier in the pass has already supplied a UV transform —
+        // gated on `has_uv_transform` rather than `has_material_data`
+        // (the latter is set by `NiMaterialProperty`, which carries
+        // no UV transform of its own and so was wrongly suppressing
+        // this branch when it preceded `NiTexturingProperty` in
+        // Oblivion / FO3 / FNV property arrays).
+        // Capture the diffuse slot's `TexDesc::clamp_mode` so the
+        // renderer can pick the matching `VkSamplerAddressMode`
+        // pair at descriptor-write time. #3516 — this used to mask
+        // `flags & 0xF` here, which is the *synthesized* pre-20.1.0.3
+        // layout; on FO3/FNV that nibble is the low half of the raw
+        // texture index and reads 0 (CLAMP/CLAMP) for essentially
+        // every legacy-chain material. The decode now lives at the
+        // parse site, where the version that selects the encoding is
+        // known. Pre-#610 the value was
+        // dropped and every NiTexturingProperty texture rendered
+        // with REPEAT/REPEAT — visible as edge bleed on decals,
+        // Oblivion architecture trim, and pre-shader skybox seams.
+        // Only update when no earlier shader path supplied a clamp mode
+        // (e.g. BSEffectShader's dedicated field) so the more-specific
+        // source still wins. Default is `3 = WRAP_S_WRAP_T` per nif.xml —
+        // the legacy REPEAT/REPEAT.
+        //
+        // #3517 / OBL-2026-08-27-02 — gate on `texture_clamp_mode_consumed`,
+        // not on the value shape (`== 3`). This was the only clamp writer
+        // in this file that neither read nor set the latch #2328 added,
+        // and the asymmetry broke #208 precedence in both directions:
+        //
+        //   * a shape-level `NiTexturingProperty` wrote without latching,
+        //     so an *inherited* `BSShader*` later in the same walk saw
+        //     `!consumed` and overwrote it;
+        //   * a shape-level `BSShader*` authoring clamp mode 3 set the
+        //     latch, but the `== 3` gate never consulted it, so an
+        //     *inherited* `NiTexturingProperty` overwrote it anyway.
+        //
+        // Identical to the value-shape-vs-latch bug #1201 already fixed
+        // for `NiAlphaProperty`. Latent on Oblivion (zero `BSShader*`
+        // blocks, so only one writer can ever run) — the exposure is
+        // FO3/FNV meshes mixing the two families across the
+        // shape/parent-node boundary (FNV ships 58,706
+        // `BSShaderPPLightingProperty` and 3,018 `NiTexturingProperty`).
+        if !info.texture_clamp_mode_consumed {
+            if let Some(base) = tex_prop.base_texture.as_ref() {
+                info.texture_clamp_mode = base.clamp_mode;
+                info.texture_clamp_mode_consumed = true;
+            }
+        }
+        if !info.has_uv_transform {
+            if let Some(base) = tex_prop.base_texture.as_ref() {
+                if let Some(tx) = base.transform {
+                    info.uv_offset = tx.translation;
+                    info.uv_scale = tx.scale;
+                    info.has_uv_transform = true;
+                }
+            }
+        }
+    }
+}
+
+/// `BSShaderPPLightingProperty` — FO3/FNV primary lit shader (the
+/// pre-Skyrim sibling of `BSLightingShaderProperty`).
+fn apply_pp_lighting_property(
+    scene: &NifScene,
+    idx: usize,
+    pool: &mut StringPool,
+    info: &mut MaterialInfo,
+) {
+    if let Some(shader) = scene.get_as::<BSShaderPPLightingProperty>(idx) {
+        // #2553 — record that the FO3/FNV lit shader pipeline is bound, so
+        // the specular-authorship post-pass can tell a vestigial black
+        // `NiMaterialProperty.specular` from an authored one.
+        info.has_legacy_bs_shader = true;
+        // #2320 — the FO3 BSShaderType enum (SHADER_SKIN/WATER/SKY/etc.),
+        // parsed off the wire since `blocks/base.rs` but never read by any
+        // importer arm before this. See `MaterialInfo::legacy_shader_type`
+        // for why this is its own field, not `Self::shader_type`.
+        info.legacy_shader_type = Some(shader.shader.shader_type);
+        // #6130 — the authored `Hair` bit: vertex colours are a tint mask.
+        info.fallout_hair |= shader.shader_flags_1() & crate::shader_flags::fo3nv_f1::HAIR != 0;
+        // FO3-D1-02 / #2317 — computed once, shared by the slot-3 texture
+        // bind below and the scalar-write gate further down.
+        let parallax_authored = fo3_parallax_authored(shader.shader_flags_1());
+        // #4401 — set by the texture-set claims below when this shader
+        // displaces a legacy `NiTexturingProperty` path; read by the clamp
+        // and parallax-scalar writes further down.
+        let mut base_displaced_legacy = false;
+        let mut parallax_displaced_legacy = false;
+        if let Some(ts_idx) = shader.texture_set_ref.index() {
+            if let Some(tex_set) = scene.get_as::<BSShaderTextureSet>(ts_idx) {
+                // #4235 — slots 0-2 outrank an `NiTexturingProperty`'s base,
+                // normal-or-bump and glow (`claim_shader_texture`). Before,
+                // whichever property came first in the chain won, so a
+                // texturing property listed ahead of this shader replaced
+                // the shader's own textures. Vanilla FO3 and FNV each carry
+                // five such shapes, all naming the same base path.
+                let slot_path = |pool: &mut StringPool, i: usize| {
+                    tex_set
+                        .textures
+                        .get(i)
+                        .and_then(|p| intern_texture_path(pool, p))
+                };
+                let base = slot_path(pool, 0);
+                base_displaced_legacy |= claim_shader_texture(
+                    &mut info.texture_path,
+                    &mut info.texturing_property_roles,
+                    TEXTURING_BASE,
+                    base,
+                );
+                // Normal map is textures[1] in BSShaderTextureSet (same layout as Skyrim).
+                let normal = slot_path(pool, 1);
+                claim_shader_texture(
+                    &mut info.normal_map,
+                    &mut info.texturing_property_roles,
+                    TEXTURING_NORMAL,
+                    normal,
+                );
+                // Glow / emissive map is textures[2].
+                let glow = slot_path(pool, 2);
+                claim_shader_texture(
+                    &mut info.glow_map,
+                    &mut info.texturing_property_roles,
+                    TEXTURING_GLOW,
+                    glow,
+                );
+                // Parallax / height map is textures[3] (FO3/FNV
+                // Parallax_Shader_Index_15 / Parallax_Occlusion).
+                // See #452.
+                //
+                // FO3-D1-02 / #2317 — gated on `parallax_authored` (bits
+                // 11/28 above), not on slot-3 presence alone. The slot
+                // exists in every `BSShaderTextureSet`, authored or not;
+                // pre-fix, any mesh whose atlas happened to carry a slot-3
+                // path ran the shader's POM branch regardless of whether
+                // the material actually authored parallax.
+                //
+                // #4401 — same claim rule as slots 0-2: when the shader
+                // authors POM, its slot-3 texture displaces a legacy
+                // `NiTexturingProperty` slot-7 path (previously the two
+                // were independent first-writer latches, so a texturing
+                // property earlier in the chain pinned the height role and
+                // the normal/height pair could come from different
+                // sources).
+                let mut shader_parallax_displaced_legacy = false;
+                if parallax_authored {
+                    if let Some(px) = tex_set.textures.get(3) {
+                        let px = intern_texture_path(pool, px);
+                        if info.texturing_property_roles & TEXTURING_PARALLAX != 0 && px.is_some() {
+                            info.parallax_map = px;
+                            info.texturing_property_roles &= !TEXTURING_PARALLAX;
+                            shader_parallax_displaced_legacy = true;
+                        } else if info.parallax_map.is_none() {
+                            info.parallax_map = px;
+                        }
+                    }
+                }
+                parallax_displaced_legacy |= shader_parallax_displaced_legacy;
+                // Environment cubemap is textures[4]. Glass bottles,
+                // power armor, polished metal — pre-#452 the path was
+                // read and thrown away. env_map_scale was captured
+                // but had no texture to route to.
+                if info.env_map.is_none() {
+                    if let Some(env) = tex_set.textures.get(4) {
+                        info.env_map = intern_texture_path(pool, env);
+                    }
+                }
+                // Environment-reflection mask is textures[5]. #452.
+                if info.env_mask.is_none() {
+                    if let Some(mask) = tex_set.textures.get(5) {
+                        info.env_mask = intern_texture_path(pool, mask);
+                    }
+                }
+            }
+        }
+        // `BSShaderPPLightingProperty.parallax_max_passes` /
+        // `parallax_scale` (parsed since BSVER >= 24 per
+        // `blocks/shader.rs:70`) flow through, converted (`parallax_scale`
+        // → engine `heightScale`) and gated on authored POM — FO3-D1-02 /
+        // #2317. Pre-fix these were written unconditionally: any mesh
+        // with a bound texture-slot-3 path got them regardless of
+        // `parallax_authored`, and `parallax_scale` was forwarded
+        // un-converted (a ~25× overshoot on the shader's 0.02–0.08
+        // contract for the common bsver<=24 fallback value of 1.0 — see
+        // `fo3_parallax_scale_to_height_scale`). Gating on
+        // `info.parallax_map.is_some()` too (not just `parallax_authored`)
+        // mirrors the sibling `NiTexturingProperty`-only branch above,
+        // which never sets a scale/passes pair without a bound texture.
+        // Only overwrite when the material hasn't already bound them
+        // from a Skyrim+ BSLightingShaderProperty ParallaxOcc
+        // variant — the shader-type capture path in
+        // `apply_shader_type_data` keeps those values. #452.
+        //
+        // #4401 — displacement is the exception, same as the clamp
+        // latch: a displaced `NiTexturingProperty` slot-7 had installed
+        // only the generic engine defaults below, and the shader's
+        // authored pair must win now that its texture owns the role.
+        if parallax_authored && info.parallax_map.is_some() {
+            if info.parallax_max_passes.is_none() || parallax_displaced_legacy {
+                info.parallax_max_passes = Some(shader.parallax_max_passes);
+            }
+            if info.parallax_height_scale.is_none() || parallax_displaced_legacy {
+                info.parallax_height_scale =
+                    Some(fo3_parallax_scale_to_height_scale(shader.parallax_scale));
+            }
+        }
+        // #773 / FO3-4-01 — `texture_clamp_mode` mirror. Pre-fix
+        // the FO3/FNV PPLighting branch dropped this u32 enum
+        // (parsed at `blocks/shader.rs:84` via
+        // `BSShaderPropertyData::parse_fo3`), so CLAMP-authored
+        // decals / scope reticles / glow planes silently fell
+        // back to default WRAP. The Skyrim+ BSEffectShader path
+        // already mirrored its own copy in `apply_bs_effect_shader` (#610) and
+        // the NiTexturingProperty path mirrored the per-slot
+        // `flags & 0xF` (#761) — only this PPLighting site was
+        // missing. nif.xml enum range is 0..=3 → `as u8` is safe.
+        //
+        // #2328 / FO3-D1-06 — gate on `texture_clamp_mode_consumed`,
+        // not a bare `=`. `apply_legacy_property_chain` walks the
+        // shape's own properties before the parent NiNode's inherited
+        // ones so the shape's authored value takes priority (#208); an
+        // unconditional write here let an inherited parent property
+        // silently overwrite a value the shape's own direct property
+        // already set on an earlier chain iteration.
+        //
+        // #4401 — the one exception to that latch: when this shader's
+        // slot-0 texture just DISPLACED a legacy `NiTexturingProperty`'s
+        // base path (#4235), the legacy property's clamp latch must not
+        // outlive the path it was latched to — the shader now owns the
+        // sampled slot, so its address mode follows it. Without this, a
+        // texturing property earlier in the chain left the shader's
+        // texture sampling with the legacy TexDesc's wrap mode.
+        if base_displaced_legacy || !info.texture_clamp_mode_consumed {
+            info.texture_clamp_mode = shader.texture_clamp_mode as u8;
+            info.texture_clamp_mode_consumed = true;
+        }
+        // #773 / FO3-4-02 — `env_map_scale` mirror. Pre-#2315 the
+        // env-cube + env-mask textures arrived via
+        // `texture_set[4]/[5]` (#452) but the scalar that
+        // modulates them was dropped, so FO3/FNV glass / polished
+        // metal / power armor rendered with `env_map_scale = 0.0`
+        // (the `MaterialInfo::default()` value) — texture bound,
+        // multiplier zero. The BSEffectShader path captures this
+        // in `apply_bs_effect_shader` and the Skyrim+ EnvironmentMap variant via
+        // `apply_shader_type_data`; only this site was missing.
+        // Field path: `BSShaderPPLightingProperty.shader:
+        // BSShaderPropertyData → .env_map_scale`. The scalar defaults
+        // to 1.0 on disk, so only forward it when an authored FO3/FNV
+        // environment-mapping flag activates the field (#2315).
+        //
+        // #2328 / FO3-D1-06 — same `_consumed` gate as `texture_clamp_mode`
+        // above; see that comment for the precedence-inversion rationale.
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+        // FO3/FNV `BSShaderPPLightingProperty` has NO Double_Sided
+        // bit on either flag pair — see the SF_DOUBLE_SIDED
+        // explanatory block at the top of this file. Leave
+        // `two_sided` unset here; the `NiStencilProperty` fallback
+        // below handles it correctly for meshes that want
+        // back-face-off.
+        if is_decal_from_legacy_shader_flags(shader.shader_flags_1(), shader.shader_flags_2()) {
+            info.is_decal = true;
+        }
+        // #2321 — mirror `refraction_strength`/promote fire-refraction
+        // heat-haze, matching the Skyrim+ `BSLightingShaderProperty`
+        // path in `dedicated_shader.rs::apply_shader_type_data`. FO3/FNV
+        // decodes `refraction_strength`/`refraction_fire_period` at
+        // `blocks/shader.rs:83` (bsver > FO3_REFRACTION) but neither
+        // value was ever forwarded into `MaterialInfo` — the only
+        // writer of `info.refraction_strength` was the Skyrim path,
+        // and the only site promoting `material_kind = 103`
+        // (`MATERIAL_KIND_FIRE_REFRACTION`) tested Skyrim-only SLSF1
+        // bits with no FO3/FNV equivalent declared. `fo3nv_f1::REFRACTION`
+        // / `FIRE_REFRACTION` (bits 15/16) share both position and
+        // semantic with `skyrim_slsf1` per nif.xml — see
+        // `shader_flags.rs`'s `fo3nv_shares_fire_refraction_bits_with_skyrim`.
+        //
+        // #3514 / FO3-2026-08-27-D1-01 — `_consumed` gate, the remainder
+        // of #2328. This write was the one scalar in this function still
+        // using a bare `=` inside `apply_legacy_property_chain`'s
+        // `direct_properties.chain(inherited_props)` loop, i.e.
+        // last-writer-wins, i.e. inherited-parent-wins — the exact
+        // inversion #2328 fixed for `texture_clamp_mode` and
+        // `env_map_scale` two statements above. Unreachable on vanilla
+        // FO3 (measured: 0 of 17,172 NIFs bind a `BSShaderPPLighting`/
+        // `NoLighting` property on a `NiNode`, so no chain ever holds
+        // two), so this is consistency for modded content plus one less
+        // policy for the next reader to re-derive.
+        if !info.refraction_strength_consumed {
+            info.refraction_strength = shader.refraction_strength;
+            info.refraction_strength_consumed = true;
+        }
+        // #4243 / FO3-2026-09-11-D2-02 — `refraction_fire_period` (the
+        // sibling scalar decoded alongside `refraction_strength` above,
+        // `blocks/shader.rs:55`) has NO `MaterialInfo`/`Material` sink and
+        // is deliberately left unwired: the renderer's fire-refraction warp
+        // (`material_kind = 103` below) is a static per-frame distortion
+        // with no scroll-phase input to drive, on either the FO3/FNV or
+        // Skyrim+ path. Wiring it would mean adding a new time-varying
+        // uniform to `triangle.frag`'s refraction pass — a Vulkan/shader
+        // change with no `cargo test` signal for whether the visual result
+        // is actually correct (see `feedback_speculative_vulkan_fixes`).
+        // Left as documented, time-invariant behavior; the field itself
+        // stays decoded (and pinned by `blocks/shader_tests`) for when a
+        // scroll-phase warp lands.
+        //
+        // The fire-refraction promotion below is deliberately NOT gated:
+        // it is a monotone latch (flags-set → promote, never demote), so
+        // an inherited property can only ever confirm it.
+        let fire_refraction_flags = crate::shader_flags::fo3nv_f1::REFRACTION
+            | crate::shader_flags::fo3nv_f1::FIRE_REFRACTION;
+        if shader.shader_flags_1() & fire_refraction_flags == fire_refraction_flags {
+            info.material_kind = 103;
+            // Screen-composition proxy, not opaque geometry — same
+            // synthesized alpha-over state as the Skyrim+ path so the
+            // renderer's dedicated fire-refraction ordering phase picks
+            // it up without requiring an authored NiAlphaProperty.
+            info.alpha_blend = true;
+            info.src_blend_mode = 6; // SRC_ALPHA
+            info.dst_blend_mode = 7; // INV_SRC_ALPHA
+            info.z_write = false;
+        }
+    }
+}
+
+/// `BSShaderNoLightingProperty` — FO3/FNV fullbright/unlit shader
+/// (terminal screens, HUD/scope overlays, blood-splat decals).
+fn apply_no_lighting_property(
+    scene: &NifScene,
+    idx: usize,
+    pool: &mut StringPool,
+    info: &mut MaterialInfo,
+) {
+    if let Some(shader) = scene.get_as::<BSShaderNoLightingProperty>(idx) {
+        // #2553 — see the sibling assignment in `apply_pp_lighting_property`.
+        info.has_legacy_bs_shader = true;
+        // #2320 — see the sibling assignment in `apply_pp_lighting_property`.
+        // Typically SHADER_NOLIGHTING (33) here, but capture whatever was
+        // actually authored rather than assuming it.
+        info.legacy_shader_type = Some(shader.shader.shader_type);
+        let file_name = intern_texture_path(pool, &shader.file_name);
+        let base_displaced_legacy = claim_shader_texture(
+            &mut info.texture_path,
+            &mut info.texturing_property_roles,
+            TEXTURING_BASE,
+            file_name,
+        );
+        // Same rationale as the PPLighting branch above: no Double_Sided
+        // bit on the FO3/FNV flag enum. #441. Pre-#454 this branch
+        // was missing the `ALPHA_DECAL_F2` (flag2 bit 21) check, so
+        // blood-splat NoLighting meshes that marked themselves decal
+        // via only the flag2 bit fell through to the opaque-coplanar
+        // path. Shared helper keeps PP + NoLighting in lockstep.
+        if is_decal_from_legacy_shader_flags(shader.shader_flags_1(), shader.shader_flags_2()) {
+            info.is_decal = true;
+        }
+        // Capture the soft-falloff cone so the HUD / VATS / scope
+        // overlay pipelines can eventually consume it. Pre-#451 the
+        // four scalars were silently discarded (parser extracted
+        // them but the importer had no field to receive them).
+        // Don't overwrite a previously-captured falloff set: if the
+        // mesh somehow binds both a NoLighting and an effect block
+        // the caller-most wins, matching the other shader-field
+        // merging in this loop.
+        info.no_lighting_falloff.get_or_insert(NoLightingFalloff {
+            start_angle: shader.falloff_start_angle,
+            stop_angle: shader.falloff_stop_angle,
+            start_opacity: shader.falloff_start_opacity,
+            stop_opacity: shader.falloff_stop_opacity,
+        });
+        // #773 / FO3-4-PPMAT SIBLING —
+        // `BSShaderNoLightingProperty` carries the same
+        // `texture_clamp_mode` (parsed at `blocks/shader.rs:140`)
+        // and `BSShaderPropertyData.env_map_scale` (line 139's
+        // embedded base) as the PPLighting block above. Pre-#773
+        // both fields fell off the import path here too. CLAMP-on-
+        // edge HUD scope crosshairs / VATS overlays / blood
+        // splats authoring `texture_clamp_mode != 3` (WRAP)
+        // silently fell back to default.
+        //
+        // #2328 / FO3-D1-06 — gate on the `_consumed` flags (see
+        // `apply_pp_lighting_property`'s comment for the rationale):
+        // the shape's own direct property wins over an inherited
+        // parent's, matching the documented precedence (#208) instead
+        // of last-writer-wins. #4401 — displacement re-latches the
+        // clamp, same exception as the PPLighting site.
+        if base_displaced_legacy || !info.texture_clamp_mode_consumed {
+            info.texture_clamp_mode = shader.texture_clamp_mode as u8;
+            info.texture_clamp_mode_consumed = true;
+        }
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+        // FO3/FNV `BSShaderNoLightingProperty` is the original
+        // engine's fullbright / unlit shader — the texture (× vertex
+        // color) IS the final pixel: terminal screens, computer text,
+        // neon/sign faces, HUD/scope overlays, blood-splat decals. Tag
+        // it `MATERIAL_KIND_NO_LIGHTING` (102) so `triangle.frag`
+        // short-circuits the lit path and emits the texture directly —
+        // NO scene lighting, NO GI, NO camera-distance term. Pre-tag
+        // these went through the full lit pipeline (`material_kind = 0`)
+        // and dimmed with distance as their GI contribution faded at
+        // the rtLOD tier — the user-reported "self-illumination dims
+        // with distance" (2026-05-27).
+        //
+        // Inlined literal (nif is upstream of renderer in the dep
+        // graph, same as the effect-shader `= 101` above); pinned by
+        // `nolighting_sets_material_kind_to_102`. Guarded on the
+        // still-default kind so a classification already made this
+        // pass isn't demoted (PP / effect / NoLighting are mutually
+        // exclusive in vanilla, but the guard keeps last-writer-wins
+        // honest).
+        if info.material_kind == 0 {
+            info.material_kind = 102;
+        }
+    }
+}
+
+/// `TileShaderProperty` / `SkyShaderProperty` / `TallGrassShaderProperty`
+/// / `WaterShaderProperty` (non-BS, FO3/FNV legacy) — each shares the
+/// `BSShaderPropertyData` base for `env_map_scale`; the first three also
+/// carry a `file_name`.
+fn apply_misc_shader_properties(
+    scene: &NifScene,
+    idx: usize,
+    pool: &mut StringPool,
+    info: &mut MaterialInfo,
+) {
+    // #940 / NIF-D4-NEW-01 — `TileShaderProperty` /
+    // `SkyShaderProperty` / `TallGrassShaderProperty` each carry a
+    // `file_name: String` populated by their dedicated parsers
+    // (#455 / #550 / #474) — the import walker was never updated
+    // to consume them, so FO3/FNV HUD tiles, sky domes, and tall
+    // grass imported with `texture_path = None` and the renderer
+    // fell back to the magenta placeholder. Last-writer-wins
+    // matches the existing `texture_path.is_none()` policy on the
+    // PP / NoLighting branches.
+    //
+    // #1243 / NIF-DIM4-NEW-02 — the `WaterShaderProperty` (non-BS,
+    // FO3/FNV legacy) was omitted by the #940 pass on the (stale)
+    // reasoning that "our BSShaderProperty base data isn't yet
+    // plumbed into MaterialInfo." It already was — the Tile / Sky
+    // / TallGrass branches below all reach `shader.shader.env_map_scale`
+    // through the same field. `WaterShaderProperty` has no `file_name`
+    // (the water texture lives outside the property), so only the
+    // env_map_scale rides through.
+    // #2328 / FO3-D1-06 — every `texture_clamp_mode`/`env_map_scale`
+    // write below is gated on the `_consumed` flags so a shape's own
+    // direct property (checked first by `apply_legacy_property_chain`)
+    // takes priority over an inherited parent NiNode's, matching the
+    // documented precedence (#208) instead of last-writer-wins.
+    if let Some(shader) = scene.get_as::<TileShaderProperty>(idx) {
+        let file_name = intern_texture_path(pool, &shader.file_name);
+        let base_displaced_legacy = claim_shader_texture(
+            &mut info.texture_path,
+            &mut info.texturing_property_roles,
+            TEXTURING_BASE,
+            file_name,
+        );
+        // #4401 — displacement re-latches the clamp (see the PPLighting
+        // site for the rationale).
+        if base_displaced_legacy || !info.texture_clamp_mode_consumed {
+            info.texture_clamp_mode = shader.texture_clamp_mode as u8;
+            info.texture_clamp_mode_consumed = true;
+        }
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+    }
+    if let Some(shader) = scene.get_as::<SkyShaderProperty>(idx) {
+        let file_name = intern_texture_path(pool, &shader.file_name);
+        let base_displaced_legacy = claim_shader_texture(
+            &mut info.texture_path,
+            &mut info.texturing_property_roles,
+            TEXTURING_BASE,
+            file_name,
+        );
+        // #4401 — displacement re-latches the clamp (see the PPLighting
+        // site for the rationale).
+        if base_displaced_legacy || !info.texture_clamp_mode_consumed {
+            info.texture_clamp_mode = shader.texture_clamp_mode as u8;
+            info.texture_clamp_mode_consumed = true;
+        }
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+    }
+    if let Some(shader) = scene.get_as::<TallGrassShaderProperty>(idx) {
+        let file_name = intern_texture_path(pool, &shader.file_name);
+        claim_shader_texture(
+            &mut info.texture_path,
+            &mut info.texturing_property_roles,
+            TEXTURING_BASE,
+            file_name,
+        );
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+    }
+    // #1856 — `env_map_scale` is the only value payload here: per
+    // nif.xml line 6322 the FO3/FNV
+    // `WaterShaderProperty` inherits `BSShaderProperty` with no fields
+    // of its own. The `water_shader_flags` word an audit might expect
+    // to see set lives only on the Skyrim-era `BSWaterShaderProperty`
+    // (nif.xml line 6705, handled in `dedicated_shader::apply_bs_water_shader`);
+    // forwarding this block's base `shader_flags_1/2` into it would mix
+    // `BSShaderFlags` with `WaterShaderPropertyFlags`.
+    if let Some(shader) = scene.get_as::<WaterShaderProperty>(idx) {
+        info.is_water_shader = true;
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+    }
+}
+
+/// `BSShaderPropertyBaseOnly` — `HairShaderProperty` /
+/// `VolumetricFogShaderProperty` / `DistantLODShaderProperty` /
+/// `BSDistantTreeShaderProperty`: base-only shape, `env_map_scale` only.
+fn apply_base_only_shader_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // #1244 / NIF-DIM4-NEW-03 — `HairShaderProperty`,
+    // `VolumetricFogShaderProperty`, `DistantLODShaderProperty`,
+    // and `BSDistantTreeShaderProperty` all share the
+    // `BSShaderPropertyBaseOnly` parser shape (#717): only
+    // `NiObjectNETData` + `BSShaderPropertyData` base, no
+    // `file_name`, no `texture_clamp_mode` (the base struct holds
+    // shader_type / flags / env_map_scale; clamp lives on the
+    // BSShaderLightingProperty layer, which these subclasses do
+    // NOT inherit per nif.xml lines 6346/6350/6359/6363). Only
+    // `env_map_scale` is plumbable here. Oblivion-era hair NIFs
+    // are the most visible case — reflective hair never received
+    // its authored env modulator pre-fix.
+    if let Some(shader) = scene.get_as::<BSShaderPropertyBaseOnly>(idx) {
+        // #2328 / FO3-D1-06 — same `_consumed` gate as the sibling
+        // shader-property branches; see `apply_pp_lighting_property`.
+        if !info.env_map_scale_consumed {
+            info.env_map_scale =
+                legacy_env_map_scale(shader.shader.shader_flags_1, shader.shader.env_map_scale);
+            info.env_map_scale_consumed = true;
+        }
+        // #4237 / FO3-D1-2026-09-11-02 — same `_consumed` precedence gate,
+        // carrying the window-specific env-mapping signal alongside the
+        // scale it already gates.
+        if !info.window_env_mapping_consumed {
+            info.window_env_mapping = legacy_window_env_mapping(shader.shader.shader_flags_1);
+            info.window_env_mapping_consumed = true;
+        }
+    }
+}
+
+/// `NiStencilProperty` — two-sided promotion + full stencil state
+/// capture for the future renderer-side pipeline-variant landing.
+fn apply_stencil_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // NiStencilProperty — proper parser replaces NiUnknown heuristic.
+    // Two-sided promotion is the 95% case (`draw_mode` 0 / 3); the
+    // remaining stencil test/write fields ride on
+    // `info.stencil_state` for the future renderer-side pipeline-
+    // variant landing. See [`StencilState`] docs and #337.
+    if let Some(stencil) = scene.get_as::<NiStencilProperty>(idx) {
+        if !info.two_sided && stencil.is_two_sided() {
+            info.two_sided = true;
+        }
+        info.stencil_state = Some(super::StencilState {
+            enabled: stencil.stencil_enabled,
+            function: stencil.stencil_function,
+            reference: stencil.stencil_ref,
+            mask: stencil.stencil_mask,
+            fail_action: stencil.fail_action,
+            z_fail_action: stencil.z_fail_action,
+            pass_action: stencil.pass_action,
+        });
+    }
+}
+
+/// `NiFlagProperty` subtypes — `NiSpecularProperty` / `NiWireframeProperty`
+/// / `NiShadeProperty` / `NiDitherProperty` (bit 0 of `flags` is the
+/// enable toggle shared by all four; `type_name` distinguishes them).
+fn apply_flag_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // NiFlagProperty subtypes: bit 0 of `flags` is the enable toggle for
+    // all four trivial properties that share this struct. The type_name
+    // distinguishes them at import time (#703).
+    if let Some(flag_prop) = scene.get_as::<NiFlagProperty>(idx) {
+        match flag_prop.block_type_name() {
+            // NiSpecularProperty (issue #220): flags=0 disables specular.
+            // Matte Oblivion/FNV surfaces use this to suppress PBR glare.
+            "NiSpecularProperty" if !flag_prop.enabled() => {
+                info.specular_enabled = false;
+            }
+            // NiWireframeProperty: flags=1 enables wireframe rendering
+            // (polygon_mode = LINE). Not present in Oblivion vanilla but
+            // used by FO3/FNV mods. Consumed (#869): the bool propagates
+            // through ImportedMesh and selects the `vk::PolygonMode::LINE`
+            // pipeline variant (`PipelineKey::Opaque { wireframe }` /
+            // `Blended { .., wireframe }` in pipeline.rs) at draw time.
+            "NiWireframeProperty" if flag_prop.enabled() => {
+                info.wireframe = true;
+            }
+            // NiShadeProperty: flags=0 requests flat shading (no
+            // per-vertex normal interpolation — faceted look). Used on a
+            // handful of Oblivion architectural pieces. Consumed (#869):
+            // sets `INSTANCE_FLAG_FLAT_SHADING` (shader_constants_data.rs),
+            // OR'd into the GpuInstance flags in the draw path and read by
+            // the shader.
+            "NiShadeProperty" if !flag_prop.enabled() => {
+                info.flat_shading = true;
+            }
+            // NiDitherProperty: flags=1 enables 16-bit color dithering,
+            // a legacy hint with no Vulkan analogue. Safe to ignore.
+            _ => {}
+        }
+    }
+}
+
+/// `NiVertexColorProperty` — controls how per-vertex colors participate
+/// in shading (`extract_vertex_colors` enforces the actual Ignore split).
+fn apply_vertex_color_property(scene: &NifScene, idx: usize, info: &mut MaterialInfo) {
+    // NiVertexColorProperty (#214) — controls how per-vertex colors
+    // participate in shading. The default is AmbientDiffuse; the
+    // mesh may instead request Ignore (don't use vertex colors at
+    // all) or Emissive (route them to self-illumination). The
+    // actual behavior split on Ignore is enforced by
+    // `extract_material` below when it decides whether to return
+    // the vertex color vec or fall back to the material diffuse.
+    //
+    // #694 — the property carries a second enum, `lighting_mode`,
+    // that gates which lighting terms actually consume the vertex
+    // color. `from_property` collapses the 2D enum into our 1D
+    // `VertexColorMode` axis: when LIGHTING_E drops the
+    // ambient/diffuse contributions, a SRC_AMB_DIFF vertex_mode
+    // becomes effectively invisible — demote to `Ignore` so the
+    // renderer skips the `texColor * fragColor` double-count.
+    //
+    // #1208 — gate on `!info.has_bs_lighting_shader`. A Skyrim+ mesh
+    // that authors both `BSLightingShaderProperty` (Skyrim+ shader
+    // path; default AmbientDiffuse is the intended mode) AND a
+    // legacy `NiVertexColorProperty` in the inherited NiNode
+    // property chain previously let the legacy property silently
+    // overwrite the Skyrim+ intent. Mirrors the
+    // `if info.texture_path.is_none()` precedence pattern used by
+    // every other secondary-source consumer in this loop.
+    //
+    // #2457 — pre-fix this gated on the broader `has_material_data`,
+    // which the ordinary pre-Skyrim `NiMaterialProperty` arm ALSO
+    // sets. Since the property chain walks in file order, a
+    // `NiMaterialProperty` visited before this property (the common
+    // Oblivion/FO3/FNV property order) latched that gate shut too,
+    // dropping every legacy vertex-color property regardless of
+    // direct-vs-inherited status. Same failure shape #435/N06 already
+    // fixed for `has_uv_transform` — see that field's doc.
+    // `has_bs_lighting_shader` is set ONLY by the actual Skyrim+ arm
+    // #1208 meant to protect, so a `NiMaterialProperty` anywhere in
+    // the chain no longer suppresses this write.
+    if !info.has_bs_lighting_shader {
+        if let Some(vcol) = scene.get_as::<NiVertexColorProperty>(idx) {
+            info.vertex_color_mode =
+                VertexColorMode::from_property(vcol.vertex_mode, vcol.lighting_mode);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shader_flags::fo3nv_f1::{
+        ENVIRONMENT_MAPPING, EYE_ENVIRONMENT_MAPPING, WINDOW_ENVIRONMENT_MAPPING,
+    };
+
+    /// #2315 — the on-disk scalar defaults to 1.0 even when no environment
+    /// mapping was authored. Every legacy shader branch shares this gate, so
+    /// pin both the inactive default and all three authoring variants here.
+    #[test]
+    fn legacy_environment_map_scale_requires_an_authored_mapping_flag() {
+        assert_eq!(legacy_env_map_scale(0, 0.85), 0.0);
+        for flag in [
+            ENVIRONMENT_MAPPING,
+            EYE_ENVIRONMENT_MAPPING,
+            WINDOW_ENVIRONMENT_MAPPING,
+        ] {
+            assert_eq!(legacy_env_map_scale(flag, 0.85), 0.85);
+        }
+    }
+
+    /// FO3-D1-02 / #2317 — either flag bit independently authors POM;
+    /// unrelated bits (and zero) must not.
+    #[test]
+    fn fo3_parallax_authored_requires_one_of_the_two_flag_bits() {
+        use crate::shader_flags::fo3nv_f1::{PARALLAX, PARALLAX_OCCLUSION};
+        assert!(!fo3_parallax_authored(0));
+        assert!(!fo3_parallax_authored(ENVIRONMENT_MAPPING));
+        assert!(fo3_parallax_authored(PARALLAX));
+        assert!(fo3_parallax_authored(PARALLAX_OCCLUSION));
+        assert!(fo3_parallax_authored(PARALLAX | PARALLAX_OCCLUSION));
+    }
+
+    /// FO3-D1-02 / #2317 — the nif.xml on-disk default (1.0) must convert
+    /// to exactly the engine's own "unauthored" default (0.04), and the
+    /// conversion must be linear (proportionate), not clamped/rounded.
+    #[test]
+    fn fo3_parallax_scale_conversion_matches_engine_default_at_nif_default() {
+        assert_eq!(fo3_parallax_scale_to_height_scale(1.0), 0.04);
+        assert_eq!(fo3_parallax_scale_to_height_scale(2.0), 0.08);
+        assert_eq!(fo3_parallax_scale_to_height_scale(0.5), 0.02);
+    }
+}

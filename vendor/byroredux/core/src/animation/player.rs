@@ -1,0 +1,341 @@
+//! Single-clip animation player component and time advancement.
+
+use crate::ecs::sparse_set::SparseSetStorage;
+use crate::ecs::storage::{Component, EntityId};
+
+use super::types::{AnimationClip, CycleType};
+
+/// ECS component that drives animation playback on an entity subtree.
+///
+/// Attached to the root entity of an animated mesh. The animation system
+/// uses the clip's channel map to find child entities by `Name` and
+/// update their `Transform` each frame.
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct AnimationPlayer {
+    pub clip_handle: u32,
+    pub local_time: f32,
+    pub playing: bool,
+    pub speed: f32,
+    /// Tracks ping-pong direction for CycleType::Reverse.
+    pub reverse_direction: bool,
+    /// Root entity of the subtree to animate. When set, name lookups are
+    /// scoped to this entity's descendants only (no global name collisions).
+    pub root_entity: Option<EntityId>,
+    /// Previous frame's local_time — used by `collect_text_key_events()` to
+    /// detect which text keys were crossed during the last `advance_time()`.
+    pub prev_time: f32,
+    /// The time delta [`advance_time`] actually applied last tick, *after*
+    /// `speed` / `frequency` scaling and `finite_time_delta`'s non-finite
+    /// fold.
+    ///
+    /// #3470 — the `(prev_time, local_time)` pair cannot distinguish "N full
+    /// periods elapsed on a `Loop` clip" from "the playhead did not move at
+    /// all": both land on `prev == curr`. The first must fire every text key,
+    /// the second must fire none. Only the applied delta separates them, so
+    /// it is recorded rather than inferred.
+    /// Not persisted (`serde(skip)`): this is per-frame transient state,
+    /// rewritten by the next `advance_*` before any consumer reads it, and a
+    /// freshly-loaded save has by definition not advanced — so the `0.0`
+    /// default is not merely safe but correct, suppressing text keys for that
+    /// first tick exactly as #3470 requires. Keeps the on-disk save shape
+    /// unchanged, so no `FORMAT_MAJOR` bump (SAVE-D2-01 / #1714).
+    #[cfg_attr(feature = "inspect", serde(skip))]
+    pub last_delta: f32,
+}
+
+impl AnimationPlayer {
+    pub fn new(clip_handle: u32) -> Self {
+        Self {
+            clip_handle,
+            local_time: 0.0,
+            playing: true,
+            speed: 1.0,
+            reverse_direction: false,
+            root_entity: None,
+            prev_time: 0.0,
+            last_delta: 0.0,
+        }
+    }
+
+    /// Seed playback to start at the clip's authored `phase` offset (#3345).
+    ///
+    /// Gamebryo's `NiTimeController` maps clip time as `frequency * t + phase`.
+    /// The offset is applied once here, at attach, rather than added on every
+    /// sample: `advance_time` already normalises `local_time` into
+    /// `[0, duration)` per the clip's `CycleType`, and a per-sample addend
+    /// would fight that normalisation on loop wrap.
+    ///
+    /// `prev_time` is seeded to match so the first `collect_text_key_events()`
+    /// call doesn't report every key between 0 and `phase` as freshly crossed.
+    /// A non-finite phase is ignored — it would latch `local_time` to NaN.
+    pub fn with_phase(mut self, phase: f32) -> Self {
+        if phase.is_finite() && phase != 0.0 {
+            self.local_time = phase;
+            self.prev_time = phase;
+        }
+        self
+    }
+
+    /// Create a player scoped to a specific entity subtree.
+    pub fn with_root(mut self, root: EntityId) -> Self {
+        self.root_entity = Some(root);
+        self
+    }
+}
+
+impl Component for AnimationPlayer {
+    type Storage = SparseSetStorage<Self>;
+    /// Membership changes (a player started, replaced or ended) are what re-open an actor to the
+    /// archetype-idle pass (`archetype_idle_system`, #6334); nothing else reads the generation.
+    const TRACK_CHANGES: bool = true;
+}
+
+/// Fold a ping-pong (`CycleType::Reverse`) clock advanced by `delta` back into
+/// `[0, duration]` via a triangle wave over period `2*duration`.
+///
+/// Returns the new `(local_time, reverse_direction)`, where `reverse_direction`
+/// means time is currently moving backward (duration → 0). Unlike a single
+/// reflection, this stays in range for **any** `delta` magnitude (a frame hitch
+/// on a short clip, a large `speed`/`frequency`, or a negative `delta`), because
+/// it reconstructs the monotonic phase, advances it, and wraps a full period.
+pub(crate) fn fold_reverse_time(
+    local_time: f32,
+    reverse_direction: bool,
+    delta: f32,
+    duration: f32,
+) -> (f32, bool) {
+    // #3432 — NaN-safe: `NaN <= 0.0` is false, so a plain `<= 0.0` guard is
+    // NaN-*transparent* and lets a poisoned duration fall through into
+    // `rem_euclid`, which latches `local_time` to NaN for the rest of the
+    // entity's life. `duration.is_nan() || duration <= 0.0` catches NaN
+    // (and non-positive) the same way the sibling `CycleType::Loop` arm's
+    // `duration > 0.0` guard in `advance_time` already does — written this
+    // way rather than `!(duration > 0.0)` per clippy::neg_cmp_op_on_partial_ord
+    // (#4090): the two are equivalent for a non-NaN RHS constant, but the
+    // negated form reads as an accidental double-negative rather than the
+    // deliberate NaN guard it is.
+    if duration.is_nan() || duration <= 0.0 {
+        return (0.0, false);
+    }
+    let period = 2.0 * duration;
+    // Reconstruct the monotonic phase along [0, 2*duration): forward maps
+    // directly, backward is mirrored into the second half.
+    let phase = if reverse_direction {
+        period - local_time
+    } else {
+        local_time
+    };
+    let m = (phase + delta).rem_euclid(period);
+    if m > duration {
+        (period - m, true)
+    } else {
+        (m, false)
+    }
+}
+
+/// A time step the clock can integrate: non-finite deltas advance nothing.
+///
+/// #3258 — `clip.frequency` is raw `NiControllerSequence` data and
+/// `player.speed` is script-settable, so this product is the one place a NaN
+/// or ±inf can reach the animation clock. `CycleType::Clamp` happens to
+/// self-heal (`f32::min` returns the non-NaN operand) and `CycleType::Reverse`
+/// early-returns on its duration guard, but `CycleType::Loop` latches:
+/// `NaN % duration` is NaN and `NaN < 0.0` is false, so neither the wrap nor
+/// the negative repair below can ever recover it and the entity's pose is
+/// poisoned for the rest of its life — the NaN reaches `find_key_pair`, the
+/// sampled bone transform, `GlobalTransform`, and the GPU instance matrix.
+///
+/// `byroredux`'s translate boundary (`anim_convert::sanitized_clip_frequency`)
+/// resolves the file-data half of that product once, at import. This is the
+/// defense-in-depth half, for a clip built by any other producer — the same
+/// posture `apply_speedtree_wind` took for the wind field under #3194.
+pub(crate) fn finite_time_delta(delta: f32) -> f32 {
+    if delta.is_finite() {
+        delta
+    } else {
+        0.0
+    }
+}
+
+/// Advance the animation time according to the cycle type.
+/// Updates `prev_time` to the value of `local_time` before advancing.
+pub fn advance_time(player: &mut AnimationPlayer, clip: &AnimationClip, dt: f32) {
+    if !player.playing {
+        return;
+    }
+
+    player.prev_time = player.local_time;
+    let delta = finite_time_delta(dt * player.speed * clip.frequency);
+    // #3470 — recorded for the text-key visitor, which cannot otherwise tell a
+    // full-period wrap from a zero advance.
+    player.last_delta = delta;
+
+    match clip.cycle_type {
+        CycleType::Clamp => {
+            player.local_time = (player.local_time + delta).min(clip.duration);
+        }
+        CycleType::Loop => {
+            player.local_time += delta;
+            if clip.duration > 0.0 {
+                player.local_time %= clip.duration;
+                if player.local_time < 0.0 {
+                    player.local_time += clip.duration;
+                }
+            }
+        }
+        CycleType::Reverse => {
+            let (local_time, reverse_direction) = fold_reverse_time(
+                player.local_time,
+                player.reverse_direction,
+                delta,
+                clip.duration,
+            );
+            player.local_time = local_time;
+            player.reverse_direction = reverse_direction;
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    //! #3345 — attach-time phase seeding.
+    use super::AnimationPlayer;
+
+    /// `with_phase` seeds both `local_time` and `prev_time` so playback starts
+    /// at the clip's authored offset without the first text-key sweep
+    /// reporting every key in `[0, phase)` as freshly crossed.
+    #[test]
+    fn with_phase_seeds_local_and_prev_time() {
+        let player = AnimationPlayer::new(3).with_phase(0.75);
+        assert_eq!(player.local_time, 0.75);
+        assert_eq!(
+            player.prev_time, 0.75,
+            "prev_time must match so collect_text_key_events doesn't replay \
+             every key before the phase offset on the first tick"
+        );
+    }
+
+    /// A zero phase — every vanilla FNV clip, measured — must be a no-op, and
+    /// a non-finite phase must be rejected rather than latching `local_time`
+    /// to NaN on the first tick.
+    #[test]
+    fn with_phase_ignores_zero_and_non_finite() {
+        for phase in [0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let player = AnimationPlayer::new(1).with_phase(phase);
+            assert_eq!(
+                player.local_time, 0.0,
+                "phase {phase} must leave local_time at the default"
+            );
+            assert_eq!(player.prev_time, 0.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    //! #1980 — the triangle-wave fold shared by `advance_time`
+    //! (`player.rs`) and `advance_stack` (`stack.rs`) must keep
+    //! `local_time` in `[0, duration]` for any `delta` magnitude,
+    //! including one larger than a full `2*duration` period.
+    use super::fold_reverse_time;
+
+    fn in_range(t: f32, duration: f32) -> bool {
+        t >= 0.0 && t <= duration
+    }
+
+    #[test]
+    fn single_reflection_case_matches_legacy() {
+        // 0.8 forward + 0.4 → past 1.0, bounce to 0.8 reversing.
+        let (t, rev) = fold_reverse_time(0.8, false, 0.4, 1.0);
+        assert!((t - 0.8).abs() < 1e-5);
+        assert!(rev);
+    }
+
+    #[test]
+    fn delta_larger_than_full_period_stays_in_range() {
+        let duration = 0.1;
+        // delta 0.55 spans 2.75 periods of 2*duration=0.2.
+        let (t, _) = fold_reverse_time(0.05, false, 0.55, duration);
+        assert!(in_range(t, duration), "t={t} escaped [0,{duration}]");
+    }
+
+    #[test]
+    fn negative_delta_stays_in_range() {
+        let duration = 1.0;
+        // A negative advance (speed<0) folds correctly too.
+        let (t, _) = fold_reverse_time(0.2, false, -3.7, duration);
+        assert!(in_range(t, duration), "t={t} escaped [0,{duration}]");
+    }
+
+    #[test]
+    fn zero_duration_is_safe() {
+        let (t, rev) = fold_reverse_time(0.5, true, 1.0, 0.0);
+        assert_eq!(t, 0.0);
+        assert!(!rev);
+    }
+
+    /// #3432 — `NaN <= 0.0` is false, so a plain `<= 0.0` guard would let a
+    /// NaN duration fall through into `rem_euclid`, latching `local_time`
+    /// to NaN forever. The guard must be NaN-safe (`!(duration > 0.0)`),
+    /// not just non-positive-safe.
+    #[test]
+    fn nan_duration_is_safe() {
+        let (t, rev) = fold_reverse_time(0.5, true, 1.0, f32::NAN);
+        assert_eq!(t, 0.0, "a NaN duration must not reach rem_euclid");
+        assert!(!rev);
+    }
+}
+
+#[cfg(all(test, feature = "inspect"))]
+mod inspect_tests {
+    //! #486 — debug snapshots must preserve ping-pong `reverse_direction`
+    //! (and every other field). Round-trips AnimationPlayer through
+    //! JSON and asserts byte-for-byte recovery of playback state.
+    use super::*;
+
+    #[test]
+    fn reverse_direction_round_trips_through_json() {
+        let mut player = AnimationPlayer::new(42);
+        // Simulate a ping-pong animation that has crossed the end
+        // boundary — `reverse_direction` has latched to true, the
+        // time has rebounded back from past-duration.
+        player.reverse_direction = true;
+        player.local_time = 0.75;
+        player.prev_time = 1.05;
+        player.speed = 1.25;
+        player.playing = true;
+
+        let json = serde_json::to_value(&player).expect("serialize");
+        assert_eq!(
+            json.get("reverse_direction"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let reloaded: AnimationPlayer = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(reloaded.clip_handle, 42);
+        assert!(
+            reloaded.reverse_direction,
+            "ping-pong direction must survive snapshot reload"
+        );
+        assert_eq!(reloaded.local_time, 0.75);
+        assert_eq!(reloaded.prev_time, 1.05);
+        assert_eq!(reloaded.speed, 1.25);
+        assert!(reloaded.playing);
+    }
+
+    #[test]
+    fn default_player_round_trips_cleanly() {
+        // Guard against serde forgetting a field default — the `new`
+        // constructor is the canonical initial state; snapshotting it
+        // immediately should reload identical.
+        let original = AnimationPlayer::new(7);
+        let json = serde_json::to_value(&original).unwrap();
+        let reloaded: AnimationPlayer = serde_json::from_value(json).unwrap();
+        assert_eq!(reloaded.clip_handle, 7);
+        assert!(!reloaded.reverse_direction);
+        assert_eq!(reloaded.local_time, 0.0);
+        assert_eq!(reloaded.speed, 1.0);
+        assert!(reloaded.playing);
+        assert!(reloaded.root_entity.is_none());
+    }
+}

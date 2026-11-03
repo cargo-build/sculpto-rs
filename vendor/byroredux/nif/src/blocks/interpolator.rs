@@ -1,0 +1,1612 @@
+//! NIF interpolator and keyframe data blocks.
+//!
+//! These blocks hold the actual animation keyframe data that controllers reference.
+//! NiTransformInterpolator → NiTransformData (position/rotation/scale keys)
+//! NiFloatInterpolator → NiFloatData (single-channel float keys)
+
+use super::NiObject;
+use crate::impl_ni_object;
+use crate::stream::NifStream;
+use crate::types::{BlockRef, NiQuatTransform};
+use std::any::Any;
+use std::io;
+use std::sync::Arc;
+
+// ── Key types ─────────────────────────────────────────────────────────
+
+/// Interpolation type for keyframe data (nif.xml KeyType enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum KeyType {
+    Linear = 1,
+    Quadratic = 2,
+    Tbc = 3,
+    XyzRotation = 4,
+    /// Step/constant interpolation — value holds until next key. Used by NiBoolData.
+    Constant = 5,
+}
+
+impl KeyType {
+    pub fn from_u32(v: u32) -> io::Result<Self> {
+        match v {
+            1 => Ok(Self::Linear),
+            2 => Ok(Self::Quadratic),
+            3 => Ok(Self::Tbc),
+            4 => Ok(Self::XyzRotation),
+            5 => Ok(Self::Constant),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown KeyType: {}", v),
+            )),
+        }
+    }
+}
+
+/// A single float keyframe.
+#[derive(Debug, Clone, Copy)]
+pub struct FloatKey {
+    pub time: f32,
+    pub value: f32,
+    /// Forward/backward tangents (Quadratic) or TBC params.
+    pub tangent_forward: f32,
+    pub tangent_backward: f32,
+    pub tbc: Option<[f32; 3]>, // tension, bias, continuity
+}
+
+/// A single Vec3 keyframe.
+#[derive(Debug, Clone, Copy)]
+pub struct Vec3Key {
+    pub time: f32,
+    pub value: [f32; 3],
+    pub tangent_forward: [f32; 3],
+    pub tangent_backward: [f32; 3],
+    pub tbc: Option<[f32; 3]>,
+}
+
+/// A single quaternion keyframe.
+#[derive(Debug, Clone, Copy)]
+pub struct QuatKey {
+    pub time: f32,
+    pub value: [f32; 4], // w, x, y, z
+    pub tbc: Option<[f32; 3]>,
+}
+
+/// A single RGBA color keyframe. Used by NiColorData / NiColorInterpolator
+/// for animated emissive, plasma glow, muzzle-flash fades, etc. (nif.xml
+/// `KeyGroup<Color4>`).
+#[derive(Debug, Clone, Copy)]
+pub struct Color4Key {
+    pub time: f32,
+    pub value: [f32; 4], // r, g, b, a
+    pub tangent_forward: [f32; 4],
+    pub tangent_backward: [f32; 4],
+    pub tbc: Option<[f32; 3]>,
+}
+
+/// A typed group of keys with a shared interpolation type.
+#[derive(Debug, Clone)]
+pub struct KeyGroup<K> {
+    pub key_type: KeyType,
+    pub keys: Vec<K>,
+}
+
+/// Per-key reader, parameterised by the keyframe-value type.
+///
+/// Lets `KeyGroup<K>::parse` carry the shared scaffold (read `num_keys`
+/// → early-return on zero → read `key_type` → `allocate_vec` → loop)
+/// once, with each value type providing only the inner per-key body.
+/// `QuatKey` implements this for symmetry with the others; the
+/// XyzRotation special case (delegate to three `KeyGroup<FloatKey>`s)
+/// stays in `NiTransformData::parse` where the version-gated `Order`
+/// float lives.
+///
+/// Past divergent-fix history (#230 TBC-on-rotation, #408 allocate_vec
+/// sweep, #8353092 reject-unknown-float-key) had to touch each scaffold
+/// independently — this trait collapses that.
+pub trait KeyParse: Sized {
+    /// Short label used in error messages — "float", "vec3", "color",
+    /// "quaternion".
+    const KIND_LABEL: &'static str;
+
+    /// Read a single key entry from the stream, given the group's
+    /// chosen `key_type`.
+    fn parse_one(stream: &mut NifStream, key_type: KeyType) -> io::Result<Self>;
+}
+
+impl KeyParse for FloatKey {
+    const KIND_LABEL: &'static str = "float";
+
+    fn parse_one(stream: &mut NifStream, key_type: KeyType) -> io::Result<Self> {
+        let time = stream.read_f32_le()?;
+        let value = stream.read_f32_le()?;
+        let mut tangent_forward = 0.0;
+        let mut tangent_backward = 0.0;
+        let mut tbc = None;
+        match key_type {
+            KeyType::Linear | KeyType::Constant => {}
+            KeyType::Quadratic => {
+                tangent_forward = stream.read_f32_le()?;
+                tangent_backward = stream.read_f32_le()?;
+            }
+            KeyType::Tbc => {
+                let t = stream.read_f32_le()?;
+                let b = stream.read_f32_le()?;
+                let c = stream.read_f32_le()?;
+                tbc = Some([t, b, c]);
+            }
+            KeyType::XyzRotation => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("XyzRotation key type in {} key group", Self::KIND_LABEL),
+                ));
+            }
+        }
+        Ok(FloatKey {
+            time,
+            value,
+            tangent_forward,
+            tangent_backward,
+            tbc,
+        })
+    }
+}
+
+impl KeyParse for Vec3Key {
+    const KIND_LABEL: &'static str = "vec3";
+
+    fn parse_one(stream: &mut NifStream, key_type: KeyType) -> io::Result<Self> {
+        let time = stream.read_f32_le()?;
+        let x = stream.read_f32_le()?;
+        let y = stream.read_f32_le()?;
+        let z = stream.read_f32_le()?;
+        let mut tangent_forward = [0.0; 3];
+        let mut tangent_backward = [0.0; 3];
+        let mut tbc = None;
+        match key_type {
+            KeyType::Linear | KeyType::Constant => {}
+            KeyType::Quadratic => {
+                tangent_forward = [
+                    stream.read_f32_le()?,
+                    stream.read_f32_le()?,
+                    stream.read_f32_le()?,
+                ];
+                tangent_backward = [
+                    stream.read_f32_le()?,
+                    stream.read_f32_le()?,
+                    stream.read_f32_le()?,
+                ];
+            }
+            KeyType::Tbc => {
+                let t = stream.read_f32_le()?;
+                let b = stream.read_f32_le()?;
+                let c = stream.read_f32_le()?;
+                tbc = Some([t, b, c]);
+            }
+            KeyType::XyzRotation => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("XyzRotation key type in {} key group", Self::KIND_LABEL),
+                ));
+            }
+        }
+        Ok(Vec3Key {
+            time,
+            value: [x, y, z],
+            tangent_forward,
+            tangent_backward,
+            tbc,
+        })
+    }
+}
+
+impl KeyParse for Color4Key {
+    const KIND_LABEL: &'static str = "color";
+
+    fn parse_one(stream: &mut NifStream, key_type: KeyType) -> io::Result<Self> {
+        let time = stream.read_f32_le()?;
+        let r = stream.read_f32_le()?;
+        let g = stream.read_f32_le()?;
+        let b = stream.read_f32_le()?;
+        let a = stream.read_f32_le()?;
+        let mut tangent_forward = [0.0; 4];
+        let mut tangent_backward = [0.0; 4];
+        let mut tbc = None;
+        match key_type {
+            KeyType::Linear | KeyType::Constant => {}
+            KeyType::Quadratic => {
+                for slot in tangent_forward.iter_mut() {
+                    *slot = stream.read_f32_le()?;
+                }
+                for slot in tangent_backward.iter_mut() {
+                    *slot = stream.read_f32_le()?;
+                }
+            }
+            KeyType::Tbc => {
+                let t = stream.read_f32_le()?;
+                let b = stream.read_f32_le()?;
+                let c = stream.read_f32_le()?;
+                tbc = Some([t, b, c]);
+            }
+            KeyType::XyzRotation => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("XyzRotation key type in {} key group", Self::KIND_LABEL),
+                ));
+            }
+        }
+        Ok(Color4Key {
+            time,
+            value: [r, g, b, a],
+            tangent_forward,
+            tangent_backward,
+            tbc,
+        })
+    }
+}
+
+impl KeyParse for QuatKey {
+    const KIND_LABEL: &'static str = "quaternion";
+
+    /// Per-key body shared with the hand-rolled scaffold in
+    /// `NiTransformData::parse`. The XyzRotation case is the CALLER's
+    /// responsibility (NiTransformData delegates to three
+    /// `KeyGroup<FloatKey>`s + the version-gated `Order` float);
+    /// reaching this function with `key_type == XyzRotation` is a
+    /// parser bug, not a malformed file.
+    fn parse_one(stream: &mut NifStream, key_type: KeyType) -> io::Result<Self> {
+        let time = stream.read_f32_le()?;
+        let w = stream.read_f32_le()?;
+        let x = stream.read_f32_le()?;
+        let y = stream.read_f32_le()?;
+        let z = stream.read_f32_le()?;
+        let tbc = if key_type == KeyType::Tbc {
+            let t = stream.read_f32_le()?;
+            let b = stream.read_f32_le()?;
+            let c = stream.read_f32_le()?;
+            Some([t, b, c])
+        } else {
+            None
+        };
+        Ok(QuatKey {
+            time,
+            value: [w, x, y, z],
+            tbc,
+        })
+    }
+}
+
+impl<K: KeyParse> KeyGroup<K> {
+    /// Shared scaffold for every keyframe array in the format: read
+    /// `num_keys`, early-return on zero, read `key_type`, allocate the
+    /// backing Vec via `allocate_vec` (the `#[must_use]` budget guard
+    /// from #408 / #831), then delegate per-key reading to `K::parse_one`.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num_keys = stream.read_u32_le()?;
+        if num_keys == 0 {
+            return Ok(Self {
+                key_type: KeyType::Linear,
+                keys: Vec::new(),
+            });
+        }
+        let key_type = KeyType::from_u32(stream.read_u32_le()?)?;
+        let mut keys: Vec<K> = stream.allocate_vec(num_keys)?;
+        for _ in 0..num_keys {
+            keys.push(K::parse_one(stream, key_type)?);
+        }
+        Ok(Self { key_type, keys })
+    }
+}
+
+// ── NiTransformData (aka NiKeyframeData) ──────────────────────────────
+
+/// Keyframe data for a transform animation: rotation, translation, and scale keys.
+#[derive(Debug)]
+pub struct NiTransformData {
+    /// Quaternion rotation keys (Linear or TBC).
+    pub rotation_type: Option<KeyType>,
+    pub rotation_keys: Vec<QuatKey>,
+    /// If rotation_type == XyzRotation, three separate float key groups for X, Y, Z euler angles.
+    pub xyz_rotations: Option<[KeyGroup<FloatKey>; 3]>,
+    /// Translation keys.
+    pub translations: KeyGroup<Vec3Key>,
+    /// Scale keys.
+    pub scales: KeyGroup<FloatKey>,
+}
+
+impl NiTransformData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // Rotation keys
+        let num_rotation_keys = stream.read_u32_le()?;
+        let mut rotation_type = None;
+        let mut rotation_keys = Vec::new();
+        let mut xyz_rotations = None;
+
+        if num_rotation_keys > 0 {
+            let rt = KeyType::from_u32(stream.read_u32_le()?)?;
+            rotation_type = Some(rt);
+
+            if rt == KeyType::XyzRotation {
+                // nif.xml: `Order` float present between RotationType and XYZ KeyGroups on
+                // pre-Gamebryo NIFs (field cond="Rotation Type == 4" until="10.1.0.0").
+                // `until=` is inclusive per the version.rs doctrine — present at
+                // v <= 10.1.0.0.
+                if stream.version() <= crate::version::NifVersion::V10_1_0_0 {
+                    let _order = stream.read_f32_le()?;
+                }
+                // XYZ rotation: no quaternion keys, three float key groups instead
+                let x_keys = KeyGroup::<FloatKey>::parse(stream)?;
+                let y_keys = KeyGroup::<FloatKey>::parse(stream)?;
+                let z_keys = KeyGroup::<FloatKey>::parse(stream)?;
+                xyz_rotations = Some([x_keys, y_keys, z_keys]);
+            } else {
+                // Quaternion keys. Per-key body delegates to
+                // `QuatKey::parse_one` (shared with `KeyGroup<QuatKey>`)
+                // so the TBC handling stays in lockstep with the float
+                // / vec3 / color paths — #230 had to fix the TBC
+                // handling here separately pre-trait. Counts go through
+                // `allocate_vec` (#408 / #764) so a corrupt 0xFFFFFFFF
+                // can't OOM before the inner reads fail.
+                // #2523 — QuatKey's true on-disk size varies by key_type
+                // (20 B Linear/Quadratic/Constant, 32 B Tbc) but
+                // size_of::<QuatKey>() (36 B) is a single fixed value —
+                // using it as a per-element bound over-rejects arrays of
+                // the (common) smaller variants, so this stays on the
+                // loose per-byte bound rather than allocate_vec_sized.
+                rotation_keys = stream.allocate_vec::<QuatKey>(num_rotation_keys)?;
+                for _ in 0..num_rotation_keys {
+                    rotation_keys.push(QuatKey::parse_one(stream, rt)?);
+                }
+            }
+        }
+
+        // Translation keys
+        let translations = KeyGroup::<Vec3Key>::parse(stream)?;
+        // Scale keys
+        let scales = KeyGroup::<FloatKey>::parse(stream)?;
+
+        Ok(Self {
+            rotation_type,
+            rotation_keys,
+            xyz_rotations,
+            translations,
+            scales,
+        })
+    }
+}
+
+// ── NiTransformInterpolator ───────────────────────────────────────────
+
+/// Interpolates a full transform (translation + rotation + scale).
+/// References NiTransformData for the actual keyframes.
+#[derive(Debug)]
+pub struct NiTransformInterpolator {
+    pub transform: NiQuatTransform,
+    pub data_ref: BlockRef,
+}
+
+impl NiTransformInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let transform = stream.read_ni_quat_transform()?;
+        let data_ref = stream.read_block_ref()?;
+        Ok(Self {
+            transform,
+            data_ref,
+        })
+    }
+}
+
+// ── NiLookAtInterpolator ───────────────────────────────────────────────
+//
+// Rotates its parent so a chosen axis tracks a target NiNode. nif.xml
+// line 4352. Replaces the deprecated `NiLookAtController` from 10.2
+// onwards; Bethesda content from FO3+ uses this driving a plain
+// `NiTransformController`. Pre-#NEW the dispatch table had no entry
+// and 18 instances per FNV mesh sweep landed in NiUnknown — surfaced
+// by the R3 per-block histogram.
+//
+// Wire layout (since 10.x; `Transform` field present `until="20.4.0.12"`,
+// which covers every game we target — Oblivion 20.0.0.5, FO3/FNV/SkyrimLE
+// 20.2.0.7, Skyrim SE/FO4/+ 20.2.0.7 — they're all <= 20.4.0.12):
+//
+//   Flags                  (LookAtFlags = u16, 2 B)
+//   Look At                (Ptr → NiNode, 4 B)
+//   Look At Name           (string — table index since 20.1.0.1)
+//   Transform              (NiQuatTransform, 32 B until 20.4.0.12)
+//   Interpolator: Trans    (Ref → NiPoint3Interpolator, 4 B)
+//   Interpolator: Roll     (Ref → NiFloatInterpolator, 4 B)
+//   Interpolator: Scale    (Ref → NiFloatInterpolator, 4 B)
+//
+// The TRS sub-interpolators each animate one channel of the local
+// orientation that gets composed against the look-at solve at runtime;
+// we parse them as plain refs so they land in `NifScene.blocks` for a
+// later constraint-evaluation pass.
+
+/// `LookAtFlags` — nif.xml line 4339. Three-bit ushort. Stored as the
+/// raw u16 with named bit constants below so the parser does not pull
+/// in the `bitflags` crate (none of the rest of the nif crate uses it).
+pub mod look_at_flags {
+    /// Flip the chosen axis (180° around the look direction).
+    pub const LOOK_FLIP: u16 = 0x0001;
+    /// Track with Y as the up axis instead of the default X.
+    pub const LOOK_Y_AXIS: u16 = 0x0002;
+    /// Track with Z as the up axis instead of the default X.
+    pub const LOOK_Z_AXIS: u16 = 0x0004;
+}
+
+#[derive(Debug)]
+pub struct NiLookAtInterpolator {
+    /// Raw flag bits. Test against constants in [`look_at_flags`].
+    pub flags: u16,
+    pub look_at: BlockRef,
+    pub look_at_name: Option<Arc<str>>,
+    /// Pose transform — the static fall-back when the three sub-
+    /// interpolators are null. Present on every game we target
+    /// (`until="20.4.0.12"`).
+    pub transform: NiQuatTransform,
+    pub interp_translation: BlockRef,
+    pub interp_roll: BlockRef,
+    pub interp_scale: BlockRef,
+}
+
+impl NiLookAtInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let flags = stream.read_u16_le()?;
+        let look_at = stream.read_block_ref()?;
+        let look_at_name = stream.read_string()?;
+        let transform = stream.read_ni_quat_transform()?;
+        let interp_translation = stream.read_block_ref()?;
+        let interp_roll = stream.read_block_ref()?;
+        let interp_scale = stream.read_block_ref()?;
+        Ok(Self {
+            flags,
+            look_at,
+            look_at_name,
+            transform,
+            interp_translation,
+            interp_roll,
+            interp_scale,
+        })
+    }
+}
+
+// ── NiFloatInterpolator ───────────────────────────────────────────────
+
+/// Interpolates a single float value. References NiFloatData.
+#[derive(Debug)]
+pub struct NiFloatInterpolator {
+    pub value: f32,
+    pub data_ref: BlockRef,
+}
+
+impl NiFloatInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let value = stream.read_f32_le()?;
+        let data_ref = stream.read_block_ref()?;
+        Ok(Self { value, data_ref })
+    }
+}
+
+// ── NiFloatData ───────────────────────────────────────────────────────
+
+/// A single channel of float keyframes.
+#[derive(Debug)]
+pub struct NiFloatData {
+    pub keys: KeyGroup<FloatKey>,
+}
+
+impl NiFloatData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let keys = KeyGroup::<FloatKey>::parse(stream)?;
+        Ok(Self { keys })
+    }
+}
+
+// ── NiPoint3Interpolator ─────────────────────────────────────────────
+
+/// Interpolates a Vec3 value. References NiPosData.
+#[derive(Debug)]
+pub struct NiPoint3Interpolator {
+    pub value: [f32; 3],
+    pub data_ref: BlockRef,
+}
+
+impl NiPoint3Interpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let x = stream.read_f32_le()?;
+        let y = stream.read_f32_le()?;
+        let z = stream.read_f32_le()?;
+        let data_ref = stream.read_block_ref()?;
+        Ok(Self {
+            value: [x, y, z],
+            data_ref,
+        })
+    }
+}
+
+// ── NiPosData ─────────────────────────────────────────────────────────
+
+/// Vec3 keyframe data (used by NiPoint3Interpolator).
+#[derive(Debug)]
+pub struct NiPosData {
+    pub keys: KeyGroup<Vec3Key>,
+}
+
+impl NiPosData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let keys = KeyGroup::<Vec3Key>::parse(stream)?;
+        Ok(Self { keys })
+    }
+}
+
+// ── NiPathInterpolator ────────────────────────────────────────────────
+//
+// Spline-path interpolator for animated motion along a curve —
+// `NiKeyBasedInterpolator` → `NiInterpolator` → `NiObject`. Door
+// hinges, pendulum swings, wind-turbine blades, hot-air-balloon drift
+// paths and similar environmental motion. nif.xml line 3270. Oblivion
+// vanilla content ships a handful of these; without a parser the
+// `block_sizes`-less Oblivion loader can't skip past the block and the
+// rest of the NIF is truncated. See audit OBL-D5-H2 / #394.
+//
+// Wire layout (24 bytes, version-independent for Oblivion-target
+// parsing):
+//   flags(u16) + bank_dir(i32) + max_bank_angle(f32) + smoothing(f32)
+//   + follow_axis(i16) + path_data(Ref) + percent_data(Ref)
+// = 2 + 4 + 4 + 4 + 2 + 4 + 4 = 24 B
+
+/// `NiPathInterpolator` — spline-path motion driver. See module doc
+/// above.
+#[derive(Debug)]
+pub struct NiPathInterpolator {
+    /// `PathFlags` bits: `CVDataNeedsUpdate` (bit 0), `CurveTypeOpen`
+    /// (bit 1), and Bethesda extensions. Preserved verbatim.
+    pub flags: u16,
+    /// Direction of banking: `-1` = negative, `1` = positive.
+    pub bank_dir: i32,
+    /// Maximum bank angle in radians.
+    pub max_bank_angle: f32,
+    pub smoothing: f32,
+    /// Axis the object aims along when following the path: 0=X, 1=Y,
+    /// 2=Z. Out-of-range values are preserved untouched for the
+    /// consumer to filter.
+    pub follow_axis: i16,
+    /// Reference to an `NiPosData` block carrying the spline control
+    /// points.
+    pub path_data_ref: BlockRef,
+    /// Reference to an `NiFloatData` block carrying
+    /// parametric-position-along-the-path keys.
+    pub percent_data_ref: BlockRef,
+}
+
+impl NiPathInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let flags = stream.read_u16_le()?;
+        let bank_dir = stream.read_i32_le()?;
+        let max_bank_angle = stream.read_f32_le()?;
+        let smoothing = stream.read_f32_le()?;
+        // No `read_i16_le` on NifStream today — follow_axis is 0/1/2
+        // for X/Y/Z so the sign never matters; cast the u16 over.
+        let follow_axis = stream.read_u16_le()? as i16;
+        let path_data_ref = stream.read_block_ref()?;
+        let percent_data_ref = stream.read_block_ref()?;
+        Ok(Self {
+            flags,
+            bank_dir,
+            max_bank_angle,
+            smoothing,
+            follow_axis,
+            path_data_ref,
+            percent_data_ref,
+        })
+    }
+}
+
+// ── NiColorInterpolator ───────────────────────────────────────────────
+
+/// Interpolates an RGBA color value. References NiColorData.
+///
+/// Paired with BSEffectShaderPropertyColorController /
+/// BSLightingShaderPropertyColorController (and historical
+/// NiMaterialColorController targets). Pre-#431 this block landed as
+/// NiUnknown because it wasn't in the dispatch table; downstream
+/// animation extraction silently ran with a default color on every
+/// animated emissive / plasma / muzzle-flash controller.
+#[derive(Debug)]
+pub struct NiColorInterpolator {
+    /// Pose value used when `data_ref` doesn't resolve.
+    pub value: [f32; 4],
+    pub data_ref: BlockRef,
+}
+
+impl NiColorInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let r = stream.read_f32_le()?;
+        let g = stream.read_f32_le()?;
+        let b = stream.read_f32_le()?;
+        let a = stream.read_f32_le()?;
+        let data_ref = stream.read_block_ref()?;
+        Ok(Self {
+            value: [r, g, b, a],
+            data_ref,
+        })
+    }
+}
+
+// ── NiColorData ───────────────────────────────────────────────────────
+
+/// RGBA keyframe data. Wrapped `KeyGroup<Color4>` — same layout shape as
+/// `NiPosData` but four components instead of three.
+#[derive(Debug)]
+pub struct NiColorData {
+    pub keys: KeyGroup<Color4Key>,
+}
+
+impl NiColorData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let keys = KeyGroup::<Color4Key>::parse(stream)?;
+        Ok(Self { keys })
+    }
+}
+
+// ── NiTextKeyExtraData ────────────────────────────────────────────────
+
+/// Text keys embedded in animation files — event markers like "start", "end", "hit".
+#[derive(Debug)]
+pub struct NiTextKeyExtraData {
+    pub name: Option<Arc<str>>,
+    pub text_keys: Vec<(f32, String)>,
+}
+
+impl NiTextKeyExtraData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // #723 / NIF-D1-05 — pre-Gamebryo (v <= 4.2.2.0) NiExtraData
+        // base format: `Next Extra Data: Ref` (linked-list head) +
+        // `Num Bytes: uint` (since 4.0.0.0, until 4.2.2.0). Both `until=`
+        // gates are inclusive per the version.rs doctrine — present at
+        // v <= 4.2.2.0. The gap window (4.2.2.0 < v < 10.0.1.0) carries
+        // neither prefix nor a Name field; v >= 10.0.1.0 inherits
+        // NiObjectNET's Name.
+        //
+        // Pre-fix `read_string()` on a pre-Gamebryo NIF consumed the
+        // `Next Extra Data` ref bytes as if they were a length-
+        // prefixed inline string (read_string's pre-20.1.0.1 path),
+        // then `num_text_keys` read consumed the `Num Bytes` payload
+        // as if it were the key count. Cosmetic on shipped Bethesda
+        // content (none in the pre-Gamebryo band); guards
+        // pre-Gamebryo NetImmerse / Morrowind-era kf compat.
+        let v = stream.version();
+        if v <= crate::version::NifVersion::V4_2_2_0 {
+            let _next_extra_data_ref = stream.read_block_ref()?;
+            if v >= crate::version::NifVersion::V4_0_0_0 {
+                let _num_bytes = stream.read_u32_le()?;
+            }
+        }
+        // NiObjectNET::name (only since 10.0.1.0; pre-Gamebryo and gap
+        // window have no name field).
+        let name = if v >= crate::version::NifVersion::V10_0_1_0 {
+            stream.read_string()?
+        } else {
+            None
+        };
+        // num_text_keys
+        let num_text_keys = stream.read_u32_le()?;
+        // #388: allocate_vec gates `count * size_of::<(f32, String)>` against
+        // the stream budget before any capacity is reserved — a corrupt
+        // u32 that used to OOM the process (135 GB abort on Oblivion
+        // `upperclassdisplaycaseblue01.nif`) now returns `Err` cleanly.
+        let mut text_keys: Vec<(f32, String)> = stream.allocate_vec(num_text_keys)?;
+        for _ in 0..num_text_keys {
+            let time = stream.read_f32_le()?;
+            let text = stream
+                .read_string()?
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            text_keys.push((time, text));
+        }
+        Ok(Self { name, text_keys })
+    }
+}
+
+// ── NiBoolInterpolator ────────────────────────────────────────────────
+
+/// Discriminator for the two wire types that share the
+/// [`NiBoolInterpolator`] Rust struct. `NiBoolTimelineInterpolator` has
+/// the identical serialized layout (nif.xml line 3287 — no additional
+/// fields beyond `NiBoolInterpolator`), but its gameplay semantics differ:
+/// timelines guarantee no key is missed between two updates, so the
+/// importer needs the wire-type tag to wire the right play-head policy.
+/// Mirrors the [`super::tri_shape::BsTriShapeKind`] pattern — #548, #560.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolInterpolatorKind {
+    /// Plain `NiBoolInterpolator` — sample the last passed key.
+    Plain,
+    /// `NiBoolTimelineInterpolator` — second-most-common NiUnknown on
+    /// Skyrim SE (6,796 blocks in vanilla). Wire layout identical to
+    /// `NiBoolInterpolator`; the discriminator distinguishes the
+    /// "don't miss a key between updates" semantics. #548.
+    Timeline,
+}
+
+/// Interpolates a boolean value (visibility). References NiBoolData.
+#[derive(Debug)]
+pub struct NiBoolInterpolator {
+    pub value: bool,
+    pub data_ref: BlockRef,
+    /// Wire-type discriminator. `NiBoolTimelineInterpolator` (nif.xml
+    /// line 3287) shares this struct; the `kind` field is what lets
+    /// downstream importers distinguish the two. See #548.
+    pub kind: BoolInterpolatorKind,
+}
+
+impl NiObject for NiBoolInterpolator {
+    fn block_type_name(&self) -> &'static str {
+        // Static-string contract — dispatch on the wire discriminator
+        // so downstream `block_type_name()` callers see the original
+        // subclass. Consumers that need the timeline semantics should
+        // match on `self.kind` instead.
+        match self.kind {
+            BoolInterpolatorKind::Plain => "NiBoolInterpolator",
+            BoolInterpolatorKind::Timeline => "NiBoolTimelineInterpolator",
+        }
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl NiBoolInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        Self::parse_with_kind(stream, BoolInterpolatorKind::Plain)
+    }
+
+    /// Parse `NiBoolTimelineInterpolator`. Per nif.xml line 3287 the
+    /// subclass adds no fields over `NiBoolInterpolator`; the dispatch
+    /// simply stamps the Timeline discriminator. 8,450 blocks across
+    /// FO3 + FNV + Skyrim SE fell into `NiUnknown` pre-#548 because
+    /// no dispatch arm existed.
+    pub fn parse_timeline(stream: &mut NifStream) -> io::Result<Self> {
+        Self::parse_with_kind(stream, BoolInterpolatorKind::Timeline)
+    }
+
+    fn parse_with_kind(stream: &mut NifStream, kind: BoolInterpolatorKind) -> io::Result<Self> {
+        // nif.xml: NiBoolInterpolator.bool_value is type "bool" (1 byte),
+        // NOT "NiBool" (version-dependent u32/u8). Always a single byte.
+        let value = stream.read_byte_bool()?;
+        let data_ref = stream.read_block_ref()?;
+        Ok(Self {
+            value,
+            data_ref,
+            kind,
+        })
+    }
+}
+
+// ── NiBoolData ────────────────────────────────────────────────────────
+
+/// Boolean keyframe data (on/off visibility keys).
+/// Stored as byte keys (0/1) with the same KeyGroup format as float keys.
+#[derive(Debug)]
+pub struct NiBoolData {
+    pub keys: KeyGroup<FloatKey>,
+}
+
+impl NiBoolData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // Bool data uses byte keys (KeyType is always 1=Linear for bool).
+        // Parsed the same as float key group but values are 0.0/1.0.
+        let num_keys = stream.read_u32_le()?;
+        if num_keys == 0 {
+            return Ok(Self {
+                keys: KeyGroup {
+                    key_type: KeyType::Linear,
+                    keys: Vec::new(),
+                },
+            });
+        }
+        let key_type = KeyType::from_u32(stream.read_u32_le()?)?;
+        let mut keys: Vec<FloatKey> = stream.allocate_vec_min_bytes(num_keys, 5)?;
+        for _ in 0..num_keys {
+            let time = stream.read_f32_le()?;
+            // Bool keys store the value as a u8 (byte)
+            let value = stream.read_u8()? as f32;
+            keys.push(FloatKey {
+                time,
+                value,
+                tangent_forward: 0.0,
+                tangent_backward: 0.0,
+                tbc: None,
+            });
+        }
+        Ok(Self {
+            keys: KeyGroup { key_type, keys },
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "interpolator_tests.rs"]
+mod tests;
+
+// ── NiBlendInterpolator family ──────────────────────────────────────
+
+/// An entry in the blend interpolator's weighted array.
+#[derive(Debug)]
+pub struct InterpBlendItem {
+    pub interpolator_ref: BlockRef,
+    pub weight: f32,
+    pub normalized_weight: f32,
+    pub priority: u8,
+    pub ease_spinner: f32,
+}
+
+/// NiBlendInterpolator base data (abstract in Gamebryo, concrete in our parser).
+///
+/// Used by NiControllerManager for NIF-level animation blending between
+/// sequences. Manager-controlled mode (flag bit 0) is the common case
+/// for Bethesda games — most optional fields are absent.
+#[derive(Debug)]
+pub struct NiBlendInterpolator {
+    pub flags: u8,
+    pub array_size: u8,
+    pub weight_threshold: f32,
+    pub manager_controlled: bool,
+    pub interp_count: u8,
+    pub single_index: u8,
+    pub items: Vec<InterpBlendItem>,
+}
+
+impl NiBlendInterpolator {
+    /// nif.xml splits `NiBlendInterpolator` into three version bands with
+    /// completely different field layouts (only `items[].interpolator_ref`
+    /// and `normalized_weight` are consumed downstream, so the discarded
+    /// fields exist purely for byte-correct stream advancement):
+    ///
+    ///   * `<= 10.1.0.109`: `Array Size`(u16) + `Array Grow By`(u16) +
+    ///     items{ref,weight,normW,**Priority int**,ease = 20 B} +
+    ///     `Manager Controlled`(bool) + `Weight Threshold`(f32) +
+    ///     `Only Use Highest Weight`(bool) + `Interp Count`(u16) +
+    ///     `Single Index`(u16) + optional `Single Interpolator`(Ref) +
+    ///     `Single Time`(f32) at 10.1.0.108..=109 + `High Priority`(int) +
+    ///     `Next High Priority`(int).
+    ///   * `10.1.0.110 ..= 10.1.0.111`: `Array Size`(byte) +
+    ///     items{ref,weight,normW,**Priority byte**,ease = 17 B} +
+    ///     `Manager Controlled`(bool) + `Weight Threshold`(f32) +
+    ///     `Only Use Highest Weight`(bool) + `Interp Count`(byte) +
+    ///     `Single Index`(byte) + `Single Interpolator`(Ref) +
+    ///     `Single Time`(f32) + `High Priority`(sbyte) + `Next High Priority`(sbyte).
+    ///   * `>= 10.1.0.112`: the modern `Flags`-gated layout.
+    ///
+    /// Before #1508 only the modern band existed; the v10.1.0.x menu/anim
+    /// NIFs (Oblivion lockpicking/health-bar/timer) were parsed with the
+    /// wrong layout, under-reading ~67 B per block and cascading
+    /// truncation through the sizeless format. Verified by byte-tracing
+    /// `menus/lockpicking/pickold.nif` (v10.1.0.106): the `<= 10.1.0.109`
+    /// band lands the next block exactly on its name-length boundary.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let version = stream.version();
+        if version <= crate::version::NifVersion::V10_1_0_109 {
+            Self::parse_legacy(stream, /* int_priority */ true)
+        } else if version <= crate::version::NifVersion::V10_1_0_111 {
+            Self::parse_legacy(stream, /* int_priority */ false)
+        } else {
+            debug_assert!(version >= crate::version::NifVersion::V10_1_0_112);
+            Self::parse_modern(stream)
+        }
+    }
+
+    /// Modern (`>= 10.1.0.112`) `Flags`-gated layout.
+    fn parse_modern(stream: &mut NifStream) -> io::Result<Self> {
+        let flags = stream.read_u8()?;
+        let array_size = stream.read_u8()?;
+        let weight_threshold = stream.read_f32_le()?;
+
+        let manager_controlled = flags & 1 != 0;
+
+        let mut interp_count = 0u8;
+        let mut single_index = 0u8;
+        let mut items = Vec::new();
+
+        if !manager_controlled {
+            interp_count = stream.read_u8()?;
+            single_index = stream.read_u8()?;
+            let _high_priority = stream.read_u8()? as i8;
+            let _next_high_priority = stream.read_u8()? as i8;
+            let _single_time = stream.read_f32_le()?;
+            let _high_weights_sum = stream.read_f32_le()?;
+            let _next_high_weights_sum = stream.read_f32_le()?;
+            let _high_ease_spinner = stream.read_f32_le()?;
+
+            // #1885 sibling — same allocate_vec byte-budget guard as the
+            // legacy path below; `items` is empty here (manager-controlled
+            // blends carry no array), so reassigning the guarded Vec is exact.
+            // #3918 sibling — `size_of::<InterpBlendItem>()` is 20 (u8
+            // `priority` padded to 4), but this path reads 4 + 4 + 4 + 1 + 4
+            // = 17 bytes per item. The guard's minimum must be a floor, never
+            // an upper bound, or it rejects valid files whose array ends
+            // within 18% of the stream end.
+            items = stream.allocate_vec_min_bytes::<InterpBlendItem>(array_size as u32, 17)?;
+            for _ in 0..array_size {
+                let interpolator_ref = stream.read_block_ref()?;
+                let weight = stream.read_f32_le()?;
+                let normalized_weight = stream.read_f32_le()?;
+                let priority = stream.read_u8()?;
+                let ease_spinner = stream.read_f32_le()?;
+                items.push(InterpBlendItem {
+                    interpolator_ref,
+                    weight,
+                    normalized_weight,
+                    priority,
+                    ease_spinner,
+                });
+            }
+        }
+
+        Ok(Self {
+            flags,
+            array_size,
+            weight_threshold,
+            manager_controlled,
+            interp_count,
+            single_index,
+            items,
+        })
+    }
+
+    /// Legacy (`<= 10.1.0.111`) layout. `int_priority` selects the
+    /// `<= 10.1.0.109` band (u16 array size + grow-by, int item priority,
+    /// u16 counts, int high-priorities) vs the `10.1.0.110..=111` band
+    /// (byte array size, byte item priority, byte counts + sbyte
+    /// high-priorities). The single interpolator/time pair has its own
+    /// 10.1.0.108..=111 version gate spanning both bands.
+    fn parse_legacy(stream: &mut NifStream, int_priority: bool) -> io::Result<Self> {
+        let array_size = if int_priority {
+            let n = stream.read_u16_le()?;
+            let _array_grow_by = stream.read_u16_le()?;
+            n
+        } else {
+            stream.read_u8()? as u16
+        };
+
+        // #1885 — route the file-driven blend-item count through the
+        // `allocate_vec` byte-budget guard (#408/#764/#768) instead of a raw
+        // `Vec::with_capacity`, so a corrupt count can't reserve past the
+        // bytes actually remaining in the stream. `array_size` is u8/u16 here,
+        // so the cap is modest, but this keeps the crate's one allocation
+        // idiom consistent (mirrors `read_block_ref_list` / `parse_modern`).
+        // #3918 sibling — 17 is the *minimum* on-disk item: this path reads
+        // `priority` as i32 (20 bytes total) only when `int_priority`, and as
+        // u8 (17) otherwise. The guard has to assume the smaller encoding.
+        let mut items = stream.allocate_vec_min_bytes::<InterpBlendItem>(array_size as u32, 17)?;
+        for _ in 0..array_size {
+            let interpolator_ref = stream.read_block_ref()?;
+            let weight = stream.read_f32_le()?;
+            let normalized_weight = stream.read_f32_le()?;
+            // Priority is `int` (<= 10.1.0.109) or `byte` (110..=111).
+            // Only the ref/normalized_weight are used downstream, so we
+            // narrow priority to u8 for storage.
+            let priority = if int_priority {
+                stream.read_i32_le()? as u8
+            } else {
+                stream.read_u8()?
+            };
+            let ease_spinner = stream.read_f32_le()?;
+            items.push(InterpBlendItem {
+                interpolator_ref,
+                weight,
+                normalized_weight,
+                priority,
+                ease_spinner,
+            });
+        }
+
+        let manager_controlled = stream.read_byte_bool()?;
+        let weight_threshold = stream.read_f32_le()?;
+        let _only_use_highest_weight = stream.read_byte_bool()?;
+
+        let (interp_count, single_index) = if int_priority {
+            (stream.read_u16_le()? as u8, stream.read_u16_le()? as u8)
+        } else {
+            (stream.read_u8()?, stream.read_u8()?)
+        };
+
+        // nif.xml gates this pair independently of the surrounding field
+        // widths: it starts at 10.1.0.108, two revisions before the
+        // byte-priority layout begins, and remains through 10.1.0.111.
+        let version = stream.version();
+        if version >= crate::version::NifVersion::V10_1_0_108
+            && version <= crate::version::NifVersion::V10_1_0_111
+        {
+            let _single_interpolator = stream.read_block_ref()?;
+            let _single_time = stream.read_f32_le()?;
+        }
+
+        if int_priority {
+            let _high_priority = stream.read_i32_le()?;
+            let _next_high_priority = stream.read_i32_le()?;
+        } else {
+            let _high_priority = stream.read_u8()? as i8;
+            let _next_high_priority = stream.read_u8()? as i8;
+        }
+
+        Ok(Self {
+            flags: 0,
+            array_size: array_size as u8,
+            weight_threshold,
+            manager_controlled,
+            interp_count,
+            single_index,
+            items,
+        })
+    }
+}
+
+/// NiBlendTransformInterpolator — blends NiQuatTransform values.
+/// The trailing `Value` (NiQuatTransform) field is `until=10.1.0.109`
+/// per nif.xml — present only on the legacy v10.1.0.x band, absent on
+/// 10.1.0.110+ (incl. every retail Bethesda title). (#1508)
+#[derive(Debug)]
+pub struct NiBlendTransformInterpolator {
+    pub base: NiBlendInterpolator,
+}
+
+impl NiBlendTransformInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiBlendInterpolator::parse(stream)?;
+        // `Value` (NiQuatTransform) until 10.1.0.109. `read_ni_quat_transform`
+        // itself honours the `TRS Valid` bool[3] tail on this same band
+        // (#1506), so this is byte-exact.
+        if stream.version() <= crate::version::NifVersion::V10_1_0_109 {
+            let _value = stream.read_ni_quat_transform()?;
+        }
+        Ok(Self { base })
+    }
+}
+
+/// NiBlendFloatInterpolator — blends float values.
+#[derive(Debug)]
+pub struct NiBlendFloatInterpolator {
+    pub base: NiBlendInterpolator,
+    pub value: f32,
+}
+
+impl NiBlendFloatInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiBlendInterpolator::parse(stream)?;
+        let value = stream.read_f32_le()?;
+        Ok(Self { base, value })
+    }
+}
+
+/// NiBlendPoint3Interpolator — blends NiPoint3 (Vec3) values.
+#[derive(Debug)]
+pub struct NiBlendPoint3Interpolator {
+    pub base: NiBlendInterpolator,
+    pub value: [f32; 3],
+}
+
+impl NiBlendPoint3Interpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiBlendInterpolator::parse(stream)?;
+        let x = stream.read_f32_le()?;
+        let y = stream.read_f32_le()?;
+        let z = stream.read_f32_le()?;
+        Ok(Self {
+            base,
+            value: [x, y, z],
+        })
+    }
+}
+
+/// NiBlendBoolInterpolator — blends bool values.
+#[derive(Debug)]
+pub struct NiBlendBoolInterpolator {
+    pub base: NiBlendInterpolator,
+    pub value: u8,
+}
+
+impl NiBlendBoolInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiBlendInterpolator::parse(stream)?;
+        let value = stream.read_u8()?;
+        Ok(Self { base, value })
+    }
+}
+
+// ── NiUVData ──────────────────────────────────────────────────────────
+//
+// Four float KeyGroups that feed NiUVController:
+//   0 = offset U, 1 = offset V, 2 = tiling U, 3 = tiling V.
+// Referenced only by NiUVController. See issue #154.
+
+#[derive(Debug)]
+pub struct NiUVData {
+    /// Four animated UV channels: [offset_u, offset_v, tiling_u, tiling_v].
+    pub groups: [KeyGroup<FloatKey>; 4],
+}
+
+impl NiUVData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let g0 = KeyGroup::<FloatKey>::parse(stream)?;
+        let g1 = KeyGroup::<FloatKey>::parse(stream)?;
+        let g2 = KeyGroup::<FloatKey>::parse(stream)?;
+        let g3 = KeyGroup::<FloatKey>::parse(stream)?;
+        Ok(Self {
+            groups: [g0, g1, g2, g3],
+        })
+    }
+}
+
+// ── NiBSpline* compressed animation family ─────────────────────────────
+//
+// Used pervasively by Skyrim / FO4 KF files for actor body and face
+// animation. Stores quantized control points for open uniform B-splines
+// of degree 3. The interpolator carries per-channel handles that index
+// into `NiBSplineData::compact_control_points` (i16 values).
+//
+// Decompression formula per control point:
+//     value = offset + (short / 32767) * half_range
+//
+// See `anim.rs::extract_transform_channel_bspline` for the De Boor
+// evaluator that turns these into sampled TQS keys.
+
+/// `NiBSplineBasisData` — control-point count for the B-spline basis.
+#[derive(Debug)]
+pub struct NiBSplineBasisData {
+    pub num_control_points: u32,
+}
+
+impl NiBSplineBasisData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num_control_points = stream.read_u32_le()?;
+        Ok(Self { num_control_points })
+    }
+}
+
+/// `NiBSplineData` — flat arrays of B-spline control points.
+///
+/// Both float and compact (i16) arrays can be populated simultaneously
+/// in the same block; handles in the interpolator pick the right slice.
+#[derive(Debug)]
+pub struct NiBSplineData {
+    pub float_control_points: Vec<f32>,
+    pub compact_control_points: Vec<i16>,
+}
+
+impl NiBSplineData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // #981 — bulk-read via `read_pod_vec` wrappers. nif.xml types
+        // `compact_control_points` as `short` (signed 16-bit) but the
+        // on-disk byte layout is identical to u16; `read_i16_array`
+        // does the reinterpretation in-place without a per-element
+        // cast loop.
+        let num_float = stream.read_u32_le()?;
+        let float_control_points = stream.read_f32_array(num_float as usize)?;
+        let num_compact = stream.read_u32_le()?;
+        let compact_control_points = stream.read_i16_array(num_compact as usize)?;
+        Ok(Self {
+            float_control_points,
+            compact_control_points,
+        })
+    }
+}
+
+/// `NiBSplineTransformInterpolator` — B-spline driven transform channel
+/// using **uncompressed** (full-precision f32) control points. Concrete
+/// (non-abstract) per nif.xml line 4132. The compressed companion
+/// [`NiBSplineCompTransformInterpolator`] extends this layout with six
+/// trailing quantization scalars; this base variant ends after the
+/// three handles.
+///
+/// Serialized layout (flat, in inheritance order):
+/// - NiBSplineInterpolator: `start_time`, `stop_time`, `spline_data_ref`, `basis_data_ref`
+/// - NiBSplineTransformInterpolator: `NiQuatTransform` + 3 handles (translation / rotation / scale)
+///
+/// Spline control points live in [`NiBSplineData::float_control_points`]
+/// (uncompressed-spline path, vs `compact_control_points` for the
+/// quantized variant). A handle value of `u32::MAX` means the
+/// corresponding channel is static (use the inherited `transform`
+/// field directly).
+///
+/// Pre-#978 the type had no dispatch arm; the outer parse loop dropped
+/// it via the block_size fallback on FO3+ (channel collapsed to rest
+/// pose) and cascaded the parse on Oblivion (no block_sizes table).
+/// See `docs/audits/AUDIT_NIF_2026-05-12.md` § NIF-D5-NEW-02.
+#[derive(Debug)]
+pub struct NiBSplineTransformInterpolator {
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub spline_data_ref: BlockRef,
+    pub basis_data_ref: BlockRef,
+    /// Static fallback transform when the corresponding handle is invalid.
+    pub transform: NiQuatTransform,
+    pub translation_handle: u32,
+    pub rotation_handle: u32,
+    pub scale_handle: u32,
+}
+
+impl NiBSplineTransformInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let spline_data_ref = stream.read_block_ref()?;
+        let basis_data_ref = stream.read_block_ref()?;
+        let transform = stream.read_ni_quat_transform()?;
+        let translation_handle = stream.read_u32_le()?;
+        let rotation_handle = stream.read_u32_le()?;
+        let scale_handle = stream.read_u32_le()?;
+        Ok(Self {
+            start_time,
+            stop_time,
+            spline_data_ref,
+            basis_data_ref,
+            transform,
+            translation_handle,
+            rotation_handle,
+            scale_handle,
+        })
+    }
+}
+
+/// `NiBSplineFloatInterpolator` — B-spline driven scalar channel using
+/// **uncompressed** (full-precision f32) control points. nif.xml marks
+/// the class `abstract="true"` (line 4108) but the field set is
+/// concrete and on-disk content does ship it (early Gamebryo titles +
+/// FO3/FNV idle KFs that authored verbatim control points instead of
+/// the quantized [`NiBSplineCompFloatInterpolator`] variant).
+///
+/// Serialized layout (flat, in inheritance order):
+/// - NiBSplineInterpolator: `start_time`, `stop_time`, `spline_data_ref`, `basis_data_ref`
+/// - NiBSplineFloatInterpolator: `value` (f32 fallback), `handle` (u32, `0xFFFFFFFF` ≡ static)
+///
+/// Pre-#978 dropped via block_size fallback (FO3+) or parse cascade
+/// (Oblivion). See `docs/audits/AUDIT_NIF_2026-05-12.md` § NIF-D5-NEW-02.
+#[derive(Debug)]
+pub struct NiBSplineFloatInterpolator {
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub spline_data_ref: BlockRef,
+    pub basis_data_ref: BlockRef,
+    /// Static fallback value used when `handle == u32::MAX`.
+    pub value: f32,
+    pub handle: u32,
+}
+
+impl NiBSplineFloatInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let spline_data_ref = stream.read_block_ref()?;
+        let basis_data_ref = stream.read_block_ref()?;
+        let value = stream.read_f32_le()?;
+        let handle = stream.read_u32_le()?;
+        Ok(Self {
+            start_time,
+            stop_time,
+            spline_data_ref,
+            basis_data_ref,
+            value,
+            handle,
+        })
+    }
+}
+
+/// `NiBSplinePoint3Interpolator` — B-spline driven Vec3 channel using
+/// **uncompressed** (full-precision f32) control points. nif.xml marks
+/// the class `abstract="true"` (line 4120) but the field set is
+/// concrete; sibling of [`NiBSplineFloatInterpolator`].
+///
+/// Serialized layout (flat, in inheritance order):
+/// - NiBSplineInterpolator: `start_time`, `stop_time`, `spline_data_ref`, `basis_data_ref`
+/// - NiBSplinePoint3Interpolator: `value` (Vector3 fallback), `handle` (u32, `0xFFFFFFFF` ≡ static)
+///
+/// Pre-#978 dropped via block_size fallback (FO3+) or parse cascade
+/// (Oblivion). See `docs/audits/AUDIT_NIF_2026-05-12.md` § NIF-D5-NEW-02.
+#[derive(Debug)]
+pub struct NiBSplinePoint3Interpolator {
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub spline_data_ref: BlockRef,
+    pub basis_data_ref: BlockRef,
+    /// Static fallback Vec3 used when `handle == u32::MAX`.
+    pub value: [f32; 3],
+    pub handle: u32,
+}
+
+impl NiBSplinePoint3Interpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let spline_data_ref = stream.read_block_ref()?;
+        let basis_data_ref = stream.read_block_ref()?;
+        let vx = stream.read_f32_le()?;
+        let vy = stream.read_f32_le()?;
+        let vz = stream.read_f32_le()?;
+        let handle = stream.read_u32_le()?;
+        Ok(Self {
+            start_time,
+            stop_time,
+            spline_data_ref,
+            basis_data_ref,
+            value: [vx, vy, vz],
+            handle,
+        })
+    }
+}
+
+/// `NiBSplineCompTransformInterpolator` — B-spline driven transform channel
+/// using compact (quantized) control points. Inherits
+/// `NiBSplineTransformInterpolator` → `NiBSplineInterpolator`.
+///
+/// Serialized layout (flat, in inheritance order):
+/// - NiBSplineInterpolator: `start_time`, `stop_time`, `spline_data_ref`, `basis_data_ref`
+/// - NiBSplineTransformInterpolator: `NiQuatTransform` + 3 handles
+/// - NiBSplineCompTransformInterpolator: 6 quantization params (offset + half_range per channel)
+///
+/// A handle value of `u32::MAX` means that channel is static (use the
+/// inherited `transform` field directly).
+#[derive(Debug)]
+pub struct NiBSplineCompTransformInterpolator {
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub spline_data_ref: BlockRef,
+    pub basis_data_ref: BlockRef,
+    /// Static fallback transform when the corresponding handle is invalid.
+    pub transform: NiQuatTransform,
+    pub translation_handle: u32,
+    pub rotation_handle: u32,
+    pub scale_handle: u32,
+    pub translation_offset: f32,
+    pub translation_half_range: f32,
+    pub rotation_offset: f32,
+    pub rotation_half_range: f32,
+    pub scale_offset: f32,
+    pub scale_half_range: f32,
+}
+
+impl NiBSplineCompTransformInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // NiBSplineInterpolator base
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let spline_data_ref = stream.read_block_ref()?;
+        let basis_data_ref = stream.read_block_ref()?;
+
+        // NiBSplineTransformInterpolator
+        let transform = stream.read_ni_quat_transform()?;
+        let translation_handle = stream.read_u32_le()?;
+        let rotation_handle = stream.read_u32_le()?;
+        let scale_handle = stream.read_u32_le()?;
+
+        // NiBSplineCompTransformInterpolator
+        let translation_offset = stream.read_f32_le()?;
+        let translation_half_range = stream.read_f32_le()?;
+        let rotation_offset = stream.read_f32_le()?;
+        let rotation_half_range = stream.read_f32_le()?;
+        let scale_offset = stream.read_f32_le()?;
+        let scale_half_range = stream.read_f32_le()?;
+
+        Ok(Self {
+            start_time,
+            stop_time,
+            spline_data_ref,
+            basis_data_ref,
+            transform,
+            translation_handle,
+            rotation_handle,
+            scale_handle,
+            translation_offset,
+            translation_half_range,
+            rotation_offset,
+            rotation_half_range,
+            scale_offset,
+            scale_half_range,
+        })
+    }
+}
+
+/// `NiBSplineCompFloatInterpolator` — B-spline driven scalar (float)
+/// channel using compact (quantized) control points. Inherits
+/// `NiBSplineFloatInterpolator` → `NiBSplineInterpolator`.
+///
+/// nif.xml wire layout (flat, in inheritance order):
+/// - NiBSplineInterpolator: `start_time` (f32), `stop_time` (f32),
+///   `spline_data_ref` (Ref → NiBSplineData), `basis_data_ref`
+///   (Ref → NiBSplineBasisData)
+/// - NiBSplineFloatInterpolator: `value` (f32 fallback), `handle` (u32,
+///   `0xFFFFFFFF` ≡ static)
+/// - NiBSplineCompFloatInterpolator: `float_offset` (f32),
+///   `float_half_range` (f32) — quantization params
+///
+/// Used by FNV/FO3/Skyrim/FO4 KFs to drive alpha or scale curves on a
+/// `NiControllerSequence`. Pre-#936 the block had no dispatch arm; the
+/// outer parse loop discarded it via the block_size fallback, so paired
+/// float channels alongside `NiBSplineCompTransformInterpolator`
+/// silently collapsed to constant or rest values.
+#[derive(Debug)]
+pub struct NiBSplineCompFloatInterpolator {
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub spline_data_ref: BlockRef,
+    pub basis_data_ref: BlockRef,
+    /// Static fallback value used when `handle == u32::MAX`.
+    pub value: f32,
+    pub handle: u32,
+    pub float_offset: f32,
+    pub float_half_range: f32,
+}
+
+impl NiBSplineCompFloatInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // NiBSplineInterpolator base.
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let spline_data_ref = stream.read_block_ref()?;
+        let basis_data_ref = stream.read_block_ref()?;
+        // NiBSplineFloatInterpolator.
+        let value = stream.read_f32_le()?;
+        let handle = stream.read_u32_le()?;
+        // NiBSplineCompFloatInterpolator.
+        let float_offset = stream.read_f32_le()?;
+        let float_half_range = stream.read_f32_le()?;
+        Ok(Self {
+            start_time,
+            stop_time,
+            spline_data_ref,
+            basis_data_ref,
+            value,
+            handle,
+            float_offset,
+            float_half_range,
+        })
+    }
+}
+
+/// `NiBSplineCompPoint3Interpolator` — B-spline driven Vec3 channel
+/// using compact (quantized) control points. Inherits
+/// `NiBSplinePoint3Interpolator` → `NiBSplineInterpolator`.
+///
+/// nif.xml wire layout (flat, in inheritance order):
+/// - NiBSplineInterpolator: `start_time` (f32), `stop_time` (f32),
+///   `spline_data_ref` (Ref → NiBSplineData), `basis_data_ref`
+///   (Ref → NiBSplineBasisData)
+/// - NiBSplinePoint3Interpolator: `value` (Vector3 fallback), `handle` (u32,
+///   `0xFFFFFFFF` ≡ static)
+/// - NiBSplineCompPoint3Interpolator: `position_offset` (f32),
+///   `position_half_range` (f32) — quantization params
+///
+/// Channel stride for the compact data slice is 3 (x, y, z). Used by
+/// FNV/FO3/Skyrim/FO4 KFs for color / translation curves that ride
+/// alongside `NiBSplineCompTransformInterpolator`. Pre-#936 the block
+/// landed on the NiUnknown recovery path and the channel was silently
+/// dropped.
+#[derive(Debug)]
+pub struct NiBSplineCompPoint3Interpolator {
+    pub start_time: f32,
+    pub stop_time: f32,
+    pub spline_data_ref: BlockRef,
+    pub basis_data_ref: BlockRef,
+    /// Static fallback Vec3 used when `handle == u32::MAX`.
+    pub value: [f32; 3],
+    pub handle: u32,
+    pub position_offset: f32,
+    pub position_half_range: f32,
+}
+
+impl NiBSplineCompPoint3Interpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // NiBSplineInterpolator base.
+        let start_time = stream.read_f32_le()?;
+        let stop_time = stream.read_f32_le()?;
+        let spline_data_ref = stream.read_block_ref()?;
+        let basis_data_ref = stream.read_block_ref()?;
+        // NiBSplinePoint3Interpolator.
+        let vx = stream.read_f32_le()?;
+        let vy = stream.read_f32_le()?;
+        let vz = stream.read_f32_le()?;
+        let handle = stream.read_u32_le()?;
+        // NiBSplineCompPoint3Interpolator.
+        let position_offset = stream.read_f32_le()?;
+        let position_half_range = stream.read_f32_le()?;
+        Ok(Self {
+            start_time,
+            stop_time,
+            spline_data_ref,
+            basis_data_ref,
+            value: [vx, vy, vz],
+            handle,
+            position_offset,
+            position_half_range,
+        })
+    }
+}
+
+/// `BSTreadTransform` (nif.xml line 6857) — one entry in the per-tread
+/// transform array on `BsTreadTransfInterpolator`. Size = 68 bytes
+/// (NiFixedString u32 + 2× NiQuatTransform 32 each).
+#[derive(Debug, Clone)]
+pub struct BsTreadTransform {
+    /// `NiFixedString` — index into the file's string table (u32).
+    /// `None` when index == -1.
+    pub name: Option<Arc<str>>,
+    pub transform_1: NiQuatTransform,
+    pub transform_2: NiQuatTransform,
+}
+
+/// `BSTreadTransfInterpolator` (nif.xml line 6864, `versions=#FO3_AND_LATER#`).
+/// Drives rolling tread / wheel animation on FO3 Liberty Prime, FNV
+/// Ranger Vertibird treads, Skyrim mammoth / horse rolling-stone, and
+/// FO4 Power Armor wheels + Vertibird. Inherits the abstract
+/// `NiInterpolator` (no inherited fields), then adds:
+///
+/// ```text
+/// uint num_tread_transforms
+/// BSTreadTransform[num_tread_transforms] tread_transforms
+/// Ref<NiFloatData> data
+/// ```
+///
+/// Pre-#941 this fell into `NiUnknown` via the `block_size` recovery
+/// path (FO3+ NIFs all carry block_sizes so no drift, but the per-tread
+/// payload was lost — affected wheel / tread animation imported as
+/// static). The parser captures the data; an animation-side consumer
+/// for a "tread-uv" channel is deferred per the issue body.
+#[derive(Debug)]
+pub struct BsTreadTransfInterpolator {
+    pub tread_transforms: Vec<BsTreadTransform>,
+    /// Reference to the `NiFloatData` driving the per-frame tread
+    /// parameter (typically 0..1 around the tread loop).
+    pub data_ref: BlockRef,
+}
+
+impl BsTreadTransfInterpolator {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num = stream.read_u32_le()?;
+        let mut tread_transforms: Vec<BsTreadTransform> = stream.allocate_vec(num)?;
+        for _ in 0..num {
+            // NiFixedString — string-table index (or inline sized
+            // string on pre-string-table builds). `read_string()`
+            // already handles both via the version gate at #615.
+            let name = stream.read_string()?;
+            let transform_1 = stream.read_ni_quat_transform()?;
+            let transform_2 = stream.read_ni_quat_transform()?;
+            tread_transforms.push(BsTreadTransform {
+                name,
+                transform_1,
+                transform_2,
+            });
+        }
+        let data_ref = stream.read_block_ref()?;
+        Ok(Self {
+            tread_transforms,
+            data_ref,
+        })
+    }
+}
+
+impl_ni_object!(
+    NiTransformData,
+    NiTransformInterpolator,
+    NiLookAtInterpolator,
+    NiFloatInterpolator,
+    NiFloatData,
+    NiPoint3Interpolator,
+    NiPosData,
+    NiPathInterpolator,
+    NiColorInterpolator,
+    NiColorData,
+    NiTextKeyExtraData,
+    NiBoolData,
+    NiBlendTransformInterpolator,
+    NiBlendFloatInterpolator,
+    NiBlendPoint3Interpolator,
+    NiBlendBoolInterpolator,
+    NiUVData,
+    NiBSplineBasisData,
+    NiBSplineData,
+    NiBSplineTransformInterpolator,
+    NiBSplineFloatInterpolator,
+    NiBSplinePoint3Interpolator,
+    NiBSplineCompTransformInterpolator,
+    NiBSplineCompFloatInterpolator,
+    NiBSplineCompPoint3Interpolator,
+    BsTreadTransfInterpolator => "BSTreadTransfInterpolator",
+);

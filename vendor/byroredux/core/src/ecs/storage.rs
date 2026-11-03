@@ -1,0 +1,121 @@
+//! Storage trait and Component trait.
+//!
+//! Every component declares its preferred storage backend via an associated
+//! type. The two built-in backends are [`SparseSetStorage`](super::sparse_set::SparseSetStorage)
+//! (default, O(1) insert/remove) and [`PackedStorage`](super::packed::PackedStorage)
+//! (sorted by entity, cache-friendly iteration).
+
+use std::any::Any;
+
+pub type EntityId = u32;
+
+/// Every component declares its own storage backend.
+///
+/// Default choice: `SparseSetStorage<Self>` for gameplay data.
+/// Hot-path components that are read every frame should opt into
+/// `PackedStorage<Self>` for cache-friendly iteration.
+pub trait Component: 'static + Send + Sync + Sized {
+    type Storage: ComponentStorage<Self> + DynStorage + Default + Send + Sync + 'static;
+
+    /// Opt into per-entity change tracking. When `true`, the backing
+    /// storage records every entity whose component is inserted, removed,
+    /// or accessed mutably (`get_mut` / `iter_mut`) into a frame-local
+    /// dirty set that consumers drain via `take_dirty()`. Default `false`
+    /// — the check is a compile-time const, so non-tracked components pay
+    /// nothing (the branch folds away and the dirty `Vec` stays empty).
+    ///
+    /// Enabled for `Transform` / `GlobalTransform` so transform propagation
+    /// and render-instance assembly can skip the entities that did not move
+    /// this frame (the change-detection root fix — see
+    /// `make_transform_propagation_system`). Only [`PackedStorage`] honors
+    /// this today; that's where the tracked components live.
+    const TRACK_CHANGES: bool = false;
+}
+
+/// The storage contract. Both sparse-set and packed backends implement this.
+pub trait ComponentStorage<T: Component> {
+    fn insert(&mut self, entity: EntityId, component: T);
+    fn remove(&mut self, entity: EntityId) -> Option<T>;
+    fn get(&self, entity: EntityId) -> Option<&T>;
+    fn get_mut(&mut self, entity: EntityId) -> Option<&mut T>;
+    fn contains(&self, entity: EntityId) -> bool;
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Insert many `(entity, component)` pairs at once. Default
+    /// implementation loops `insert`; backends that can do better
+    /// (notably [`PackedStorage`](super::packed::PackedStorage), which
+    /// otherwise shifts the backing Vec by O(n) per insert) override
+    /// this with an append + single-sort path.
+    ///
+    /// Called by [`World::insert_batch`](super::world::World::insert_batch)
+    /// so cell-load bulk imports pick up the fast path automatically.
+    /// See #467.
+    fn insert_bulk<I: IntoIterator<Item = (EntityId, T)>>(&mut self, iter: I) {
+        for (entity, component) in iter {
+            self.insert(entity, component);
+        }
+    }
+
+    /// Iterate over all (entity, component) pairs.
+    fn iter(&self) -> Box<dyn Iterator<Item = (EntityId, &T)> + '_>;
+
+    /// Iterate over all (entity, &mut component) pairs.
+    fn iter_mut(&mut self) -> Box<dyn Iterator<Item = (EntityId, &mut T)> + '_>;
+}
+
+/// Object-safe view over a storage of unknown element type.
+///
+/// `ComponentStorage<T>` is parameterized by `T` and returns `Option<T>`
+/// from `remove`, which makes it non-object-safe. `DynStorage` exposes
+/// just the operations `World` needs when walking its storages without
+/// knowing each component type — specifically, removing all of one
+/// entity's components in [`World::despawn`](super::world::World::despawn).
+pub trait DynStorage: Send + Sync + 'static {
+    /// Remove this entity's component from the storage, dropping the value.
+    /// No-op if the entity has no component here.
+    fn remove_entity_erased(&mut self, entity: EntityId);
+
+    /// Remove a sorted, deduplicated batch of entities from this storage.
+    ///
+    /// The default preserves the single-remove behavior. Storage backends may
+    /// override this when they can compact once instead of repeating an
+    /// expensive structural mutation for every entity.
+    fn remove_entities_erased(&mut self, entities: &[EntityId]) {
+        debug_assert!(entities.windows(2).all(|pair| pair[0] < pair[1]));
+        for &entity in entities {
+            self.remove_entity_erased(entity);
+        }
+    }
+
+    /// Drop every component in this storage, leaving it empty but
+    /// reusable. Used by [`World::clear_entities`](super::world::World::clear_entities)
+    /// when a save load replaces the entire entity population — far
+    /// cheaper than walking `next_entity` and despawning one ID at a
+    /// time, and it can't miss a live entity the way an ID sweep would.
+    fn clear_erased(&mut self);
+
+    /// Release memory this storage is holding purely because entity IDs are
+    /// monotonic (#2148).
+    ///
+    /// `SparseSetStorage` indexes `sparse` by raw `EntityId`, and IDs are
+    /// never reclaimed (#372), so its length tracks the global high-water mark
+    /// rather than the live component count: a long exterior-streaming session
+    /// keeps a slot for every entity ever spawned. This truncates the trailing
+    /// run of empty slots and returns the capacity.
+    ///
+    /// Default is a no-op — `PackedStorage` sizes everything by live count and
+    /// has nothing to release. Call at load boundaries, not per frame: the
+    /// scan is cheap but the `shrink_to_fit` reallocates.
+    fn shrink_sparse_tail(&mut self) {}
+
+    /// Upcast to `&dyn Any` so `World` can downcast back to the concrete
+    /// `T::Storage` for typed access.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Mutable counterpart to [`as_any`](Self::as_any).
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}

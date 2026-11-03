@@ -1,0 +1,217 @@
+//! Items extracted from ../mod.rs (refactor stage C).
+//!
+//! Lead types: apply_shader_type_data, capture_shader_type_fields, ShaderTypeFields, capture_effect_shader_data.
+
+use super::*;
+pub use byroredux_core::ecs::components::material::ShaderTypeFields;
+
+/// Lift a `BSEffectShaderProperty` into the importer's
+/// [`BsEffectShaderData`] capture struct. Empty string fields collapse
+/// to `None`. Pre-FO76 inputs leave `refraction_power = None`. See
+/// #345 / audit S4-01.
+pub(crate) fn capture_effect_shader_data(shader: &BSEffectShaderProperty) -> BsEffectShaderData {
+    fn opt(s: &str) -> Option<String> {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+    BsEffectShaderData {
+        falloff_start_angle: shader.falloff_start_angle,
+        falloff_stop_angle: shader.falloff_stop_angle,
+        falloff_start_opacity: shader.falloff_start_opacity,
+        falloff_stop_opacity: shader.falloff_stop_opacity,
+        soft_falloff_depth: shader.soft_falloff_depth,
+        greyscale_texture: opt(&shader.greyscale_texture),
+        env_map_texture: opt(&shader.env_map_texture),
+        normal_texture: opt(&shader.normal_texture),
+        env_mask_texture: opt(&shader.env_mask_texture),
+        env_map_scale: shader.env_map_scale,
+        // refraction_power is FO76-only; the parser fills it with 0.0
+        // on pre-FO76. Surface as `None` so the shader-side dispatch
+        // can branch on `Some(p)` instead of guessing whether 0.0
+        // means "off" or "FO76 with literal 0".
+        refraction_power: (shader.refraction_power != 0.0).then_some(shader.refraction_power),
+        lighting_influence: shader.lighting_influence,
+        env_map_min_lod: shader.env_map_min_lod,
+        texture_clamp_mode: shader.texture_clamp_mode,
+        // #890 — capture the four BSEffect-relevant flag bits via the
+        // typed-word + CRC32-list union helpers so FO76 / Starfield
+        // content (which writes the typed words as zero and rides
+        // exclusively on the CRC arrays) surfaces them as well.
+        effect_soft: is_soft_effect_from_modern_shader_flags(
+            shader.shader_flags_1,
+            &shader.sf1_crcs,
+            &shader.sf2_crcs,
+        ),
+        effect_palette_color: is_palette_color_from_modern_shader_flags(
+            shader.shader_flags_1,
+            &shader.sf1_crcs,
+            &shader.sf2_crcs,
+        ),
+        effect_palette_alpha: is_palette_alpha_from_modern_shader_flags(
+            shader.shader_flags_1,
+            &shader.sf1_crcs,
+            &shader.sf2_crcs,
+        ),
+        effect_lit: is_effect_lit_from_modern_shader_flags(
+            shader.shader_flags_2,
+            &shader.sf1_crcs,
+            &shader.sf2_crcs,
+        ),
+        // #1205 — FO76-only fields (BSVER == 155). Parser stores
+        // textures as `String` (empty on non-FO76); collapse empties
+        // to `None` per the `opt()` pattern. `emittance_color` doesn't
+        // have a "missing" wire signal, so use the all-zero RGB triple
+        // as the sentinel — Bethesda's pre-FO76 default.
+        reflectance_texture: opt(&shader.reflectance_texture),
+        lighting_texture: opt(&shader.lighting_texture),
+        emit_gradient_texture: opt(&shader.emit_gradient_texture),
+        emittance_color: (shader.emittance_color != [0.0; 3]).then_some(shader.emittance_color),
+        luminance: shader.luminance.clone(),
+    }
+}
+
+/// Decode an NiAlphaProperty onto a `MaterialInfo`. `NiAlphaProperty.flags`
+/// packs both alpha-blend (bit 0) and alpha-test (bit 9, mask 0x200) per
+/// nif.xml; `threshold` is a u8 in [0, 255]. See issue #152.
+///
+/// When a material sets both bits (common on Gamebryo foliage, hair,
+/// chain-link fences) we prefer alpha-test over alpha-blend — the
+/// discard + opaque-depth path gives clean cutouts without the z-sort
+/// artifacts that plague back-to-front blend on statics. `alpha_blend`
+/// is intentionally set to `false` in that case so the renderer binds
+/// the opaque pipeline.
+/// Write every `ShaderTypeData` variant's trailing fields onto
+/// `MaterialInfo`. Previously only `EnvironmentMap` was consumed; the
+/// remaining 8 variants (SkinTint, Fo76SkinTint, HairTint, ParallaxOcc,
+/// MultiLayerParallax, SparkleSnow, EyeEnvmap, and the `None`
+/// pass-through for types that carry no trailing data) were pattern-
+/// matched out and dropped. Issue #343 / SK-D3-01.
+///
+/// Renderer-side dispatch on `MaterialInfo.material_kind` landed with
+/// #344 / #562. The live consumers in `triangle.frag` are SkinTint (5),
+/// HairTint (6) and SparkleSnow (14) in the variant ladder,
+/// MultiLayerParallax (11) for the inner layer and its environment
+/// strength (also `include/ray_hit.glsl`), ParallaxOcc (7) through the
+/// POM path (passes / scale), and EnvironmentMap (1) through the
+/// explicit-environment gate. EyeEnvmap (16) and MultiLayerParallax's
+/// `refraction_scale` are packed into the GPU material but not yet
+/// shaded (#5961). The purpose of this function is to ensure no
+/// variant is silently discarded at the import boundary.
+pub(crate) fn apply_shader_type_data(info: &mut MaterialInfo, data: &ShaderTypeData) {
+    // Env-map scale lives on its own field for backwards compatibility with
+    // pre-#343 readers; the other variants copy through `ShaderTypeFields`.
+    //
+    // #4251 — latch `env_map_scale_consumed`, mirroring the #3514/#3517
+    // fix shape for `refraction_strength`/`texture_clamp_mode`: this is a
+    // dedicated-shader (more specific) value and must survive a later
+    // legacy `NiTexturingProperty`/`BSEffectShaderProperty` write, which
+    // already gates on this same latch (`legacy_properties.rs`).
+    if let ShaderTypeData::EnvironmentMap { env_map_scale } = *data {
+        info.env_map_scale = env_map_scale;
+        info.env_map_scale_consumed = true;
+    }
+    // Game-specific shader-type integers are already translated once in
+    // `dedicated_shader::normalize_shader_type`. Keep this function limited to
+    // the variant payload: remapping one tag here was the partial fix that left
+    // FO76 FaceTint/HairTint/EyeEnvmap cross-contaminated (#2579).
+    let fields = capture_shader_type_fields(data);
+    // #623 / SK-D3-07: GpuInstance packs `multi_layer_envmap_strength`
+    // into the `w` slot of the `hair_tint_{r,g,b,_}` vec4 to save
+    // alignment padding (scene_buffer.rs:240-263). The packing is
+    // safe only because `ShaderTypeData` is a single-tag enum, so
+    // `capture_shader_type_fields` populates one or the other but
+    // never both. If a future variant or refactor breaks that, the
+    // assert fires before we silently render hair-tinted meshes
+    // with a stray multi-layer envmap strength (or vice versa).
+    debug_assert!(
+        fields.hair_tint_color.is_none() || fields.multi_layer_envmap_strength.is_none(),
+        "GpuInstance vec4 share is broken: hair_tint and multi_layer_envmap_strength \
+         must never appear together in a single ShaderTypeData capture"
+    );
+    info.skin_tint_color = fields.skin_tint_color.or(info.skin_tint_color);
+    info.skin_tint_alpha = fields.skin_tint_alpha.or(info.skin_tint_alpha);
+    info.hair_tint_color = fields.hair_tint_color.or(info.hair_tint_color);
+    info.eye_cubemap_scale = fields.eye_cubemap_scale.or(info.eye_cubemap_scale);
+    info.eye_left_reflection_center = fields
+        .eye_left_reflection_center
+        .or(info.eye_left_reflection_center);
+    info.eye_right_reflection_center = fields
+        .eye_right_reflection_center
+        .or(info.eye_right_reflection_center);
+    info.parallax_max_passes = fields.parallax_max_passes.or(info.parallax_max_passes);
+    info.parallax_height_scale = fields.parallax_height_scale.or(info.parallax_height_scale);
+    info.multi_layer_inner_thickness = fields
+        .multi_layer_inner_thickness
+        .or(info.multi_layer_inner_thickness);
+    info.multi_layer_refraction_scale = fields
+        .multi_layer_refraction_scale
+        .or(info.multi_layer_refraction_scale);
+    info.multi_layer_inner_layer_scale = fields
+        .multi_layer_inner_layer_scale
+        .or(info.multi_layer_inner_layer_scale);
+    info.multi_layer_envmap_strength = fields
+        .multi_layer_envmap_strength
+        .or(info.multi_layer_envmap_strength);
+    info.sparkle_parameters = fields.sparkle_parameters.or(info.sparkle_parameters);
+}
+
+/// Pull the shader-type-specific trailing fields out of a `ShaderTypeData`
+/// into the core-owned [`ShaderTypeFields`] bundle. Complements
+/// [`apply_shader_type_data`] — both are exhaustive on the 9 variants so
+/// any future addition fails compilation here.
+pub(crate) fn capture_shader_type_fields(data: &ShaderTypeData) -> ShaderTypeFields {
+    let mut f = ShaderTypeFields::default();
+    match *data {
+        ShaderTypeData::None | ShaderTypeData::EnvironmentMap { .. } => {}
+        ShaderTypeData::SkinTint {
+            skin_tint_color,
+            skin_tint_alpha,
+        } => {
+            f.skin_tint_color = Some(skin_tint_color);
+            f.skin_tint_alpha = skin_tint_alpha;
+        }
+        ShaderTypeData::Fo76SkinTint { skin_tint_color } => {
+            f.skin_tint_color = Some([skin_tint_color[0], skin_tint_color[1], skin_tint_color[2]]);
+            f.skin_tint_alpha = Some(skin_tint_color[3]);
+        }
+        ShaderTypeData::HairTint { hair_tint_color } => {
+            f.hair_tint_color = Some(hair_tint_color);
+        }
+        ShaderTypeData::ParallaxOcc { max_passes, scale } => {
+            f.parallax_max_passes = Some(max_passes);
+            f.parallax_height_scale = Some(scale);
+        }
+        ShaderTypeData::MultiLayerParallax {
+            inner_layer_thickness,
+            refraction_scale,
+            inner_layer_texture_scale,
+            envmap_strength,
+        } => {
+            f.multi_layer_inner_thickness = Some(inner_layer_thickness);
+            f.multi_layer_refraction_scale = Some(refraction_scale);
+            f.multi_layer_inner_layer_scale = Some(inner_layer_texture_scale);
+            f.multi_layer_envmap_strength = Some(envmap_strength);
+        }
+        ShaderTypeData::SparkleSnow { sparkle_parameters } => {
+            f.sparkle_parameters = Some(sparkle_parameters);
+        }
+        ShaderTypeData::EyeEnvmap {
+            eye_cubemap_scale,
+            left_eye_reflection_center,
+            right_eye_reflection_center,
+        } => {
+            f.eye_cubemap_scale = Some(eye_cubemap_scale);
+            // #6214 — the centres are positions in the eye shape's Z-up local
+            // space (nif.xml Left/Right Eye Reflection Center); like every other
+            // authored position they cross this boundary Y-up, so the shader's
+            // Y-up instance matrix places them where the iris is.
+            let to_yup = byroredux_core::math::coord::zup_to_yup_pos;
+            f.eye_left_reflection_center = Some(to_yup(left_eye_reflection_center));
+            f.eye_right_reflection_center = Some(to_yup(right_eye_reflection_center));
+        }
+    }
+    f
+}

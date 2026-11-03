@@ -1,0 +1,747 @@
+//! Base class data structs for NIF block inheritance.
+//!
+//! Gamebryo NIF blocks form a class hierarchy:
+//!   NiObject → NiObjectNET → NiAVObject → NiNode / NiGeometry / BSTriShape
+//!   NiObject → NiObjectNET → NiProperty → BSShaderProperty → ...
+//!
+//! These structs extract the shared base class fields so each concrete block
+//! parser delegates to a single implementation instead of duplicating.
+
+use crate::stream::NifStream;
+use crate::types::{BlockRef, NiTransform};
+use crate::version::NifVersion;
+use std::io;
+use std::sync::Arc;
+
+/// NiObjectNET base class fields: name, extra data refs, controller ref.
+///
+/// Every named NIF block (nodes, geometry, properties, textures) inherits these.
+/// Previously duplicated across 11 parsers.
+#[derive(Debug, Clone)]
+pub struct NiObjectNETData {
+    pub name: Option<Arc<str>>,
+    pub extra_data_refs: Vec<BlockRef>,
+    pub controller_ref: BlockRef,
+}
+
+impl NiObjectNETData {
+    /// Parse NiObjectNET fields from the stream.
+    /// Works for all NIF versions (string table or inline, list or single ref).
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let name = stream.read_string()?;
+
+        // Pre-Gamebryo (v < 10.0.1.0): NiObjectNET stores a single extra_data ref
+        // (head of a linked list) instead of a counted array. Each NiExtraData block
+        // has a next_extra_data_ref field that chains them together.
+        let extra_data_refs = if stream.version() < NifVersion::V10_0_1_0 {
+            let r = stream.read_block_ref()?;
+            if r.is_null() {
+                Vec::new()
+            } else {
+                vec![r]
+            }
+        } else {
+            stream.read_block_ref_list()?
+        };
+
+        let controller_ref = stream.read_block_ref()?;
+        Ok(Self {
+            name,
+            extra_data_refs,
+            controller_ref,
+        })
+    }
+}
+
+/// NiAVObject base class fields: flags, transform, properties, collision ref.
+///
+/// Scene graph participants (nodes, geometry) inherit these on top of NiObjectNET.
+/// Previously duplicated across 3 parsers (NiNode, NiTriShape, BsTriShape).
+#[derive(Debug, Clone)]
+pub struct NiAVObjectData {
+    pub net: NiObjectNETData,
+    pub flags: u32,
+    pub transform: NiTransform,
+    pub properties: Vec<BlockRef>,
+    pub collision_ref: BlockRef,
+}
+
+impl NiAVObjectData {
+    /// Parse standard NiAVObject (reads properties list when variant has it).
+    /// Used by NiNode, NiTriShape, NiTriStrips.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let net = NiObjectNETData::parse(stream)?;
+
+        // Flags: u32 for BSVER > 26 (FO3+), u16 for older (Oblivion and non-Bethesda).
+        // nif.xml gates NiAVObject.Flags on `#BSVER# #GT# 26` (uint) vs `#LTE# 26`
+        // (ushort) — a strict *per-file* gate. Use the actual header BSVER, not
+        // `variant().avobject_flags_u32()`: a transitional v20.2.0.7 export with
+        // uv=11/bsver≤26 (NifSkope/newer-tool Oblivion + non-Bethesda content)
+        // detects as the `Fallout3` variant, whose helper says u32 — reading 4
+        // bytes where 2 are on disk and slipping the stream +2. See #1331.
+        let flags = if stream.bsver() > crate::version::bsver::FLAGS_U32_THRESHOLD {
+            stream.read_u32_le()?
+        } else {
+            stream.read_u16_le()? as u32
+        };
+
+        let transform = stream.read_ni_transform()?;
+
+        // Pre-Gamebryo Velocity: nif.xml `until="4.2.2.0"` inclusive (per
+        // niftools/nifly — see version.rs doctrine). Field present at
+        // versions <= 4.2.2.0. Morrowind ships at v4.0.0.2, Civ IV /
+        // Culpa Innata / DAOC at v4.2.2.0 — all read the field.
+        if stream.version() <= NifVersion::V4_2_2_0 {
+            let _velocity = stream.read_ni_point3()?;
+        }
+
+        // Properties list: present on every pre-Skyrim NIF per nif.xml
+        // `#NI_BS_LTE_FO3#` gate (BSVER <= 34). Removed in Skyrim+ where
+        // shader/alpha are dedicated refs on NiGeometry. We use the raw
+        // bsver() directly rather than `variant().has_properties_list()`
+        // because the variant path returns `false` for `Unknown` —
+        // misclassifying non-Bethesda Gamebryo files (Civ IV, Freedom
+        // Force, etc.) and causing 4-byte stream misalignment on every
+        // NiAVObject. Same pattern as the u32/u16 flags check above.
+        // See issue #160.
+        let properties = if stream.bsver() <= crate::version::bsver::FO3_FNV {
+            stream.read_block_ref_list()?
+        } else {
+            Vec::new()
+        };
+
+        // Three version branches per nif.xml:
+        //  - v <= 4.2.2.0 (Morrowind / early NetImmerse): legacy
+        //    `Has Bounding Volume: bool` + optional body
+        //    (since="3.0" until="4.2.2.0", inclusive per the doctrine
+        //    in `version.rs`).
+        //  - v in (4.2.2.0, 10.0.1.0) — the NetImmerse→Gamebryo gap
+        //    window: neither the bounding volume nor a collision ref
+        //    is serialized. Reading `has_bv` here consumes a phantom
+        //    byte and misaligns every downstream NiAVObject in the
+        //    [4.2.3.0, 10.0.0.x] range. See #328 / audit N1-04.
+        //  - v >= 10.0.1.0: dedicated `NiCollisionObject` ref
+        //    (since="10.0.1.0").
+        let collision_ref = if stream.version() >= NifVersion::V10_0_1_0 {
+            stream.read_block_ref()?
+        } else if stream.version() <= NifVersion::V4_2_2_0 {
+            skip_bounding_volume(stream)?;
+            BlockRef::NULL
+        } else {
+            BlockRef::NULL
+        };
+
+        Ok(Self {
+            net,
+            flags,
+            transform,
+            properties,
+            collision_ref,
+        })
+    }
+
+    /// Parse NiAVObject WITHOUT properties list (for BSTriShape).
+    /// BSTriShape inherits NiAVObject but never has a properties array —
+    /// it uses direct shader_property_ref/alpha_property_ref fields instead.
+    pub fn parse_no_properties(stream: &mut NifStream) -> io::Result<Self> {
+        let net = NiObjectNETData::parse(stream)?;
+
+        // BSTriShape is Skyrim+ only — flags are always u32.
+        let flags = stream.read_u32_le()?;
+        let transform = stream.read_ni_transform()?;
+        let collision_ref = stream.read_block_ref()?;
+
+        Ok(Self {
+            net,
+            flags,
+            transform,
+            properties: Vec::new(),
+            collision_ref,
+        })
+    }
+}
+
+/// `NiDynamicEffect` base fields: `Switch State` + `Affected Nodes`.
+///
+/// Exactly two NIF blocks subclass `NiDynamicEffect` — `NiLight`
+/// (`light.rs`) and `NiTextureEffect` (`texture.rs`). Both read this
+/// identical tail immediately after the `NiAVObject` base. FO4
+/// (BSVER >= 130) reparents the subclasses straight onto `NiAVObject`
+/// and drops the plumbing: nif.xml lines 3499/3504 carry
+/// `vercond="#NI_BS_LT_FO4#"` on both fields.
+///
+/// History: the BSVER gate was fixed for `NiLight` under #721 but the
+/// byte-identical copy in `NiTextureEffect` was missed and only fixed
+/// ~500 commits later under #1240 — over-reading 5+ bytes of FO4 data
+/// the whole time. Consolidated here under #1750 / TD2-001 so the gate
+/// has a single home; the next change applies to both subclasses at once.
+#[derive(Debug, Clone)]
+pub struct NiDynamicEffectData {
+    /// Effect is applied to the scene when true. Defaults true (absent)
+    /// at BSVER >= 130.
+    pub switch_state: bool,
+    /// Subtree Ptr-hashes this effect affects (kept raw u32 — Gamebryo
+    /// stores Ptr-typed fields as hashes). Empty at BSVER >= 130.
+    pub affected_nodes: Vec<u32>,
+}
+
+impl NiDynamicEffectData {
+    /// Parse the `NiDynamicEffect` tail. MUST be called immediately after
+    /// [`NiAVObjectData::parse`]. Reads nothing (switch_state=true, no
+    /// affected nodes) when `bsver >= FALLOUT4`, matching nif.xml's
+    /// `#NI_BS_LT_FO4#` gate.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let pre_fo4 = stream.bsver() < crate::version::bsver::FALLOUT4;
+        let switch_state = if pre_fo4 && stream.version() >= NifVersion::V10_1_0_106 {
+            stream.read_u8()? != 0
+        } else {
+            true
+        };
+        let affected_nodes = if pre_fo4 && stream.version() >= NifVersion::V10_1_0_0 {
+            // #981 — bulk-read affected-nodes u32 array.
+            let count = stream.read_u32_le()? as usize;
+            stream.read_u32_array(count)?
+        } else if pre_fo4 && stream.version() <= NifVersion::V4_0_0_2 {
+            // #3717 — nif.xml gives `NiDynamicEffect` a SECOND
+            // affected-nodes field group, gated `until="4.0.0.2"`:
+            // `Affected Nodes` (`Ptr`, <= 3.3.0.13) or
+            // `Affected Node Pointers` (`uint`, 4.0.0.0..=4.0.0.2). Both
+            // sub-ranges are byte-identical on disk — a `count: u32`
+            // followed by `count` 4-byte entries — only the field's
+            // name/type annotation in nif.xml differs between them, so
+            // one read covers both. Oblivion's own `Data/` ships 5 files
+            // in this band (v3.3.0.13 / v4.0.0.2 markers); none carries a
+            // `NiLight` or `NiTextureEffect`, so this arm is untested
+            // against real content — covered by a synthetic fixture.
+            let count = stream.read_u32_le()? as usize;
+            stream.read_u32_array(count)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            switch_state,
+            affected_nodes,
+        })
+    }
+}
+
+/// BSShaderProperty base class fields (FO3/FNV era).
+///
+/// Shared by BSShaderPPLightingProperty and BSShaderNoLightingProperty.
+/// BSLightingShaderProperty (Skyrim+) has a different layout and parses its own fields.
+///
+/// Inheritance chain on disk:
+///   NiProperty → NiShadeProperty → BSShaderProperty → BSShaderLightingProperty
+///
+/// The first u16 (`shade_flags`) is **NiShadeProperty.Flags**, *not*
+/// BSShaderProperty's own shader flags (which are the u32 pair
+/// `shader_flags_1` / `shader_flags_2`). Previously this field was
+/// named `shader_flags` which conflated the two levels. See #167.
+#[derive(Debug, Clone)]
+pub struct BSShaderPropertyData {
+    /// NiShadeProperty flags (u16) — smooth/specular bits at the
+    /// NiShadeProperty inheritance level. NOT the BSShaderProperty
+    /// u32 shader flags.
+    pub shade_flags: u16,
+    pub shader_type: u32,
+    pub shader_flags_1: u32,
+    pub shader_flags_2: u32,
+    pub env_map_scale: f32,
+}
+
+impl BSShaderPropertyData {
+    /// Parse FO3-era BSShaderProperty + BSShaderLightingProperty base fields.
+    /// Returns (shader_data, texture_clamp_mode).
+    pub fn parse_fo3(stream: &mut NifStream) -> io::Result<(Self, u32)> {
+        let shader = Self::parse_base(stream)?;
+        // BSShaderLightingProperty adds texture_clamp_mode.
+        let texture_clamp_mode = stream.read_u32_le()?;
+        Ok((shader, texture_clamp_mode))
+    }
+
+    /// Parse BSShaderProperty base only (no texture_clamp_mode).
+    ///
+    /// Used by blocks that inherit `BSShaderProperty` directly rather than
+    /// via `BSShaderLightingProperty` — e.g. `WaterShaderProperty`,
+    /// `TallGrassShaderProperty`, `DistantLODShaderProperty` (nif.xml
+    /// lines 6322/6354/6346). Previously these were aliased to
+    /// `BSShaderPPLightingProperty::parse` which over-read the Lighting
+    /// branch + refraction + parallax fields, masked by `block_sizes`
+    /// recovery. See issue #474.
+    pub fn parse_base(stream: &mut NifStream) -> io::Result<Self> {
+        let shade_flags = stream.read_u16_le()?;
+        let shader_type = stream.read_u32_le()?;
+        let shader_flags_1 = stream.read_u32_le()?;
+        let shader_flags_2 = stream.read_u32_le()?;
+        let env_map_scale = stream.read_f32_le()?;
+
+        Ok(Self {
+            shade_flags,
+            shader_type,
+            shader_flags_1,
+            shader_flags_2,
+            env_map_scale,
+        })
+    }
+}
+
+// ── Pre-Gamebryo bounding volume ──────────────────────────────────────
+
+/// Read and discard a NiBoundingVolume (pre-Gamebryo NiAVObject).
+/// The bounding volume replaces the collision_ref in NIF v < 10.0.1.0.
+fn skip_bounding_volume(stream: &mut NifStream) -> io::Result<()> {
+    // #1843 (NIF-D1-01) — nif.xml: `<field name="Has Bounding Volume"
+    // type="bool" since="3.0" until="4.2.2.0" />`. The caller reaches this
+    // function for every `stream.version() <= V4_2_2_0`, a range that
+    // spans BOTH the pre-4.1.0.1 32-bit-bool band (Morrowind, v<=4.0.0.2)
+    // and the 8-bit-bool band (4.0.0.3..=4.2.2.0). A fixed 1-byte read is
+    // only correct for the latter half; `read_bool()` is version-aware.
+    let has_bv = stream.read_bool()?;
+    if has_bv {
+        read_and_skip_bounding_volume(stream, 0)?;
+    }
+    Ok(())
+}
+
+/// Maximum `UNION` bounding-volume nesting depth (#4148). Each level costs
+/// only 8 on-disk bytes (`bv_type` + `count`), so with no cap an N-byte
+/// crafted/fuzzed file could drive native Rust call-stack recursion to
+/// depth N/8 — an uncatchable stack overflow (process abort), not a
+/// returned `Err`, since this is real recursion rather than a bounded loop
+/// or heap allocation the crate's `allocate_vec`/`MAX_SINGLE_ALLOC_BYTES`
+/// guards would catch. No legitimate bounding-volume tree nests anywhere
+/// close to this deep; mirrors the depth-cap pattern used for other
+/// recursive NIF/ESM tree walks (e.g. `MAX_COLLISION_SHAPE_DEPTH` in
+/// `import/collision/shape.rs`, the ESM GRUP walker's 64-level cap).
+const MAX_BOUNDING_VOLUME_DEPTH: u32 = 32;
+
+fn read_and_skip_bounding_volume(stream: &mut NifStream, depth: u32) -> io::Result<()> {
+    if depth > MAX_BOUNDING_VOLUME_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "bounding volume nesting exceeds depth limit {MAX_BOUNDING_VOLUME_DEPTH} (#4148)"
+            ),
+        ));
+    }
+    let bv_type = stream.read_u32_le()?;
+    match bv_type {
+        u32::MAX => {} // BASE_BV has no payload.
+        0 => {
+            // SPHERE: center(3×f32) + radius(f32) = 16 bytes
+            stream.skip(16)?;
+        }
+        1 => {
+            // BOX: center(3×f32) + 3 axes(9×f32) + extents(3×f32) = 60 bytes
+            stream.skip(60)?;
+        }
+        2 => {
+            // CAPSULE: center(3×f32) + origin(3×f32) + extent(f32) + radius(f32) = 32 bytes
+            stream.skip(32)?;
+        }
+        3 => {
+            // LOZENGE: radius + center + two axes; 4.2.1.0 adds two extents.
+            // See OpenMW components/nif/node.cpp, BoundingVolume::read.
+            stream.skip(if stream.version() >= NifVersion::V4_2_1_0 {
+                48
+            } else {
+                40
+            })?;
+        }
+        4 => {
+            // UNION: num_bv(u32) + BoundingVolume[num_bv]
+            let count = stream.read_u32_le()?;
+            for _ in 0..count {
+                read_and_skip_bounding_volume(stream, depth + 1)?;
+            }
+        }
+        5 => {
+            // HALF_SPACE: plane, plus an origin starting at 4.2.1.0.
+            stream.skip(if stream.version() >= NifVersion::V4_2_1_0 {
+                28
+            } else {
+                16
+            })?;
+        }
+        _ => {
+            // #4150 — every other arm consumes its body via `stream.skip`;
+            // this one didn't, silently leaving the stream mid-body with
+            // zero bytes consumed. On the no-`block_sizes` band that
+            // misaligns every subsequent field with nothing to catch it.
+            // Returning `Err` here instead engages the caller's existing
+            // recovery paths, matching the file-wide "unknown short-reads
+            // are errors, not silent skips" doctrine.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown bounding volume type {bv_type}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod niavobject_version_gate_tests {
+    use super::*;
+    use crate::header::NifHeader;
+    use crate::stream::NifStream;
+
+    fn header_at(version: NifVersion) -> NifHeader {
+        NifHeader::detached(version, 0, 0)
+    }
+
+    /// Common prologue: NiObjectNET (pre-Gamebryo variant — single
+    /// extra_data ref) + flags (u16 at bsver=0) + identity transform.
+    fn pre_gamebryo_prologue() -> Vec<u8> {
+        let mut d = Vec::new();
+        // NiObjectNET at version < 20.1.0.1: name is an inline
+        // length-prefixed string (u32 length, 0 = empty ⇒ None). No body bytes.
+        d.extend_from_slice(&0u32.to_le_bytes()); // name length = 0
+                                                  // extra_data_ref (single i32 ref, -1 = null) — pre-Gamebryo branch.
+        d.extend_from_slice(&(-1i32).to_le_bytes());
+        // controller_ref (-1 = null).
+        d.extend_from_slice(&(-1i32).to_le_bytes());
+        // flags (bsver=0 ⇒ u16 branch)
+        d.extend_from_slice(&0u16.to_le_bytes());
+        // translation (3 f32)
+        for _ in 0..3 {
+            d.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        // identity 3×3 rotation (9 f32)
+        for row in 0..3 {
+            for col in 0..3 {
+                let v: f32 = if row == col { 1.0 } else { 0.0 };
+                d.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        // scale
+        d.extend_from_slice(&1.0f32.to_le_bytes());
+        d
+    }
+
+    /// Regression: #328 / audit N1-04 — NiAVObject in the
+    /// (4.2.2.0, 10.0.1.0) gap window has neither `Has Bounding Volume`
+    /// (nif.xml until=4.2.2.0) nor `Collision Object` (since=10.0.1.0).
+    /// The parser must consume neither.
+    #[test]
+    fn gap_window_reads_neither_bv_nor_collision_ref() {
+        // 10.0.0.0 — firmly in the gap.
+        let header = header_at(NifVersion::V10_0_0_0);
+        let mut bytes = pre_gamebryo_prologue();
+        // Properties list (bsver=0 ≤ 34 ⇒ list present): zero entries.
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        // No velocity (version > 4.2.2.0).
+        // No bounding volume, no collision_ref — stream ends here.
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiAVObjectData::parse(&mut stream)
+            .expect("NiAVObject should parse in the NetImmerse→Gamebryo gap");
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "gap-window NiAVObject must consume stream exactly — no phantom \
+             has_bv bool and no phantom collision_ref"
+        );
+        assert!(data.collision_ref.is_null());
+        assert!(data.properties.is_empty());
+    }
+
+    /// Pre-Gamebryo (v <= 4.2.2.0 per nif.xml `until="4.2.2.0"` inclusive
+    /// — see version.rs doctrine) still reads the legacy `Has Bounding
+    /// Volume` bool (plus the per-version velocity vector). v4.2.1.0
+    /// sits inside the boundary and exercises the legacy branch.
+    /// has_bv=false keeps the trailing body out of the fixture.
+    #[test]
+    fn pre_gamebryo_consumes_has_bounding_volume_bool() {
+        let header = header_at(NifVersion::V4_2_1_0);
+        let mut bytes = pre_gamebryo_prologue();
+        // Pre-Gamebryo velocity vector (3 f32) — see existing parse() branch.
+        for _ in 0..3 {
+            bytes.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        // Properties list: bsver=0 ≤ 34 ⇒ list present, zero entries.
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        // has_bv = false (no body follows).
+        bytes.push(0u8);
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data =
+            NiAVObjectData::parse(&mut stream).expect("pre-Gamebryo NiAVObject should parse");
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "pre-Gamebryo NiAVObject must consume the velocity + has_bv bool"
+        );
+        assert!(data.collision_ref.is_null());
+    }
+
+    // ── #1331: NiAVObject.Flags width follows per-file BSVER, not variant ──
+
+    /// v20.2.0.7 header with explicit user_version + BSVER (user_version_2).
+    fn header_v20_2_bsver(bsver: u32) -> NifHeader {
+        NifHeader::detached(NifVersion::V20_2_0_7, 11, bsver)
+    }
+
+    /// NiObjectNET prologue for v20.2.0.7 (>= 20.1.0.1 string-table layout):
+    /// name string-index = -1 (None), counted extra_data list = 0,
+    /// controller_ref = -1.
+    fn modern_objectnet_prologue() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&(-1i32).to_le_bytes()); // name index -1 → None
+        d.extend_from_slice(&0u32.to_le_bytes()); // extra_data list count = 0
+        d.extend_from_slice(&(-1i32).to_le_bytes()); // controller_ref = -1
+        d
+    }
+
+    /// NiAVObject tail after `flags`: identity transform (52 B) + empty
+    /// properties list (bsver ≤ 34) + null collision_ref (version ≥ 10.0.1.0).
+    fn modern_avobject_tail() -> Vec<u8> {
+        let mut d = Vec::new();
+        for _ in 0..3 {
+            d.extend_from_slice(&0.0f32.to_le_bytes()); // translation
+        }
+        for row in 0..3 {
+            for col in 0..3 {
+                let v: f32 = if row == col { 1.0 } else { 0.0 };
+                d.extend_from_slice(&v.to_le_bytes()); // identity rotation
+            }
+        }
+        d.extend_from_slice(&1.0f32.to_le_bytes()); // scale
+        d.extend_from_slice(&0u32.to_le_bytes()); // properties list count = 0
+        d.extend_from_slice(&(-1i32).to_le_bytes()); // collision_ref = -1
+        d
+    }
+
+    /// #1331 — a transitional v20.2.0.7 export with bsver=11 (NifSkope /
+    /// newer-tool Oblivion + non-Bethesda content) detects as the `Fallout3`
+    /// variant, but nif.xml gates `NiAVObject.Flags` as `ushort` for
+    /// BSVER ≤ 26. The width must follow the per-file BSVER, not the variant
+    /// helper — otherwise a u32 read slips the stream +2 from `flags` on.
+    /// Red before the fix (variant helper → u32), green after.
+    #[test]
+    fn flags_read_as_u16_when_bsver_le_26() {
+        let header = header_v20_2_bsver(11);
+        let mut bytes = modern_objectnet_prologue();
+        bytes.extend_from_slice(&0xABCDu16.to_le_bytes()); // flags as u16
+        bytes.extend(modern_avobject_tail());
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiAVObjectData::parse(&mut stream)
+            .expect("v20.2.0.7 / bsver=11 NiAVObject should parse");
+        assert_eq!(data.flags, 0xABCD, "bsver ≤ 26 must read flags as u16");
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "u16 flags must consume exactly 2 bytes — a u32 read slips the stream +2"
+        );
+    }
+
+    /// #1331 — retail FO3/FNV (bsver=34 > 26) reads `NiAVObject.Flags` as
+    /// `uint`. Pins the upper branch so the fix doesn't regress sized games.
+    #[test]
+    fn flags_read_as_u32_when_bsver_gt_26() {
+        let header = header_v20_2_bsver(34);
+        let mut bytes = modern_objectnet_prologue();
+        bytes.extend_from_slice(&0x0001_ABCDu32.to_le_bytes()); // flags as u32
+        bytes.extend(modern_avobject_tail());
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiAVObjectData::parse(&mut stream)
+            .expect("v20.2.0.7 / bsver=34 NiAVObject should parse");
+        assert_eq!(data.flags, 0x0001_ABCD, "bsver > 26 must read flags as u32");
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "u32 flags must consume exactly 4 bytes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounding_volume_tests {
+    use super::*;
+    use crate::header::NifHeader;
+    use crate::stream::NifStream;
+
+    fn header() -> NifHeader {
+        NifHeader::detached(NifVersion::V4_2_1_0, 0, 0)
+    }
+
+    #[test]
+    fn legacy_bounding_volume_layouts_preserve_the_following_field() {
+        for version in [
+            NifVersion(0x04000002),
+            NifVersion::V4_2_1_0,
+            NifVersion(0x04020200),
+        ] {
+            let modern = version >= NifVersion::V4_2_1_0;
+            for (kind, size) in [
+                (u32::MAX, 0),
+                (3, if modern { 48 } else { 40 }),
+                (5, if modern { 28 } else { 16 }),
+            ] {
+                let header = NifHeader::detached(version, 0, 0);
+                let mut bytes = 4u32.to_le_bytes().to_vec(); // UNION also checks recursive handling
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&kind.to_le_bytes());
+                bytes.resize(bytes.len() + size, 0);
+                bytes.extend_from_slice(&0x12345678u32.to_le_bytes());
+                let mut stream = NifStream::new(&bytes, &header);
+                read_and_skip_bounding_volume(&mut stream, 0).unwrap();
+                assert_eq!(
+                    stream.read_u32_le().unwrap(),
+                    0x12345678,
+                    "{version:?}, kind {kind}"
+                );
+                assert_eq!(stream.position() as usize, bytes.len());
+                if size > 0 {
+                    let mut truncated = NifStream::new(&bytes[..bytes.len() - 5], &header);
+                    assert!(read_and_skip_bounding_volume(&mut truncated, 0).is_err());
+                }
+            }
+        }
+    }
+
+    /// Regression for #4148 — an unbounded `UNION` chain must not overflow
+    /// the native call stack. 40 nested `UNION(count=1)` levels (320 bytes)
+    /// exceeds `MAX_BOUNDING_VOLUME_DEPTH` (32); the parser must return a
+    /// clean `Err` instead of recursing to depth 40 (or aborting the
+    /// process — this test existing and returning at all is itself part of
+    /// the regression signal, since a real stack overflow wouldn't unwind
+    /// to a `Result`).
+    #[test]
+    fn deeply_nested_union_returns_err_instead_of_overflowing_stack() {
+        let mut bytes = Vec::new();
+        for _ in 0..40 {
+            bytes.extend_from_slice(&4u32.to_le_bytes()); // bv_type = UNION
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        }
+        let header = header();
+        let mut stream = NifStream::new(&bytes, &header);
+        let err = read_and_skip_bounding_volume(&mut stream, 0)
+            .expect_err("40 nested UNION levels must be rejected past the depth cap");
+        // Assert on the specific depth-cap message rather than just
+        // `is_err()` — the fixture also runs out of bytes at depth 40
+        // (no terminal leaf shape), so a plain EOF `Err` from a missing
+        // cap would pass a weaker assertion for the wrong reason.
+        assert!(
+            err.to_string().contains("depth limit"),
+            "must fail via the depth cap, not incidentally via EOF: {err}"
+        );
+    }
+
+    /// A `UNION` chain at or under the depth cap must still parse
+    /// correctly — the cap must not falsely reject legitimate (if unusual)
+    /// shallow nesting.
+    #[test]
+    fn union_nesting_within_depth_cap_still_parses() {
+        let mut bytes = Vec::new();
+        for _ in 0..5 {
+            bytes.extend_from_slice(&4u32.to_le_bytes()); // bv_type = UNION
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        }
+        // Terminal leaf: SPHERE (16 bytes).
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        let header = header();
+        let mut stream = NifStream::new(&bytes, &header);
+        let result = read_and_skip_bounding_volume(&mut stream, 0);
+        assert!(result.is_ok(), "5 levels of nesting is well under the cap");
+        assert_eq!(stream.position() as usize, bytes.len());
+    }
+
+    /// Regression for #4150 — an unrecognized `bv_type` must return `Err`
+    /// (engaging the caller's existing recovery paths) instead of silently
+    /// continuing with zero bytes consumed. Pre-fix this logged a warning
+    /// and returned `Ok(())`, leaving the stream mid-body.
+    #[test]
+    fn unknown_bv_type_returns_err_instead_of_silently_continuing() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&99u32.to_le_bytes()); // unrecognized bv_type
+        let header = header();
+        let mut stream = NifStream::new(&bytes, &header);
+        let result = read_and_skip_bounding_volume(&mut stream, 0);
+        assert!(
+            result.is_err(),
+            "an unrecognized bv_type must return Err, not Ok with zero bytes consumed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ni_dynamic_effect_data_version_gate_tests {
+    use super::*;
+    use crate::header::NifHeader;
+    use crate::stream::NifStream;
+
+    fn header_at(version: NifVersion) -> NifHeader {
+        NifHeader::detached(version, 0, 0)
+    }
+
+    /// #3717 — nif.xml's SECOND `NiDynamicEffect` affected-nodes field
+    /// group (`until="4.0.0.2"`) was never read at all; the parser only
+    /// implemented the `since="10.1.0.0"` pair. No vanilla file in the
+    /// 624,702-file corpus this project has parsed carries a `NiLight` /
+    /// `NiTextureEffect` in this band, so this is a synthetic fixture —
+    /// the issue's own suggested-fix note that there is no vanilla sample
+    /// to regress against.
+    #[test]
+    fn v4_0_0_2_reads_the_affected_nodes_array() {
+        let header = header_at(NifVersion::V4_0_0_2);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // Num Affected Nodes
+        bytes.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        bytes.extend_from_slice(&0x9abc_def0u32.to_le_bytes());
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiDynamicEffectData::parse(&mut stream)
+            .expect("v4.0.0.2 NiDynamicEffect tail should parse");
+        assert!(
+            data.switch_state,
+            "no switch_state field below v10.1.0.106 — must default true"
+        );
+        assert_eq!(data.affected_nodes, vec![0x1234_5678, 0x9abc_def0]);
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "the pre-4.0.0.2 affected-nodes array must be consumed exactly \
+             — a miss here under-reads by 4 + 4×N bytes and cascades, since \
+             files this old have no block_sizes recovery anchor"
+        );
+    }
+
+    /// The lower sub-range (`Affected Nodes` as `Ptr`, `until="3.3.0.13"`)
+    /// is byte-identical on disk to the `4.0.0.0..=4.0.0.2` `uint` arm —
+    /// pin that the same gate covers it too.
+    #[test]
+    fn v3_3_0_13_reads_the_affected_nodes_array() {
+        let header = header_at(NifVersion::V3_3_0_13);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiDynamicEffectData::parse(&mut stream)
+            .expect("v3.3.0.13 NiDynamicEffect tail should parse");
+        assert_eq!(data.affected_nodes, vec![0xdead_beef]);
+        assert_eq!(stream.position() as usize, bytes.len());
+    }
+
+    /// The (4.0.0.2, 10.1.0.0) gap window has neither field group — must
+    /// read nothing, matching `NiAVObjectData`'s own documented gap-window
+    /// discipline (`niavobject_version_gate_tests::
+    /// gap_window_reads_neither_bv_nor_collision_ref`) applied to this
+    /// sibling field.
+    #[test]
+    fn gap_window_reads_nothing() {
+        let header = header_at(NifVersion::V10_0_0_0);
+        let bytes: Vec<u8> = Vec::new();
+
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiDynamicEffectData::parse(&mut stream)
+            .expect("gap-window NiDynamicEffect tail should parse");
+        assert!(data.switch_state);
+        assert!(data.affected_nodes.is_empty());
+        assert_eq!(stream.position() as usize, 0);
+    }
+}

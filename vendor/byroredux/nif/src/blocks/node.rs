@@ -1,0 +1,1263 @@
+//! NiNode — scene graph parent node.
+//!
+//! NiNode is the fundamental grouping object: it has a transform,
+//! a list of children (NiAVObject refs), and a list of properties.
+
+use super::base::NiAVObjectData;
+use super::traits::{HasAVObject, HasObjectNET};
+use super::NiObject;
+use crate::stream::NifStream;
+use crate::types::{BlockRef, NiPoint3, NiTransform};
+use std::any::Any;
+use std::io;
+
+/// Scene graph node (NiNode, BSFadeNode, etc.).
+#[derive(Debug)]
+pub struct NiNode {
+    /// NiObjectNET + NiAVObject base fields.
+    pub av: NiAVObjectData,
+    /// NiNode-specific: child node/geometry references.
+    pub children: Vec<BlockRef>,
+    /// NiNode-specific: dynamic effect references (removed in FO4+).
+    pub effects: Vec<BlockRef>,
+}
+
+impl NiObject for NiNode {
+    fn block_type_name(&self) -> &'static str {
+        "NiNode"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(self)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(self)
+    }
+}
+
+impl HasObjectNET for NiNode {
+    fn name(&self) -> Option<&str> {
+        self.av.net.name.as_deref()
+    }
+    fn name_arc(&self) -> Option<&std::sync::Arc<str>> {
+        self.av.net.name.as_ref()
+    }
+    fn extra_data_refs(&self) -> &[BlockRef] {
+        &self.av.net.extra_data_refs
+    }
+    fn controller_ref(&self) -> BlockRef {
+        self.av.net.controller_ref
+    }
+}
+
+impl HasAVObject for NiNode {
+    fn flags(&self) -> u32 {
+        self.av.flags
+    }
+    fn transform(&self) -> &NiTransform {
+        &self.av.transform
+    }
+    fn properties(&self) -> &[BlockRef] {
+        &self.av.properties
+    }
+    fn collision_ref(&self) -> BlockRef {
+        self.av.collision_ref
+    }
+}
+
+impl NiNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let av = NiAVObjectData::parse(stream)?;
+
+        // NiNode-specific fields
+        let children = stream.read_block_ref_list()?;
+        // FO4+ removes the effects list from NiNode (BSVER >= 130).
+        // Use raw bsver rather than `variant().has_effects_list()` so
+        // non-Bethesda pre-FO4 Gamebryo files (Unknown variant, bsver=0)
+        // still read the list correctly. Same pattern + rationale as
+        // the `has_properties_list` fix in base.rs. See issue #160.
+        let effects = if stream.bsver() < crate::version::bsver::FALLOUT4 {
+            stream.read_block_ref_list()?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            av,
+            children,
+            effects,
+        })
+    }
+}
+
+// ── BSOrderedNode ──────────────────────────────────────────────────
+
+/// BSOrderedNode — NiNode subclass with alpha sort bound for draw ordering.
+///
+/// Used by FO3/FNV for transparent object sorting within a node hierarchy.
+#[derive(Debug)]
+pub struct BsOrderedNode {
+    pub base: NiNode,
+    /// Alpha sort bounding sphere: [x, y, z, radius].
+    pub alpha_sort_bound: [f32; 4],
+    /// Whether the bound is static (doesn't update with animation).
+    pub is_static_bound: bool,
+}
+
+impl NiObject for BsOrderedNode {
+    fn block_type_name(&self) -> &'static str {
+        "BSOrderedNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsOrderedNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let alpha_sort_bound = [
+            stream.read_f32_le()?,
+            stream.read_f32_le()?,
+            stream.read_f32_le()?,
+            stream.read_f32_le()?,
+        ];
+        let is_static_bound = stream.read_u8()? != 0;
+        Ok(Self {
+            base,
+            alpha_sort_bound,
+            is_static_bound,
+        })
+    }
+}
+
+// ── BSValueNode ────────────────────────────────────────────────────
+
+/// BSValueNode — NiNode subclass with an integer value and flags.
+///
+/// Used by FO3/FNV for attaching numeric metadata to scene graph nodes.
+#[derive(Debug)]
+pub struct BsValueNode {
+    pub base: NiNode,
+    pub value: u32,
+    pub value_flags: u8,
+}
+
+impl NiObject for BsValueNode {
+    fn block_type_name(&self) -> &'static str {
+        "BSValueNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsValueNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let value = stream.read_u32_le()?;
+        let value_flags = stream.read_u8()?;
+        Ok(Self {
+            base,
+            value,
+            value_flags,
+        })
+    }
+}
+
+// ── BSMultiBoundNode ────────────────────────────────────────────────
+
+/// BSMultiBoundNode — NiNode subclass with a pre-computed multi-bound
+/// culling volume used for fast rejection of large interior cells.
+///
+/// Wire layout (niflib nif.xml):
+/// ```text
+/// NiNode body
+/// BlockRef multi_bound_ref      ; → BSMultiBound
+/// uint culling_mode             ; only for BSVER >= 83 (Skyrim+)
+/// ```
+///
+/// `culling_mode` values: 0 = normal, 1 = all bounds visible, 2 = all
+/// bounds hidden, 3 = force culled. Only present on Skyrim+ — the FO3/FNV
+/// variant stops at `multi_bound_ref`. See issue #148.
+#[derive(Debug)]
+pub struct BsMultiBoundNode {
+    pub base: NiNode,
+    /// Reference to the associated BSMultiBound block.
+    pub multi_bound_ref: BlockRef,
+    /// Culling mode (Skyrim+ only; FO3/FNV leaves this as 0).
+    pub culling_mode: u32,
+}
+
+impl NiObject for BsMultiBoundNode {
+    fn block_type_name(&self) -> &'static str {
+        "BSMultiBoundNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsMultiBoundNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let multi_bound_ref = stream.read_block_ref()?;
+        // culling_mode is Skyrim+ only (BSVER >= 83). FO3/FNV (bsver=34)
+        // stops after the multi_bound_ref. nif.xml gates on `#BS_GTE_SKY#`
+        // (pure BSVER), so read the file's bsver directly — a `variant()`
+        // helper misfires on the 35..=82 `Unknown` corner. See #1839.
+        let culling_mode = if stream.bsver() >= crate::version::bsver::SKYRIM_LE {
+            stream.read_u32_le()?
+        } else {
+            0
+        };
+        Ok(Self {
+            base,
+            multi_bound_ref,
+            culling_mode,
+        })
+    }
+}
+
+// ── BSTreeNode ───────────────────────────────────────────────────────
+
+/// BSTreeNode — Skyrim SpeedTree root with two bone lists (branches /
+/// trunk) that the engine's tree simulation uses to animate bending
+/// under wind loads. The bones are references to existing `NiNode`
+/// blocks, so the scene walker still descends through the regular
+/// `NiNode.children` path — these extra ref lists are just metadata
+/// for the future SpeedTree runtime.
+///
+/// Wire layout (niflib nif.xml):
+/// ```text
+/// NiNode body
+/// uint num_bones_1
+/// BlockRef[num_bones_1] bones_1
+/// uint num_bones_2
+/// BlockRef[num_bones_2] bones_2
+/// ```
+///
+/// See issue #159.
+#[derive(Debug)]
+pub struct BsTreeNode {
+    pub base: NiNode,
+    /// First bone list — the SpeedTree tool labels this "branch roots".
+    pub bones_1: Vec<BlockRef>,
+    /// Second bone list — the SpeedTree tool labels this "trunk bones".
+    pub bones_2: Vec<BlockRef>,
+}
+
+impl NiObject for BsTreeNode {
+    fn block_type_name(&self) -> &'static str {
+        "BSTreeNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsTreeNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let bones_1 = stream.read_block_ref_list()?;
+        let bones_2 = stream.read_block_ref_list()?;
+        Ok(Self {
+            base,
+            bones_1,
+            bones_2,
+        })
+    }
+}
+
+// ── NiBillboardNode ────────────────────────────────────────────────────
+//
+// Pre-10.1.0.0 the billboard mode was packed into the parent NiAVObject
+// flags (bits 5-6). From 10.1.0.0 onward — including Oblivion v20.0.0.5
+// — it becomes a trailing u16.
+
+/// NiBillboardNode — children face the camera at rendering time.
+#[derive(Debug)]
+pub struct NiBillboardNode {
+    pub base: NiNode,
+    /// 0 = ALWAYS_FACE_CAMERA, 1 = ROTATE_ABOUT_UP,
+    /// 2 = RIGID_FACE_CAMERA, 3 = ALWAYS_FACE_CENTER, 4 = RIGID_FACE_CENTER.
+    pub billboard_mode: u16,
+}
+
+impl NiObject for NiBillboardNode {
+    fn block_type_name(&self) -> &'static str {
+        "NiBillboardNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl NiBillboardNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        // Mode field was introduced in 10.1.0.0. Earlier NIFs pack the
+        // mode into NiAVObject flags (bits 5-6) and have no trailing
+        // field — see nif.xml.
+        let billboard_mode = if stream.version() >= crate::version::NifVersion::V10_1_0_0 {
+            stream.read_u16_le()?
+        } else {
+            0
+        };
+        Ok(Self {
+            base,
+            billboard_mode,
+        })
+    }
+}
+
+// ── NiSwitchNode ───────────────────────────────────────────────────────
+//
+// Groups multiple scenegraph subtrees and exposes a single "active child"
+// index. The flags field was added in 10.1.0.0 — at Oblivion-era versions
+// we always read it.
+
+/// NiSwitchNode — scenegraph node with a single active child.
+#[derive(Debug)]
+pub struct NiSwitchNode {
+    pub base: NiNode,
+    /// Bit 0: update only active child. Bit 1: update controllers.
+    pub switch_flags: u16,
+    /// Active child index into `base.children`.
+    pub index: u32,
+}
+
+impl NiObject for NiSwitchNode {
+    fn block_type_name(&self) -> &'static str {
+        "NiSwitchNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl NiSwitchNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let switch_flags = if stream.version() >= crate::version::NifVersion::V10_1_0_0 {
+            stream.read_u16_le()?
+        } else {
+            0
+        };
+        let index = stream.read_u32_le()?;
+        Ok(Self {
+            base,
+            switch_flags,
+            index,
+        })
+    }
+}
+
+// ── NiLODNode ──────────────────────────────────────────────────────────
+//
+// Distance-based LOD selector. Inherits NiSwitchNode; from 10.1.0.0 onward
+// it stores a ref to NiLODData. Before that it held an inline (LOD center +
+// num levels + level array) block — the legacy path is not exercised by
+// any Bethesda game we target (Oblivion is already 20.0.0.5).
+
+/// NiLODNode — distance-based level-of-detail selector.
+#[derive(Debug)]
+pub struct NiLODNode {
+    pub base: NiSwitchNode,
+    /// Ref to NiLODData (since 10.1.0.0). `NULL` for the legacy path.
+    pub lod_level_data: BlockRef,
+}
+
+impl NiObject for NiLODNode {
+    fn block_type_name(&self) -> &'static str {
+        "NiLODNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base.base)
+    }
+}
+
+impl NiLODNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiSwitchNode::parse(stream)?;
+        let lod_level_data = if stream.version() >= crate::version::NifVersion::V10_1_0_0 {
+            stream.read_block_ref()?
+        } else {
+            // Legacy path (Vector3 center + num levels + N × LODRange)
+            // is not exercised by any currently-targeted game. Leave
+            // unread; callers that hit this should switch to the
+            // legacy branch if it ever becomes needed.
+            BlockRef::NULL
+        };
+        Ok(Self {
+            base,
+            lod_level_data,
+        })
+    }
+}
+
+// ── NiRangeLODData ─────────────────────────────────────────────────────
+//
+// The Z-depth LOD ranges referenced by `NiLODNode.lod_level_data` (since
+// 10.1.0.0). One `(near, far)` extent per LOD level, parallel to the
+// NiLODNode's children (child i ↔ level i). Layout per nif.xml
+// `NiRangeLODData` + `LODRange`: LOD Center (Vector3) + Num LOD Levels (u32)
+// + N × { Near Extent: f32, Far Extent: f32 } (the trailing 3×uint in
+// `LODRange` is `until=3.1` — absent in every targeted game). EXAL/NIFAL
+// in-cell-LOD foundation: parsed + surfaced so a future distance-switch
+// system has the ranges; nothing consumes it at runtime yet.
+
+/// LOD distance ranges for a [`NiLODNode`] (its `lod_level_data` ref).
+#[derive(Debug)]
+pub struct NiRangeLODData {
+    /// LOD center in NIF (Z-up) space — the point camera Z-depth is measured
+    /// from when selecting a level.
+    pub lod_center: NiPoint3,
+    /// `(near_extent, far_extent)` per LOD level, parallel to the host
+    /// `NiLODNode`'s children. A level is active when the camera distance is
+    /// in `[near, far)`.
+    pub lod_levels: Vec<(f32, f32)>,
+}
+
+impl NiObject for NiRangeLODData {
+    fn block_type_name(&self) -> &'static str {
+        "NiRangeLODData"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl NiRangeLODData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let lod_center = stream.read_ni_point3()?;
+        let num = stream.read_u32_le()? as usize;
+        // Cap the pre-allocation against corrupt counts; the loop still reads
+        // exactly `num` pairs so a genuinely large (but valid) table parses,
+        // while a corrupt huge `num` simply runs the reader to EOF → the
+        // block falls to the recovery path rather than OOM-allocating.
+        let mut lod_levels = Vec::with_capacity(num.min(64));
+        for _ in 0..num {
+            let near = stream.read_f32_le()?;
+            let far = stream.read_f32_le()?;
+            lod_levels.push((near, far));
+        }
+        Ok(Self {
+            lod_center,
+            lod_levels,
+        })
+    }
+}
+
+// ── NiSortAdjustNode ───────────────────────────────────────────────────
+//
+// Overrides the transparency sorter for a subtree. Oblivion v20.0.0.5 is
+// > 20.0.0.3, so the trailing `accumulator` ref is absent.
+
+/// NiSortAdjustNode — alpha sort override for a scenegraph subtree.
+#[derive(Debug)]
+pub struct NiSortAdjustNode {
+    pub base: NiNode,
+    /// SortingMode enum (u32). Typical values: 0 = inherit, 1 = off, 2 = sub-sort.
+    pub sorting_mode: u32,
+}
+
+impl NiObject for NiSortAdjustNode {
+    fn block_type_name(&self) -> &'static str {
+        "NiSortAdjustNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl NiSortAdjustNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let sorting_mode = stream.read_u32_le()?;
+        // Legacy accumulator ref (until 20.0.0.3) — Oblivion and later
+        // don't serialize it. `until=` is inclusive per the version.rs
+        // doctrine — field present at v <= 20.0.0.3.
+        if stream.version() <= crate::version::NifVersion::V20_0_0_3 {
+            let _accumulator = stream.read_block_ref()?;
+        }
+        Ok(Self { base, sorting_mode })
+    }
+}
+
+// ── BSRangeNode ────────────────────────────────────────────────────────
+//
+// Bethesda node with (min, max, current) byte range values. FO3 and later.
+// Its subclasses BSBlastNode, BSDamageStage, BSDebrisNode add no extra
+// fields and share the exact same layout — the discriminator only
+// matters to gameplay-side systems (destruction sequence vs blast
+// effect vs debris ejection root). The dispatcher in
+// `crates/nif/src/blocks/mod.rs` populates `kind` from the matched
+// type-name arm so downstream consumers can branch without the
+// gameplay system having to redo the dispatch from `original_type`.
+
+/// Discriminator for the four wire-distinct types that all share the
+/// `BsRangeNode` Rust struct. Pre-#364 the dispatcher merged all four
+/// into a single struct and `block_type_name()` reported `"BSRangeNode"`
+/// for each — gameplay-side systems (destructible-object switching,
+/// blast-effect spawning, debris ejection) couldn't tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BsRangeKind {
+    /// Generic range node — no special gameplay role on its own.
+    Range,
+    /// Damage-stage holder — `current` selects which child geometry
+    /// (the visible damage stage 0..max) is rendered. Used by
+    /// destructible architecture.
+    DamageStage,
+    /// Blast-effect root — child geometry is the blast / explosion
+    /// hull, conditionally enabled by the destructible-object system.
+    Blast,
+    /// Debris ejection root — child geometry detaches and spawns as
+    /// physics-driven debris when the destructible threshold is hit.
+    Debris,
+}
+
+/// BSRangeNode — Bethesda-specific node carrying min/max/current bytes.
+/// Now also carries the wire-type [`BsRangeKind`] discriminator (#364).
+#[derive(Debug)]
+pub struct BsRangeNode {
+    pub base: NiNode,
+    pub min: u8,
+    pub max: u8,
+    pub current: u8,
+    /// Discriminator preserved from the dispatcher's matched type-name
+    /// arm. Defaults to [`BsRangeKind::Range`] for `BSRangeNode` itself.
+    /// See #364.
+    pub kind: BsRangeKind,
+}
+
+impl NiObject for BsRangeNode {
+    fn block_type_name(&self) -> &'static str {
+        // Static-string contract on the trait — return the *base*
+        // wire type name. Consumers that need the original subclass
+        // name should branch on the `kind` field instead.
+        "BSRangeNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsRangeNode {
+    /// Parse the wire-shared `(min, max, current)` triple. The
+    /// discriminator [`Self::kind`] defaults to `Range` here — the
+    /// dispatcher overwrites it via [`Self::with_kind`] for the
+    /// BSBlastNode / BSDamageStage / BSDebrisNode arms.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+        let min = stream.read_u8()?;
+        let max = stream.read_u8()?;
+        let current = stream.read_u8()?;
+        Ok(Self {
+            base,
+            min,
+            max,
+            current,
+            kind: BsRangeKind::Range,
+        })
+    }
+
+    /// Builder helper used by the block dispatcher to stamp the wire
+    /// type-name discriminator after `parse()` runs.
+    pub fn with_kind(mut self, kind: BsRangeKind) -> Self {
+        self.kind = kind;
+        self
+    }
+}
+
+// ── NiCamera ───────────────────────────────────────────────────────────
+//
+// Animated cinematic NIFs ship an embedded NiCamera describing a view
+// frustum + viewport + LOD bias. Used to drive cutscene cameras from
+// an animated scene graph. See issue #153.
+//
+// Layout (from nif.xml):
+//
+//   NiAVObject base
+//   camera_flags: u16 (since 10.1.0.0)
+//   frustum_left/right/top/bottom: f32
+//   frustum_near, frustum_far: f32
+//   use_orthographic: bool (since 10.1.0.0)
+//   viewport_left/right/top/bottom: f32
+//   lod_adjust: f32
+//   scene_ref: Ref (NiAVObject)
+//   num_screen_polygons: u32 (always 0 on disk)
+//   num_screen_textures: u32 (since 4.2.1.0, always 0 on disk)
+
+/// NiCamera — embedded camera block with frustum, viewport, LOD bias.
+#[derive(Debug)]
+pub struct NiCamera {
+    pub av: NiAVObjectData,
+    pub camera_flags: u16,
+    pub frustum_left: f32,
+    pub frustum_right: f32,
+    pub frustum_top: f32,
+    pub frustum_bottom: f32,
+    pub frustum_near: f32,
+    pub frustum_far: f32,
+    pub use_orthographic: bool,
+    pub viewport_left: f32,
+    pub viewport_right: f32,
+    pub viewport_top: f32,
+    pub viewport_bottom: f32,
+    pub lod_adjust: f32,
+    pub scene_ref: BlockRef,
+    /// Legacy — always zero on disk.
+    pub num_screen_polygons: u32,
+    /// Legacy — always zero on disk.
+    pub num_screen_textures: u32,
+}
+
+impl NiObject for NiCamera {
+    fn block_type_name(&self) -> &'static str {
+        "NiCamera"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(self)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(self)
+    }
+}
+
+impl HasObjectNET for NiCamera {
+    fn name(&self) -> Option<&str> {
+        self.av.net.name.as_deref()
+    }
+    fn name_arc(&self) -> Option<&std::sync::Arc<str>> {
+        self.av.net.name.as_ref()
+    }
+    fn extra_data_refs(&self) -> &[BlockRef] {
+        &self.av.net.extra_data_refs
+    }
+    fn controller_ref(&self) -> BlockRef {
+        self.av.net.controller_ref
+    }
+}
+
+impl HasAVObject for NiCamera {
+    fn flags(&self) -> u32 {
+        self.av.flags
+    }
+    fn transform(&self) -> &NiTransform {
+        &self.av.transform
+    }
+    fn properties(&self) -> &[BlockRef] {
+        &self.av.properties
+    }
+    fn collision_ref(&self) -> BlockRef {
+        self.av.collision_ref
+    }
+}
+
+impl NiCamera {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let av = NiAVObjectData::parse(stream)?;
+
+        // camera_flags added at 10.1.0.0. Oblivion (20.0.0.5) has it.
+        let camera_flags = if stream.version() >= crate::version::NifVersion::V10_1_0_0 {
+            stream.read_u16_le()?
+        } else {
+            0
+        };
+
+        let frustum_left = stream.read_f32_le()?;
+        let frustum_right = stream.read_f32_le()?;
+        let frustum_top = stream.read_f32_le()?;
+        let frustum_bottom = stream.read_f32_le()?;
+        let frustum_near = stream.read_f32_le()?;
+        let frustum_far = stream.read_f32_le()?;
+
+        // use_orthographic added at 10.1.0.0. Per nif.xml, `bool` is
+        // 8-bit from 4.1.0.1 onward — all games we target (Oblivion+)
+        // sit in that window, so read a single byte.
+        let use_orthographic = if stream.version() >= crate::version::NifVersion::V10_1_0_0 {
+            stream.read_byte_bool()?
+        } else {
+            false
+        };
+
+        let viewport_left = stream.read_f32_le()?;
+        let viewport_right = stream.read_f32_le()?;
+        let viewport_top = stream.read_f32_le()?;
+        let viewport_bottom = stream.read_f32_le()?;
+        let lod_adjust = stream.read_f32_le()?;
+        let scene_ref = stream.read_block_ref()?;
+        let num_screen_polygons = stream.read_u32_le()?;
+
+        // num_screen_textures added at 4.2.1.0 — always present for our targets.
+        let num_screen_textures = if stream.version() >= crate::version::NifVersion::V4_2_1_0 {
+            stream.read_u32_le()?
+        } else {
+            0
+        };
+
+        Ok(Self {
+            av,
+            camera_flags,
+            frustum_left,
+            frustum_right,
+            frustum_top,
+            frustum_bottom,
+            frustum_near,
+            frustum_far,
+            use_orthographic,
+            viewport_left,
+            viewport_right,
+            viewport_top,
+            viewport_bottom,
+            lod_adjust,
+            scene_ref,
+            num_screen_polygons,
+            num_screen_textures,
+        })
+    }
+}
+
+// ── BSWeakReferenceNode ────────────────────────────────────────────────────────
+
+/// Starfield composite-LOD / packin reference node (SF-D5-02 / #754).
+///
+/// Extends `NiNode` with a list of `BSWeakReference` entries (packin mesh +
+/// material bindings) and an optional list of water-surface references.
+/// Wire layout sourced from nifly `Nodes.hpp` / `Nodes.cpp`. nif.xml has no
+/// `<niobject>` entry — this struct was introduced in Starfield and is absent
+/// from all pre-Starfield games.
+///
+/// The engine currently does not consume the weak-ref or water-ref payloads
+/// (they feed the LOD-streaming / packin system which is M35+ work). The
+/// parser reads and discards the trailing data so block alignment is
+/// maintained and downstream block refs remain valid.
+///
+/// #1882 — every retail-Starfield instance carries a small undocumented tail
+/// after the water-ref list (byte-audited as a constant +2 B on 6907/7552
+/// MeshesPatch instances, the residual sitting at the exact block end; +8 B on
+/// a handful of others). nifly's visible `Sync` doesn't read it and nif.xml has
+/// no entry. [`parse_with_size`](Self::parse_with_size) captures it opaquely up
+/// to `block_size` (mirroring #1606 on `BSLightingShaderProperty`) so
+/// `consumed == block_size` instead of leaning on drift recovery, and the bytes
+/// survive for a future decoder.
+#[derive(Debug)]
+pub struct BsWeakReferenceNode {
+    pub base: NiNode,
+    /// Opaque trailing Starfield bytes captured up to `block_size` (#1882).
+    /// Empty when parsed without a `block_size` (the legacy `parse` entry).
+    pub starfield_tail: Vec<u8>,
+}
+
+impl NiObject for BsWeakReferenceNode {
+    // #2625 — report the captured tail so an under-read stays visible to
+    // `opaque_tail_histogram`; capturing it zeroes the drift signal.
+    fn opaque_tail_len(&self) -> Option<usize> {
+        Some(self.starfield_tail.len())
+    }
+
+    fn block_type_name(&self) -> &'static str {
+        "BSWeakReferenceNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsWeakReferenceNode {
+    /// Parse without a `block_size` — no Starfield tail capture (any trailing
+    /// bytes fall to the outer drift recovery as before). Equivalent to
+    /// `parse_with_size(stream, None)`.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        Self::parse_with_size(stream, None)
+    }
+
+    /// As [`parse`](Self::parse), but with the block's declared `block_size` so
+    /// the undocumented Starfield trailing tail (#1882) is captured opaquely up
+    /// to the block boundary — mirroring #1606 on `BSLightingShaderProperty`.
+    /// The dispatcher passes `Some(block_size)`; `parse(stream)` passes `None`.
+    pub fn parse_with_size(stream: &mut NifStream, block_size: Option<u32>) -> io::Result<Self> {
+        let block_start = stream.position();
+        let bsver = stream.bsver();
+        // #3524 — hand the declared block boundary down so the two
+        // count-driven loops can decline a `skip()` that provably overruns
+        // it instead of collapsing the whole block to `NiUnknown`.
+        let block_end = block_size.map(|size| block_start.saturating_add(u64::from(size)));
+        let mut me = Self::parse_inner(stream, block_end)?;
+        // Capture the trailing bytes between the parser's stop point and
+        // block_size (Starfield only, when a size is known and bytes remain).
+        if bsver >= crate::version::bsver::STARFIELD {
+            if let Some(size) = block_size {
+                let consumed = stream.position().saturating_sub(block_start);
+                let remaining = u64::from(size).saturating_sub(consumed);
+                if remaining > 0 {
+                    me.starfield_tail = stream.read_bytes(remaining as usize)?;
+                }
+            }
+        }
+        Ok(me)
+    }
+
+    /// `block_end` is the absolute stream offset the declared `block_size`
+    /// ends at, when the dispatcher knows it. Used only to bound the two
+    /// count-driven loops (#3524); `None` reproduces the pre-#3524
+    /// unbounded behaviour for the legacy `parse` entry.
+    fn parse_inner(stream: &mut NifStream, block_end: Option<u64>) -> io::Result<Self> {
+        let base = NiNode::parse(stream)?;
+
+        // #3524 (SF-2026-08-27b-D7-01) — bytes left inside this block, or
+        // `u64::MAX` when the caller did not supply a size. A count whose
+        // implied payload exceeds this cannot be the real count: the
+        // remainder is captured opaquely by `starfield_tail` instead, which
+        // keeps the parsed `NiNode` base and its children rather than
+        // dropping the block to `NiUnknown`.
+        //
+        // This is the defensive half of the finding. The six residual
+        // `Starfield - MeshesPatch.ba2` truncations were all this block
+        // type, all bsver 175, and five of six stopped at exactly
+        // `block_size - 10` after reading a garbage `num_water_refs` from a
+        // 10-byte run that appears in some files and not in their clean
+        // siblings. What that run MEANS is deliberately not guessed here —
+        // determining it needs a byte-audit against the real corpus, which
+        // is tracked separately. Being wrong about the count must not cost
+        // the node's children.
+        let budget = |stream: &NifStream| -> u64 {
+            block_end.map_or(u64::MAX, |end| end.saturating_sub(stream.position()))
+        };
+
+        // BSWeakReference[] — nifly Nodes.cpp:166
+        let num_weak_refs = stream.read_u32_le()?;
+        // Smallest possible entry: BSResourceID(12) + num_transforms(4) +
+        // num_materials(4), plus formID(4) on bsver >= SF_FORM_ID.
+        let min_weak_ref_bytes = if stream.bsver() >= crate::version::bsver::SF_FORM_ID {
+            24
+        } else {
+            20
+        };
+        let num_weak_refs =
+            if u64::from(num_weak_refs).saturating_mul(min_weak_ref_bytes) > budget(stream) {
+                0
+            } else {
+                num_weak_refs
+            };
+        for _ in 0..num_weak_refs {
+            // formID: present when bsver >= crate::version::bsver::SF_FORM_ID (some Starfield builds).
+            if stream.bsver() >= crate::version::bsver::SF_FORM_ID {
+                let _form_id = stream.read_u32_le()?;
+            }
+            // BSResourceID: fileHash(u32) + extension([u8;4]) + dirHash(u32)
+            stream.skip(12)?;
+            // Matrix4 transforms: 16 × f32 = 64 bytes each.
+            let num_transforms = stream.read_u32_le()?;
+            let transform_bytes = u64::from(num_transforms).saturating_mul(64);
+            if transform_bytes > budget(stream) {
+                break;
+            }
+            stream.skip(transform_bytes)?;
+            // UnkMaterialStruct[]: biomeFormID(u32) + dirHash(u32) + fileHash(u32) + null-terminated mat string.
+            let num_materials = stream.read_u32_le()?;
+            // Smallest entry is 12 B + a lone NUL. `lc174world.1.0.1.nif`
+            // is the sub-mode this arm catches: it misaligns INSIDE a
+            // `materials\…` string here and then reads `0x616D0000` (the
+            // ASCII bytes `\0\0ma`) as a length.
+            if u64::from(num_materials).saturating_mul(13) > budget(stream) {
+                break;
+            }
+            for _ in 0..num_materials {
+                stream.skip(12)?; // 3 × u32
+                                  // null-terminated string — read until '\0'
+                read_past_cstring(stream)?;
+            }
+        }
+
+        // #2105 — undocumented 2-byte field between the weak-ref array and
+        // `unkInt1` (nifly's `Sync` has no such field and nif.xml has no
+        // entry for this block at all). Found by byte-diffing real content:
+        // 18/18 sampled `Starfield - MeshesPatch.ba2` NIFs with a populated
+        // water-ref list (bsver 175) decode cleanly only when these 2 bytes
+        // are skipped here — without them `unkInt1`/the water-ref count are
+        // read 2 bytes early, producing a huge garbage count whose implied
+        // `skip()` runs past EOF and drops the block to `NiUnknown`
+        // (325/29 849 MeshesPatch.ba2 files). Confirmed by locating each
+        // sample's real `materials/water/*.mat` resource string and walking
+        // backward through `BSWaterReferenceStruct`'s known field sizes to
+        // the count — it lines up only 2 bytes later than nifly predicts.
+        //
+        // #2201 — this gate is `SF_WEAK_REF_GAP` (175), NOT the `SF_FORM_ID`
+        // (173) gate used for the per-entry `formID` above. #2105 reused
+        // that constant on the assumption the two fields correlate; they
+        // don't. `Starfield - Meshes02.ba2` is uniformly bsver 173, has the
+        // `formID`, and does NOT have this gap — skipping 2 bytes there
+        // misaligned 7 091/7 552 of its NIFs (93.9%) into `NiUnknown` by the
+        // exact mechanism described above, just inverted. Both boundaries
+        // are load-bearing and independently attested: bsver-172 "packin"
+        // composites have neither field (an earlier *unconditional* skip
+        // regressed 20/29 849 files), 173 has one, 175 has both. See
+        // `SF_WEAK_REF_GAP`'s doc for the table and the unobserved-174 caveat.
+        // Distinct from #1882's tail (after the *whole* struct).
+        if stream.bsver() >= crate::version::bsver::SF_WEAK_REF_GAP {
+            stream.skip(2)?;
+        }
+
+        // unkInt1: u32
+        let _unk_int1 = stream.read_u32_le()?;
+
+        // BSWaterReferenceStruct[]: Matrix4(64) + BSResourceID(12) + unkInt1(u32) + NiString(u32 length-prefix)
+        let num_water_refs = stream.read_u32_le()?;
+        // The five-of-six failure mode: a garbage count here implied
+        // `skip(80)` past the block end (80 = 64 + 12 + 4, the fixed part of
+        // one entry, before its length-prefixed string). Declining is what
+        // keeps the node's children.
+        let num_water_refs = if u64::from(num_water_refs).saturating_mul(84) > budget(stream) {
+            0
+        } else {
+            num_water_refs
+        };
+        for _ in 0..num_water_refs {
+            if budget(stream) < 84 {
+                break;
+            }
+            stream.skip(64 + 12 + 4)?; // transform + resourceID + unkInt1
+            let mat_len = stream.read_u32_le()?;
+            if u64::from(mat_len) > budget(stream) {
+                break;
+            }
+            stream.skip(u64::from(mat_len))?;
+        }
+
+        Ok(Self {
+            base,
+            // Set by parse_with_size after the body; empty on the no-size path.
+            starfield_tail: Vec::new(),
+        })
+    }
+}
+
+// ── BSFaceGenNiNode ──────────────────────────────────────────────────
+
+/// Starfield FaceGen head node (`.esm`-side NPC facegen data,
+/// `FaceMeshes.ba2`). nif.xml has no `<niobject>` entry for this type —
+/// it was previously aliased straight to plain `NiNode::parse` as a
+/// coverage-first stub (#727).
+///
+/// #3464 / NIF-2026-08-27-D1-01 — that alias under-reads by a constant
+/// `+2` bytes on 100% of measured retail content (1,417 / 1,417 across
+/// `Starfield - FaceMeshes.ba2` + `ShatteredSpace - Main01/02.ba2`, all
+/// `bsver = 175`). The drift is specific to this type — 58,128 plain
+/// `NiNode` and 9,440 `BSWeakReferenceNode` blocks in the same `bsver`
+/// band drift by zero — so it is `BSFaceGenNiNode`'s own trailing field,
+/// not the shared `NiNode` base and not `BSWeakReferenceNode`'s
+/// `SF_WEAK_REF_GAP` field (#2105). The semantics are unrecoverable from
+/// either authority (no nif.xml schema, predates the Gamebryo 2.3
+/// source), so [`parse_with_size`](Self::parse_with_size) captures the
+/// bytes opaquely up to `block_size` instead of fabricating a layout —
+/// mirroring `BSWeakReferenceNode`'s `#1882` `starfield_tail` (#1606's
+/// opaque-capture idiom).
+#[derive(Debug)]
+pub struct BsFaceGenNiNode {
+    pub base: NiNode,
+    /// Opaque trailing Starfield bytes captured up to `block_size`
+    /// (#3464). Empty when parsed without a `block_size` (the legacy
+    /// `parse` entry).
+    pub starfield_tail: Vec<u8>,
+}
+
+impl NiObject for BsFaceGenNiNode {
+    // #2625 — report the captured tail so an under-read stays visible to
+    // `opaque_tail_histogram`; capturing it zeroes the drift signal.
+    fn opaque_tail_len(&self) -> Option<usize> {
+        Some(self.starfield_tail.len())
+    }
+
+    fn block_type_name(&self) -> &'static str {
+        "BSFaceGenNiNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base)
+    }
+}
+
+impl BsFaceGenNiNode {
+    /// Parse without a `block_size` — no tail capture (any trailing bytes
+    /// fall to the outer drift recovery as before). Equivalent to
+    /// `parse_with_size(stream, None)`.
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        Self::parse_with_size(stream, None)
+    }
+
+    /// As [`parse`](Self::parse), but with the block's declared
+    /// `block_size` so the undocumented +2-byte Starfield tail (#3464) is
+    /// captured opaquely up to the block boundary — mirroring #1606 /
+    /// `BSWeakReferenceNode::parse_with_size`. The dispatcher passes
+    /// `Some(block_size)`; `parse(stream)` passes `None`.
+    pub fn parse_with_size(stream: &mut NifStream, block_size: Option<u32>) -> io::Result<Self> {
+        let block_start = stream.position();
+        let base = NiNode::parse(stream)?;
+        let mut starfield_tail = Vec::new();
+        if let Some(size) = block_size {
+            let consumed = stream.position().saturating_sub(block_start);
+            let remaining = u64::from(size).saturating_sub(consumed);
+            if remaining > 0 {
+                starfield_tail = stream.read_bytes(remaining as usize)?;
+            }
+        }
+        Ok(Self {
+            base,
+            starfield_tail,
+        })
+    }
+}
+
+/// Read and discard a null-terminated (C-style) string from the stream.
+/// Advances past the terminal '\0'. Used only for `BSWeakReferenceNode`'s
+/// `UnkMaterialStruct.mat` field (nifly `SyncString` → `getstring`). The
+/// alloc cap from `MAX_SINGLE_ALLOC_BYTES` is not applied here because the
+/// data is discarded one byte at a time — excess bytes would require
+/// maliciously large null-free runs to hang the parser, which is not a
+/// realistic NIF corpus threat given the block-size bound wrapping this call.
+fn read_past_cstring(stream: &mut NifStream) -> io::Result<()> {
+    loop {
+        let b = stream.read_u8()?;
+        if b == 0 {
+            return Ok(());
+        }
+    }
+}
+
+// ── BSDistantObjectInstancedNode (FO76) ──────────────────────────────
+
+/// One per-instance entry inside a `BsDistantObjectInstancedNode`.
+/// nif.xml `BSDistantObjectInstance` compound (`module="BSMain"
+/// versions="#F76#"`):
+///
+/// ```text
+/// BSResourceID resource_id            ; fileHash(u32) + extension([u8;4]) + dirHash(u32) — 12 B
+/// uint num_unknown_data
+/// BSDistantObjectUnknown[num_unknown_data] unknown_data  ; u64 + u32 — 12 B each
+/// uint num_transforms
+/// Matrix44[num_transforms] transforms ; 16 × f32 — 64 B each
+/// ```
+///
+/// Each instance contributes one or more world-space placements of the
+/// host LOD mesh — that's the "foliage cluster" the renderer sees in
+/// FO76 distant terrain.
+#[derive(Debug, Clone)]
+pub struct BsDistantObjectInstance {
+    /// `BSResourceID.fileHash` — first u32 of the 12-byte resource ID.
+    pub resource_file_hash: u32,
+    /// `BSResourceID.extension` — 4-byte ASCII tag (e.g. b"nif\0").
+    pub resource_extension: [u8; 4],
+    /// `BSResourceID.dirHash` — second u32 of the 12-byte resource ID.
+    pub resource_dir_hash: u32,
+    /// `BSDistantObjectUnknown` array. Each entry is `(u64, u32)`; the
+    /// semantics are not documented in nif.xml so we surface the raw
+    /// bytes for future consumers without interpreting them.
+    pub unknown_data: Vec<(u64, u32)>,
+    /// Per-instance Matrix44 transforms (16 × f32, row-major as written
+    /// on the wire). The importer translates these into ECS Transform
+    /// components when the FO76 LOD streaming milestone consumes the
+    /// block.
+    pub transforms: Vec<[f32; 16]>,
+}
+
+/// FO76 distant-LOD instancing container. Inherits `BSMultiBoundNode`
+/// (NiNode + multi_bound_ref + Skyrim+ culling_mode), then adds:
+///
+/// ```text
+/// uint num_instances
+/// BSDistantObjectInstance[num_instances] instances
+/// BSShaderTextureArray[3] texture_arrays         ; fixed-length 3
+/// ```
+///
+/// where each `BSShaderTextureArray` is `byte unknown + uint count +
+/// BSTextureArray[count]` and each `BSTextureArray` is `uint width +
+/// SizedString[width]`.
+///
+/// Pre-#942 the block fell into the `NiUnknown` recovery path. Block
+/// size let the file parse, but every per-instance transform was lost
+/// — distant foliage and rock clusters rendered only the multi-bound
+/// shell ("ghost foliage" in FO76 worldspace LOD). The texture array
+/// metadata is parsed-then-consumed (bytes accounted for, contents not
+/// yet surfaced) because the M35 terrain-streaming milestone owns the
+/// downstream binding work; preserving the per-instance transform
+/// array is the load-bearing fix.
+#[derive(Debug)]
+pub struct BsDistantObjectInstancedNode {
+    pub base: BsMultiBoundNode,
+    pub instances: Vec<BsDistantObjectInstance>,
+}
+
+impl NiObject for BsDistantObjectInstancedNode {
+    fn block_type_name(&self) -> &'static str {
+        "BSDistantObjectInstancedNode"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_object_net(&self) -> Option<&dyn HasObjectNET> {
+        Some(&self.base.base)
+    }
+    fn as_av_object(&self) -> Option<&dyn HasAVObject> {
+        Some(&self.base.base)
+    }
+}
+
+impl BsDistantObjectInstancedNode {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = BsMultiBoundNode::parse(stream)?;
+
+        let num_instances = stream.read_u32_le()?;
+        // BsDistantObjectInstance contains a heap-indirect
+        // Vec<(u64, u32)> field — stays on the loose per-byte bound
+        // (#2523: size_of::<BsDistantObjectInstance>() would undercount
+        // its true variable on-disk footprint).
+        let mut instances: Vec<BsDistantObjectInstance> = stream.allocate_vec(num_instances)?;
+        for _ in 0..num_instances {
+            // BSResourceID — 12 B fixed (uint + 4-byte tag + uint).
+            let resource_file_hash = stream.read_u32_le()?;
+            let resource_extension = [
+                stream.read_u8()?,
+                stream.read_u8()?,
+                stream.read_u8()?,
+                stream.read_u8()?,
+            ];
+            let resource_dir_hash = stream.read_u32_le()?;
+
+            // BSDistantObjectUnknown[] — each entry is u64 + u32 = 12 B
+            // on disk; size_of::<(u64,u32)>() is 16 B (alignment padding
+            // on the tuple), which would overstate the true minimum and
+            // false-positive-reject legitimate dense arrays — bound on
+            // the real 12-byte-per-element wire size instead (#2523).
+            let num_unknown = stream.read_u32_le()?;
+            let mut unknown_data: Vec<(u64, u32)> =
+                stream.allocate_vec_min_bytes(num_unknown, 12)?;
+            for _ in 0..num_unknown {
+                let u1 = stream.read_u64_le()?;
+                let u2 = stream.read_u32_le()?;
+                unknown_data.push((u1, u2));
+            }
+
+            // Matrix44[] — 16 f32 per transform, 64 B on disk, exact
+            // match for size_of::<[f32; 16]>() (#2523 — the worst-case
+            // amplification site this fix was written for: a corrupt
+            // num_transforms could otherwise request up to 19.2 GB).
+            //
+            // #2525 / PERF-D8-NEW-02 — bulk-read the raw f32 stream in
+            // one call then reshape via `chunks_exact`, mirroring the
+            // idiom #1263 established at `bs_geometry.rs:434-444`,
+            // instead of 16 individual `read_f32_le()` calls per
+            // transform. `read_f32_array` bottoms out in `read_pod_vec`,
+            // whose `check_alloc` byte-count guard (`num_transforms *
+            // 16` f32s = the same 64 B/transform `allocate_vec_sized`
+            // used to bound) supersedes the old pre-check, so the #2523
+            // hostile-count protection is unchanged.
+            let num_transforms = stream.read_u32_le()?;
+            let transforms: Vec<[f32; 16]> = stream
+                .read_f32_array(num_transforms as usize * 16)?
+                .as_chunks::<16>()
+                .0
+                .to_vec();
+
+            instances.push(BsDistantObjectInstance {
+                resource_file_hash,
+                resource_extension,
+                resource_dir_hash,
+                unknown_data,
+                transforms,
+            });
+        }
+
+        // BSShaderTextureArray[3] — fixed-length 3 per nif.xml. The
+        // texture array metadata isn't surfaced yet (the M35
+        // terrain-streaming milestone owns the binding work); consume
+        // the bytes correctly so the drift detector stays quiet.
+        for _ in 0..3 {
+            // `Unknown Byte` (default 1 in vanilla content).
+            let _unknown_byte = stream.read_u8()?;
+            let num_texture_arrays = stream.read_u32_le()?;
+            for _ in 0..num_texture_arrays {
+                // BSTextureArray: uint width + SizedString[width].
+                let width = stream.read_u32_le()?;
+                for _ in 0..width {
+                    let _ = stream.read_sized_string()?;
+                }
+            }
+        }
+
+        Ok(Self { base, instances })
+    }
+}

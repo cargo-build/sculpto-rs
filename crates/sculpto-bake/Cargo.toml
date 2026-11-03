@@ -1,0 +1,12 @@
+[package]
+name = "sculpto-bake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Resolve a BodySlide project and preset into per-vertex morph offsets and apply them."
+
+[dependencies]
+sculpto-core = { workspace = true }
+[dev-dependencies]
+sculpto-nif = { workspace = true }

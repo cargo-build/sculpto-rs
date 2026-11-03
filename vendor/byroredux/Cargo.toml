@@ -1,0 +1,25 @@
+# Vendored subset of matiaszanolli/ByroRedux at
+# f04c3433d32b7e12ea32df6a39d434adcc6b85b3 (MIT). See README.md for the
+# adaptation record. This workspace exists only so the two crates keep their
+# upstream `{ workspace = true }` manifests resolvable.
+[workspace]
+members = ["core", "nif"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+byroredux-core = { path = "core" }
+glam = { version = "0.33", features = ["mint"] }
+log = "0.4"
+nalgebra = "0.35"
+rayon = "1"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+string-interner = "0.20"
+thiserror = "2"
+uuid = { version = "1", features = ["v5", "serde"] }

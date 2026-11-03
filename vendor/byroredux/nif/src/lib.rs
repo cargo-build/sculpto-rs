@@ -1,0 +1,1123 @@
+//! NIF file parser for Gamebryo .nif files.
+//!
+//! Parses the binary NIF format used by Gamebryo 2.3 and derivative engines
+//! (Oblivion, Skyrim, Fallout 3/4). Three-phase loading: parse → link → scene.
+//!
+//! # Usage
+//!
+//! `no_run` rather than `ignore` (#3348): needs a real NIF on disk, so it must
+//! not execute — but it still compiles, pinning the public signatures.
+//! ```no_run
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let bytes = std::fs::read("mesh.nif")?;
+//!     let scene = byroredux_nif::parse_nif(&bytes)?;
+//!     for block in &scene.blocks {
+//!         println!("{}", block.block_type_name());
+//!     }
+//!     Ok(())
+//! }
+//! ```
+
+pub mod anim;
+pub mod blocks;
+pub mod corpus;
+pub mod header;
+pub mod import;
+pub mod kfm;
+pub mod rotation;
+pub mod scene;
+pub mod shader_flags;
+pub mod stream;
+pub mod types;
+pub mod version;
+
+use blocks::{parse_block_with_name_arc, NiObject};
+use header::NifHeader;
+use scene::NifScene;
+use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
+use stream::NifStream;
+
+/// Options for NIF parsing — allows skipping block categories for performance.
+#[derive(Debug, Clone, Default)]
+pub struct ParseOptions {
+    /// Skip animation blocks (controllers, interpolators, animation data).
+    /// Reduces parse time by 40-60% for character NIFs. Skipped blocks are
+    /// replaced with NiUnknown placeholders (via block_size).
+    /// Only effective when the NIF header has block sizes (v20.2.0.7+).
+    pub skip_animation: bool,
+    /// Hand-registered skip sizes for Oblivion-era unknown block types.
+    ///
+    /// Oblivion NIFs (v20.0.0.4/5) have no `block_sizes` table, so when a
+    /// block parser returns `Err` the main loop cannot resume — it stops
+    /// and marks the scene truncated, losing every subsequent block.
+    ///
+    /// When a type name is registered here, the loop instead seeks forward
+    /// by the given size and inserts an `NiUnknown` placeholder, letting
+    /// the rest of the file parse normally. Intended for rare/undiscovered
+    /// block types whose size is known from an external source (Gamebryo
+    /// 2.3 headers, nif_stats corpus analysis, modder documentation) but
+    /// whose full schema has not been implemented yet. See #224.
+    pub oblivion_skip_sizes: HashMap<String, u32>,
+    /// Run [`crate::scene::NifScene::validate_refs`] after parse and
+    /// store the dangling-ref count in `scene.link_errors`. Off by
+    /// default — the walk visits every block once and follows every
+    /// trait-exposed `BlockRef` plus `NiNode.children` / `effects`,
+    /// so on a 1k-block NIF it adds a few µs to the parse path.
+    /// Useful for debug builds, `nif_stats`, and the
+    /// `tests/parse_real_nifs.rs` integration sweep that wants a
+    /// link-integrity histogram. See #892.
+    pub validate_links: bool,
+}
+
+/// Animation block type names that can be skipped in geometry-only mode.
+/// Havok-to-engine unit scale for the NIF's game variant. Per the
+/// niftools / havok-format references:
+///
+///   - Morrowind / Oblivion / FO3 / FNV: 7.0
+///   - Skyrim (LE + SE) / FO4 / FO76 / Starfield: 69.99125
+///
+/// Detected from the NifHeader's version triplet via
+/// [`version::NifVariant::detect`]. The result is stamped on every
+/// `NifScene` returned from [`parse_nif`] so the import pipeline can
+/// scale collision shapes correctly without re-detecting per-call.
+///
+/// Pre-#1230 the collision importer hardcoded 7.0 across every game,
+/// so Skyrim+ collision was imported at 1/10 the correct size — the
+/// entire collision world was squished near origin while the
+/// character / camera lived at architectural coordinates. M28.5
+/// surfaced this as "character falls forever, KCC never finds a
+/// floor on Whiterun Bannered Mare."
+fn havok_scale_for(header: &NifHeader) -> f32 {
+    use version::NifVariant;
+    match NifVariant::detect(header.version, header.user_version, header.user_version_2) {
+        NifVariant::Morrowind
+        | NifVariant::Oblivion
+        | NifVariant::Fallout3
+        | NifVariant::FalloutNV => 7.0,
+        NifVariant::SkyrimLE
+        | NifVariant::SkyrimSE
+        | NifVariant::Fallout4
+        | NifVariant::Fallout76
+        | NifVariant::Starfield => 69.99125,
+        // Unknown variant — fall back to the pre-#1230 default. Safer
+        // than guessing; the worst case is collision misalignment on
+        // an exotic NIF, which is the failure mode the user already
+        // expects from `Unknown`.
+        NifVariant::Unknown => 7.0,
+    }
+}
+
+fn is_animation_block(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "NiControllerManager"
+            | "NiControllerSequence"
+            | "NiMultiTargetTransformController"
+            | "NiTransformController"
+            // pre-Skyrim alias of NiTransformController (#144 / #1442);
+            // listed alongside its NiKeyframeData below for parity
+            | "NiKeyframeController"
+            | "NiVisController"
+            | "bhkBlendController"
+            | "NiAlphaController"
+            | "BSNiAlphaPropertyTestRefController"
+            | "NiFloatExtraDataController"
+            | "NiLightColorController"
+            | "NiLightDimmerController"
+            | "NiLightIntensityController"
+            | "NiLightRadiusController"
+            | "NiMaterialColorController"
+            | "NiTextureTransformController"
+            | "NiGeomMorpherController"
+            | "NiTransformInterpolator"
+            | "BSRotAccumTransfInterpolator"
+            | "NiTransformData"
+            | "NiKeyframeData"
+            | "NiFloatInterpolator"
+            | "NiFloatData"
+            | "NiPoint3Interpolator"
+            | "NiPosData"
+            | "NiColorInterpolator"
+            | "NiColorData"
+            | "NiBoolInterpolator"
+            | "NiBoolTimelineInterpolator"
+            | "NiBoolData"
+            | "NiBlendTransformInterpolator"
+            | "NiBlendFloatInterpolator"
+            | "NiBlendPoint3Interpolator"
+            | "NiBlendBoolInterpolator"
+            | "NiTextKeyExtraData"
+            | "NiDefaultAVObjectPalette"
+            | "NiMorphData"
+            // #394 — newly dispatched Oblivion-era animation blocks.
+            // Listed so `ParseOptions::skip_animation_blocks` can
+            // fast-skip them in geometry-only mode.
+            | "NiPathInterpolator"
+            | "NiFlipController"
+            | "NiBSBoneLODController"
+    )
+}
+
+/// Whether this file's blocks carry their type name inline (as a sized
+/// string per block) rather than through the header's global block-type
+/// table. #4257 — keyed directly off the same version threshold
+/// `header.rs` uses to decide whether that table exists at all
+/// (`NifVersion::V5_0_0_1`), not off `block_types.is_empty()`. The two
+/// agree on every version-appropriate header today, but emptiness is an
+/// incidental signal: on hand-corrupted or fuzzed input a >= 5.0.0.1
+/// header could have a spuriously empty table and would then be
+/// misclassified as using inline names it doesn't have.
+fn uses_inline_block_type_names(version: version::NifVersion, num_blocks: u32) -> bool {
+    version < version::NifVersion::V5_0_0_1 && num_blocks > 0
+}
+
+/// Parse a NIF file from raw bytes.
+///
+/// Performs all three phases: parse header → parse blocks → build scene.
+pub fn parse_nif(data: &[u8]) -> io::Result<NifScene> {
+    parse_nif_with_options(data, &ParseOptions::default())
+}
+
+/// Parse a NIF file with options (e.g., skip animation blocks).
+pub fn parse_nif_with_options(data: &[u8], options: &ParseOptions) -> io::Result<NifScene> {
+    parse_nif_with_options_and_consumed(data, options).map(|(scene, _)| scene)
+}
+
+/// Parse a NIF and return the number of bytes consumed from its block-data
+/// section. This is useful to validate the footer boundary on formats such
+/// as Oblivion that do not carry a per-block size table.
+pub fn parse_nif_with_options_and_consumed(
+    data: &[u8],
+    options: &ParseOptions,
+) -> io::Result<(NifScene, usize)> {
+    // Three-phase parse (#1672) — header / block dispatch / post-link.
+    let (header, block_data_offset) = parse_header(data)?;
+    let dispatched = dispatch_blocks(data, block_data_offset, &header, options)?;
+    let block_bytes_consumed = dispatched.block_bytes_consumed;
+    Ok((
+        finalize_scene(dispatched, &header, options),
+        block_bytes_consumed,
+    ))
+}
+
+/// Outputs of the block-dispatch phase ([`dispatch_blocks`]) handed to the
+/// post-link phase ([`finalize_scene`]): the parsed blocks plus the recovery
+/// telemetry the latter folds into the [`NifScene`]. Extracted under #1672.
+struct DispatchedBlocks {
+    blocks: Vec<Box<dyn NiObject>>,
+    block_bytes_consumed: usize,
+    truncated: bool,
+    dropped_block_count: usize,
+    recovered_blocks: usize,
+    recovered_by_guess: usize,
+    drift_histogram: std::collections::HashMap<String, std::collections::HashMap<i64, u32>>,
+    /// #2625 — opaque trailing bytes captured per block type. Keyed by length,
+    /// not signed drift: these blocks have zero drift by construction.
+    opaque_tail_histogram: std::collections::HashMap<String, std::collections::HashMap<usize, u32>>,
+}
+
+/// Phase 1 (#1672) — parse and validate the NIF header. Rejects big-endian
+/// (console) files. Extracted verbatim from `parse_nif_with_options`.
+fn parse_header(data: &[u8]) -> io::Result<(NifHeader, usize)> {
+    // Phase 1: Parse header
+    let (header, block_data_offset) = NifHeader::parse(data)?;
+    log::debug!(
+        "NIF version {}, {} blocks, {} strings",
+        header.version,
+        header.num_blocks,
+        header.strings.len()
+    );
+
+    // Validate endianness — we only support little-endian (all PC game content).
+    // Big-endian NIFs (Xbox 360 console ports) would produce silently wrong data.
+    if !header.little_endian {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Big-endian NIF files are not supported (console format)",
+        ));
+    }
+
+    Ok((header, block_data_offset))
+}
+
+/// Phase 2 (#1672) — walk the block table, dispatching each block to its
+/// parser and recovering (NiUnknown) or realigning (header size table) on a
+/// short/long read. Returns the parsed blocks plus the recovery telemetry the
+/// post-link phase folds into the scene. Extracted verbatim.
+fn dispatch_blocks(
+    data: &[u8],
+    block_data_offset: usize,
+    header: &NifHeader,
+    options: &ParseOptions,
+) -> io::Result<DispatchedBlocks> {
+    // Phase 2: Parse blocks
+    let block_data = &data[block_data_offset..];
+    let mut stream = NifStream::new(block_data, header);
+    // #388: bound `num_blocks` against the remaining stream so a header
+    // u32 that drifted past validation can't trip a 16-bytes-per-slot
+    // multi-GB allocation. Each block consumes at least one byte
+    // (BlockRef in older streams) so num_blocks > remaining is corrupt.
+    let mut blocks: Vec<Box<dyn NiObject>> = stream.allocate_vec(header.num_blocks)?;
+    // Set to `true` if an Oblivion-style (no block-sizes) parse bails out
+    // early — `NifScene.truncated` exposes the state to downstream
+    // consumers so they can decide how to handle the incomplete graph.
+    let mut truncated = false;
+    let mut dropped_block_count: usize = 0;
+    // Count of blocks that fell into the NiUnknown recovery path. Bumped
+    // inside the block-size recovery, runtime size cache, and
+    // oblivion_skip_sizes recovery branches below, plus once per block
+    // the dispatch-level unknown-type fallback returns. Surfaces via
+    // `NifScene.recovered_blocks` so the parse-rate gate treats these
+    // NIFs as non-clean — pre-#568 the warn-and-continue path left the
+    // scene flagged as clean and hid under-consuming parser bugs like
+    // #546. See #568.
+    let mut recovered_blocks: usize = 0;
+    // #3926 — the subset of `recovered_blocks` recovered by an *inferred*
+    // skip distance (median size cache / `oblivion_skip_sizes`) rather than
+    // one the file declares. See `NifScene::recovered_by_guess` for why the
+    // two are counted apart.
+    let mut recovered_by_guess: usize = 0;
+
+    // Per-block-type recovery counters. Bumped every time the
+    // block_size-driven `Err` recovery fires, the runtime size cache
+    // skip hint fires, or the oblivion_skip_sizes fallback fires.
+    // Aggregated at end of parse into a single `log::warn!` summary
+    // line — pre-#565 every recovery emitted its own `warn!`, so a
+    // single `Skyrim - Meshes0.bsa` walk fired thousands of warnings
+    // (BSLagBoneController × 3,300, BSLODTriShape × 50,
+    // BSWaterShaderProperty × 50, etc.) drowning every other log line.
+    // The per-block detail still surfaces at `log::debug!` for
+    // targeted parser debugging. See #565 / SK-D5-04.
+    let mut recovered_by_type: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    // Companion counter for the success-branch drift detector — the
+    // parser returned `Ok` but consumed != block_size, so block_size
+    // realigns the stream while the (possibly-wrong) parsed struct
+    // stays in the scene. Pre-#565 each instance emitted its own
+    // `warn!` line ("Block N 'TypeX': expected A bytes, consumed B.
+    // Adjusting position."). Same aggregation pattern, separate
+    // summary line so consumers can distinguish "block lost to
+    // NiUnknown" from "block parsed with stream drift" at a glance.
+    let mut drifted_by_type: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    // Per-block-type drift histogram — keyed by `declared - consumed`.
+    // Populated alongside `drifted_by_type` so the parse-end summary log
+    // stays unchanged while a richer, structured surface is also
+    // available via `NifScene.drift_histogram`. Used by `nif_stats
+    // --drift-histogram` to aggregate byte-level parser drift across
+    // archive walks: a `100 % clean` rate can paper over a parser
+    // that's consistently 1 byte short on every instance of a given
+    // type, and only the magnitude (not the count) surfaces the
+    // pattern. See #939.
+    let mut drift_histogram: std::collections::HashMap<
+        String,
+        std::collections::HashMap<i64, u32>,
+    > = std::collections::HashMap::new();
+    // #2625 — second histogram, because the tail capture is a blind spot in the
+    // other one rather than a variant of it: a block that reads
+    // `block_size - consumed` into a tail has zero drift by construction.
+    let mut opaque_tail_histogram: std::collections::HashMap<
+        String,
+        std::collections::HashMap<usize, u32>,
+    > = std::collections::HashMap::new();
+
+    // For Oblivion-era NIFs (no block_sizes table), track the consumed
+    // byte count for each successfully parsed block type. When a block
+    // fails to parse, the cache provides a skip hint for that type —
+    // same concept as oblivion_skip_sizes but self-calibrating from the
+    // file itself rather than a manually-maintained table. See #324.
+    let mut parsed_size_cache: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+
+    // Bump a per-type counter without paying `to_string()` on the hot
+    // (already-seen) path. `HashMap::entry(K)` takes K by value, so a
+    // direct `entry(name.to_string())` would allocate every block —
+    // see #832 for the audit numbers (~150 KB/cell on Oblivion).
+    fn bump_counter(map: &mut std::collections::HashMap<String, u32>, key: &str) {
+        if let Some(c) = map.get_mut(key) {
+            *c += 1;
+        } else {
+            map.insert(key.to_string(), 1);
+        }
+    }
+
+    // Record one event into a per-type histogram. Uses the same get/insert
+    // split as `bump_counter` to skip `to_string()` on the common
+    // already-seen-this-type path.
+    //
+    // #2625 — generic over the bucket key so the signed-drift histograms and
+    // the unsigned opaque-tail-length histogram share one implementation
+    // rather than carrying a near-identical copy each.
+    fn bump_hist<K: std::hash::Hash + Eq>(
+        map: &mut std::collections::HashMap<String, std::collections::HashMap<K, u32>>,
+        key: &str,
+        bucket: K,
+    ) {
+        if let Some(inner) = map.get_mut(key) {
+            *inner.entry(bucket).or_insert(0) += 1;
+        } else {
+            let mut inner = std::collections::HashMap::new();
+            inner.insert(bucket, 1u32);
+            map.insert(key.to_string(), inner);
+        }
+    }
+
+    let no_block_sizes = header.block_sizes.is_empty() && header.num_blocks > 0;
+
+    if no_block_sizes {
+        log::debug!(
+            "NIF v{} has no block sizes — runtime size cache will track parse sizes for error recovery",
+            header.version,
+            );
+    }
+
+    // Pre-Gamebryo NetImmerse files (NIF v < 5.0.0.1, e.g. Morrowind at
+    // v4.0.0.2) inline each block's type name as a sized string instead of
+    // using a global block-type table. We read them inline in the loop below.
+    let inline_type_names = uses_inline_block_type_names(header.version, header.num_blocks);
+    if inline_type_names {
+        log::debug!(
+            "NIF v{} uses inline block type names (pre-Gamebryo, {} blocks)",
+            header.version,
+            header.num_blocks
+        );
+    }
+
+    for i in 0..header.num_blocks as usize {
+        // Resolve block type name: from header table (Gamebryo+) or
+        // inline string (pre-Gamebryo). The four `NiUnknown` recovery
+        // sites below clone the `Arc<str>` produced here rather than
+        // calling `Arc::from(&str)` per dispatch failure (#834). The
+        // header-table path refcount-clones the header's existing
+        // `Arc<str>` storage; the (rare) inline path allocates one
+        // fresh `Arc<str>` per block since each inline name lives
+        // for one block only.
+        let type_name_arc: Arc<str> = if inline_type_names {
+            // Pre-Gamebryo: each block is prefixed by a u32-length-prefixed type name string.
+            // Use truncation rather than hard-Err if the inline name read fails (e.g. a
+            // corrupt-by-design debug NIF whose type-name length field overflows the alloc
+            // cap — #698 Oblivion `marker_radius.nif`).
+            match stream.read_sized_string() {
+                Ok(name) => Arc::from(name),
+                Err(e) => {
+                    log::warn!(
+                        "Block {} inline type-name read failed: {} — truncating (keeping {} blocks)",
+                        i, e, blocks.len()
+                    );
+                    truncated = true;
+                    dropped_block_count = header.num_blocks as usize - i;
+                    break;
+                }
+            }
+        } else {
+            match header.block_type_name_arc(i) {
+                Some(arc) => Arc::clone(arc),
+                None => {
+                    log::warn!(
+                        "Block {} has no type name in header table — truncating (keeping {} blocks)",
+                        i, blocks.len()
+                    );
+                    truncated = true;
+                    dropped_block_count = header.num_blocks as usize - i;
+                    break;
+                }
+            }
+        };
+        let type_name: &str = type_name_arc.as_ref();
+
+        let block_size = header.block_sizes.get(i).copied();
+        let start_pos = stream.position();
+
+        // Skip animation blocks when geometry-only parsing is requested.
+        if options.skip_animation && is_animation_block(type_name) {
+            if let Some(size) = block_size {
+                if stream.skip(size as u64).is_ok() {
+                    blocks.push(Box::new(blocks::NiUnknown {
+                        type_name: Arc::clone(&type_name_arc),
+                        data: Vec::new(), // Don't store data — just a placeholder
+                    }));
+                    continue;
+                }
+                // #4158 — a declared `size` that overruns the remaining
+                // file no longer escapes as a whole-parse `Err` via `?`.
+                // Fall through to the normal dispatch below instead:
+                // `parse_block_with_name_arc`'s own block_size-driven
+                // recovery (NiUnknown substitution + `recovered_blocks`,
+                // a few lines down) handles this exact truncated-block
+                // case uniformly, whether or not `skip_animation` was
+                // requested.
+            }
+            // No block_size (Oblivion) — must parse, can't skip
+        }
+
+        // #1261 — pass the already-built `type_name_arc` so the unknown-
+        // block fallback inside `parse_block_inner` refcount-clones it
+        // instead of allocating a fresh `Arc<str>`. The lib.rs sites that
+        // construct NiUnknown directly already use `Arc::clone(&type_name_arc)`;
+        // this completes the sweep at the dispatch site missed by #834.
+        match parse_block_with_name_arc(&type_name_arc, &mut stream, block_size) {
+            Ok(block) => {
+                let consumed = stream.position() - start_pos;
+                log::trace!(
+                    "Block {} '{}': offset {}, consumed {} bytes",
+                    i,
+                    type_name,
+                    start_pos,
+                    consumed
+                );
+                // Verify we consumed exactly block_size bytes (if known)
+                if let Some(size) = block_size {
+                    let consumed = stream.position() - start_pos;
+                    if consumed != size as u64 {
+                        // #565: downgraded from `warn!` — the
+                        // per-NIF summary at the end of this
+                        // function rolls these into a single
+                        // `warn!` line. Per-block detail stays
+                        // visible at `debug!` for parser-author
+                        // debugging. #939: log the signed drift
+                        // explicitly so per-block grep'ing
+                        // (`drift=+1`) picks out the canonical
+                        // 1-byte-short `NiTexturingProperty`
+                        // pattern without arithmetic.
+                        let drift = size as i64 - consumed as i64;
+                        log::debug!(
+                            "Block {} '{}': declared={} consumed={} drift={:+} — adjusting position.",
+                            i,
+                            type_name,
+                            size,
+                            consumed,
+                            drift,
+                        );
+                        bump_counter(&mut drifted_by_type, type_name);
+                        bump_hist(&mut drift_histogram, type_name, drift);
+                        // #4159 — `set_position` doesn't bounds-check, unlike
+                        // `skip()`. Rewind to the (already-visited, in-bounds)
+                        // block start and use the bounds-checked `skip` to
+                        // reach the declared end instead of silently parking
+                        // the cursor past EOF on a corrupt `size`.
+                        stream.set_position(start_pos);
+                        if stream.skip(size as u64).is_err() {
+                            log::warn!(
+                                "Block {} '{}' (offset {}): declared size {} exceeds the \
+                                 file length — keeping this block (it parsed successfully) \
+                                 but stopping here; scene marked truncated",
+                                i,
+                                type_name,
+                                start_pos,
+                                size,
+                            );
+                            blocks.push(block);
+                            truncated = true;
+                            dropped_block_count = header.num_blocks as usize - i - 1;
+                            break;
+                        }
+                    }
+                }
+                // #2625 — record the opaque tail BEFORE the block is moved into
+                // `blocks`. Only types that actually capture a tail override
+                // `opaque_tail_len`; everything else returns `None` and costs a
+                // devirtualised call returning a constant.
+                if let Some(tail_len) = block.opaque_tail_len() {
+                    bump_hist(&mut opaque_tail_histogram, type_name, tail_len);
+                }
+                // Cache consumed size for Oblivion recovery (#324).
+                if no_block_sizes {
+                    let final_consumed = (stream.position() - start_pos) as u32;
+                    // Drift detector — debug builds only (#395). Catches
+                    // the earliest sign of an upstream parser drifting
+                    // the stream by an unexpected number of bytes; the
+                    // perpetrator is silent in the success path so
+                    // without this hook the first symptom is a much
+                    // later block surfacing garbage enum values.
+                    #[cfg(debug_assertions)]
+                    if let Some(prior) = parsed_size_cache.get(type_name) {
+                        if let Some(msg) = drift_warning(type_name, final_consumed, prior) {
+                            log::warn!(
+                                "Stream drift suspect: block {} '{}' (offset {}) {} \
+                                 — a previous block likely under- or over-consumed; \
+                                 treat downstream garbage reads as symptoms, not the \
+                                 cause. See #395.",
+                                i,
+                                type_name,
+                                start_pos,
+                                msg
+                            );
+                        }
+                    }
+                    // #832 — same allocation-on-every-block bug as the
+                    // drifted_by_type bump above. This site fires on
+                    // EVERY successful parse on Oblivion-no-block-sizes
+                    // files (~7500 blocks per cell load).
+                    if let Some(v) = parsed_size_cache.get_mut(type_name) {
+                        v.push(final_consumed);
+                    } else {
+                        parsed_size_cache.insert(type_name.to_string(), vec![final_consumed]);
+                    }
+                }
+                // Dispatch-level unknown-type recovery: `parse_block`'s
+                // fallback at `blocks/mod.rs` returns `Ok(NiUnknown)`
+                // when the header advertised a type that isn't in the
+                // dispatch table. Bump the recovery counter so these
+                // NIFs don't count as clean on the parse-rate gate —
+                // same rationale as the three Err-branch recoveries
+                // below. See #568.
+                //
+                // Also bump the per-type rollup so the
+                // `recovered N block(s) via …: {per_type_rollup}`
+                // summary tells operators which unknown types are
+                // flooding (e.g. a newly-shipped Bethesda block
+                // class showing up in a content sweep). Pre-fix the
+                // dispatch path bumped the total but left
+                // `recovered_by_type` empty, so the summary listed
+                // only the err-branch recoveries. See NIF-D3-NEW-05
+                // (audit 2026-05-12).
+                if type_name != "NiUnknown" && block.block_type_name() == "NiUnknown" {
+                    recovered_blocks += 1;
+                    bump_counter(&mut recovered_by_type, type_name);
+                }
+                blocks.push(block);
+            }
+            Err(e) => {
+                let consumed = stream.position() - start_pos;
+                if let Some(size) = block_size {
+                    // With block_size we can recover: seek to the expected end of
+                    // the block, record an NiUnknown placeholder, and keep going.
+                    // Without this, a single buggy block parser (e.g. a Havok
+                    // layout quirk) takes down the entire NIF. The unit tests
+                    // still exercise the happy path; this is the belt-and-braces
+                    // path that keeps `parse_rate_*` integration tests meaningful.
+                    //
+                    // #565 / SK-D5-04: downgraded from `warn!` to `debug!`
+                    // because Skyrim Meshes0 has thousands of these per
+                    // archive walk; the per-NIF summary at the end of this
+                    // function rolls the counts up into a single `warn!`
+                    // line so the high-level signal stays visible without
+                    // drowning every other log.
+                    log::debug!(
+                        "Block {} '{}' (size {}, offset {}, consumed {}): {} — \
+                         seeking past block and inserting NiUnknown",
+                        i,
+                        type_name,
+                        size,
+                        start_pos,
+                        consumed,
+                        e
+                    );
+                    // #4159 — bounds-checked realignment: rewind to the
+                    // (already-visited, in-bounds) block start and use the
+                    // bounds-checked `skip` instead of an unchecked
+                    // `set_position(start_pos + size)`, which could
+                    // silently park the cursor past EOF on a corrupt size.
+                    stream.set_position(start_pos);
+                    if stream.skip(size as u64).is_ok() {
+                        blocks.push(Box::new(blocks::NiUnknown {
+                            type_name: Arc::clone(&type_name_arc),
+                            data: Vec::new(),
+                        }));
+                        recovered_blocks += 1;
+                        bump_counter(&mut recovered_by_type, type_name);
+                        continue;
+                    }
+                    // Declared size ALSO overruns the file — this block
+                    // can't be recovered via block_size at all. Fall
+                    // through to the same runtime-size-cache /
+                    // oblivion_skip_sizes / truncation fallbacks used for
+                    // Oblivion's no-block-size case below.
+                    log::debug!(
+                        "Block {} '{}' (offset {}): declared size {} also exceeds the \
+                         file length — falling through to size-cache/truncation recovery",
+                        i,
+                        type_name,
+                        start_pos,
+                        size,
+                    );
+                }
+                // Without block_size (Oblivion), there's no header-driven
+                // recovery — and a declared block_size that ALSO overruns
+                // the file (#4159, just above) falls through here too,
+                // since it's equally unable to seek to a trusted resync
+                // point. Try three fallbacks in order:
+                //
+                // 1. Runtime size cache: if we successfully parsed another
+                //    instance of this type earlier in the file, use its
+                //    median consumed size as a skip hint. Self-calibrating
+                //    and file-specific — handles variable-size types where
+                //    instances in one NIF tend to be similarly sized. #324.
+                //
+                // 2. oblivion_skip_sizes: caller-registered fixed-size hints
+                //    for rare types that only appear once per NIF. #224.
+                //
+                // 3. Truncation: discard remaining blocks.
+                if let Some(sizes) = parsed_size_cache.get(type_name) {
+                    if !sizes.is_empty() {
+                        let mut sorted = sizes.clone();
+                        sorted.sort_unstable();
+                        let median_size = sorted[sorted.len() / 2];
+                        // #3926 — the one plausibility check available at this
+                        // point that is a *fact* rather than a tuned bound.
+                        //
+                        // Two independent measurements of this block's length
+                        // are in hand: `consumed`, the bytes its own parser
+                        // read as this block's fields before erroring, and
+                        // `median_size`, the length prior instances of the
+                        // same type took in the same file. When the median is
+                        // the smaller of the two they contradict each other —
+                        // skipping to `start_pos + median_size` would land
+                        // *inside* a region the parser already walked as this
+                        // block's own data, so the skip is misaligned by
+                        // construction rather than merely uncertain.
+                        //
+                        // Rejecting falls through to truncation, which loses
+                        // this file's tail. That is the deliberate trade:
+                        // truncation is loud, counted (`dropped_block_count`)
+                        // and red on the #3919 clean-rate floor, whereas a
+                        // known-misaligned skip is silent and multiplies (see
+                        // `NifScene::recovered_by_guess`). No factor, ratio or
+                        // tolerance is invented here — only the case where the
+                        // two numbers provably disagree is refused, so a
+                        // variable-size type whose median is merely an
+                        // estimate still recovers exactly as it did before.
+                        if (median_size as u64) < consumed {
+                            log::warn!(
+                                "Block {} '{}' (offset {}): declining runtime-size-cache \
+                                 recovery — median of {} prior parses is {} bytes but the \
+                                 failed parse already consumed {}; the skip would land \
+                                 inside this block (#3926)",
+                                i,
+                                type_name,
+                                start_pos,
+                                sizes.len(),
+                                median_size,
+                                consumed,
+                            );
+                        } else {
+                            stream.set_position(start_pos);
+                            if stream.skip(median_size as u64).is_ok() {
+                                log::info!(
+                                    "Block {} '{}' (offset {}): skipped {} bytes via \
+                                     runtime size cache (median of {} prior parses; was: {})",
+                                    i,
+                                    type_name,
+                                    start_pos,
+                                    median_size,
+                                    sizes.len(),
+                                    e
+                                );
+                                blocks.push(Box::new(blocks::NiUnknown {
+                                    type_name: Arc::clone(&type_name_arc),
+                                    data: Vec::new(),
+                                }));
+                                recovered_blocks += 1;
+                                recovered_by_guess += 1;
+                                bump_counter(&mut recovered_by_type, type_name);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if let Some(&skip_size) = options.oblivion_skip_sizes.get(type_name) {
+                    // Rewind whatever the failed parse consumed, then skip
+                    // the full registered size. `set_position` is safe; the
+                    // stream is backed by an in-memory slice.
+                    stream.set_position(start_pos);
+                    if stream.skip(skip_size as u64).is_ok() {
+                        log::info!(
+                            "Block {} '{}' (offset {}): skipped {} bytes via \
+                             oblivion_skip_sizes hint (was: {})",
+                            i,
+                            type_name,
+                            start_pos,
+                            skip_size,
+                            e
+                        );
+                        blocks.push(Box::new(blocks::NiUnknown {
+                            type_name: Arc::clone(&type_name_arc),
+                            data: Vec::new(),
+                        }));
+                        recovered_blocks += 1;
+                        // #3926 — a caller-registered constant is still a
+                        // distance this file never declared, so it carries the
+                        // same misalignment risk as the median and is counted
+                        // in the same bucket.
+                        recovered_by_guess += 1;
+                        bump_counter(&mut recovered_by_type, type_name);
+                        continue;
+                    }
+                    // If the skip would go past EOF, fall through to the
+                    // truncation path — the caller's hint was wrong.
+                    log::warn!(
+                        "Block {} '{}' (offset {}): oblivion_skip_sizes hint of {} \
+                         bytes would exceed file length; truncating",
+                        i,
+                        type_name,
+                        start_pos,
+                        skip_size
+                    );
+                }
+
+                // Stop parsing but keep blocks parsed so far. This allows
+                // geometry blocks to be imported even when collision blocks
+                // fail. `truncated = true` is exposed via NifScene so
+                // consumers that care about completeness can detect the
+                // partial state. See #175.
+                let dropped = header.num_blocks as usize - i;
+                log::warn!(
+                    "Block {} '{}' (offset {}, consumed {}): {} — stopping parse; \
+                     keeping {} blocks, DISCARDING {} subsequent blocks (scene marked truncated)",
+                    i,
+                    type_name,
+                    start_pos,
+                    consumed,
+                    e,
+                    blocks.len(),
+                    dropped
+                );
+                truncated = true;
+                dropped_block_count = dropped;
+                break;
+            }
+        }
+    }
+
+    // #565: emit aggregated `warn!` summaries for the per-block-type
+    // recovery + drift counts collected during the parse loop.
+    // Pre-#565 every recovery / drift emitted its own `warn!` line,
+    // drowning out everything else when an archive walk hit thousands
+    // of recoverable blocks. The per-block detail is preserved at
+    // `log::debug!` for targeted debugging; these summaries keep the
+    // high-level signal visible at the default log level. Empty maps
+    // → no log output.
+    fn format_type_count_map(map: &std::collections::HashMap<String, u32>) -> String {
+        // Sort by count descending then type-name for deterministic
+        // output (helps log diffs across runs and aggregator scripts).
+        let mut entries: Vec<(&String, &u32)> = map.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        entries
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    if !recovered_by_type.is_empty() {
+        log::warn!(
+            "NIF parse recovered {} block(s) via block_size / runtime-cache / \
+             oblivion_skip_sizes paths: {} (set \
+             RUST_LOG=byroredux_nif=debug for per-block detail)",
+            recovered_blocks,
+            format_type_count_map(&recovered_by_type),
+        );
+    }
+    if !drifted_by_type.is_empty() {
+        let drift_total: u32 = drifted_by_type.values().sum();
+        log::warn!(
+            "NIF parse: {} block(s) parsed Ok but consumed != block_size; \
+             stream realigned by header size table: {} (set \
+             RUST_LOG=byroredux_nif=debug for per-block detail)",
+            drift_total,
+            format_type_count_map(&drifted_by_type),
+        );
+    }
+
+    Ok(DispatchedBlocks {
+        blocks,
+        block_bytes_consumed: stream.position() as usize,
+        truncated,
+        dropped_block_count,
+        recovered_blocks,
+        recovered_by_guess,
+        drift_histogram,
+        opaque_tail_histogram,
+    })
+}
+
+/// Phase 3 (#1672) — post-link: pick the scene root, convert the per-parse
+/// drift histograms to their deterministic `BTreeMap` surface, build the
+/// `NifScene`, and run the opt-in dangling-ref walk. Extracted verbatim.
+fn finalize_scene(
+    dispatched: DispatchedBlocks,
+    header: &NifHeader,
+    options: &ParseOptions,
+) -> NifScene {
+    let DispatchedBlocks {
+        blocks,
+        block_bytes_consumed: _,
+        truncated,
+        dropped_block_count,
+        recovered_blocks,
+        recovered_by_guess,
+        drift_histogram,
+        opaque_tail_histogram,
+    } = dispatched;
+
+    // Phase 3: Identify root. Root is typically the first NiNode (or
+    // any of its specialised Bethesda subclasses: BSTreeNode, NiSwitchNode,
+    // BSMultiBoundNode, etc. — see `is_ni_node_subclass`). When the
+    // scene is truncated that "first NiNode" may be a subtree rather
+    // than the real root — the warning above documents the risk.
+    //
+    // Pre-#611 this matched only the literal `"NiNode"`. Scenes rooted
+    // at a subclass with its own Rust struct (BSTreeNode for SpeedTree,
+    // BsValueNode for FO3/FNV metadata roots, NiSwitchNode for furniture
+    // states, etc.) skipped past their real root and picked the first
+    // plain-NiNode child — typically a leaf bone container — yielding
+    // 0 imported meshes for tree LODs, weapon-state switches, and
+    // similar content. `BSFadeNode` / `BSLeafAnimNode` happened to
+    // survive only because `parse_block` aliases them to `NiNode`
+    // (their `block_type_name` already returns `"NiNode"`).
+    let root_index = if !blocks.is_empty() {
+        blocks
+            .iter()
+            .position(|b| is_ni_node_subclass(b.block_type_name()))
+            .or(Some(0))
+    } else {
+        None
+    };
+
+    // Convert the per-parse `HashMap<String, HashMap<i64, u32>>` into the
+    // deterministic `BTreeMap<String, BTreeMap<i64, u32>>` surface
+    // documented on `NifScene.drift_histogram`. The HashMap is the
+    // hot-path-friendly shape inside the loop; the BTreeMap gives
+    // diff-friendly iteration order to downstream consumers
+    // (`nif_stats --drift-histogram`, baseline regression tests). See #939.
+    let scene_drift_histogram: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<i64, u32>,
+    > = drift_histogram
+        .into_iter()
+        .map(|(type_name, inner)| (type_name, inner.into_iter().collect()))
+        .collect();
+    let scene_opaque_tail_histogram: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<usize, u32>,
+    > = opaque_tail_histogram
+        .into_iter()
+        .map(|(type_name, inner)| (type_name, inner.into_iter().collect()))
+        .collect();
+
+    let mut scene = NifScene {
+        blocks,
+        root_index,
+        truncated,
+        dropped_block_count,
+        recovered_blocks,
+        recovered_by_guess,
+        link_errors: 0,
+        drift_histogram: scene_drift_histogram,
+        opaque_tail_histogram: scene_opaque_tail_histogram,
+        havok_scale: havok_scale_for(header),
+        bsver: header.user_version_2,
+    };
+    // Opt-in dangling-ref walk (#892). Off by default; debug builds,
+    // `nif_stats`, and integration sweeps flip
+    // `ParseOptions::validate_links` to surface link-integrity drift
+    // that the parse-rate gate alone wouldn't catch (a parser
+    // regression that produces technically-Ok scenes with
+    // semantically-broken `BlockRef`s would otherwise only show up
+    // as a render artifact).
+    if options.validate_links {
+        let errors = scene.validate_refs();
+        if !errors.is_empty() {
+            log::warn!(
+                "parse_nif: validate_links found {} dangling BlockRef(s) \
+                 — first 3: {:?}",
+                errors.len(),
+                errors.iter().take(3).collect::<Vec<_>>(),
+            );
+        }
+        scene.link_errors = errors.len();
+    }
+    scene
+}
+
+/// Return `true` when `block_type_name` is `NiNode` or any specialised
+/// Bethesda NiNode subclass with its own dispatch arm in `parse_block`.
+///
+/// Drives the scene-root selection in `parse_nif_with_options`. The
+/// list mirrors the dispatch arms in [`crate::blocks::parse_block`]
+/// (around line 134 — `"NiNode" | "BSFadeNode" | …` and the dedicated
+/// subclass branches that follow). Aliased subclasses (BSFadeNode,
+/// BSLeafAnimNode, RootCollisionNode, AvoidNode, NiBSAnimationNode,
+/// NiBSParticleNode) parse as `NiNode` and report their type as
+/// `"NiNode"`, so they're caught by the first arm; only the dedicated
+/// subclass parsers need explicit entries below.
+///
+/// Update both this list and the dispatch table when adding a new
+/// NiNode-derived block type. See #611 / SK-D5-02.
+fn is_ni_node_subclass(block_type_name: &str) -> bool {
+    matches!(
+        block_type_name,
+        "NiNode"
+            | "BSOrderedNode"
+            | "BSValueNode"
+            | "BSMultiBoundNode"
+            // #942 — BSDistantObjectInstancedNode (FO76) extends
+            // BSMultiBoundNode and is a valid root for distant-LOD NIFs.
+            | "BSDistantObjectInstancedNode"
+            | "BSTreeNode"
+            | "NiBillboardNode"
+            | "NiSwitchNode"
+            | "NiLODNode"
+            | "NiSortAdjustNode"
+            | "BSRangeNode"
+            // #3464 — was a plain-NiNode alias (reported "NiNode", caught
+            // by the first arm above) until its own dedicated
+            // `BsFaceGenNiNode` parser landed with real RTTI. Starfield
+            // FaceGen head NIFs are plausibly rooted at this type, so it
+            // needs its own entry now that its `block_type_name()` no
+            // longer reads "NiNode".
+            | "BSFaceGenNiNode"
+    )
+}
+
+/// Block types empirically confirmed genuinely fixed-size on-disk: their
+/// within-file repeat-instance `consumed` byte count NEVER varies by more
+/// than 2 bytes anywhere across a real 9,612-file Oblivion corpus (base +
+/// all eight DLC archives), even for types repeated hundreds of times in a
+/// single file. Measured, not inferred from the type name or the NIF spec
+/// — see #3711 (NIF-2026-08-30-D1-01). Structurally this tracks which
+/// blocks carry no length-prefixed data (no embedded strings, no `Vec<T>`
+/// whose count varies per instance): controllers, interpolators, PSys
+/// modifiers, and simple flag-only properties/collision objects.
+///
+/// [`drift_warning`] only fires for a type on this list — #3711 found the
+/// prior "arm whenever the first couple of samples happen to agree"
+/// heuristic gave a **100% false-positive rate** (4,280 warnings, 0 real
+/// drift) on the same corpus, because every genuinely variable-length type
+/// (`NiSourceTexture`, `NiTriStrips`, `NiMaterialProperty`, `NiNode`, …)
+/// can coincidentally agree within ±2 bytes on its first couple of
+/// same-file instances and then diverge later — raising the sample-count
+/// threshold alone (tried: 5, then 10) only reduced the count (870, then
+/// 303), never reached zero, because a long enough same-file repeat run
+/// eventually beats any fixed threshold for a type that is not actually
+/// fixed-size. Sorted for `binary_search`.
+///
+/// Regenerate by re-running the corpus with a wider net if a new type
+/// needs adding — never add a type here from the NIF spec alone (the
+/// no-guessing policy: this list is a measurement, and mixing a
+/// spec-derived entry into a measured list silently changes what the list
+/// means to a future reader).
+#[cfg(any(debug_assertions, test))]
+const FIXED_SIZE_BLOCK_TYPES: &[&str] = &[
+    "BSKeyframeController",
+    "BSParentVelocityModifier",
+    "BSWindModifier",
+    "NiAlphaController",
+    "NiAlphaProperty",
+    "NiBlendBoolInterpolator",
+    "NiBlendFloatInterpolator",
+    "NiBlendPoint3Interpolator",
+    "NiBlendTransformInterpolator",
+    "NiBoolInterpolator",
+    "NiBoolTimelineInterpolator",
+    "NiBooleanExtraData",
+    "NiFloatInterpolator",
+    "NiIntegerExtraData",
+    "NiMaterialColorController",
+    "NiMeshParticleSystem",
+    "NiPSysAgeDeathModifier",
+    "NiPSysBoundUpdateModifier",
+    "NiPSysBoxEmitter",
+    "NiPSysColliderManager",
+    "NiPSysColorModifier",
+    "NiPSysCylinderEmitter",
+    "NiPSysDragModifier",
+    "NiPSysGravityModifier",
+    "NiPSysGravityStrengthCtlr",
+    "NiPSysGrowFadeModifier",
+    "NiPSysMeshEmitter",
+    "NiPSysMeshUpdateModifier",
+    "NiPSysModifierActiveCtlr",
+    "NiPSysPlanarCollider",
+    "NiPSysPositionModifier",
+    "NiPSysRotationModifier",
+    "NiPSysSpawnModifier",
+    "NiPSysSphereEmitter",
+    "NiPSysUpdateCtlr",
+    "NiPathInterpolator",
+    "NiPoint3Interpolator",
+    "NiStencilProperty",
+    "NiTextureTransformController",
+    "NiTransformController",
+    "NiTransformInterpolator",
+    "NiVertexColorProperty",
+    "NiVisController",
+    "NiZBufferProperty",
+    "bhkBlendCollisionObject",
+    "bhkBlendController",
+    "bhkBoxShape",
+    "bhkCapsuleShape",
+    "bhkCollisionObject",
+    "bhkConvexSweepShape",
+    "bhkConvexTransformShape",
+    "bhkHingeConstraint",
+    "bhkLimitedHingeConstraint",
+    "bhkPackedNiTriStripsShape",
+    "bhkRagdollConstraint",
+    "bhkSPCollisionObject",
+    "bhkSimpleShapePhantom",
+    "bhkStiffSpringConstraint",
+    "bhkTransformShape",
+];
+
+/// Heuristic stream-drift detector for Oblivion-style NIFs (no
+/// per-block size table). Returns `Some(msg)` when the freshly-parsed
+/// `consumed` byte count disagrees with previously-parsed instances of
+/// the same type, indicating an upstream parser likely consumed the
+/// wrong number of bytes and shifted the stream forward (or backward).
+///
+/// Gated to debug + test builds: the call site in `parse_nif_with_options`
+/// is `#[cfg(debug_assertions)]`, so this function is unreferenced in
+/// release. `cfg(any(debug_assertions, test))` keeps both build paths
+/// clean — release strips the dead code, and `cargo test --release` (a
+/// rare but valid invocation) still compiles the regression suite.
+///
+/// Only fires for a type on [`FIXED_SIZE_BLOCK_TYPES`] — see that list's
+/// doc for why (#3711). The ±2-byte agreement-among-priors check below is
+/// kept as a second line of defense (if the allowlist's premise is ever
+/// wrong for some future NIF variant, this silently no-ops rather than
+/// spamming), not the primary filter anymore.
+///
+/// The actual buggy parser is almost always one or two blocks
+/// upstream of where the warning fires — by the time a downstream
+/// block sees the drift, the perpetrator has already returned `Ok`
+/// with a wrong byte count. The earliest detector firing is the most
+/// useful breadcrumb. See #395.
+#[cfg(any(debug_assertions, test))]
+fn drift_warning(type_name: &str, consumed: u32, prior: &[u32]) -> Option<String> {
+    if FIXED_SIZE_BLOCK_TYPES.binary_search(&type_name).is_err() {
+        return None;
+    }
+    if prior.len() < 2 {
+        return None;
+    }
+    let &min = prior.iter().min().unwrap();
+    let &max = prior.iter().max().unwrap();
+    // High-variance type — drift detection unreliable; skip silently.
+    if max.saturating_sub(min) > 2 {
+        return None;
+    }
+    let dist = prior
+        .iter()
+        .map(|&s| (s as i64 - consumed as i64).abs())
+        .min()
+        .unwrap_or(0);
+    if dist <= 2 {
+        return None;
+    }
+    let mut sorted = prior.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    Some(format!(
+        "consumed {consumed} bytes, but {prior_count} prior parse(s) of this type \
+         all consumed {min}±{spread} bytes (median {median})",
+        prior_count = prior.len(),
+        spread = max - min,
+    ))
+}
+
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod version_literal_tests;

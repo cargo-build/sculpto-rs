@@ -1,0 +1,416 @@
+//! Tests for `nigeometry_data_version_tests` extracted from ../tri_shape.rs (refactor stage A).
+//!
+//! Same qualified path preserved (`nigeometry_data_version_tests::FOO`).
+
+use super::*;
+use crate::header::NifHeader;
+
+fn header_at(version: NifVersion) -> NifHeader {
+    NifHeader::detached(version, 0, 0)
+}
+
+/// Minimal NiGeometryData body with zero vertices/normals/UVs/colors.
+/// Each optional pair matches one nif.xml version gate:
+///  - `include_group_id`      — `Group ID` (since 10.1.0.114, 4 B)
+///  - `include_keep_compress` — `Keep/Compress Flags` (since 10.1.0.0, 2 B)
+///  - `include_consistency`   — `Consistency Flags` (since 10.0.1.0, 2 B)
+fn nigeometry_data_bytes(
+    include_group_id: bool,
+    include_keep_compress: bool,
+    include_consistency: bool,
+) -> Vec<u8> {
+    let mut d = Vec::new();
+    if include_group_id {
+        d.extend_from_slice(&0i32.to_le_bytes()); // group_id
+    }
+    // num_vertices = 0
+    d.extend_from_slice(&0u16.to_le_bytes());
+    if include_keep_compress {
+        d.push(0u8); // keep_flags
+        d.push(0u8); // compress_flags
+    }
+    d.push(0u8); // has_vertices = false
+                 // data_flags (u16) — version >= 10.0.1.0 branch.
+    d.extend_from_slice(&0u16.to_le_bytes());
+    d.push(0u8); // has_normals = false
+                 // bounding sphere: center(3 f32) + radius(f32)
+    for _ in 0..3 {
+        d.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    d.extend_from_slice(&0.0f32.to_le_bytes());
+    d.push(0u8); // has_vertex_colors = false
+                 // (data_flags=0 ⇒ num_uv_sets=0 ⇒ has_uv=false, no UV arrays)
+    if include_consistency {
+        d.extend_from_slice(&0u16.to_le_bytes()); // consistency_flags
+    }
+    d
+}
+
+/// Regression: #327 / audit N1-02 — at NIF 10.0.1.0 the parser must
+/// NOT consume `keep_flags` / `compress_flags`. Those fields
+/// appear only from 10.1.0.0 per nif.xml. Previously this branch
+/// stole 2 bytes from `has_vertices` + `data_flags`, corrupting
+/// every downstream field. With #326 applied, `Group ID` is also
+/// absent (since 10.1.0.114).
+#[test]
+fn nigeometry_data_at_10_0_1_0_skips_keep_compress_flags() {
+    let header = header_at(NifVersion::V10_0_1_0); // 10.0.1.0 — in the gap.
+    let bytes = nigeometry_data_bytes(
+        /*include_group_id=*/ false, /*include_keep_compress=*/ false,
+        /*include_consistency=*/ true,
+    );
+    let mut stream = crate::stream::NifStream::new(&bytes, &header);
+    let _ = parse_geometry_data_base(&mut stream)
+        .expect("NiGeometryData base should parse at 10.0.1.0");
+    assert_eq!(
+        stream.position() as usize,
+        bytes.len(),
+        "at 10.0.1.0 NiGeometryData must NOT consume group_id or keep/compress"
+    );
+}
+
+/// At NIF 10.1.0.0 (the corrected keep/compress threshold) the 2
+/// flags bytes ARE consumed. `Group ID` is still absent — it only
+/// appears from 10.1.0.114.
+#[test]
+fn nigeometry_data_at_10_1_0_0_reads_keep_compress_flags() {
+    let header = header_at(NifVersion::V10_1_0_0); // 10.1.0.0 — threshold.
+    let bytes = nigeometry_data_bytes(
+        /*include_group_id=*/ false, /*include_keep_compress=*/ true,
+        /*include_consistency=*/ true,
+    );
+    let mut stream = crate::stream::NifStream::new(&bytes, &header);
+    let _ = parse_geometry_data_base(&mut stream)
+        .expect("NiGeometryData base should parse at 10.1.0.0");
+    assert_eq!(
+        stream.position() as usize,
+        bytes.len(),
+        "at 10.1.0.0 NiGeometryData MUST consume keep/compress flags"
+    );
+}
+
+/// Regression: #326 / audit N1-01 — `Group ID` is only serialized
+/// from 10.1.0.114 onward per nif.xml. Previously read from 10.0.1.0,
+/// stealing 4 bytes in the [10.0.1.0, 10.1.0.114) window (non-Bethesda
+/// Gamebryo pre-Civ IV era).
+#[test]
+fn nigeometry_data_at_10_1_0_113_skips_group_id() {
+    let header = header_at(NifVersion::V10_1_0_113); // 10.1.0.113 — one below.
+    let bytes = nigeometry_data_bytes(
+        /*include_group_id=*/ false, /*include_keep_compress=*/ true,
+        /*include_consistency=*/ true,
+    );
+    let mut stream = crate::stream::NifStream::new(&bytes, &header);
+    let _ = parse_geometry_data_base(&mut stream)
+        .expect("NiGeometryData base should parse at 10.1.0.113");
+    assert_eq!(
+        stream.position() as usize,
+        bytes.len(),
+        "at 10.1.0.113 NiGeometryData must NOT consume group_id"
+    );
+}
+
+/// Regression: #440 / FO3-5-01. Bethesda streams (BSVER > 0,
+/// version 20.2.0.7) interpret `dataFlags` as `BSGeometryDataFlags`,
+/// where bit 0 is a `Has UV` bool — exactly 0 or 1 UV sets. The
+/// non-Bethesda `NiGeometryDataFlags` decode (bits 0..5 = count)
+/// would read bits 1..5 as additional UV slots, over-reading N ×
+/// `num_vertices × 8` bytes. On a real FO3 FaceGen head
+/// (`headfemalefacegen.nif`, 1307 vertices, `data_flags = 0x1003`)
+/// the pre-fix decode asked for 3 UV sets and over-read enough to
+/// demote every FO3 NPC face to `NiUnknown`.
+#[test]
+fn bs_geometry_data_flags_decodes_has_uv_bit0_only() {
+    // FO3/FNV header: NIF 20.2.0.7, user_version=11, bsver=34.
+    let header = NifHeader::test_fo3_fnv();
+    // Build a minimal NiGeometryData body for 2 vertices, no normals,
+    // no vcolor, 1 UV set, data_flags = 0x1003 (bits 0, 1, 12 set).
+    let mut data = Vec::new();
+    data.extend_from_slice(&0i32.to_le_bytes()); // group_id
+    data.extend_from_slice(&2u16.to_le_bytes()); // num_vertices
+    data.push(0u8); // keep_flags
+    data.push(0u8); // compress_flags
+    data.push(1u8); // has_vertices
+                    // Two vertices, 12 bytes each.
+    for _ in 0..2 {
+        for _ in 0..3 {
+            data.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+    }
+    // data_flags: bit 0 = HasUV, bit 1 = unused noise, bit 12 = tangents
+    data.extend_from_slice(&0x1003u16.to_le_bytes());
+    data.push(0u8); // has_normals = false (no NBT payload to read)
+                    // bounding sphere
+    for _ in 0..3 {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    data.extend_from_slice(&0.0f32.to_le_bytes());
+    data.push(0u8); // has_vertex_colors = false
+                    // Exactly 1 UV set (per BS decode) × 2 vertices × 8 bytes = 16 bytes
+    for _ in 0..2 {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    data.extend_from_slice(&0u16.to_le_bytes()); // consistency
+    data.extend_from_slice(&(-1i32).to_le_bytes()); // additional_data_ref
+    let expected_len = data.len();
+
+    let mut stream = crate::stream::NifStream::new(&data, &header);
+    let (verts, flags, _norms, _c, _r, _vc, uvs) = parse_geometry_data_base(&mut stream)
+        .expect("FO3 NiGeometryData should parse with BS data flag decode");
+    assert_eq!(
+        stream.position() as usize,
+        expected_len,
+        "BS decode must consume exactly 1 UV set; got position {} expected {}",
+        stream.position(),
+        expected_len
+    );
+    assert_eq!(flags, 0x1003);
+    assert_eq!(verts.len(), 2);
+    assert_eq!(uvs.len(), 1, "BS decode: bit 0 = 1 UV set, bit 1 is noise");
+}
+
+/// Non-Bethesda Gamebryo streams (bsver = 0) keep the
+/// `NiGeometryDataFlags` decode where bits 0..5 encode a 6-bit
+/// count. `data_flags = 0x0003` must still mean 3 UV sets on that
+/// path — the BS fix must not break vanilla Gamebryo content.
+#[test]
+fn ni_geometry_data_flags_decodes_count_on_non_bethesda() {
+    // bsver=0 → NiGeometryDataFlags path
+    let header = NifHeader::detached(NifVersion::V20_2_0_7, 0, 0);
+    let mut data = Vec::new();
+    data.extend_from_slice(&0i32.to_le_bytes()); // group_id
+    data.extend_from_slice(&1u16.to_le_bytes()); // num_vertices = 1
+    data.push(0u8); // keep
+    data.push(0u8); // compress
+    data.push(1u8); // has_vertices
+    for _ in 0..3 {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    // data_flags = 3 → NiGeometryDataFlags count = 3 UV sets
+    data.extend_from_slice(&0x0003u16.to_le_bytes());
+    data.push(0u8); // has_normals
+    for _ in 0..3 {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    data.extend_from_slice(&0.0f32.to_le_bytes());
+    data.push(0u8); // has_vertex_colors
+                    // 3 UV sets × 1 vertex × 8 bytes = 24
+    for _ in 0..3 {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    data.extend_from_slice(&0u16.to_le_bytes()); // consistency
+    data.extend_from_slice(&(-1i32).to_le_bytes()); // additional_data
+
+    let mut stream = crate::stream::NifStream::new(&data, &header);
+    let (_v, _f, _n, _c, _r, _vc, uvs) = parse_geometry_data_base(&mut stream)
+        .expect("non-Bethesda NiGeometryData should parse with count decode");
+    assert_eq!(uvs.len(), 3, "non-Bethesda: bits 0..5 encode UV count");
+}
+
+/// Dual-side for #326: at 10.1.0.114 the `group_id` i32 IS consumed.
+#[test]
+fn nigeometry_data_at_10_1_0_114_reads_group_id() {
+    let header = header_at(NifVersion::V10_1_0_114); // 10.1.0.114 — threshold.
+    let bytes = nigeometry_data_bytes(
+        /*include_group_id=*/ true, /*include_keep_compress=*/ true,
+        /*include_consistency=*/ true,
+    );
+    let mut stream = crate::stream::NifStream::new(&bytes, &header);
+    let _ = parse_geometry_data_base(&mut stream)
+        .expect("NiGeometryData base should parse at 10.1.0.114");
+    assert_eq!(
+        stream.position() as usize,
+        bytes.len(),
+        "at 10.1.0.114 NiGeometryData MUST consume group_id"
+    );
+}
+
+/// Regression: #1301 / OBL-D1-02 — `NiTriShapeData` must NOT read a
+/// `has_triangles` bool at v10.0.1.2 (Oblivion). The bool is absent on
+/// disk at v < 10.0.1.3; consuming it shifts the stream 1 byte and
+/// corrupts the triangle list + num_match_groups. With no Oblivion block
+/// size table there is no recovery.
+///
+/// Wire layout at v10.0.1.2 with 0 triangles (simplest case — no triangle
+/// index data, no match groups):
+///   NiGeometryData base (via nigeometry_data_bytes)
+///   num_triangles:       u16  = 0
+///   num_triangle_points: u32  = 0
+///   [no has_triangles bool]  (absent at v < 10.0.1.3)
+///   [no triangles]           (num_triangles == 0)
+///   num_match_groups:    u16  = 0
+///   [no match group data]
+#[test]
+fn nitrishapedata_at_10_0_1_2_no_has_triangles_bool() {
+    use super::NiTriShapeData;
+    let header = header_at(NifVersion::V10_0_1_2); // Oblivion's sub-10.0.1.3 version
+    let mut bytes = nigeometry_data_bytes(false, false, true);
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // num_triangles = 0
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // num_triangle_points = 0
+                                                  // NO has_triangles bool on the wire at v10.0.1.2
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // num_match_groups = 0
+
+    let mut stream = crate::stream::NifStream::new(&bytes, &header);
+    let result = NiTriShapeData::parse(&mut stream);
+    assert!(
+        result.is_ok(),
+        "NiTriShapeData should parse cleanly at v10.0.1.2"
+    );
+    assert_eq!(
+        stream.position() as usize,
+        bytes.len(),
+        "at v10.0.1.2 NiTriShapeData must NOT consume a phantom has_triangles bool"
+    );
+    assert_eq!(result.unwrap().triangles.len(), 0);
+}
+
+/// Regression: #1310 / OBL-D1-01 — `NiTriStripsData` must NOT read a
+/// `has_points` bool at v10.0.1.2 (Oblivion). The nif.xml `Has Points`
+/// field is `since="10.0.1.3"`; both nifly and OpenMW confirm this boundary.
+///
+/// Wire layout at v10.0.1.2 with 0 strips:
+///   NiGeometryData base
+///   num_triangles: u16  = 0
+///   num_strips:    u16  = 0
+///   [strip_lengths: empty]
+///   [no has_strips bool]   (absent at v < 10.0.1.3)
+///   [no strip data]        (num_strips == 0 => has_strips = false)
+#[test]
+fn nitristripsdata_at_10_0_1_2_no_has_points_bool() {
+    use super::NiTriStripsData;
+    let header = header_at(NifVersion::V10_0_1_2);
+    let mut bytes = nigeometry_data_bytes(false, false, true);
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // num_triangles = 0
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // num_strips = 0
+                                                  // strip_lengths: empty (num_strips == 0)
+                                                  // NO has_strips bool on the wire at v10.0.1.2
+                                                  // strips: empty (num_strips == 0 => has_strips = num_strips > 0 = false)
+
+    let mut stream = crate::stream::NifStream::new(&bytes, &header);
+    let result = NiTriStripsData::parse(&mut stream);
+    assert!(
+        result.is_ok(),
+        "NiTriStripsData should parse cleanly at v10.0.1.2"
+    );
+    assert_eq!(
+        stream.position() as usize,
+        bytes.len(),
+        "at v10.0.1.2 NiTriStripsData must NOT consume a phantom has_points bool"
+    );
+    assert_eq!(result.unwrap().strips.len(), 0);
+}
+
+/// Regression: #1838 / NIF-D2-01 — the material-CRC gate must read the
+/// file's raw BSVER, not the routed `NifVariant`. On a hybrid header
+/// `(version=20.2.0.7, user_version=11, bsver=50)` the variant detects
+/// as `Unknown` (bsver 50 is outside every game's fan-out), so
+/// `variant().has_material_crc()` returns `false` — yet nif.xml gates
+/// the CRC purely on `#BSVER# #GT# 34`, and bsver 50 > 34 authors it.
+/// The #1277 refactor briefly reverted this site back to the variant
+/// helper; this test trips red if that happens again (the 4-byte CRC
+/// would be left unconsumed and the stream would end 4 bytes short).
+#[test]
+fn nigeometry_data_reads_material_crc_on_hybrid_unknown_bsver_over_34() {
+    // Unknown variant, but bsver > 34 → CRC authored
+    let header = NifHeader::detached(NifVersion::V20_2_0_7, 11, 50);
+    // This exact tuple is the `Unknown` corner the fix targets — a game-
+    // variant helper would answer `false` here and drop the CRC, disagreeing
+    // with the spec-correct raw bsver the production gate reads (#1838 / #1840).
+    let variant = crate::version::NifVariant::detect(header.version, 11, 50);
+    assert_eq!(variant, crate::version::NifVariant::Unknown);
+
+    let mut data = Vec::new();
+    data.extend_from_slice(&0i32.to_le_bytes()); // group_id (>= 10.1.0.114)
+    data.extend_from_slice(&0u16.to_le_bytes()); // num_vertices = 0
+    data.push(0u8); // keep_flags
+    data.push(0u8); // compress_flags
+    data.push(0u8); // has_vertices = false
+    data.extend_from_slice(&0u16.to_le_bytes()); // data_flags = 0
+    data.extend_from_slice(&0u32.to_le_bytes()); // material_crc (bsver > 34)
+    data.push(0u8); // has_normals = false
+    for _ in 0..4 {
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // bounding sphere
+    }
+    data.push(0u8); // has_vertex_colors = false
+    data.extend_from_slice(&0u16.to_le_bytes()); // consistency_flags
+    data.extend_from_slice(&(-1i32).to_le_bytes()); // additional_data_ref
+
+    let mut stream = crate::stream::NifStream::new(&data, &header);
+    let _ =
+        parse_geometry_data_base(&mut stream).expect("hybrid-header NiGeometryData should parse");
+    assert_eq!(
+        stream.position() as usize,
+        data.len(),
+        "bsver 50 > 34 must consume the 4-byte material CRC (raw-bsver gate); \
+         a revert to the game-variant helper would leave it unread"
+    );
+}
+
+/// Regression for #1843 (NIF-D1-01) — at v4.0.0.2 (Morrowind-era
+/// NetImmerse, pre-4.1.0.1), nif.xml's `bool` basic type is 32-bit, not
+/// 8-bit. `has_vertices` / `has_normals` / `has_vertex_colors` / `has_uv`
+/// are all the version-dependent `bool` type with no `since=` gate (or,
+/// for `has_uv`, gated to a band that is always pre-4.1.0.1 when reached),
+/// so at this version each is a 4-byte field on the wire. Pre-fix the
+/// parser read a fixed 1 byte for each — a real v4.0.0.2 file would
+/// under-read by 3 bytes × 4 fields = 12 bytes, and this band carries no
+/// `block_sizes` table to recover from the drift.
+#[test]
+fn nigeometry_data_at_v4_0_0_2_reads_32_bit_bools() {
+    let header = header_at(NifVersion::V4_0_0_2);
+    let mut data = Vec::new();
+    // No group_id (since 10.1.0.114), no keep/compress (since 10.1.0.0).
+    data.extend_from_slice(&0u16.to_le_bytes()); // num_vertices = 0
+    data.extend_from_slice(&0u32.to_le_bytes()); // has_vertices = false (32-bit)
+                                                 // No data_flags (since 10.0.1.0).
+    data.extend_from_slice(&0u32.to_le_bytes()); // has_normals = false (32-bit)
+    for _ in 0..4 {
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // bounding sphere
+    }
+    data.extend_from_slice(&0u32.to_le_bytes()); // has_vertex_colors = false (32-bit)
+    data.extend_from_slice(&0u16.to_le_bytes()); // num_uv_sets (pre-Gamebryo u16 field)
+    data.extend_from_slice(&0u32.to_le_bytes()); // has_uv = false (32-bit, until 4.0.0.2)
+                                                 // No consistency_flags (since 10.0.1.0), no
+                                                 // additional_data_ref (since 20.0.0.4).
+
+    let mut stream = crate::stream::NifStream::new(&data, &header);
+    let _ = parse_geometry_data_base(&mut stream)
+        .expect("NiGeometryData base should parse at v4.0.0.2");
+    assert_eq!(
+        stream.position() as usize,
+        data.len(),
+        "at v4.0.0.2 every has_* bool must be read as 32-bit; a fixed \
+         1-byte read would leave 12 bytes unconsumed and misalign every \
+         downstream block"
+    );
+}
+
+/// The mirror failure mode: the OLD (pre-fix) fixed-1-byte layout is 12
+/// bytes shorter than the wire-correct 32-bit-bool layout. Feeding it to
+/// the current (fixed) parser at v4.0.0.2 must fail with an EOF-class
+/// error — proves the parser genuinely demands 32-bit bools now, not that
+/// it happens to tolerate either width silently.
+#[test]
+fn nigeometry_data_at_v4_0_0_2_rejects_8_bit_bool_layout() {
+    let header = header_at(NifVersion::V4_0_0_2);
+    let mut data = Vec::new();
+    data.extend_from_slice(&0u16.to_le_bytes()); // num_vertices = 0
+    data.push(0u8); // has_vertices (WRONG WIDTH — pre-fix 1-byte layout)
+    data.push(0u8); // has_normals (WRONG WIDTH)
+    for _ in 0..4 {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    data.push(0u8); // has_vertex_colors (WRONG WIDTH)
+    data.extend_from_slice(&0u16.to_le_bytes()); // num_uv_sets
+    data.push(0u8); // has_uv (WRONG WIDTH)
+
+    let mut stream = crate::stream::NifStream::new(&data, &header);
+    assert!(
+        parse_geometry_data_base(&mut stream).is_err(),
+        "an 8-bit-bool-layout buffer (12 bytes shorter than the wire-correct \
+         32-bit layout) must fail to parse at v4.0.0.2 — if it succeeds, the \
+         parser silently regressed back to fixed-width bool reads"
+    );
+}

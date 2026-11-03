@@ -1,0 +1,990 @@
+//! Coverage for the typed `bhkRagdollConstraint` /
+//! `bhkLimitedHingeConstraint` CInfo decode that feeds PHYSAL (the
+//! physics abstraction layer — see `docs/engine/physal.md`). Pre-M41.x
+//! these were name-only stubs (16 bytes read, the rest skipped); now the
+//! per-variant body is decoded in the era-correct field order so the same
+//! `RagdollCInfo` / `LimitedHingeCInfo` — and therefore one ragdoll path —
+//! is reached from every game.
+//!
+//! Both eras are pinned: Oblivion (`#NI_BS_LTE_16#`: 6 Vec4 ragdoll /
+//! 7 Vec4 hinge, no motors, pivots-first order), FO3/FNV
+//! (`!#NI_BS_LTE_16#`: 8 Vec4 + trailing motor), and Skyrim (same FO3+
+//! layout, gated by NIF version not bsver). Field order + sizes are from
+//! nif.xml, cross-checked against the FNV prefix sizes the sibling
+//! `BhkBreakableConstraint` already encodes (Ragdoll 152, LimitedHinge
+//! 140). The prefix tests below put no motor bytes in the buffer and assert
+//! the stream advanced by `16 + prefix`: the trailing motor is consumed
+//! leniently (#5960), so a buffer that ends at the prefix is still accepted.
+//! The `*_motor_*` tests at the end pin what the motor consumption itself
+//! does, per `hkMotorType` (nif.xml: NONE 0 B, POSITION 25 B, VELOCITY 18 B,
+//! SPRING 17 B, after a 1-byte type).
+use super::*;
+use crate::header::NifHeader;
+use crate::version::NifVersion;
+
+fn oblivion_header() -> NifHeader {
+    NifHeader::detached(NifVersion::V20_0_0_5, 11, 0)
+}
+
+/// Shared `bhkConstraintCInfo` base — 16 bytes:
+/// num_entities + entity_a + entity_b + priority.
+fn base() -> Vec<u8> {
+    let mut d = Vec::with_capacity(16);
+    d.extend_from_slice(&2u32.to_le_bytes());
+    d.extend_from_slice(&1u32.to_le_bytes()); // entity_a
+    d.extend_from_slice(&2u32.to_le_bytes()); // entity_b
+    d.extend_from_slice(&3u32.to_le_bytes()); // priority
+    d
+}
+
+fn vec4(x: f32, y: f32, z: f32, w: f32) -> Vec<u8> {
+    let mut d = Vec::with_capacity(16);
+    for c in [x, y, z, w] {
+        d.extend_from_slice(&c.to_le_bytes());
+    }
+    d
+}
+
+#[test]
+fn fnv_ragdoll_decodes_typed_cinfo() {
+    let mut bytes = base();
+    // 8 × Vec4 in FO3+ order: TwistA, PlaneA, MotorA, PivotA, TwistB,
+    // PlaneB, MotorB, PivotB. Encode the first component as the index so
+    // each field is individually identifiable.
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // twist_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // plane_a
+    bytes.extend(vec4(2.0, 0.0, 0.0, 0.0)); // motor_a
+    bytes.extend(vec4(3.0, 10.0, 20.0, 1.0)); // pivot_a
+    bytes.extend(vec4(4.0, 0.0, 1.0, 0.0)); // twist_b
+    bytes.extend(vec4(5.0, 0.0, 0.0, 0.0)); // plane_b
+    bytes.extend(vec4(6.0, 0.0, 0.0, 0.0)); // motor_b
+    bytes.extend(vec4(7.0, -10.0, 5.0, 1.0)); // pivot_b
+                                              // 6 × f32 limits.
+    for v in [0.5f32, -0.25, 0.75, -1.5, 1.5, 100.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 16 + 152, "base + 8×Vec4 + 6×f32");
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkRagdollConstraint").unwrap();
+
+    assert_eq!(c.priority, 3);
+    let BhkConstraintData::Ragdoll(r) = c.data else {
+        panic!("expected Ragdoll data, got {:?}", c.data);
+    };
+    assert_eq!(r.twist_a, [0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(r.plane_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.motor_a, [2.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.pivot_a, [3.0, 10.0, 20.0, 1.0]);
+    assert_eq!(r.twist_b, [4.0, 0.0, 1.0, 0.0]);
+    assert_eq!(r.plane_b, [5.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.motor_b, [6.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.pivot_b, [7.0, -10.0, 5.0, 1.0]);
+    assert_eq!(r.cone_max_angle, 0.5);
+    assert_eq!(r.plane_min_angle, -0.25);
+    assert_eq!(r.plane_max_angle, 0.75);
+    assert_eq!(r.twist_min_angle, -1.5);
+    assert_eq!(r.twist_max_angle, 1.5);
+    assert_eq!(r.max_friction, 100.0);
+    // Fixed prefix consumed exactly; the trailing motor is left for
+    // block_size recovery.
+    assert_eq!(stream.position() as usize, 16 + 152);
+}
+
+#[test]
+fn fnv_limited_hinge_decodes_typed_cinfo() {
+    let mut bytes = base();
+    // 8 × Vec4 in FO3+ order: AxisA, PerpA1, PerpA2, PivotA, AxisB,
+    // PerpB1, PerpB2, PivotB.
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // axis_a
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // perp_axis_in_a1
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // perp_axis_in_a2
+    bytes.extend(vec4(11.0, 22.0, 33.0, 1.0)); // pivot_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // axis_b
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // perp_axis_in_b1
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // perp_axis_in_b2
+    bytes.extend(vec4(44.0, 55.0, 66.0, 1.0)); // pivot_b
+                                               // 3 × f32: min, max, friction.
+    for v in [-1.0f32, 1.0, 10.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 16 + 140, "base + 8×Vec4 + 3×f32");
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkLimitedHingeConstraint").unwrap();
+
+    let BhkConstraintData::LimitedHinge(h) = c.data else {
+        panic!("expected LimitedHinge data, got {:?}", c.data);
+    };
+    assert_eq!(h.axis_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(h.perp_axis_in_a1, [0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(h.perp_axis_in_a2, [0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(h.pivot_a, [11.0, 22.0, 33.0, 1.0]);
+    assert_eq!(h.pivot_b, [44.0, 55.0, 66.0, 1.0]);
+    assert_eq!(h.min_angle, -1.0);
+    assert_eq!(h.max_angle, 1.0);
+    assert_eq!(h.max_friction, 10.0);
+    assert_eq!(stream.position() as usize, 16 + 140);
+}
+
+/// #3792 — FNV/FO3+ `bhkPrismaticConstraint`, nif.xml `since="20.2.0.7"`
+/// order: SlidingA, RotationA, PlaneA, PivotA, SlidingB, RotationB,
+/// PlaneB, PivotB, then MinDistance/MaxDistance/Friction. `creatures\
+/// protectron\skeleton.nif` carries two bare instances of this type.
+#[test]
+fn fnv_prismatic_decodes_typed_cinfo() {
+    let mut bytes = base();
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // sliding_a
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // rotation_a
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // plane_a
+    bytes.extend(vec4(11.0, 22.0, 33.0, 1.0)); // pivot_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // sliding_b
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // rotation_b
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // plane_b
+    bytes.extend(vec4(44.0, 55.0, 66.0, 1.0)); // pivot_b
+    for v in [-5.0f32, 5.0, 0.2] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 16 + 140, "base + 8×Vec4 + 3×f32");
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkPrismaticConstraint").unwrap();
+
+    let BhkConstraintData::Prismatic(p) = c.data else {
+        panic!("expected Prismatic data, got {:?}", c.data);
+    };
+    assert_eq!(p.sliding_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(p.rotation_a, [0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(p.plane_a, [0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(p.pivot_a, [11.0, 22.0, 33.0, 1.0]);
+    assert_eq!(p.sliding_b, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(p.pivot_b, [44.0, 55.0, 66.0, 1.0]);
+    assert_eq!(p.min_distance, -5.0);
+    assert_eq!(p.max_distance, 5.0);
+    assert_eq!(p.friction, 0.2);
+    // Fixed prefix consumed exactly; the trailing motor is left for
+    // block_size recovery, matching Ragdoll/LimitedHinge.
+    assert_eq!(stream.position() as usize, 16 + 140);
+}
+
+/// #3792 — Oblivion (`#NI_BS_LTE_16#`) `bhkPrismaticConstraint`, nif.xml
+/// `until="20.0.0.5"` order: PivotA, RotationA, PlaneA, SlidingA,
+/// SlidingB, PivotB, RotationB, PlaneB — a DIFFERENT field order from the
+/// FO3+ layout above (nif.xml's own note: "In reality Havok loads these
+/// as Transform A and Transform B using hkTransform" on the FO3+ side).
+#[test]
+fn oblivion_prismatic_decodes_typed_cinfo() {
+    let mut bytes = base();
+    bytes.extend(vec4(11.0, 22.0, 33.0, 1.0)); // pivot_a
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // rotation_a
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // plane_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // sliding_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // sliding_b
+    bytes.extend(vec4(44.0, 55.0, 66.0, 1.0)); // pivot_b
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // rotation_b
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // plane_b
+    for v in [-5.0f32, 5.0, 0.2] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 16 + 140, "base + 8×Vec4 + 3×f32");
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkPrismaticConstraint").unwrap();
+
+    let BhkConstraintData::Prismatic(p) = c.data else {
+        panic!("Oblivion Prismatic must decode, got {:?}", c.data);
+    };
+    assert_eq!(p.pivot_a, [11.0, 22.0, 33.0, 1.0]);
+    assert_eq!(p.sliding_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(p.pivot_b, [44.0, 55.0, 66.0, 1.0]);
+    assert_eq!(p.sliding_b, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(p.min_distance, -5.0);
+    assert_eq!(p.max_distance, 5.0);
+    assert_eq!(p.friction, 0.2);
+    assert_eq!(stream.position() as usize, 16 + 140);
+}
+
+/// FNV `bhkMalleableConstraint` wrapping a Ragdoll (Type 7) — the
+/// dominant joint form in the vanilla humanoid skeleton (14 of 17
+/// joints). The inner CInfo's entities are −1/−1; the real bodies are
+/// the outer base. Layout: base(16) + Type(4) + inner CInfo(16) + Ragdoll
+/// prefix(152). The trailing Strength + inner motor recover via block_size.
+#[test]
+fn fnv_malleable_wrapping_ragdoll_surfaces_as_ragdoll() {
+    let mut bytes = base(); // outer base: real bodies (entity_a=1, entity_b=2)
+    bytes.extend_from_slice(&7u32.to_le_bytes()); // wrapped Type = 7 (Ragdoll)
+                                                  // inner bhkConstraintCInfo: num=2, entity_a=-1, entity_b=-1, priority=1
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&(-1i32).to_le_bytes());
+    bytes.extend_from_slice(&(-1i32).to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    // inner Ragdoll CInfo: 8 × Vec4 + 6 × f32.
+    for i in 0..8 {
+        bytes.extend(vec4(i as f32, 0.0, 0.0, 0.0));
+    }
+    for v in [0.5f32, -0.25, 0.75, -1.5, 1.5, 100.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkMalleableConstraint").unwrap();
+
+    // Outer entities are the constrained bodies.
+    assert_eq!(c.entity_a.index(), Some(1));
+    assert_eq!(c.entity_b.index(), Some(2));
+    let BhkConstraintData::Ragdoll(r) = c.data else {
+        panic!(
+            "malleable-wrapped Ragdoll must surface as Ragdoll, got {:?}",
+            c.data
+        );
+    };
+    assert_eq!(r.twist_a, [0.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.pivot_b, [7.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.max_friction, 100.0);
+    // base(16) + Type(4) + inner CInfo(16) + Ragdoll prefix(152) = 188.
+    assert_eq!(stream.position() as usize, 16 + 4 + 16 + 152);
+}
+
+/// Non-decoded FO3+ types stay name-only stubs (16-byte base read; the
+/// rest recovered via block_size) — unchanged from pre-M41.x behaviour.
+///
+/// The exemplar has moved twice as the decode widened: `bhkHingeConstraint`
+/// until #3330, then `bhkStiffSpringConstraint` until #4212. It is now
+/// `bhkGenericConstraint`, which is the last genuinely undecodable type —
+/// nif.xml carries only its name, with no field spec to decode against, so
+/// unlike its predecessors this one cannot be promoted by a future issue.
+#[test]
+fn fnv_other_constraint_type_stays_stub() {
+    let bytes = base();
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkGenericConstraint").unwrap();
+    assert!(matches!(c.data, BhkConstraintData::Other));
+    assert_eq!(stream.position() as usize, 16, "only the base is read");
+}
+
+/// #4212 — a bare `bhkBallAndSocketConstraint` decodes its two pivots.
+/// nif.xml gives the CInfo a fixed `size="32"` with no version branch, so
+/// the same 16 + 32 accounting holds on every era; this pins the FO3+ side
+/// and `oblivion_ball_and_socket_decodes_pivots` the other.
+#[test]
+fn fnv_bare_ball_and_socket_decodes_pivots() {
+    let mut bytes = base();
+    bytes.extend(vec4(1.0, 2.0, 3.0, 1.0)); // pivot_a
+    bytes.extend(vec4(-1.0, -2.0, -3.0, 1.0)); // pivot_b
+    assert_eq!(bytes.len(), 16 + 32);
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkBallAndSocketConstraint").unwrap();
+
+    let BhkConstraintData::BallAndSocket(b) = c.data else {
+        panic!("bhkBallAndSocketConstraint must decode, got {:?}", c.data);
+    };
+    assert_eq!(b.pivot_a, [1.0, 2.0, 3.0, 1.0]);
+    assert_eq!(b.pivot_b, [-1.0, -2.0, -3.0, 1.0]);
+    assert_eq!(
+        stream.position() as usize,
+        16 + 32,
+        "the whole body is consumed — no motor field exists to leave behind"
+    );
+}
+
+/// #4212 — Oblivion sibling of the test above. The byte layout is
+/// identical (nif.xml declares no `until`/`since` variant for this CInfo),
+/// which is why one parser serves both branches; this pins that claim
+/// rather than assuming it.
+#[test]
+fn oblivion_ball_and_socket_decodes_pivots() {
+    let mut bytes = base();
+    bytes.extend(vec4(4.0, 5.0, 6.0, 1.0));
+    bytes.extend(vec4(7.0, 8.0, 9.0, 1.0));
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkBallAndSocketConstraint").unwrap();
+
+    let BhkConstraintData::BallAndSocket(b) = c.data else {
+        panic!(
+            "Oblivion bhkBallAndSocketConstraint must decode, got {:?}",
+            c.data
+        );
+    };
+    assert_eq!(b.pivot_a, [4.0, 5.0, 6.0, 1.0]);
+    assert_eq!(b.pivot_b, [7.0, 8.0, 9.0, 1.0]);
+    assert_eq!(stream.position() as usize, 16 + 32);
+}
+
+/// #4212 — a bare `bhkStiffSpringConstraint` decodes both pivots plus the
+/// rest length, the one field that distinguishes it from a ball-and-socket
+/// (nif.xml `size="36"`, no version branch, no motor).
+#[test]
+fn fnv_bare_stiff_spring_decodes_pivots_and_length() {
+    let mut bytes = base();
+    bytes.extend(vec4(1.0, 0.0, 0.0, 1.0));
+    bytes.extend(vec4(0.0, 1.0, 0.0, 1.0));
+    bytes.extend_from_slice(&12.5f32.to_le_bytes());
+    assert_eq!(bytes.len(), 16 + 36);
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkStiffSpringConstraint").unwrap();
+
+    let BhkConstraintData::StiffSpring(s) = c.data else {
+        panic!("bhkStiffSpringConstraint must decode, got {:?}", c.data);
+    };
+    assert_eq!(s.pivot_a, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(s.pivot_b, [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(s.length, 12.5);
+    assert_eq!(stream.position() as usize, 16 + 36);
+}
+
+/// #3330 — a bare FNV `bhkHingeConstraint` is a `bhkLimitedHingeConstraint`
+/// without the three trailing scalars: 8 × Vec4 = 128 B in the identical
+/// field order. It decodes into `LimitedHingeCInfo` with synthesized ±PI
+/// limits so it reaches the existing canonical `LimitedHinge` joint instead
+/// of being dropped as `Other`.
+///
+/// Pre-fix this severed `creatures\sentryturret\skeleton.nif` and
+/// `creatures\minisentryturret\skeleton.nif` into two disconnected
+/// components each (3 authored edges, 2 surfaced).
+#[test]
+fn fnv_bare_hinge_decodes_into_a_limitless_limited_hinge() {
+    let mut bytes = base();
+    // 8 × Vec4 in nif.xml order: axis_a, perp_a1, perp_a2, pivot_a,
+    // axis_b, perp_b1, perp_b2, pivot_b.
+    for i in 0..8 {
+        bytes.extend(vec4(i as f32, 0.0, 0.0, 1.0));
+    }
+    assert_eq!(bytes.len(), 16 + 128);
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkHingeConstraint").unwrap();
+
+    let BhkConstraintData::LimitedHinge(h) = c.data else {
+        panic!(
+            "bhkHingeConstraint must surface as LimitedHinge, got {:?}",
+            c.data
+        );
+    };
+    // Field order is the limited hinge's, verbatim.
+    assert_eq!(h.axis_a, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.perp_axis_in_a1, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.perp_axis_in_a2, [2.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.pivot_a, [3.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.axis_b, [4.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.perp_axis_in_b1, [5.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.perp_axis_in_b2, [6.0, 0.0, 0.0, 1.0]);
+    assert_eq!(h.pivot_b, [7.0, 0.0, 0.0, 1.0]);
+    // "No angular limits" is encoded as a full turn either way — a hinge
+    // CInfo carries no limit fields to read.
+    assert_eq!(h.min_angle, -std::f32::consts::PI);
+    assert_eq!(h.max_angle, std::f32::consts::PI);
+    assert_eq!(h.max_friction, 0.0);
+    assert_eq!(
+        stream.position() as usize,
+        16 + 128,
+        "8 Vec4 consumed, no more"
+    );
+}
+
+/// The Oblivion (`#NI_BS_LTE_16#`) hinge layout is a different 5 × Vec4 =
+/// 80 B order with **no** `Axis A` field. nif.xml states `Perp Axis In A2`
+/// "is always the vector product of Axis A and Perp Axis In A1", so the axis
+/// is recovered exactly as `perp_a1 × perp_a2` rather than guessed. #3330.
+#[test]
+fn oblivion_bare_hinge_recovers_axis_a_from_the_perpendiculars() {
+    let mut bytes = base();
+    bytes.extend(vec4(1.0, 2.0, 3.0, 0.0)); // pivot_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // perp_a1 = +X
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // perp_a2 = +Y
+    bytes.extend(vec4(4.0, 5.0, 6.0, 0.0)); // pivot_b
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // axis_b
+    assert_eq!(bytes.len(), 16 + 80);
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkHingeConstraint").unwrap();
+
+    let BhkConstraintData::LimitedHinge(h) = c.data else {
+        panic!("Oblivion bhkHingeConstraint must surface as LimitedHinge");
+    };
+    // +X × +Y = +Z.
+    assert_eq!(h.axis_a, [0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(h.pivot_a, [1.0, 2.0, 3.0, 0.0]);
+    assert_eq!(h.pivot_b, [4.0, 5.0, 6.0, 0.0]);
+    assert_eq!(h.axis_b, [0.0, 0.0, 1.0, 0.0]);
+    // No Oblivion counterpart — zeroed, exactly as the limited-hinge decode
+    // does; the solver synthesizes a perpendicular for a degenerate input.
+    assert_eq!(h.perp_axis_in_b1, [0.0; 4]);
+    assert_eq!(
+        stream.position() as usize,
+        16 + 80,
+        "5 Vec4 consumed, no more"
+    );
+}
+
+/// Oblivion ragdoll decodes its own (`#NI_BS_LTE_16#`) field order:
+/// 6 × Vec4 (pivot/plane/twist, A then B — no Motor A/B) + 6 × f32.
+/// The absent motors zero out; the common subset the importer reads
+/// (twist/plane/pivot + angle limits) must match the FNV decode so the
+/// same `RagdollCInfo` funnels every game into one ragdoll path (PHYSAL).
+#[test]
+fn oblivion_ragdoll_decodes_typed_cinfo() {
+    let mut bytes = base();
+    // 6 × Vec4 in Oblivion order: PivotA, PlaneA, TwistA, PivotB, PlaneB,
+    // TwistB. First component encodes the field index.
+    bytes.extend(vec4(0.0, 10.0, 20.0, 1.0)); // pivot_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // plane_a
+    bytes.extend(vec4(2.0, 0.0, 1.0, 0.0)); // twist_a
+    bytes.extend(vec4(3.0, -10.0, 5.0, 1.0)); // pivot_b
+    bytes.extend(vec4(4.0, 0.0, 0.0, 0.0)); // plane_b
+    bytes.extend(vec4(5.0, 0.0, 1.0, 0.0)); // twist_b
+                                            // 6 × f32 limits (same shared trailer as FNV).
+    for v in [0.5f32, -0.25, 0.75, -1.5, 1.5, 10.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 16 + 120, "base + 6×Vec4 + 6×f32");
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkRagdollConstraint").unwrap();
+
+    let BhkConstraintData::Ragdoll(r) = c.data else {
+        panic!("Oblivion Ragdoll must decode, got {:?}", c.data);
+    };
+    // Fields the PHYSAL translate boundary actually reads.
+    assert_eq!(r.pivot_a, [0.0, 10.0, 20.0, 1.0]);
+    assert_eq!(r.plane_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.twist_a, [2.0, 0.0, 1.0, 0.0]);
+    assert_eq!(r.pivot_b, [3.0, -10.0, 5.0, 1.0]);
+    assert_eq!(r.plane_b, [4.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.twist_b, [5.0, 0.0, 1.0, 0.0]);
+    assert_eq!(r.cone_max_angle, 0.5);
+    assert_eq!(r.twist_min_angle, -1.5);
+    assert_eq!(r.twist_max_angle, 1.5);
+    assert_eq!(r.max_friction, 10.0);
+    // FO3-only motors don't exist pre-FO3 → zeroed, invisible downstream.
+    assert_eq!(r.motor_a, [0.0; 4]);
+    assert_eq!(r.motor_b, [0.0; 4]);
+    assert_eq!(stream.position() as usize, 16 + 120);
+}
+
+/// Oblivion limited hinge: 7 × Vec4 (pivot/axis/perp, no Perp Axis In B1)
+/// + 3 × f32. Absent perp axis zeroes out.
+#[test]
+fn oblivion_limited_hinge_decodes_typed_cinfo() {
+    let mut bytes = base();
+    // 7 × Vec4 in Oblivion order: PivotA, AxisA, PerpA1, PerpA2, PivotB,
+    // AxisB, PerpB2.
+    bytes.extend(vec4(11.0, 22.0, 33.0, 1.0)); // pivot_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // axis_a
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // perp_axis_in_a1
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // perp_axis_in_a2
+    bytes.extend(vec4(44.0, 55.0, 66.0, 1.0)); // pivot_b
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // axis_b
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // perp_axis_in_b2
+    for v in [-1.0f32, 1.0, 10.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(bytes.len(), 16 + 124, "base + 7×Vec4 + 3×f32");
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkLimitedHingeConstraint").unwrap();
+
+    let BhkConstraintData::LimitedHinge(h) = c.data else {
+        panic!("Oblivion LimitedHinge must decode, got {:?}", c.data);
+    };
+    assert_eq!(h.axis_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(h.pivot_a, [11.0, 22.0, 33.0, 1.0]);
+    assert_eq!(h.axis_b, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(h.pivot_b, [44.0, 55.0, 66.0, 1.0]);
+    assert_eq!(h.min_angle, -1.0);
+    assert_eq!(h.max_angle, 1.0);
+    assert_eq!(h.max_friction, 10.0);
+    // #5537 — the absent FO3+ field is DERIVED, not zeroed: with
+    // AxisB = +X and PerpB2 = +Z, PerpB1 = PerpB2 × AxisB = +Y.
+    assert_eq!(h.perp_axis_in_b1, [0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(stream.position() as usize, 16 + 124);
+}
+
+/// #5537 — the Oblivion layout's `Perp Axis In B1` is recovered as
+/// `Perp B2 × Axis B`, nif.xml's own identity inverted (nif.xml defines
+/// `Perp Axis In B2` as `Axis B × Perp Axis In B1` expressed in B's
+/// space). The audit measured the identity against FNV's authored B1 to
+/// ~1e-7; zeroing the field instead left `frame_rot` to synthesize an
+/// arbitrary zero-reference, putting Oblivion bind poses 1.5–1.8 rad
+/// outside the limits and tearing the rig apart on its first solve.
+/// Non-axis-aligned axes: a unit-less (0.6, 0, 0.8) pair with an
+/// authored PerpB2 the identity must reproduce exactly.
+#[test]
+fn oblivion_limited_hinge_derives_perp_b1_from_perp_b2_cross_axis_b() {
+    let axis_b = [0.6f32, 0.0, 0.8, 0.0];
+    // Any unit vector orthogonal to axis_b: rotate axis_b 90° about Z-up.
+    let perp_b2 = [-0.8f32, 0.0, 0.6, 0.0];
+    let mut bytes = base();
+    bytes.extend(vec4(11.0, 22.0, 33.0, 1.0)); // pivot_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // axis_a
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0)); // perp_axis_in_a1
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // perp_axis_in_a2
+    bytes.extend(vec4(44.0, 55.0, 66.0, 1.0)); // pivot_b
+    bytes.extend_from_slice(&axis_b[0].to_le_bytes());
+    bytes.extend_from_slice(&axis_b[1].to_le_bytes());
+    bytes.extend_from_slice(&axis_b[2].to_le_bytes());
+    bytes.extend_from_slice(&axis_b[3].to_le_bytes());
+    bytes.extend_from_slice(&perp_b2[0].to_le_bytes());
+    bytes.extend_from_slice(&perp_b2[1].to_le_bytes());
+    bytes.extend_from_slice(&perp_b2[2].to_le_bytes());
+    bytes.extend_from_slice(&perp_b2[3].to_le_bytes());
+    for v in [0.0f32, 1.9, 10.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkLimitedHingeConstraint").unwrap();
+    let BhkConstraintData::LimitedHinge(h) = c.data else {
+        panic!("Oblivion LimitedHinge must decode, got {:?}", c.data);
+    };
+    // The identity: B1 = B2 × B, itself a unit vector orthogonal to both.
+    let expect = [
+        perp_b2[1] * axis_b[2] - perp_b2[2] * axis_b[1],
+        perp_b2[2] * axis_b[0] - perp_b2[0] * axis_b[2],
+        perp_b2[0] * axis_b[1] - perp_b2[1] * axis_b[0],
+        0.0,
+    ];
+    for (i, expected) in expect.iter().enumerate().take(3) {
+        assert!(
+            (h.perp_axis_in_b1[i] - expected).abs() < 1e-7,
+            "perp_b1[{i}] = {} must equal PerpB2 × AxisB = {}",
+            h.perp_axis_in_b1[i],
+            expected
+        );
+    }
+    assert_eq!(h.perp_axis_in_b1[3], 0.0);
+    let dot = h.perp_axis_in_b1[0] * axis_b[0]
+        + h.perp_axis_in_b1[1] * axis_b[1]
+        + h.perp_axis_in_b1[2] * axis_b[2];
+    assert!(
+        dot.abs() < 1e-7,
+        "the derived perpendicular is orthogonal to the axle"
+    );
+    let norm = (h.perp_axis_in_b1[0].powi(2)
+        + h.perp_axis_in_b1[1].powi(2)
+        + h.perp_axis_in_b1[2].powi(2))
+    .sqrt();
+    assert!(
+        (norm - 1.0).abs() < 1e-6,
+        "the derived perpendicular is unit"
+    );
+}
+
+/// Oblivion `bhkMalleableConstraint` wrapping a Ragdoll (Type 7) must
+/// surface as Ragdoll just like the FNV form, using the Oblivion inner
+/// layout (120 B) + the Oblivion tau/damping trailer (8 B).
+#[test]
+fn oblivion_malleable_wrapping_ragdoll_surfaces_as_ragdoll() {
+    let mut bytes = base(); // outer base: real bodies (entity_a=1, entity_b=2)
+    bytes.extend_from_slice(&7u32.to_le_bytes()); // wrapped Type = 7 (Ragdoll)
+                                                  // nested bhkConstraintCInfo: num=2, entity_a=-1, entity_b=-1, priority=1
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&(-1i32).to_le_bytes());
+    bytes.extend_from_slice(&(-1i32).to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    // inner Oblivion Ragdoll CInfo: 6 × Vec4 + 6 × f32 = 120.
+    for i in 0..6 {
+        bytes.extend(vec4(i as f32, 0.0, 0.0, 0.0));
+    }
+    for v in [0.5f32, -0.25, 0.75, -1.5, 1.5, 10.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    // Oblivion malleable trailer: Tau + Damping.
+    bytes.extend_from_slice(&0.8f32.to_le_bytes());
+    bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+    let header = oblivion_header();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkMalleableConstraint").unwrap();
+
+    assert_eq!(c.entity_a.index(), Some(1));
+    assert_eq!(c.entity_b.index(), Some(2));
+    let BhkConstraintData::Ragdoll(r) = c.data else {
+        panic!(
+            "Oblivion malleable-wrapped Ragdoll must surface as Ragdoll, got {:?}",
+            c.data
+        );
+    };
+    // Oblivion order: index 0 = pivot_a, index 2 = twist_a.
+    assert_eq!(r.pivot_a, [0.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.twist_a, [2.0, 0.0, 0.0, 0.0]);
+    assert_eq!(r.max_friction, 10.0);
+    // base(16) + Type(4) + nested CInfo(16) + Ragdoll(120) + trailer(8).
+    assert_eq!(stream.position() as usize, 16 + 4 + 16 + 120 + 8);
+}
+
+/// Skyrim LE/SE share the FNV (`!#NI_BS_LTE_16#`) constraint layout —
+/// they're distinguished from Oblivion by NIF version (20.2.0.7), not
+/// bsver, so a Skyrim-header Ragdoll must decode byte-identically to FNV.
+/// This pins the version gate so a future change can't silently route
+/// Skyrim down the Oblivion arm. (havok_scale ×69.99 is applied later, at
+/// the import boundary, from `havok_scale_for(header)`.)
+#[test]
+fn skyrim_ragdoll_uses_fo3_layout() {
+    let mut bytes = base();
+    // FO3+ order, 8 × Vec4 + 6 × f32 (same as FNV).
+    bytes.extend(vec4(0.0, 0.0, 1.0, 0.0)); // twist_a
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0)); // plane_a
+    bytes.extend(vec4(2.0, 0.0, 0.0, 0.0)); // motor_a
+    bytes.extend(vec4(3.0, 10.0, 20.0, 1.0)); // pivot_a
+    bytes.extend(vec4(4.0, 0.0, 1.0, 0.0)); // twist_b
+    bytes.extend(vec4(5.0, 0.0, 0.0, 0.0)); // plane_b
+    bytes.extend(vec4(6.0, 0.0, 0.0, 0.0)); // motor_b
+    bytes.extend(vec4(7.0, -10.0, 5.0, 1.0)); // pivot_b
+    for v in [0.5f32, -0.25, 0.75, -1.5, 1.5, 100.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    // Skyrim SE header: NIF 20.2.0.7 (== FNV), bsver 100 (> 16 → FO3+ arm).
+    let mut header = NifHeader::test_fo3_fnv();
+    header.user_version = 12;
+    header.user_version_2 = 100;
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkRagdollConstraint").unwrap();
+
+    let BhkConstraintData::Ragdoll(r) = c.data else {
+        panic!(
+            "Skyrim Ragdoll must decode via the FO3+ path, got {:?}",
+            c.data
+        );
+    };
+    assert_eq!(r.pivot_a, [3.0, 10.0, 20.0, 1.0]);
+    assert_eq!(r.pivot_b, [7.0, -10.0, 5.0, 1.0]);
+    assert_eq!(r.motor_a, [2.0, 0.0, 0.0, 0.0]); // FO3+ motors present
+    assert_eq!(stream.position() as usize, 16 + 152);
+}
+
+/// #1604 — `bhkBallSocketConstraintChain` inherits `bhkSerializable`, not
+/// `bhkConstraint`, so it has NO leading CInfo. Build a 7-entity chain
+/// (num_pivots = (7-1)*2 = 12 → 6 pivot-pairs) and assert the dedicated
+/// parser consumes exactly `block_size` 260, pulling the real entity refs
+/// from the TRAILING bhkConstraintCInfo (not the head pivot bytes the old
+/// `parse` misread).
+#[test]
+fn ball_socket_chain_consumes_block_and_reads_trailing_refs() {
+    let mut bytes = Vec::new();
+    // num_pivots = 12 (6 bhkBallAndSocketConstraintCInfo, each 2×Vec4).
+    bytes.extend_from_slice(&12u32.to_le_bytes());
+    for i in 0..6u32 {
+        bytes.extend(vec4(i as f32, 0.0, 0.0, 1.0)); // pivot A
+        bytes.extend(vec4(i as f32, 1.0, 0.0, 1.0)); // pivot B
+    }
+    // tau, damping, constraint_force_mixing, max_error_distance.
+    for v in [1.0f32, 0.6, 1.1920929e-08, 0.1] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    // bhkConstraintChainCInfo: 7 chained entities, then the trailing CInfo.
+    bytes.extend_from_slice(&7u32.to_le_bytes());
+    for e in 0..7u32 {
+        bytes.extend_from_slice(&(100 + e).to_le_bytes()); // chained-entity Ptr
+    }
+    // Trailing bhkConstraintCInfo — the REAL refs/priority.
+    bytes.extend_from_slice(&2u32.to_le_bytes()); // num_entities
+    bytes.extend_from_slice(&42u32.to_le_bytes()); // entity_a
+    bytes.extend_from_slice(&43u32.to_le_bytes()); // entity_b
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // priority
+
+    assert_eq!(bytes.len(), 260, "7-entity chain must be block_size 260");
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse_ball_socket_chain(&mut stream, "bhkBallSocketConstraintChain")
+        .expect("chain parse");
+
+    assert_eq!(
+        stream.position() as usize,
+        260,
+        "must consume the whole chain, not misread the head as a base CInfo",
+    );
+    // Real refs come from the trailing CInfo, NOT the leading pivot floats.
+    assert_eq!(c.entity_a.0, 42);
+    assert_eq!(c.entity_b.0, 43);
+    assert_eq!(c.priority, 1);
+
+    // #4212 — the chain's own data is retained now, not just consumed. The
+    // pivots are the only record of where its links attach, so a chain that
+    // parses but surfaces as `Other` is indistinguishable from one that was
+    // skipped.
+    let BhkConstraintData::BallSocketChain(chain) = &c.data else {
+        panic!("the chain must retain its pivots, got {:?}", c.data);
+    };
+    assert_eq!(chain.pivots.len(), 6, "num_pivots 12 = 6 pivot pairs");
+    assert_eq!(chain.pivots[0].pivot_a, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(chain.pivots[5].pivot_b, [5.0, 1.0, 0.0, 1.0]);
+    assert_eq!(chain.tau, 1.0);
+    assert_eq!(chain.damping, 0.6);
+    assert_eq!(chain.max_error_distance, 0.1);
+    assert_eq!(
+        chain
+            .chained_entities
+            .iter()
+            .filter_map(|e| e.index())
+            .collect::<Vec<_>>(),
+        (100..107).collect::<Vec<_>>(),
+        "all seven chained bodies, in order",
+    );
+}
+
+/// #1609 — a malleable-wrapped Hinge (type 1, FNV fixed body = 8×Vec4 =
+/// 128 B) must consume its fixed inner-CInfo body, not rely solely on the
+/// outer `block_size` seek. Total: outer base 16 + type 4 + inner base 16 +
+/// body 128 = 164.
+///
+/// #3330 — the byte accounting is unchanged, but the inner hinge is now
+/// *decoded* into `LimitedHinge` rather than size-skipped as `Other`, so a
+/// malleable-wrapped hinge surfaces identically to a bare one (the same
+/// property the Ragdoll / LimitedHinge arms already had).
+#[test]
+fn fo3_malleable_wrapped_hinge_consumes_inner_body() {
+    let mut bytes = base(); // outer bhkConstraintCInfo (16)
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // wrapped_type = Hinge
+    bytes.extend_from_slice(&base()); // inner bhkConstraintCInfo (16)
+                                      // Hinge FNV fixed body — 8 × Vec4 = 128 B.
+    for i in 0..8 {
+        bytes.extend(vec4(i as f32, 0.0, 0.0, 1.0));
+    }
+    assert_eq!(bytes.len(), 16 + 4 + 16 + 128);
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkMalleableConstraint").unwrap();
+
+    assert!(
+        matches!(c.data, BhkConstraintData::LimitedHinge(_)),
+        "a malleable-wrapped Hinge must surface as LimitedHinge (#3330), got {:?}",
+        c.data
+    );
+    assert_eq!(
+        stream.position() as usize,
+        16 + 4 + 16 + 128,
+        "the Hinge inner body must be fully consumed, not left to block_size",
+    );
+}
+
+/// Sibling: a malleable-wrapped StiffSpring (type 8, 36 B body) — the other
+/// non-motor type — likewise consumes its fixed body, and since #4212
+/// surfaces the decoded spring rather than `Other`.
+#[test]
+fn fo3_malleable_wrapped_stiffspring_consumes_inner_body() {
+    let mut bytes = base();
+    bytes.extend_from_slice(&8u32.to_le_bytes()); // wrapped_type = StiffSpring
+    bytes.extend_from_slice(&base());
+    // StiffSpring fixed body — 2 × Vec4 + f32 = 36 B.
+    bytes.extend(vec4(1.0, 0.0, 0.0, 0.0));
+    bytes.extend(vec4(0.0, 1.0, 0.0, 0.0));
+    bytes.extend_from_slice(&0.5f32.to_le_bytes());
+    assert_eq!(bytes.len(), 16 + 4 + 16 + 36);
+
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkConstraint::parse(&mut stream, "bhkMalleableConstraint").unwrap();
+    let BhkConstraintData::StiffSpring(s) = c.data else {
+        panic!(
+            "a malleable-wrapped StiffSpring must surface as StiffSpring (#4212), got {:?}",
+            c.data
+        );
+    };
+    assert_eq!(s.pivot_a, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(s.length, 0.5);
+    assert_eq!(stream.position() as usize, 16 + 4 + 16 + 36);
+}
+
+// ── #5960 — the trailing bhkConstraintMotorCInfo ─────────────────────────
+//
+// 100% of Skyrim's 1,575 Ragdoll/LimitedHinge blocks parsed exactly one byte
+// short (every authored motor is MOTOR_NONE) and FO3/FNV's real position
+// motors parsed 26 short, each logged as a realignment WARN. The motor is
+// the last field of all three CInfos (`since 20.2.0.7`), so it is consumed
+// after the typed prefix.
+
+/// 8 × Vec4 + 6 × f32 = 152 B Ragdoll prefix.
+fn ragdoll_body() -> Vec<u8> {
+    let mut d = Vec::new();
+    for i in 0..8 {
+        d.extend(vec4(i as f32, 0.0, 0.0, 0.0));
+    }
+    for v in [0.5f32, -0.25, 0.75, -1.5, 1.5, 100.0] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    d
+}
+
+/// 8 × Vec4 + 3 × f32 = 140 B LimitedHinge (and Prismatic) prefix.
+fn limited_hinge_body() -> Vec<u8> {
+    let mut d = Vec::new();
+    for i in 0..8 {
+        d.extend(vec4(i as f32, 0.0, 0.0, 0.0));
+    }
+    for v in [-0.5f32, 0.5, 10.0] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    d
+}
+
+fn parse_fo3(bytes: &[u8], type_name: &'static str) -> (std::io::Result<BhkConstraint>, usize) {
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(bytes, &header);
+    let result = BhkConstraint::parse(&mut stream, type_name);
+    (result, stream.position() as usize)
+}
+
+/// Skyrim's whole constraint corpus: MOTOR_NONE, a single type byte.
+#[test]
+fn fo3_ragdoll_consumes_a_none_motor_type_byte() {
+    let mut bytes = base();
+    bytes.extend(ragdoll_body());
+    bytes.push(0); // MOTOR_NONE
+    let (result, position) = parse_fo3(&bytes, "bhkRagdollConstraint");
+    assert!(matches!(
+        result.unwrap().data,
+        BhkConstraintData::Ragdoll(_)
+    ));
+    assert_eq!(position, 16 + 152 + 1, "the 1-byte motor type is consumed");
+    assert_eq!(
+        position,
+        bytes.len(),
+        "nothing left for block_size to realign"
+    );
+}
+
+/// FO3/FNV's real position motors: 1 type byte + 25 payload = the +26 drift.
+#[test]
+fn fo3_limited_hinge_consumes_a_position_motor() {
+    let mut bytes = base();
+    bytes.extend(limited_hinge_body());
+    bytes.push(1); // MOTOR_POSITION
+    bytes.extend([0u8; 25]);
+    let (result, position) = parse_fo3(&bytes, "bhkLimitedHingeConstraint");
+    assert!(matches!(
+        result.unwrap().data,
+        BhkConstraintData::LimitedHinge(_)
+    ));
+    assert_eq!(position, bytes.len());
+    assert_eq!(position, 16 + 140 + 26);
+}
+
+/// Velocity (18 B) and spring-damper (17 B) payloads, on the third
+/// motor-bearing kind (Prismatic).
+#[test]
+fn fo3_prismatic_consumes_velocity_and_spring_motors() {
+    for (motor_type, payload) in [(2u8, 18usize), (3u8, 17usize)] {
+        let mut bytes = base();
+        bytes.extend(limited_hinge_body());
+        bytes.push(motor_type);
+        bytes.extend(vec![0u8; payload]);
+        let (result, position) = parse_fo3(&bytes, "bhkPrismaticConstraint");
+        assert!(matches!(
+            result.unwrap().data,
+            BhkConstraintData::Prismatic(_)
+        ));
+        assert_eq!(position, 16 + 140 + 1 + payload, "motor type {motor_type}");
+        assert_eq!(position, bytes.len());
+    }
+}
+
+/// An unrecognised motor type must not turn a decoded joint into a hard
+/// parse error (the reason the motor used to be skipped): the joint decodes,
+/// and the unread remainder is left to the outer walker's `block_size` seek.
+#[test]
+fn an_unknown_motor_type_does_not_fail_the_decoded_joint() {
+    let mut bytes = base();
+    bytes.extend(ragdoll_body());
+    bytes.push(9); // not an hkMotorType
+    bytes.extend([0xAB; 7]);
+    let (result, position) = parse_fo3(&bytes, "bhkRagdollConstraint");
+    let c = result.expect("an unknown motor must stay a recoverable block");
+    assert!(matches!(c.data, BhkConstraintData::Ragdoll(_)));
+    assert_eq!(position, 16 + 152 + 1, "only the type byte is consumed");
+}
+
+/// A payload cut short mid-motor is likewise recoverable.
+#[test]
+fn a_truncated_motor_payload_does_not_fail_the_decoded_joint() {
+    let mut bytes = base();
+    bytes.extend(ragdoll_body());
+    bytes.push(1); // MOTOR_POSITION, but only 5 of 25 payload bytes follow
+    bytes.extend([0u8; 5]);
+    let (result, _) = parse_fo3(&bytes, "bhkRagdollConstraint");
+    assert!(matches!(
+        result.unwrap().data,
+        BhkConstraintData::Ragdoll(_)
+    ));
+}
+
+/// Malleable wrapper: Type, inner base, typed CInfo WITH its motor, then the
+/// `Strength` f32 (nif.xml `bhkMalleableConstraintCInfo`). FNV's +5 drift was
+/// the motor type byte plus Strength.
+#[test]
+fn fo3_malleable_ragdoll_consumes_its_motor_and_strength() {
+    let mut bytes = base();
+    bytes.extend_from_slice(&7u32.to_le_bytes()); // wrapped Ragdoll
+    bytes.extend_from_slice(&base()); // inner bhkConstraintCInfo
+    bytes.extend(ragdoll_body());
+    bytes.push(0); // MOTOR_NONE
+    bytes.extend_from_slice(&2.5f32.to_le_bytes()); // Strength
+    let (result, position) = parse_fo3(&bytes, "bhkMalleableConstraint");
+    assert!(matches!(
+        result.unwrap().data,
+        BhkConstraintData::Ragdoll(_)
+    ));
+    assert_eq!(position, 16 + 4 + 16 + 152 + 1 + 4);
+    assert_eq!(position, bytes.len());
+}
+
+/// A malleable-wrapped plain Hinge has NO motor (nif.xml: "no angular limits
+/// or motor"), only the Strength float: FO3's lone +4 malleable drift.
+#[test]
+fn fo3_malleable_hinge_has_strength_but_no_motor() {
+    let mut bytes = base();
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // wrapped Hinge
+    bytes.extend_from_slice(&base());
+    for i in 0..8 {
+        bytes.extend(vec4(i as f32, 0.0, 0.0, 1.0));
+    }
+    bytes.extend_from_slice(&2.5f32.to_le_bytes()); // Strength
+    let (result, position) = parse_fo3(&bytes, "bhkMalleableConstraint");
+    assert!(matches!(
+        result.unwrap().data,
+        BhkConstraintData::LimitedHinge(_)
+    ));
+    assert_eq!(position, 16 + 4 + 16 + 128 + 4);
+    assert_eq!(position, bytes.len());
+}
+
+/// The breakable wrapper already consumes the motor itself after
+/// `parse_fo3`; the typed parsers must NOT consume it too (that would eat
+/// the threshold / remove-when-broken trailer). Pin that the breakable path's
+/// accounting did not move.
+#[test]
+fn the_motor_is_consumed_exactly_once_on_the_breakable_path() {
+    let mut bytes = base();
+    bytes.extend_from_slice(&7u32.to_le_bytes()); // wrapped_type = Ragdoll
+    bytes.extend_from_slice(&base()); // inner bhkConstraintCInfo
+    bytes.extend(ragdoll_body());
+    bytes.push(0); // MOTOR_NONE
+    bytes.extend_from_slice(&75.0f32.to_le_bytes()); // threshold
+    bytes.push(1); // remove_when_broken
+    let header = NifHeader::test_fo3_fnv();
+    let mut stream = NifStream::new(&bytes, &header);
+    let c = BhkBreakableConstraint::parse(&mut stream).unwrap();
+    assert!(matches!(c.data, BhkConstraintData::Ragdoll(_)));
+    assert_eq!(c.threshold, 75.0, "the trailer must still be reachable");
+    assert!(c.remove_when_broken);
+    assert_eq!(stream.position() as usize, bytes.len());
+}

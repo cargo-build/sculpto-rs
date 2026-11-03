@@ -1,0 +1,1199 @@
+//! Built-in ECS systems.
+//!
+//! Systems live in the core crate so every downstream crate (binary,
+//! editor, server, tests) gets the same scene-graph semantics for free.
+//! Each public factory returns a `impl FnMut(&World, f32) + Send + Sync`
+//! closure that captures reusable scratch buffers — the scheduler
+//! wires them into a stage via `Scheduler::add_to`.
+//!
+//! The first resident is `make_transform_propagation_system`, moved
+//! out of `byroredux/src/systems.rs` in #81. More engine systems
+//! (bounds propagation, billboard, animation ticks) may follow as the
+//! binary crate consolidates.
+
+use std::collections::VecDeque;
+
+use crate::ecs::components::{Children, GlobalTransform, Parent, Transform};
+use crate::ecs::storage::EntityId;
+use crate::ecs::world::World;
+use crate::ecs::HierarchyTraversalGuard;
+use rustc_hash::FxHashSet;
+
+fn enqueue_unique_children(
+    queue: &mut VecDeque<EntityId>,
+    queued: &mut FxHashSet<EntityId>,
+    expanded: &FxHashSet<EntityId>,
+    owner: EntityId,
+    children: &Children,
+    duplicate_reported: &mut bool,
+) {
+    for &child in &children.0 {
+        if expanded.contains(&child) {
+            if !*duplicate_reported {
+                log::error!(
+                    "transform propagation stopped revisiting hierarchy entity {child} from {owner}; cyclic or duplicate Children edge"
+                );
+                *duplicate_reported = true;
+            }
+        } else if queued.insert(child) {
+            queue.push_back(child);
+        }
+    }
+}
+
+/// Transform propagation system — the ECS equivalent of Gamebryo's
+/// `NiNode::UpdateDownwardPass`.
+///
+/// Each frame:
+///
+/// 1. Every entity that has a `Transform` but no `Parent` is a root;
+///    its `GlobalTransform` is copied straight from its local
+///    `Transform`.
+/// 2. Starting from each root, a breadth-first walk through `Children`
+///    composes each child's `GlobalTransform` as
+///    `parent_global ∘ child_local`.
+///
+/// Must run after the animation system and before rendering. When a
+/// system pipeline overwrites `GlobalTransform` *after* propagation
+/// (the billboard system, the world-bound folder) it should be
+/// scheduled as an `add_exclusive` step inside the same stage so the
+/// read/write doesn't race against this walk.
+///
+/// Returns a closure that owns two reusable `Vec` scratch buffers
+/// (`roots` and `queue`), cleared and reused every frame instead of
+/// reallocating.
+pub fn make_transform_propagation_system() -> impl FnMut(&World, f32) + Send + Sync {
+    let mut roots: Vec<EntityId> = Vec::new();
+    let mut queue: VecDeque<EntityId> = VecDeque::new();
+    // Full change-detection state: the roots key plus the `Parent` /
+    // `Children` structural generations. When this is unchanged AND no
+    // `Transform` was mutated this frame, every `GlobalTransform` is
+    // already correct and the whole propagation is skipped — the
+    // change-detection fast path (the render-distance root fix). The
+    // generations catch hierarchy edits (reparent / attach) that move no
+    // Transform and leave entity counts unchanged.
+    let mut last_state: Option<((usize, usize, EntityId), u64, u64)> = None;
+    // Persistent scratch for the dirty-entity list (#1371). Reusing the
+    // same Vec across frames keeps the backing allocation alive so the
+    // next `mark_dirty` call does not re-grow from zero capacity.
+    let mut transform_dirty: Vec<EntityId> = Vec::new();
+    let mut queued: FxHashSet<EntityId> = FxHashSet::default();
+    let mut expanded: FxHashSet<EntityId> = FxHashSet::default();
+    // Set view of `transform_dirty`, used by the incremental seed pass to
+    // ask "does this entity have a dirty ancestor?" (#4060). Persistent for
+    // the same reason as the others: keeps the allocation across frames.
+    let mut dirty_set: FxHashSet<EntityId> = FxHashSet::default();
+
+    move |world: &World, _dt: f32| {
+        queue.clear();
+        queued.clear();
+        expanded.clear();
+        dirty_set.clear();
+
+        // Acquire all ECS queries once per frame and hold them across
+        // both phases and the BFS walk. The prior implementation called
+        // `world.query*` four times *per child* inside the BFS loop,
+        // costing ~4 RwLock acquisitions + drops per node on top of the
+        // actual transform composition work. Holding the handles for
+        // the whole function collapses that to 4 acquisitions total.
+        // See #238.
+        //
+        // `Transform` is taken as a WRITE query (vs read pre-change-
+        // detection) so we can drain its per-entity dirty set — the
+        // local transforms are only read, never mutated, by this system.
+        let Some(mut tq) = world.query_mut::<Transform>() else {
+            return;
+        };
+        let parent_q = world.query::<Parent>();
+        let children_q = world.query::<Children>();
+        let Some(mut gq) = world.query_mut::<GlobalTransform>() else {
+            return;
+        };
+        let child_reference_count = children_q
+            .as_ref()
+            .map(|q| q.iter().map(|(_, children)| children.0.len()).sum())
+            .unwrap_or(0);
+        let mut traversal_guard =
+            HierarchyTraversalGuard::new(world.next_entity_id() as usize, child_reference_count);
+        let mut duplicate_reported = false;
+
+        // Change-detection drain: which entities' local Transform was
+        // mutated since last frame. Draining every frame keeps the dirty
+        // Vec bounded (it would otherwise grow unbounded). See
+        // `Component::TRACK_CHANGES` + `PackedStorage::drain_dirty_into`.
+        // Using `drain_dirty_into` rather than `take_dirty` preserves the
+        // storage's capacity across frames (#1371).
+        tq.storage_mut().drain_dirty_into(&mut transform_dirty);
+
+        // Hierarchy structural generations — bumped on any Parent/Children
+        // insert/remove (incl. reparent overwrites), 0 when nothing's
+        // changed. Together with the roots key this detects every hierarchy
+        // edit a pure Transform-dirty check would miss.
+        let parent_gen = parent_q
+            .as_ref()
+            .map(|q| q.storage().structural_generation())
+            .unwrap_or(0);
+        let children_gen = children_q
+            .as_ref()
+            .map(|q| q.storage().structural_generation())
+            .unwrap_or(0);
+
+        let roots_key = (
+            tq.len(),
+            parent_q.as_ref().map(|q| q.len()).unwrap_or(0),
+            world.next_entity_id(),
+        );
+        let state = (roots_key, parent_gen, children_gen);
+
+        // FAST PATH: nothing moved and the hierarchy is identical to last
+        // frame → all GlobalTransforms are already correct, skip the walk.
+        // This is the change-detection win: a static cell (camera parked or
+        // moving — the camera's own Transform mutation marks only itself
+        // dirty) skips the full O(entities) BFS entirely.
+        if transform_dirty.is_empty() && last_state == Some(state) {
+            return;
+        }
+        // `structural_changed` = the hierarchy itself moved (spawn / despawn
+        // / reparent / cell load), detected by any change to the roots key
+        // OR the Parent/Children structural generations. When false, only
+        // some local Transforms moved and the cheap incremental path applies.
+        let structural_changed = last_state != Some(state);
+        last_state = Some(state);
+
+        // Phase 1: find root entities (have Transform but no Parent).
+        // Steady-state interior cells touch ~6 k Transforms with ~30
+        // roots; rescanning every frame burned ~250 µs / frame on
+        // Megaton (#825). The generation key matches the `NameIndex`
+        // pattern used in `animation_system`.
+        // Seed the BFS queue. Two modes:
+        //
+        // * STRUCTURAL change (spawn / despawn / reparent / cell load):
+        //   rebuild the root set if counts moved, set every root's global
+        //   from its local, and seed the walk with every root's children —
+        //   the original full O(entities) propagation.
+        //
+        // * INCREMENTAL (only some locals moved, hierarchy identical): set
+        //   each moved entity's own global, seed only ITS children. The
+        //   static cell with a moving camera lands here — the camera's
+        //   Transform is the only dirty entry, so the walk touches ~1
+        //   subtree instead of all 110 k entities. This is the win.
+        queue.clear();
+        if structural_changed {
+            // #4061 — rebuild on ANY structural change, not on a roots-key
+            // (count) change alone. The old gate was
+            // `last_roots_key != Some(roots_key)` over
+            // `(Transform::len(), Parent::len(), next_entity_id())`, all
+            // three of which are invariant under a `Parent` removal paired
+            // with a `Parent` insertion in the same frame with no spawn —
+            // while the root set genuinely moves: the detached entity is a
+            // new root absent from the stale list and unreachable from any
+            // parent, so nothing recomposes it, and the newly attached
+            // entity is still IN the list, so Phase 1b overwrites its
+            // global with its bare local and `expanded.insert(root)` then
+            // makes `enqueue_unique_children` refuse to walk it from its
+            // real parent. Both stay wrong forever, because the next frame
+            // takes the fast path.
+            //
+            // The `structural_gen` counters exist for exactly this class of
+            // count-invariant hierarchy edit (see `last_state`'s comment
+            // above) and were wired only to the fast-path decision, never
+            // to this one. `structural_changed` subsumes the old key, so
+            // this is strictly more conservative: the frames it newly
+            // rescans on are reparent-overwrites and first-`Children`
+            // inserts, which are hierarchy edits already paying for a full
+            // BFS in the same branch.
+            roots.clear();
+            for (entity, _) in tq.iter() {
+                let is_root = parent_q
+                    .as_ref()
+                    .map(|pq| pq.get(entity).is_none())
+                    .unwrap_or(true);
+                if is_root {
+                    roots.push(entity);
+                }
+            }
+            // Phase 1b: every root's global = its local.
+            for &entity in &roots {
+                if let (Some(t), Some(g)) = (tq.get(entity), gq.get_mut(entity)) {
+                    g.translation = t.translation;
+                    g.rotation = t.rotation;
+                    g.scale = t.scale;
+                }
+            }
+            if let Some(ref cq) = children_q {
+                for &root in &roots {
+                    expanded.insert(root);
+                    if let Some(children) = cq.get(root) {
+                        enqueue_unique_children(
+                            &mut queue,
+                            &mut queued,
+                            &expanded,
+                            root,
+                            children,
+                            &mut duplicate_reported,
+                        );
+                    }
+                }
+            }
+        } else {
+            // Dedup the dirty list (an entity may be marked multiple times
+            // in one frame) so each subtree is seeded once.
+            transform_dirty.sort_unstable();
+            transform_dirty.dedup();
+            dirty_set.extend(transform_dirty.iter().copied());
+            // #4060 — climbing `Parent` here costs its OWN budget, not the
+            // shared `traversal_guard`. The climbs are O(dirty x depth) in
+            // the worst case, which can exceed the BFS budget on a deep
+            // hierarchy; spending the shared one would abort the walk that
+            // does the actual work. Both are bounded by the same size, so a
+            // `Parent` cycle still terminates.
+            let mut seed_guard = HierarchyTraversalGuard::new(
+                world.next_entity_id() as usize,
+                child_reference_count,
+            );
+            for &e in &transform_dirty {
+                // Seed only the SHALLOWEST dirty entities. When an ancestor
+                // of `e` is also dirty, seeding `e` here composes it against
+                // that ancestor's not-yet-updated global — and, worse,
+                // immediately enqueues `e`'s children, which are then popped
+                // and marked `expanded` while `e` still holds the wrong
+                // value. When the BFS later recomposes `e` correctly its
+                // re-enqueue of those children is refused by the `expanded`
+                // guard (#3700), so the subtree below `e` keeps a global
+                // built from `e`'s pre-update value and never self-heals:
+                // the next frame nothing is dirty, the state key is
+                // unchanged, and the fast path returns immediately.
+                //
+                // Skipping the seed lets the BFS from that dirty ancestor
+                // reach `e` top-down exactly once, with a correct parent
+                // global, and drops the redundant seed work as a side
+                // effect. It relies on `e` being reachable from the ancestor
+                // through `Children` — the same assumption the structural
+                // path already makes, since an entity missing from its
+                // parent's `Children` is never enqueued by the root walk
+                // either and so has no correct global on any path.
+                let mut has_dirty_ancestor = false;
+                if let Some(pq) = parent_q.as_ref() {
+                    let mut cursor = e;
+                    while let Some(parent) = pq.get(cursor) {
+                        if !seed_guard.step() {
+                            // Budget exhausted (a `Parent` cycle, or a
+                            // pathological depth). Fail safe: seed `e` the
+                            // pre-#4060 way rather than skip it entirely.
+                            has_dirty_ancestor = false;
+                            break;
+                        }
+                        if dirty_set.contains(&parent.0) {
+                            has_dirty_ancestor = true;
+                            break;
+                        }
+                        cursor = parent.0;
+                    }
+                }
+                if has_dirty_ancestor {
+                    continue;
+                }
+                let local = tq.get(e).copied().unwrap_or(Transform::IDENTITY);
+                // Recompose e's own global: parent's current global ∘ local,
+                // or the local itself when e is a root. The parent's global
+                // is correct here BY CONSTRUCTION as of #4060 — the climb
+                // above skipped every `e` that has a dirty ancestor, so any
+                // remaining `e` has only clean ancestors, whose globals were
+                // finalised last frame.
+                //
+                // This used to say the ancestor's seeded subtree "re-fixes e
+                // — order doesn't matter". It re-fixed `e` but not `e`'s
+                // children; see the climb's comment above.
+                let e_global = match parent_q.as_ref().and_then(|pq| pq.get(e)) {
+                    // #4062 — a read, not a write; see the BFS drain's
+                    // note on `get_mut`'s unconditional `mark_dirty`.
+                    Some(parent) => match gq.get(parent.0).copied() {
+                        Some(pg) => GlobalTransform::compose(
+                            &pg,
+                            local.translation,
+                            local.rotation,
+                            local.scale,
+                        ),
+                        None => continue,
+                    },
+                    None => GlobalTransform::new(local.translation, local.rotation, local.scale),
+                };
+                if let Some(g) = gq.get_mut(e) {
+                    *g = e_global;
+                }
+                // Leave the seeded entity unexpanded so the BFS can still
+                // reach it through a dirty ancestor's subtree. Post-#4060 no
+                // ancestor of `e` is dirty, so this is now only about a
+                // second path to `e` through a shared/duplicate edge. Dirty
+                // roots are marked immediately so a malformed child edge back
+                // to the root is diagnosed rather than walked.
+                if parent_q.as_ref().and_then(|pq| pq.get(e)).is_none() {
+                    expanded.insert(e);
+                }
+                if let Some(ref cq) = children_q {
+                    if let Some(children) = cq.get(e) {
+                        enqueue_unique_children(
+                            &mut queue,
+                            &mut queued,
+                            &expanded,
+                            e,
+                            children,
+                            &mut duplicate_reported,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Shared BFS drain. Requires both Parent (to look up each child's
+        // parent) and Children (to enqueue grandchildren); a flat scene with
+        // neither already reached its final state in the seeding above.
+        let (Some(pq), Some(cq)) = (parent_q.as_ref(), children_q.as_ref()) else {
+            return;
+        };
+
+        while let Some(entity) = queue.pop_front() {
+            queued.remove(&entity);
+            if !traversal_guard.step() {
+                log::error!(
+                    "transform propagation aborted after exhausting the hierarchy traversal budget at entity {entity}"
+                );
+                return;
+            }
+            if !expanded.insert(entity) {
+                if !duplicate_reported {
+                    log::error!(
+                        "transform propagation skipped repeated hierarchy entity {entity}; cyclic or duplicate Children edge"
+                    );
+                    duplicate_reported = true;
+                }
+                continue;
+            }
+            let Some(parent) = pq.get(entity) else {
+                continue;
+            };
+            let parent_id = parent.0;
+
+            // Read the parent's GlobalTransform through the held write
+            // query. `QueryWrite::get` takes `&self` and routes through
+            // `storage()`, so the shared borrow ends at the `copied()` and
+            // the child write below is free to take `&mut self`.
+            //
+            // #4062 — this is a READ, so it must not be `get_mut`.
+            // `PackedStorage::get_mut` calls `mark_dirty` unconditionally
+            // and `GlobalTransform` is `TRACK_CHANGES`, so the old
+            // `get_mut(parent_id).map(|g| *g)` pushed this entity's parent
+            // into the dirty set on every BFS step, on top of the
+            // legitimate mark for the child actually written below. On a
+            // 40-entity tree that was 119 dirty entries for 40 unique
+            // entities. `bounds.rs` is the sole drainer and paid for it
+            // twice: a larger `sort_unstable + dedup`, then a Pass-1
+            // `WorldBound` recompute plus a Pass-2 root climb for parents
+            // whose global had not moved.
+            let Some(parent_global) = gq.get(parent_id).copied() else {
+                continue;
+            };
+
+            let local = tq.get(entity).copied().unwrap_or(Transform::IDENTITY);
+
+            let composed = GlobalTransform::compose(
+                &parent_global,
+                local.translation,
+                local.rotation,
+                local.scale,
+            );
+
+            if let Some(g) = gq.get_mut(entity) {
+                *g = composed;
+            }
+
+            if let Some(children) = cq.get(entity) {
+                enqueue_unique_children(
+                    &mut queue,
+                    &mut queued,
+                    &expanded,
+                    entity,
+                    children,
+                    &mut duplicate_reported,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the core transform propagation system
+    //! extracted from the binary crate in #81.
+
+    use super::*;
+    use crate::ecs::components::{GlobalTransform, Parent, Transform};
+    use crate::ecs::world::World;
+    use crate::math::{Quat, Vec3};
+
+    fn spawn_with_transform(
+        world: &mut World,
+        translation: Vec3,
+        rotation: Quat,
+        scale: f32,
+    ) -> EntityId {
+        let e = world.spawn();
+        world.insert(e, Transform::new(translation, rotation, scale));
+        world.insert(e, GlobalTransform::IDENTITY);
+        e
+    }
+
+    #[test]
+    fn root_global_matches_local_transform() {
+        let mut world = World::new();
+        let e = spawn_with_transform(
+            &mut world,
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            2.0,
+        );
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        let g = gq.get(e).unwrap();
+        assert!((g.translation - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5);
+        assert!((g.scale - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn child_inherits_parent_translation_and_scale() {
+        let mut world = World::new();
+        let parent =
+            spawn_with_transform(&mut world, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, 2.0);
+        let child = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(child, Parent(parent));
+        world.insert(parent, Children(vec![child]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        let cg = gq.get(child).unwrap();
+        // Child local offset (1, 0, 0) scaled by parent scale 2 and
+        // added to parent world position (10, 0, 0) → (12, 0, 0).
+        assert!((cg.translation - Vec3::new(12.0, 0.0, 0.0)).length() < 1e-5);
+        assert!((cg.scale - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn grandchild_composes_through_two_parents() {
+        let mut world = World::new();
+        let a = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let b = spawn_with_transform(&mut world, Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let c = spawn_with_transform(&mut world, Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(b, Parent(a));
+        world.insert(c, Parent(b));
+        world.insert(a, Children(vec![b]));
+        world.insert(b, Children(vec![c]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        let ga = gq.get(a).unwrap();
+        let gb = gq.get(b).unwrap();
+        let gc = gq.get(c).unwrap();
+        assert!((ga.translation.x - 1.0).abs() < 1e-5);
+        assert!((gb.translation.x - 3.0).abs() < 1e-5);
+        assert!((gc.translation.x - 6.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn child_rotation_is_composed_with_parent() {
+        use std::f32::consts::FRAC_PI_2;
+        let mut world = World::new();
+        // Parent rotated 90° around Y — its local +X now points at world +Z
+        // (in a right-handed Y-up coordinate system with CCW-positive Y rotation,
+        // `rot_y(π/2) * +X → -Z`). We check the child's translation ends up
+        // consistent with the parent rotation regardless of sign convention.
+        let parent = spawn_with_transform(
+            &mut world,
+            Vec3::ZERO,
+            Quat::from_rotation_y(FRAC_PI_2),
+            1.0,
+        );
+        let child = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(child, Parent(parent));
+        world.insert(parent, Children(vec![child]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        let cg = gq.get(child).unwrap();
+        // Child's world translation must lie on the Z axis (x and y ≈ 0).
+        assert!(
+            cg.translation.x.abs() < 1e-5,
+            "x should be 0, got {}",
+            cg.translation.x
+        );
+        assert!(cg.translation.y.abs() < 1e-5);
+        assert!((cg.translation.z.abs() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parentless_orphan_keeps_identity_for_missing_global() {
+        // Entity with Transform but no GlobalTransform inserted — the
+        // system must not panic; it simply skips the missing storage.
+        let mut world = World::new();
+        let e = world.spawn();
+        world.insert(
+            e,
+            Transform::new(Vec3::new(9.0, 9.0, 9.0), Quat::IDENTITY, 1.0),
+        );
+        // Deliberately no GlobalTransform.
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+        // No crash, and no global got invented for `e`.
+        let gq = world.query::<GlobalTransform>();
+        if let Some(q) = gq {
+            assert!(q.get(e).is_none());
+        }
+    }
+
+    /// Regression test for #238: a 10-level-deep chain composed in a
+    /// single propagation call must produce a linear translation
+    /// accumulation. The old implementation would acquire four ECS
+    /// locks per child (~40 acquisitions for this chain); the new
+    /// implementation holds all four queries across the BFS. Functional
+    /// correctness must be identical.
+    #[test]
+    fn ten_level_chain_composes_correctly_with_held_locks() {
+        let mut world = World::new();
+        let mut prev: Option<EntityId> = None;
+        let mut ids: Vec<EntityId> = Vec::new();
+        for _ in 0..10 {
+            let e = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+            if let Some(parent) = prev {
+                world.insert(e, Parent(parent));
+                world.insert(parent, Children(vec![e]));
+            }
+            prev = Some(e);
+            ids.push(e);
+        }
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        for (i, &id) in ids.iter().enumerate() {
+            let g = gq.get(id).unwrap();
+            let expected_x = (i + 1) as f32;
+            assert!(
+                (g.translation.x - expected_x).abs() < 1e-4,
+                "level {i}: expected x={expected_x}, got {}",
+                g.translation.x,
+            );
+            assert!(g.translation.y.abs() < 1e-4);
+            assert!(g.translation.z.abs() < 1e-4);
+        }
+    }
+
+    /// M41.0 Phase 1b.x — replicate the NPC spawn topology that's
+    /// rendering with broken body skinning interactively. Spawn order
+    /// mirrors `byroredux::npc_spawn::resumable::NpcSpawnJob`'s runtime recipe:
+    ///   1. placement_root with T + GT BOTH explicitly set to the
+    ///      cell-world ref position.
+    ///   2. skel_root spawned (no Parent), then `Parent(placement_root)`
+    ///      inserted afterwards.
+    ///   3. Several bones spawned as a deep chain *before* the skel_root
+    ///      → placement_root edge is set, so add_child runs after.
+    ///
+    /// If propagation works under this exact ordering, the runtime bug
+    /// isn't in the topology — it's in the GPU palette upload or the
+    /// dispatch order against the scheduler.
+    #[test]
+    fn npc_spawn_topology_propagates_to_deep_bone_chain() {
+        let mut world = World::new();
+        // Step 1: placement_root with EXPLICIT GT (mirrors
+        // npc_spawn.rs:319-323 — both Transform AND GlobalTransform
+        // get inserted at spawn time so the renderer can read a valid
+        // pose on frame 0 before propagation runs).
+        let placement_root = world.spawn();
+        let ref_pos = Vec3::new(2288.76, 7360.0, -2244.41);
+        world.insert(placement_root, Transform::new(ref_pos, Quat::IDENTITY, 1.0));
+        world.insert(
+            placement_root,
+            GlobalTransform::new(ref_pos, Quat::IDENTITY, 1.0),
+        );
+
+        // Step 2: skel_root spawned via "import" (no Parent yet), all
+        // bones spawned next as a deep chain inside the skel.nif. Mirror
+        // load_nif_bytes_with_skeleton's Phase 1+2 ordering: spawn all
+        // node entities first, then walk the parent_node array to set
+        // Parent + add_child.
+        let skel_root = spawn_with_transform(&mut world, Vec3::ZERO, Quat::IDENTITY, 1.0);
+        let bones: Vec<EntityId> = (0..30)
+            .map(|_| {
+                spawn_with_transform(&mut world, Vec3::new(0.0, 1.0, 0.0), Quat::IDENTITY, 1.0)
+            })
+            .collect();
+        // Build the bone chain: bones[0] under skel_root, bones[i] under
+        // bones[i-1].
+        world.insert(bones[0], Parent(skel_root));
+        world.insert(skel_root, Children(vec![bones[0]]));
+        for i in 1..bones.len() {
+            world.insert(bones[i], Parent(bones[i - 1]));
+            world.insert(bones[i - 1], Children(vec![bones[i]]));
+        }
+
+        // Step 3: NOW set Parent(skel_root) = placement_root and
+        // add_child(placement_root, skel_root). Mirrors npc_spawn.rs:
+        // 366-367. This is the "external skeleton parent edge" — set
+        // AFTER the NIF spawn assembled the skel internals.
+        world.insert(skel_root, Parent(placement_root));
+        world.insert(placement_root, Children(vec![skel_root]));
+
+        // Run propagation.
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        // Verify: placement_root keeps its world ref. skel_root composes
+        // ref + identity = ref. bones[0] = ref + (0,1,0) = ref+y.
+        // bones[i] should accumulate i+1 of (0,1,0) on top of ref.
+        let gq = world.query::<GlobalTransform>().unwrap();
+        let gp = gq.get(placement_root).unwrap();
+        assert!(
+            (gp.translation - ref_pos).length() < 1e-3,
+            "placement_root GT must equal ref_pos"
+        );
+        let gs = gq.get(skel_root).unwrap();
+        assert!(
+            (gs.translation - ref_pos).length() < 1e-3,
+            "skel_root GT must compose to ref_pos (got {:?})",
+            gs.translation
+        );
+        for (i, &b) in bones.iter().enumerate() {
+            let gb = gq.get(b).unwrap();
+            let expected = ref_pos + Vec3::new(0.0, (i + 1) as f32, 0.0);
+            assert!(
+                (gb.translation - expected).length() < 1e-3,
+                "bone[{i}] expected {:?}, got {:?}",
+                expected,
+                gb.translation
+            );
+        }
+    }
+
+    /// Two sibling subtrees under a common root must BOTH receive the
+    /// root's world translation. This pins the fan-out case — the BFS
+    /// enqueues both children, and both pops must re-read the same
+    /// `parent_global` through the held write query.
+    #[test]
+    fn fan_out_siblings_both_compose_from_same_root() {
+        let mut world = World::new();
+        let root =
+            spawn_with_transform(&mut world, Vec3::new(100.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let left = spawn_with_transform(&mut world, Vec3::new(-5.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let right = spawn_with_transform(&mut world, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(left, Parent(root));
+        world.insert(right, Parent(root));
+        world.insert(root, Children(vec![left, right]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        let gl = gq.get(left).unwrap();
+        let gr = gq.get(right).unwrap();
+        assert!((gl.translation.x - 95.0).abs() < 1e-4);
+        assert!((gr.translation.x - 105.0).abs() < 1e-4);
+    }
+
+    /// Regression test for #825: the cached root set must invalidate
+    /// when a new top-level entity (Transform-only) is spawned, when an
+    /// entity gains a Parent (becomes non-root), and when a Parent is
+    /// removed (becomes a root). All three transitions move the
+    /// `(Transform::len, Parent::len, next_entity_id)` key.
+    #[test]
+    fn root_cache_invalidates_on_topology_change() {
+        let mut world = World::new();
+        let r1 = spawn_with_transform(&mut world, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+        assert_eq!(
+            world
+                .query::<GlobalTransform>()
+                .unwrap()
+                .get(r1)
+                .unwrap()
+                .translation
+                .x,
+            10.0
+        );
+
+        // 1) New root appears — cache must rescan and produce its GT.
+        let r2 = spawn_with_transform(&mut world, Vec3::new(20.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        sys(&world, 0.016);
+        let gq = world.query::<GlobalTransform>().unwrap();
+        assert_eq!(gq.get(r2).unwrap().translation.x, 20.0);
+        drop(gq);
+
+        // 2) New child of r1 — gains a Parent (Parent::len changes), so
+        //    the rescan must NOT classify it as a root, and BFS must
+        //    still compose its GT through r1.
+        let child = spawn_with_transform(&mut world, Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(child, Parent(r1));
+        world.insert(r1, Children(vec![child]));
+        sys(&world, 0.016);
+        let gq = world.query::<GlobalTransform>().unwrap();
+        // r1 (10) + child local (3) = 13, composed via the BFS pass.
+        assert!((gq.get(child).unwrap().translation.x - 13.0).abs() < 1e-4);
+        drop(gq);
+
+        // 3) Remove the Parent — `child` should be promoted to root and
+        //    its GT should now equal its local Transform alone (3.0, not
+        //    13.0). Parent::len drops, invalidating the cache.
+        world.remove::<Parent>(child);
+        sys(&world, 0.016);
+        let gq = world.query::<GlobalTransform>().unwrap();
+        assert!(
+            (gq.get(child).unwrap().translation.x - 3.0).abs() < 1e-4,
+            "child should be a root after Parent removed (got x={})",
+            gq.get(child).unwrap().translation.x
+        );
+    }
+
+    /// Steady-state cache hit: with no topology change between frames,
+    /// the propagated values must remain correct (i.e. Phase 1b/2 still
+    /// run on the cached root set).
+    #[test]
+    fn root_cache_steady_state_still_runs_propagation() {
+        let mut world = World::new();
+        let root = spawn_with_transform(&mut world, Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let child = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(child, Parent(root));
+        world.insert(root, Children(vec![child]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        // Mutate the root's local transform without touching topology —
+        // cache stays valid, but Phase 1b/2 must still re-compose.
+        {
+            let mut tq = world.query_mut::<Transform>().unwrap();
+            tq.get_mut(root).unwrap().translation.x = 50.0;
+        }
+        sys(&world, 0.016);
+        let gq = world.query::<GlobalTransform>().unwrap();
+        assert!((gq.get(root).unwrap().translation.x - 50.0).abs() < 1e-4);
+        assert!((gq.get(child).unwrap().translation.x - 51.0).abs() < 1e-4);
+    }
+
+    /// Change-detection fast path: a frame with no `Transform` mutation and
+    /// no hierarchy change must SKIP the propagation walk entirely. Proven
+    /// by corrupting a `GlobalTransform` directly and showing the skip
+    /// leaves the corruption in place — then a real local mutation
+    /// re-propagates and fixes it.
+    #[test]
+    fn change_detection_skips_when_nothing_moved() {
+        let mut world = World::new();
+        let parent =
+            spawn_with_transform(&mut world, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let child = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(child, Parent(parent));
+        world.insert(parent, Children(vec![child]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016); // frame 1 — full propagation
+        assert!(
+            (world
+                .query::<GlobalTransform>()
+                .unwrap()
+                .get(child)
+                .unwrap()
+                .translation
+                .x
+                - 11.0)
+                .abs()
+                < 1e-4
+        );
+
+        // Corrupt the child's GlobalTransform directly. GlobalTransform is
+        // not change-tracked, so this does not arm the dirty set.
+        {
+            let mut gq = world.query_mut::<GlobalTransform>().unwrap();
+            gq.get_mut(child).unwrap().translation.x = -999.0;
+        }
+        // No Transform mutated, hierarchy unchanged → MUST skip, leaving the
+        // corruption untouched (a re-run would overwrite it back to 11).
+        sys(&world, 0.016);
+        assert_eq!(
+            world
+                .query::<GlobalTransform>()
+                .unwrap()
+                .get(child)
+                .unwrap()
+                .translation
+                .x,
+            -999.0,
+            "propagation should have skipped (nothing changed)"
+        );
+
+        // Move the parent → marks Transform dirty → re-propagation fixes the
+        // child (and overwrites the corruption).
+        {
+            let mut tq = world.query_mut::<Transform>().unwrap();
+            tq.get_mut(parent).unwrap().translation.x = 20.0;
+        }
+        sys(&world, 0.016);
+        assert!(
+            (world
+                .query::<GlobalTransform>()
+                .unwrap()
+                .get(child)
+                .unwrap()
+                .translation
+                .x
+                - 21.0)
+                .abs()
+                < 1e-4,
+            "moving the parent must re-propagate the child to 21"
+        );
+    }
+
+    /// A reparent that overwrites an existing `Parent` (no Transform moved,
+    /// entity count unchanged) must NOT be skipped — the `Parent`/`Children`
+    /// structural generation guards against the dirty-set blind spot.
+    #[test]
+    fn change_detection_reacts_to_reparent_overwrite() {
+        let mut world = World::new();
+        let parent =
+            spawn_with_transform(&mut world, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let child = spawn_with_transform(&mut world, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(child, Parent(parent));
+        world.insert(parent, Children(vec![child]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        // Corrupt the child global, then re-insert Parent (an overwrite with
+        // the same value — entity count + Transforms all unchanged, but the
+        // Parent storage's structural generation bumps).
+        {
+            let mut gq = world.query_mut::<GlobalTransform>().unwrap();
+            gq.get_mut(child).unwrap().translation.x = -999.0;
+        }
+        world.insert(child, Parent(parent)); // structural insert → gen bump
+        sys(&world, 0.016);
+        assert!(
+            (world
+                .query::<GlobalTransform>()
+                .unwrap()
+                .get(child)
+                .unwrap()
+                .translation
+                .x
+                - 11.0)
+                .abs()
+                < 1e-4,
+            "a Parent overwrite must defeat the skip and re-propagate the child"
+        );
+    }
+
+    #[test]
+    fn cyclic_children_terminate_with_a_bounded_walk() {
+        let mut world = World::new();
+        let root = spawn_with_transform(&mut world, Vec3::ZERO, Quat::IDENTITY, 1.0);
+        let a = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+        let b = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+
+        // The Parent side is a valid root-to-leaf chain, but the hand-edited
+        // Children side closes b back to a. The propagation system must log
+        // the repeated edge and return instead of spinning forever.
+        world.insert(a, Parent(root));
+        world.insert(b, Parent(a));
+        world.insert(root, Children(vec![a]));
+        world.insert(a, Children(vec![b]));
+        world.insert(b, Children(vec![a]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        assert!(gq.get(a).unwrap().translation.is_finite());
+        assert!(gq.get(b).unwrap().translation.is_finite());
+    }
+
+    /// #4060 — this fixture used to stop at a two-entity chain, where the
+    /// dirty descendant is a LEAF. That is precisely the one shape the
+    /// defect cannot exhibit, so the test's name over-promised: the
+    /// pre-#4060 recovery did re-fix the dirty descendant itself, and only
+    /// stranded its children. The chain is now four deep with a clean node
+    /// between the two dirty entities, which is what the name claims.
+    #[test]
+    fn dirty_descendant_is_recomposed_after_a_later_dirty_ancestor() {
+        let mut world = World::new();
+        // Spawn leaf-first so EntityIds sort descendant-before-ancestor in
+        // the dirty list, forcing the seed pass to meet the descendant
+        // before the moved ancestor.
+        let leaf = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+        let child = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+        let middle = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+        let parent =
+            spawn_with_transform(&mut world, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        // parent -> middle -> child -> leaf. `middle` stays clean.
+        for (c, p) in [(middle, parent), (child, middle), (leaf, child)] {
+            world.insert(c, Parent(p));
+            world.insert(p, Children(vec![c]));
+        }
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+
+        {
+            let mut tq = world.query_mut::<Transform>().unwrap();
+            tq.get_mut(child).unwrap().translation.x = 2.0;
+            tq.get_mut(parent).unwrap().translation.x = 20.0;
+        }
+        sys(&world, 0.016);
+
+        let gq = world.query::<GlobalTransform>().unwrap();
+        assert_eq!(gq.get(parent).unwrap().translation.x, 20.0);
+        assert_eq!(gq.get(middle).unwrap().translation.x, 21.0);
+        assert_eq!(gq.get(child).unwrap().translation.x, 23.0);
+        assert_eq!(
+            gq.get(leaf).unwrap().translation.x,
+            24.0,
+            "the subtree BELOW the dirty descendant is the half the two-entity \
+             fixture could not reach (#4060)"
+        );
+    }
+
+    /// #4060 (ECS-2026-09-08-D8-01) — a CLEAN node between two dirty ones
+    /// used to permanently strand the subtree below the deeper dirty entity.
+    ///
+    /// `dirty_descendant_is_recomposed_after_a_later_dirty_ancestor` above
+    /// reads as if it covers this, but its dirty descendant is a **leaf** —
+    /// the one shape that cannot exhibit the defect, because the recovery
+    /// the incremental seed relies on ("the ancestor's seeded subtree
+    /// re-fixes `e`") works for `e` itself and not for `e`'s children.
+    ///
+    /// Chain A → B → C → D with A and C dirty, B and D clean. Pre-fix trace:
+    /// seeding C composed it from B's still-stale global and enqueued D; the
+    /// BFS popped D (composing it from the wrong C) and marked it
+    /// `expanded`, so when C was finally recomposed correctly its re-enqueue
+    /// of D was refused as a "cyclic or duplicate Children edge". D kept a
+    /// global built from C's pre-update value, and the next frame's fast
+    /// path returned immediately, so it never self-healed.
+    #[test]
+    fn a_clean_node_between_two_dirty_ones_does_not_strand_the_subtree_below() {
+        for leaf_first in [false, true] {
+            let mut world = World::new();
+            // Both spawn orders: the dirty list is sorted by EntityId, so
+            // this flips which of A / C is seeded first. The defect
+            // reproduced either way.
+            let ids: Vec<_> = (0..4)
+                .map(|_| spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0))
+                .collect();
+            let (a, b, c, d) = if leaf_first {
+                (ids[3], ids[2], ids[1], ids[0])
+            } else {
+                (ids[0], ids[1], ids[2], ids[3])
+            };
+
+            for (child, parent) in [(b, a), (c, b), (d, c)] {
+                world.insert(child, Parent(parent));
+                world.insert(parent, Children(vec![child]));
+            }
+
+            let mut sys = make_transform_propagation_system();
+            sys(&world, 0.016);
+            {
+                let gq = world.query::<GlobalTransform>().unwrap();
+                assert_eq!(gq.get(d).unwrap().translation.x, 4.0, "baseline");
+            }
+
+            // Move A and C. B and D are untouched — B is the clean node
+            // BETWEEN the two dirty ones, which is what makes C's seed
+            // compose against a stale parent.
+            {
+                let mut tq = world.query_mut::<Transform>().unwrap();
+                tq.get_mut(a).unwrap().translation.x = 10.0;
+                tq.get_mut(c).unwrap().translation.x = 100.0;
+            }
+            sys(&world, 0.016);
+
+            {
+                let gq = world.query::<GlobalTransform>().unwrap();
+                let got = |e| gq.get(e).unwrap().translation.x;
+                assert_eq!(got(a), 10.0, "leaf_first={leaf_first}: A is a moved root");
+                assert_eq!(got(b), 11.0, "leaf_first={leaf_first}: B rides A");
+                assert_eq!(got(c), 111.0, "leaf_first={leaf_first}: C rides B");
+                assert_eq!(
+                    got(d),
+                    112.0,
+                    "leaf_first={leaf_first}: D must ride C's RECOMPOSED global, not the \
+                     one C briefly held while B was still stale (#4060)"
+                );
+            }
+
+            // It never self-healed: nothing is dirty now and the state key
+            // is unchanged, so the fast path returns immediately. Pin that
+            // the value is right on the frame that does no work at all.
+            sys(&world, 0.016);
+            let gq = world.query::<GlobalTransform>().unwrap();
+            assert_eq!(
+                gq.get(d).unwrap().translation.x,
+                112.0,
+                "leaf_first={leaf_first}: the fast-path frame must not resurrect a stale value"
+            );
+        }
+    }
+
+    /// #4061 — a `Parent` removal paired with a `Parent` insertion in the
+    /// same frame leaves `(Transform::len(), Parent::len(),
+    /// next_entity_id())` bit-identical while genuinely moving the root
+    /// set. The pre-fix roots cache was keyed on exactly that triple, so it
+    /// was never rebuilt: the detached entity became a root absent from the
+    /// stale list (nothing recomposes it — it has no parent to be reached
+    /// from), and the newly attached entity stayed IN the list, so Phase 1b
+    /// overwrote its global with its bare local and `expanded.insert(root)`
+    /// then made `enqueue_unique_children` refuse to walk it from its real
+    /// parent. Both stayed wrong forever, since the next frame takes the
+    /// fast path.
+    ///
+    /// Confirmed to fail with the rebuild re-gated on the old count key:
+    /// `X=6.0 (want 99.0)  Y=7.0 (want 12.0)`.
+    #[test]
+    fn a_parent_remove_and_insert_that_nets_out_still_rebuilds_the_root_set() {
+        let mut world = World::new();
+        world.register::<Children>();
+        // R is a root with child X; Y is free-standing.
+        let r = spawn_with_transform(&mut world, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        let x = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+        let y = spawn_with_transform(&mut world, Vec3::new(7.0, 0.0, 0.0), Quat::IDENTITY, 1.0);
+        world.insert(x, Parent(r));
+        world.insert(r, Children(vec![x]));
+
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+        {
+            let gq = world.query::<GlobalTransform>().unwrap();
+            assert_eq!(gq.get(x).unwrap().translation.x, 6.0, "baseline: X rides R");
+            assert_eq!(
+                gq.get(y).unwrap().translation.x,
+                7.0,
+                "baseline: Y is its own root"
+            );
+        }
+
+        // The swap. `Parent::len()` nets out, `Transform::len()` is
+        // untouched, and nothing spawns — so every component of the old
+        // roots key is unchanged, while `Parent`'s structural generation
+        // bumps twice.
+        world.remove::<Parent>(x);
+        world.insert(y, Parent(r));
+        world.insert(r, Children(vec![y]));
+        world.get_mut::<Transform>(x).unwrap().translation.x = 99.0;
+
+        sys(&world, 0.016);
+        {
+            let gq = world.query::<GlobalTransform>().unwrap();
+            assert_eq!(
+                gq.get(x).unwrap().translation.x,
+                99.0,
+                "the detached entity is a root now — its global is its own local"
+            );
+            assert_eq!(
+                gq.get(y).unwrap().translation.x,
+                12.0,
+                "the newly attached entity must compose under R, not be re-seeded as a root"
+            );
+        }
+
+        // Neither recovered on its own pre-fix: the following frame has
+        // nothing dirty and an unchanged state key, so it returns from the
+        // fast path without touching anything.
+        sys(&world, 0.016);
+        let gq = world.query::<GlobalTransform>().unwrap();
+        assert_eq!(gq.get(x).unwrap().translation.x, 99.0);
+        assert_eq!(gq.get(y).unwrap().translation.x, 12.0);
+    }
+
+    /// #4062 — the walk reads each parent's `GlobalTransform` to compose its
+    /// children. `PackedStorage::get_mut` calls `mark_dirty`
+    /// unconditionally and `GlobalTransform` is `TRACK_CHANGES`, so doing
+    /// those reads through `get_mut` pushed the parent into the dirty set on
+    /// every step, on top of the legitimate mark for the child actually
+    /// written. `bounds.rs` is the sole drainer and re-folds whatever it
+    /// finds there, so the inflation bought nothing.
+    ///
+    /// There are two such reads and they need different fixtures, because
+    /// on a well-formed hierarchy a parent the BFS reads has always been
+    /// written itself — so the deduped *set* cannot tell them apart, only
+    /// the entry *count* can:
+    ///
+    /// * the BFS drain's read is caught by the count on a structural frame;
+    /// * the incremental seed pass's read is caught by the set, since there
+    ///   the parent is clean and must not appear at all.
+    #[test]
+    fn a_read_only_parent_lookup_does_not_dirty_the_parent() {
+        const DEPTH: usize = 8;
+        let mut world = World::new();
+        world.register::<Children>();
+        let mut ids = Vec::new();
+        for i in 0..DEPTH {
+            let e = spawn_with_transform(&mut world, Vec3::X, Quat::IDENTITY, 1.0);
+            if i > 0 {
+                world.insert(e, Parent(ids[i - 1]));
+                world.insert(ids[i - 1], Children(vec![e]));
+            }
+            ids.push(e);
+        }
+        // Drop the marks the inserts themselves made, so the next drain
+        // measures only what the walk did.
+        world
+            .query_mut::<GlobalTransform>()
+            .unwrap()
+            .storage_mut()
+            .take_dirty();
+
+        // ── Structural frame: Phase 1b writes the root, the BFS writes the
+        // other DEPTH-1 and reads each one's parent. One mark per write is
+        // correct; pre-fix the parent reads added DEPTH-1 more.
+        let mut sys = make_transform_propagation_system();
+        sys(&world, 0.016);
+        let structural_marks = world
+            .query_mut::<GlobalTransform>()
+            .unwrap()
+            .storage_mut()
+            .take_dirty();
+        assert_eq!(
+            structural_marks.len(),
+            DEPTH,
+            "one dirty entry per GlobalTransform actually written; the BFS's \
+             parent lookup is a read and must not add {} more (got {:?})",
+            DEPTH - 1,
+            structural_marks
+        );
+
+        // ── Incremental frame: move only the leaf. Its global is the one
+        // write; its parent is read to compose it and must not appear.
+        let leaf = *ids.last().unwrap();
+        world.get_mut::<Transform>(leaf).unwrap().translation.x = 5.0;
+        sys(&world, 0.016);
+        let mut dirty = world
+            .query_mut::<GlobalTransform>()
+            .unwrap()
+            .storage_mut()
+            .take_dirty();
+        dirty.sort_unstable();
+        dirty.dedup();
+        assert_eq!(
+            dirty,
+            vec![leaf],
+            "only the entity whose GlobalTransform was written may enter the \
+             dirty set; its parent was read to compose it and every other \
+             entity was not touched at all"
+        );
+    }
+}

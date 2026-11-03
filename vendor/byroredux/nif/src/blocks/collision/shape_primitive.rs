@@ -1,0 +1,209 @@
+//! Primitive collision shapes.
+//!
+//! Sphere, MultiSphere, Box, Capsule, Cylinder — single-volume shapes with
+//! material + bounding metadata.
+
+use crate::impl_ni_object;
+use crate::stream::NifStream;
+use std::io;
+
+use super::{read_havok_material, read_vec4};
+
+/// bhkSphereShape — sphere collision primitive.
+#[derive(Debug)]
+pub struct BhkSphereShape {
+    pub material: u32,
+    pub radius: f32,
+}
+
+impl BhkSphereShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?; // bhkSphereRepShape
+        let radius = stream.read_f32_le()?; // bhkConvexShape
+        Ok(Self { material, radius })
+    }
+}
+
+/// `bhkMultiSphereShape` — compound Havok shape made of up to 8
+/// spheres. nif.xml line 3124. Inherits `bhkSphereRepShape` (which
+/// supplies `Material`) then adds a `bhkWorldObjCInfoProperty` block
+/// and a `NiBound`-per-sphere array. Appears in creature skeleton /
+/// ragdoll NIFs across all Bethesda games; was a MEDIUM-count block
+/// on Oblivion where no `block_sizes` table exists to skip it.
+/// See audit OBL-D5-H2 / #394.
+///
+/// Byte layout on Oblivion (20.0.0.5; HavokMaterial drops its pre-
+/// 10.0.1.2 `Unknown Int` prefix): material(4) +
+/// bhkWorldObjCInfoProperty(12) + num_spheres(4) + N × (Vector3 + f32)
+/// = 20 + 16 × N bytes.
+#[derive(Debug)]
+pub struct BhkMultiSphereShape {
+    pub material: u32,
+    /// Bethesda's `bhkWorldObjCInfoProperty` — 3 × u32 opaque CInfo
+    /// bookkeeping. Preserved verbatim for future physics bridges.
+    pub shape_property: [u32; 3],
+    /// Up to 8 spheres making up the collision approximation. Each is
+    /// (center_x, center_y, center_z, radius).
+    pub spheres: Vec<[f32; 4]>,
+}
+
+impl BhkMultiSphereShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?;
+        let shape_property = [
+            stream.read_u32_le()?,
+            stream.read_u32_le()?,
+            stream.read_u32_le()?,
+        ];
+        let num_spheres = stream.read_u32_le()?;
+        // #1902 / NIF-D6-01 — contiguous (cx,cy,cz,r) run, byte-identical
+        // to the [f32;4] bulk-read shape `read_ni_color4_array` already
+        // serves for non-color data (#981, shape_compound.rs vertices/
+        // normals). One read_exact instead of a per-element push loop.
+        let spheres = stream.read_ni_color4_array(num_spheres as usize)?;
+        Ok(Self {
+            material,
+            shape_property,
+            spheres,
+        })
+    }
+}
+
+/// bhkBoxShape — axis-aligned box collision primitive.
+#[derive(Debug)]
+pub struct BhkBoxShape {
+    pub material: u32,
+    pub radius: f32,
+    pub dimensions: [f32; 3],
+}
+
+impl BhkBoxShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        stream.skip(8)?; // unused
+        let dx = stream.read_f32_le()?;
+        let dy = stream.read_f32_le()?;
+        let dz = stream.read_f32_le()?;
+        let _w = stream.read_f32_le()?; // padding
+        Ok(Self {
+            material,
+            radius,
+            dimensions: [dx, dy, dz],
+        })
+    }
+}
+
+/// bhkCapsuleShape — capsule (line segment + radius) collision primitive.
+#[derive(Debug)]
+pub struct BhkCapsuleShape {
+    pub material: u32,
+    pub radius: f32,
+    pub point1: [f32; 3],
+    pub radius1: f32,
+    pub point2: [f32; 3],
+    pub radius2: f32,
+}
+
+impl BhkCapsuleShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        stream.skip(8)?; // unused
+        let p1x = stream.read_f32_le()?;
+        let p1y = stream.read_f32_le()?;
+        let p1z = stream.read_f32_le()?;
+        let radius1 = stream.read_f32_le()?;
+        let p2x = stream.read_f32_le()?;
+        let p2y = stream.read_f32_le()?;
+        let p2z = stream.read_f32_le()?;
+        let radius2 = stream.read_f32_le()?;
+        Ok(Self {
+            material,
+            radius,
+            point1: [p1x, p1y, p1z],
+            radius1,
+            point2: [p2x, p2y, p2z],
+            radius2,
+        })
+    }
+}
+
+/// bhkCylinderShape — cylinder collision primitive.
+#[derive(Debug)]
+pub struct BhkCylinderShape {
+    pub material: u32,
+    pub radius: f32,
+    pub point1: [f32; 4],
+    pub point2: [f32; 4],
+    pub cylinder_radius: f32,
+}
+
+impl BhkCylinderShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?;
+        let radius = stream.read_f32_le()?;
+        stream.skip(8)?; // unused
+        let point1 = read_vec4(stream)?;
+        let point2 = read_vec4(stream)?;
+        let cylinder_radius = stream.read_f32_le()?;
+        stream.skip(12)?; // unused padding
+        Ok(Self {
+            material,
+            radius,
+            point1,
+            point2,
+            cylinder_radius,
+        })
+    }
+}
+
+/// `bhkPlaneShape` — an infinite plane bounded by an AABB (nif.xml
+/// `inherit="bhkHeightFieldShape"`, `#BETHESDA#`). One vanilla Skyrim SE
+/// instance ships it: the slaughterfish egg-cluster ground plane. Pre-#1334
+/// it hit the `NiUnknown` fallback — `block_size`-recovered on SSE (no
+/// cascade) but the shape was lost. Byte layout (nif.xml): `Material`
+/// (HavokMaterial, from `bhkHeightFieldShape`) + 12 unused bytes + `Plane
+/// Normal` (Vector3) + `Plane Constant` (f32) + `AABB Half Extents`
+/// (Vector4) + `AABB Center` (Vector4). Captured here so the block parses
+/// cleanly; mapping it to a Rapier half-space `CollisionShape` is a future
+/// follow-up (no `Plane` variant yet — the egg-cluster mesh still renders).
+#[derive(Debug)]
+pub struct BhkPlaneShape {
+    pub material: u32,
+    pub plane_normal: [f32; 3],
+    pub plane_constant: f32,
+    pub aabb_half_extents: [f32; 4],
+    pub aabb_center: [f32; 4],
+}
+
+impl BhkPlaneShape {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let material = read_havok_material(stream)?; // bhkHeightFieldShape
+        stream.skip(12)?; // Unused 01 (12 bytes)
+        let plane_normal = [
+            stream.read_f32_le()?,
+            stream.read_f32_le()?,
+            stream.read_f32_le()?,
+        ];
+        let plane_constant = stream.read_f32_le()?;
+        let aabb_half_extents = read_vec4(stream)?;
+        let aabb_center = read_vec4(stream)?;
+        Ok(Self {
+            material,
+            plane_normal,
+            plane_constant,
+            aabb_half_extents,
+            aabb_center,
+        })
+    }
+}
+
+impl_ni_object!(
+    BhkSphereShape => "bhkSphereShape",
+    BhkMultiSphereShape => "bhkMultiSphereShape",
+    BhkBoxShape => "bhkBoxShape",
+    BhkCapsuleShape => "bhkCapsuleShape",
+    BhkCylinderShape => "bhkCylinderShape",
+    BhkPlaneShape => "bhkPlaneShape",
+);

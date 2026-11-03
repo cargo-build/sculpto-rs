@@ -1,0 +1,807 @@
+//! Public entry points for KF + embedded clip import.
+//!
+//! `import_kf` walks a parsed `NifScene` and emits one clip per controller
+//! sequence. `import_embedded_animations` extracts the implicit animation
+//! tree from a single mesh.
+
+use super::*;
+use crate::blocks::controller::{
+    NiControllerManager, NiControllerSequence, NiGeomMorpherController, NiPreSplitDataController,
+};
+use crate::scene::NifScene;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+// ── Import function ───────────────────────────────────────────────────
+
+/// Import all animation clips from a parsed NIF/KF scene.
+///
+/// Discovers sequences in two ways:
+/// 1. Top-level `NiControllerSequence` blocks (standalone .kf files)
+/// 2. `NiControllerManager` blocks that reference sequences embedded
+///    in .nif files (follows `sequence_refs` to find them)
+///
+/// The `cumulative` flag from NiControllerManager is stored in each
+/// clip's `accum_root_name` field (non-empty when cumulative).
+pub fn import_kf(scene: &NifScene) -> Vec<AnimationClip> {
+    let mut clips = Vec::new();
+    let mut seen_indices = std::collections::HashSet::new();
+    // #5486 — one aggregate B-spline key budget across every sequence:
+    // `import_kf` builds them all before the first is chosen, so
+    // per-sequence budgets would still multiply a hostile file's cost.
+    let mut sampling = super::bspline::BsplineSampling::new();
+
+    // Path 1: NiControllerManager → follow sequence_refs.
+    // This handles .nif files with embedded animations.
+    for block in &scene.blocks {
+        let Some(mgr) = block.as_any().downcast_ref::<NiControllerManager>() else {
+            continue;
+        };
+
+        for seq_ref in &mgr.sequence_refs {
+            let Some(idx) = seq_ref.index() else {
+                continue;
+            };
+            if !seen_indices.insert(idx) {
+                continue; // already imported
+            }
+
+            let Some(seq) = scene.get_as::<NiControllerSequence>(idx) else {
+                log::warn!(
+                    "NiControllerManager references block {} but it's not a NiControllerSequence",
+                    idx
+                );
+                continue;
+            };
+
+            let clip = import_sequence(scene, seq, &mut sampling);
+            if clip_has_data(&clip) {
+                log::debug!(
+                    "Imported sequence '{}' from NiControllerManager (cumulative={})",
+                    clip.name,
+                    mgr.cumulative
+                );
+                clips.push(clip);
+            }
+        }
+    }
+
+    // Path 2: Top-level NiControllerSequence blocks (standalone .kf files).
+    // Skip any already imported via a NiControllerManager above.
+    for (i, block) in scene.blocks.iter().enumerate() {
+        if seen_indices.contains(&i) {
+            continue;
+        }
+
+        let Some(seq) = block.as_any().downcast_ref::<NiControllerSequence>() else {
+            continue;
+        };
+
+        let clip = import_sequence(scene, seq, &mut sampling);
+        if clip_has_data(&clip) {
+            clips.push(clip);
+        }
+    }
+
+    sampling.log_degraded();
+    for clip in &mut clips {
+        crate::import::units::animation(scene, clip);
+    }
+    clips
+}
+
+pub fn clip_has_data(clip: &AnimationClip) -> bool {
+    !clip.channels.is_empty()
+        || !clip.float_channels.is_empty()
+        || !clip.color_channels.is_empty()
+        || !clip.bool_channels.is_empty()
+        || !clip.texture_flip_channels.is_empty()
+}
+
+// Resolve a block's NiObjectNET view (name + controller_ref). Covers
+// every block type the import pipeline cares about — adding a new
+// block kind with its own embedded-controller chain is a one-line
+// downcast addition here. Free helper for `import_embedded_animations` (#1673).
+fn net_of(block: &dyn crate::NiObject) -> Option<&crate::blocks::base::NiObjectNETData> {
+    use crate::blocks::base::NiAVObjectData;
+    use crate::blocks::light::{NiAmbientLight, NiDirectionalLight, NiPointLight, NiSpotLight};
+    use crate::blocks::node::{NiCamera, NiNode};
+    use crate::blocks::tri_shape::{BsTriShape, NiTriShape};
+    let any = block.as_any();
+    if let Some(n) = any.downcast_ref::<NiNode>() {
+        return Some(&n.av.net);
+    }
+    if let Some(t) = any.downcast_ref::<NiTriShape>() {
+        return Some(&t.av.net);
+    }
+    if let Some(t) = any.downcast_ref::<BsTriShape>() {
+        return Some(&t.av.net);
+    }
+    if let Some(c) = any.downcast_ref::<NiCamera>() {
+        return Some(&c.av.net);
+    }
+    // Property blocks that carry embedded controllers (material color,
+    // shader float/color). Using a macro would save lines but every
+    // block here has a `.net` field reachable at a distinct path.
+    if let Some(b) = any.downcast_ref::<crate::blocks::properties::NiMaterialProperty>() {
+        return Some(&b.net);
+    }
+    if let Some(b) = any.downcast_ref::<crate::blocks::properties::NiTexturingProperty>() {
+        return Some(&b.net);
+    }
+    if let Some(b) = any.downcast_ref::<crate::blocks::shader::BSLightingShaderProperty>() {
+        return Some(&b.net);
+    }
+    if let Some(b) = any.downcast_ref::<crate::blocks::shader::BSEffectShaderProperty>() {
+        return Some(&b.net);
+    }
+    // #983 — NiLight subtypes carry their controller chain on
+    // the NiObjectNET inside `NiLightBase.av.net`. Walking it
+    // surfaces the four `NiLight*Controller` types into the
+    // embedded clip so torches / lanterns / plasma weapons get
+    // their authored flicker / dim / pulse instead of emitting
+    // constant light.
+    if let Some(l) = any.downcast_ref::<NiPointLight>() {
+        return Some(&l.base.av.net);
+    }
+    if let Some(l) = any.downcast_ref::<NiSpotLight>() {
+        return Some(&l.point.base.av.net);
+    }
+    if let Some(l) = any.downcast_ref::<NiAmbientLight>() {
+        return Some(&l.base.av.net);
+    }
+    if let Some(l) = any.downcast_ref::<NiDirectionalLight>() {
+        return Some(&l.base.av.net);
+    }
+    let _ = NiAVObjectData::parse; // keep the import path alive for future block types
+    None
+}
+
+// The property block types `net_of` resolves. A controller chain hosted on
+// one of these animates the geometry that owns the property, never the
+// property itself — see `property_owner_names`.
+fn is_property_block(block: &dyn crate::NiObject) -> bool {
+    let any = block.as_any();
+    any.is::<crate::blocks::properties::NiMaterialProperty>()
+        || any.is::<crate::blocks::properties::NiTexturingProperty>()
+        || any.is::<crate::blocks::shader::BSLightingShaderProperty>()
+        || any.is::<crate::blocks::shader::BSEffectShaderProperty>()
+}
+
+// Property block index → names of every named node/shape referencing it,
+// through the Skyrim+ dedicated shader/alpha slots or the legacy
+// `NiAVObject` property list. A shared property yields one name per owner so
+// each owner's entity receives the channel.
+fn property_owner_names(scene: &NifScene) -> HashMap<usize, Vec<Arc<str>>> {
+    use crate::blocks::bs_geometry::BSGeometry;
+    use crate::blocks::node::NiNode;
+    use crate::blocks::tri_shape::{BsTriShape, NiTriShape};
+    use crate::types::BlockRef;
+
+    let mut owners: HashMap<usize, Vec<Arc<str>>> = HashMap::new();
+    for block in &scene.blocks {
+        let any = block.as_any();
+        let (av, slots) = if let Some(s) = any.downcast_ref::<BsTriShape>() {
+            (&s.av, [s.shader_property_ref, s.alpha_property_ref])
+        } else if let Some(s) = any.downcast_ref::<NiTriShape>() {
+            (&s.av, [s.shader_property_ref, s.alpha_property_ref])
+        } else if let Some(g) = any.downcast_ref::<BSGeometry>() {
+            (&g.av, [g.shader_property_ref, g.alpha_property_ref])
+        } else if let Some(n) = any.downcast_ref::<NiNode>() {
+            (&n.av, [BlockRef::NULL, BlockRef::NULL])
+        } else {
+            continue;
+        };
+        let Some(name) = av.net.name.as_ref() else {
+            continue;
+        };
+        for idx in slots
+            .iter()
+            .chain(av.properties.iter())
+            .filter_map(|r| r.index())
+        {
+            let names = owners.entry(idx).or_default();
+            if !names.contains(name) {
+                names.push(Arc::clone(name));
+            }
+        }
+    }
+    owners
+}
+
+// Clone the channels a walk appended past `from` onto another owner, so a
+// property shared by several shapes animates each of them.
+fn fan_out_channels<T: Clone>(channels: &mut Vec<(Arc<str>, T)>, from: usize, owner: &Arc<str>) {
+    let copies: Vec<(Arc<str>, T)> = channels[from..]
+        .iter()
+        .map(|(_, channel)| (Arc::clone(owner), channel.clone()))
+        .collect();
+    channels.extend(copies);
+}
+
+// Resolve the `NiTimeControllerBase` envelope for a controller block,
+// dispatching per known type at the same `.base` depth used by
+// `walk_controller_chain`'s `next_controller_ref` advance below — the
+// two must stay in lockstep since they downcast the same type set.
+// #3097 — previously this same ladder existed ONLY to find
+// `next_controller_ref`; the base's `flags`/`frequency`/`phase`/
+// `start_time`/`stop_time` were reachable but never read.
+fn time_controller_base_of(
+    block: &dyn crate::NiObject,
+) -> Option<&crate::blocks::controller::NiTimeControllerBase> {
+    use crate::blocks::controller::{
+        BsNamedFloatInterpController, BsShaderController, NiFlipController, NiLightColorController,
+        NiLightFloatController, NiMaterialColorController, NiPreSplitDataController,
+        NiSingleInterpController, NiTextureTransformController,
+    };
+    let any = block.as_any();
+    if let Some(c) = any.downcast_ref::<NiSingleInterpController>() {
+        Some(&c.base)
+    } else if let Some(c) = any.downcast_ref::<NiPreSplitDataController>() {
+        // #2562 / #2563 — NiKeyframeController / NiTransformController /
+        // NiVisController / NiAlphaController used to parse as a bare
+        // NiSingleInterpController (caught by the arm above); they now
+        // have their own type so their real block_type_name() reaches
+        // the embedded-controller dispatch below instead of being erased
+        // to "NiSingleInterpController".
+        Some(&c.base.base)
+    } else if let Some(c) = any.downcast_ref::<BsNamedFloatInterpController>() {
+        // #3327 — BSMaterialEmittanceMultController / BSRefractionStrengthController /
+        // BSFrustumFOVController, same reasoning as the NiPreSplitDataController
+        // arm above: without this arm, `time_controller_base_of` returns
+        // `None` for these three and `walk_controller_chain` stops dead
+        // (its `next_controller_ref` advance reads through `base`),
+        // silently dropping every controller further down the same chain.
+        Some(&c.base.base)
+    } else if let Some(c) = any.downcast_ref::<NiTextureTransformController>() {
+        Some(&c.base)
+    } else if let Some(c) = any.downcast_ref::<NiFlipController>() {
+        Some(&c.base.base)
+    } else if let Some(c) = any.downcast_ref::<BsShaderController>() {
+        Some(&c.base.base)
+    } else if let Some(c) = any.downcast_ref::<NiMaterialColorController>() {
+        Some(&c.base)
+    } else if let Some(c) = any.downcast_ref::<crate::blocks::controller::NiUVController>() {
+        Some(&c.base)
+    } else if let Some(c) = any.downcast_ref::<NiGeomMorpherController>() {
+        Some(&c.base)
+    } else if let Some(c) = any.downcast_ref::<NiLightColorController>() {
+        Some(&c.base)
+    } else if let Some(c) = any.downcast_ref::<NiLightFloatController>() {
+        Some(&c.base.base)
+    } else if let Some(c) = any.downcast_ref::<crate::blocks::particle::NiPSysEmitterCtlr>() {
+        // #4261 — without this arm, walk_controller_chain stops dead at a
+        // NiPSysEmitterCtlr that isn't the last link in a particle
+        // system's controller chain, same failure mode #3327 fixed for
+        // BsNamedFloatInterpController.
+        Some(&c.base)
+    } else {
+        None
+    }
+}
+
+// Follow the `next_controller_ref` chain from `controller_ref` head,
+// invoking `visit` once per controller block with its resolved
+// `NiTimeControllerBase` envelope (`None` for an unrecognized type).
+// Returns on chain termination (BlockRef::NULL) or on the first
+// missing block. Free helper for `import_embedded_animations` (#1673).
+//
+// `pub(crate)` since #3231 — `import::mesh::extract_mesh` /
+// `extract_bs_tri_shape` reuse this same walk to find a shape's
+// `NiGeomMorpherController` (morph-target vertex deltas) rather than
+// duplicating the type-dispatch ladder `time_controller_base_of` above
+// already has to stay in lockstep for.
+pub(crate) fn walk_controller_chain(
+    scene: &NifScene,
+    head: crate::types::BlockRef,
+    mut visit: impl FnMut(
+        usize,
+        &dyn crate::NiObject,
+        Option<&crate::blocks::controller::NiTimeControllerBase>,
+    ),
+) {
+    use crate::types::BlockRef;
+    let mut cur = head;
+    let mut hops = 0u32;
+    while let Some(idx) = cur.index() {
+        let Some(block) = scene.blocks.get(idx) else {
+            break;
+        };
+        let base = time_controller_base_of(block.as_ref());
+        visit(idx, block.as_ref(), base);
+
+        // Advance via NiTimeControllerBase.next_controller_ref — same
+        // envelope just resolved above for `visit`.
+        cur = base.map_or(BlockRef::NULL, |b| b.next_controller_ref);
+        // Cycle guard: Bethesda controllers don't normally form cycles,
+        // but malformed files could. Bound the walk at 64 hops.
+        hops += 1;
+        if hops >= 64 {
+            log::warn!(
+                "Embedded controller chain exceeded 64 hops at block {} — stopping",
+                idx
+            );
+            break;
+        }
+    }
+}
+
+/// Import one embedded time controller into `clip`, dispatching on its block type
+/// (material / shader / light / flip / UV controllers). Unsupported types are
+/// logged and skipped. (#6143, split out of `import_embedded_animations`.)
+fn import_embedded_controller(
+    scene: &NifScene,
+    ctrl_block: &dyn crate::NiObject,
+    node_name: &Arc<str>,
+    clip: &mut AnimationClip,
+    sampling: &mut super::bspline::BsplineSampling,
+) {
+    use crate::blocks::controller::{
+        BsNamedFloatInterpController, BsShaderController, NiFlipController, NiLightColorController,
+        NiLightFloatController, NiMaterialColorController, NiSingleInterpController,
+        NiTextureTransformController,
+    };
+
+    let ctrl_type = ctrl_block.block_type_name();
+    let any = ctrl_block.as_any();
+
+    // For each controller, dispatch on type and use the
+    // ControlledBlock-free extract_*_at helpers.
+    match ctrl_type {
+        // #2562 / #2563 — NiAlphaController / NiVisController now
+        // parse into their own `NiPreSplitDataController` type
+        // (previously a bare `NiSingleInterpController`, which
+        // erased the RTTI `block_type_name()` reports — these two
+        // match arms existed but were unreachable dead code before
+        // that fix, since `ctrl_type` could never actually equal
+        // these strings).
+        "NiAlphaController" => {
+            let interp_idx = any
+                .downcast_ref::<NiPreSplitDataController>()
+                .and_then(|c| c.base.interpolator_ref.index());
+            if let Some(idx) = interp_idx {
+                if let Some(ch) = extract_float_channel_at(scene, idx, FloatTarget::Alpha, sampling)
+                {
+                    clip.float_channels.push((Arc::clone(&node_name), ch));
+                }
+            }
+        }
+        "NiVisController" => {
+            let interp_idx = any
+                .downcast_ref::<NiPreSplitDataController>()
+                .and_then(|c| c.base.interpolator_ref.index());
+            if let Some(idx) = interp_idx {
+                if let Some(ch) = extract_bool_channel_at(scene, idx) {
+                    clip.bool_channels.push((Arc::clone(&node_name), ch));
+                }
+            }
+        }
+        // #1440 (LC-D5-01) — an inline transform controller hung
+        // directly off a node (animated scenery: fans, doors, lifts,
+        // swinging signs in loose Oblivion/FO3/FNV .nifs) carries no
+        // NiControllerSequence, so the KF-sequence dispatch never sees
+        // it and the mesh rendered static.
+        //
+        // #2562 / #2563 — `NiTransformController` and the pre-Skyrim
+        // `NiKeyframeController` alias now parse into
+        // `NiPreSplitDataController` with their real RTTI preserved
+        // (previously a bare `NiSingleInterpController`, erased to
+        // that name — see the comment on the arm below for what
+        // still reaches it under the erased name today).
+        "NiTransformController" | "NiKeyframeController" => {
+            let interp_idx = any
+                .downcast_ref::<NiPreSplitDataController>()
+                .and_then(|c| c.base.interpolator_ref.index());
+            if let Some(channel) =
+                interp_idx.and_then(|idx| extract_transform_channel_at(scene, idx, sampling))
+            {
+                clip.channels.insert(Arc::clone(&node_name), channel);
+            }
+        }
+        // #3327 — pre-fix, the three arms below all parsed as a bare
+        // `NiSingleInterpController` and fell through to this arm
+        // under that erased name; none of them drive a transform, so
+        // `extract_transform_channel_at` always self-selected to
+        // `None`. Kept as a harmless, self-selecting fallback for
+        // any genuinely-unlisted same-shape block that might still
+        // reach here.
+        "NiSingleInterpController" => {
+            let interp_idx = any
+                .downcast_ref::<NiSingleInterpController>()
+                .and_then(|c| c.interpolator_ref.index());
+            if let Some(channel) =
+                interp_idx.and_then(|idx| extract_transform_channel_at(scene, idx, sampling))
+            {
+                clip.channels.insert(Arc::clone(&node_name), channel);
+            }
+        }
+        // #3327 — animated material emissive multiplier (pulsing/
+        // flickering neon, glow-panel signage). No ECS/render
+        // consumer yet (same state `ShaderFloat` shipped in for
+        // #2221) — this restores the channel reaching
+        // `AnimationClip::float_channels` with its real RTTI, which
+        // is this issue's scope.
+        "BSMaterialEmittanceMultController" => {
+            let interp_idx = any
+                .downcast_ref::<BsNamedFloatInterpController>()
+                .and_then(|c| c.base.interpolator_ref.index());
+            if let Some(ch) = interp_idx.and_then(|idx| {
+                extract_float_channel_at(scene, idx, FloatTarget::EmissiveMultiple, sampling)
+            }) {
+                clip.float_channels.push((Arc::clone(&node_name), ch));
+            }
+        }
+        // #3327 — animated glass refraction strength (Stealth Boy /
+        // heat-haze). Same no-consumer-yet caveat as above.
+        "BSRefractionStrengthController" => {
+            let interp_idx = any
+                .downcast_ref::<BsNamedFloatInterpController>()
+                .and_then(|c| c.base.interpolator_ref.index());
+            if let Some(ch) = interp_idx.and_then(|idx| {
+                extract_float_channel_at(scene, idx, FloatTarget::RefractionStrength, sampling)
+            }) {
+                clip.float_channels.push((Arc::clone(&node_name), ch));
+            }
+        }
+        // #3327 — animated camera FOV. No `FloatTarget` variant:
+        // unlike the two arms above, this doesn't animate a
+        // Material field at all (it's a NiCamera property), so
+        // there's no natural sink to route it to yet. This arm
+        // exists purely so the block keeps its real RTTI
+        // (`BSFrustumFOVController`, not the erased
+        // `NiSingleInterpController` label) rather than to extract
+        // a channel — a future camera-animation feature has a real
+        // type to hang off of.
+        "BSFrustumFOVController" => {}
+        "NiTextureTransformController" => {
+            if let Some(c) = any.downcast_ref::<NiTextureTransformController>() {
+                let target = float_target_from_operation(c.operation);
+                if let Some(idx) = c.interpolator_ref.index() {
+                    if let Some(ch) = extract_float_channel_at(scene, idx, target, sampling) {
+                        clip.float_channels.push((Arc::clone(&node_name), ch));
+                    }
+                }
+            }
+        }
+        "NiMaterialColorController" => {
+            if let Some(c) = any.downcast_ref::<NiMaterialColorController>() {
+                if let Some(idx) = c.interpolator_ref.index() {
+                    let keys = resolve_color_keys_at(scene, idx, sampling);
+                    if !keys.is_empty() {
+                        let target = color_target_from_target_color(c.target_color);
+                        clip.color_channels
+                            .push((Arc::clone(&node_name), ColorChannel { target, keys }));
+                    }
+                }
+            }
+        }
+        "BSEffectShaderPropertyFloatController" | "BSLightingShaderPropertyFloatController" => {
+            if let Some(c) = any.downcast_ref::<BsShaderController>() {
+                let target = float_target_from_shader_controller(c.kind);
+                if let Some(idx) = c.base.interpolator_ref.index() {
+                    if let Some(ch) = extract_float_channel_at(scene, idx, target, sampling) {
+                        clip.float_channels.push((Arc::clone(&node_name), ch));
+                    }
+                }
+            }
+        }
+        "BSEffectShaderPropertyColorController" | "BSLightingShaderPropertyColorController" => {
+            let interp_idx = any
+                .downcast_ref::<BsShaderController>()
+                .and_then(|c| c.base.interpolator_ref.index());
+            if let Some(idx) = interp_idx {
+                let keys = resolve_color_keys_at(scene, idx, sampling);
+                if !keys.is_empty() {
+                    clip.color_channels.push((
+                        Arc::clone(&node_name),
+                        ColorChannel {
+                            target: ColorTarget::ShaderColor,
+                            keys,
+                        },
+                    ));
+                }
+            }
+        }
+        "NiFlipController" => {
+            // Texture-flipbook controller (#545). Resolve the
+            // per-frame source list to filenames at import time
+            // so the runtime never has to walk back into the
+            // NIF scene. Float keys come from the inherited
+            // NiSingleInterpController.interpolator_ref —
+            // typically a stepped saw 0..N over the cycle.
+            if let Some(c) = any.downcast_ref::<NiFlipController>() {
+                let source_paths = resolve_flip_source_paths(scene, &c.sources);
+                if source_paths.is_empty() {
+                    // Empty source list — controller is structurally
+                    // valid but contributes nothing to render.
+                    return;
+                }
+                let keys = c
+                    .base
+                    .interpolator_ref
+                    .index()
+                    .and_then(|idx| {
+                        extract_float_channel_at(scene, idx, FloatTarget::ShaderFloat, sampling)
+                    })
+                    .map(|ch| ch.keys)
+                    .unwrap_or_default();
+                clip.texture_flip_channels.push((
+                    Arc::clone(&node_name),
+                    TextureFlipChannel {
+                        texture_slot: c.texture_slot,
+                        source_paths,
+                        keys,
+                    },
+                ));
+            }
+        }
+        // #983 — Four NiLight*Controller types animate the
+        // light's color / dimmer / intensity / radius slots.
+        // All four follow the standard
+        // NiSingleInterpController shape (interpolator_ref
+        // → NiFloatInterpolator / NiPoint3Interpolator →
+        // NiFloatData / NiPosData keys), so the extract
+        // helpers used elsewhere in this match work
+        // directly. See the dispatch in `blocks/mod.rs`
+        // and the FloatTarget::Light* / ColorTarget::Light*
+        // sinks in `core/src/animation/types.rs`.
+        "NiLightColorController" => {
+            if let Some(c) = any.downcast_ref::<NiLightColorController>() {
+                if let Some(idx) = c.interpolator_ref.index() {
+                    let keys = resolve_color_keys_at(scene, idx, sampling);
+                    if !keys.is_empty() {
+                        // target_color: 0 = Diffuse, 1 = Ambient
+                        // (per nif.xml line 1241 LightColor enum).
+                        let target = if c.target_color == 1 {
+                            ColorTarget::LightAmbient
+                        } else {
+                            ColorTarget::LightDiffuse
+                        };
+                        clip.color_channels
+                            .push((Arc::clone(&node_name), ColorChannel { target, keys }));
+                    }
+                }
+            }
+        }
+        "NiLightDimmerController" | "NiLightIntensityController" | "NiLightRadiusController" => {
+            if let Some(c) = any.downcast_ref::<NiLightFloatController>() {
+                let target = match ctrl_type {
+                    "NiLightDimmerController" => FloatTarget::LightDimmer,
+                    "NiLightIntensityController" => FloatTarget::LightIntensity,
+                    "NiLightRadiusController" => FloatTarget::LightRadius,
+                    _ => unreachable!(),
+                };
+                if let Some(idx) = c.base.interpolator_ref.index() {
+                    if let Some(ch) = extract_float_channel_at(scene, idx, target, sampling) {
+                        clip.float_channels.push((Arc::clone(&node_name), ch));
+                    }
+                }
+            }
+        }
+        "NiUVController" => {
+            // The NiUVController + NiUVData path is distinct from
+            // the NiTextureTransformController: UVData stores four
+            // independent float-key groups (offsetU, offsetV,
+            // scaleU, scaleV). Emit up to four channels per host
+            // node, each with its own target. See #154.
+            if let Some(c) = any.downcast_ref::<crate::blocks::controller::NiUVController>() {
+                if let Some(data_idx) = c.data_ref.index() {
+                    if let Some(data) =
+                        scene.get_as::<crate::blocks::interpolator::NiUVData>(data_idx)
+                    {
+                        // NiUVData.groups = [offset_u, offset_v, tiling_u, tiling_v].
+                        for (group, target) in [
+                            (&data.groups[0], FloatTarget::UvOffsetU),
+                            (&data.groups[1], FloatTarget::UvOffsetV),
+                            (&data.groups[2], FloatTarget::UvScaleU),
+                            (&data.groups[3], FloatTarget::UvScaleV),
+                        ] {
+                            if group.keys.is_empty() {
+                                continue;
+                            }
+                            let keys: Vec<AnimFloatKey> = group
+                                .keys
+                                .iter()
+                                .map(|k| AnimFloatKey {
+                                    time: k.time,
+                                    value: k.value,
+                                })
+                                .collect();
+                            clip.float_channels
+                                .push((Arc::clone(&node_name), FloatChannel { target, keys }));
+                        }
+                    }
+                }
+            }
+        }
+        other => {
+            log::debug!(
+                "Skipping unsupported embedded controller type '{}' on node '{}'",
+                other,
+                node_name
+            );
+        }
+    }
+}
+
+/// Import mesh-embedded animation controllers into a single looping
+/// `AnimationClip`. See #261.
+///
+/// Walks every NiObjectNET-bearing block in the scene (scene-graph
+/// nodes + geometry). For each block whose `controller_ref` is
+/// non-null, follows the `next_controller_ref` chain and emits a
+/// float / color / bool channel per supported controller type. These
+/// are the *ambient* animations authored directly into the .nif —
+/// UV scrolling on water, alpha fade on ghost meshes, visibility
+/// flicker on torch flames, material color pulses on lava — as
+/// distinct from the sequence-driven KF clips that [`import_kf`]
+/// collects.
+///
+/// Returns `None` when no supported embedded controllers are found.
+///
+/// #3097 — the clip's `cycle_type` / `frequency` / `phase` are taken
+/// from the FIRST controller's `NiTimeControllerBase` envelope
+/// encountered during the walk below (mixed-envelope controllers
+/// chained onto the same mesh are rare in vanilla content and, when
+/// they occur, are authored as one coordinated effect — a single
+/// representative envelope is the honest first step, not a
+/// per-channel timing model). A mesh with no recognized controller at
+/// all falls back to `Loop` @ `1.0`/phase `0.0` — that fallback used
+/// to be unconditional; now it only applies when the walk finds
+/// nothing to read an envelope from.
+///
+/// `duration` is NOT taken from the envelope — it's derived from the
+/// actual maximum key time across every extracted channel (see the
+/// computation at the end of this function, which predates #3097).
+/// That was already correct: the authored `stop_time`/`start_time`
+/// can undershoot the real longest channel, and the sampler needs the
+/// true extent to avoid clipping playback.
+///
+/// Supported controller types match the KF importer's dispatch
+/// (`NiTransformController` / `NiKeyframeController`, `NiAlphaController`,
+/// `NiVisController`, `NiTextureTransformController`, `NiMaterialColorController`,
+/// `BSEffect/BSLightingShaderProperty{Float,Color}Controller`, `NiUVController`,
+/// `NiFlipController`, `NiLight*Controller`). Unsupported types are skipped
+/// with a debug-log.
+pub fn import_embedded_animations(scene: &NifScene) -> Option<AnimationClip> {
+    // #5486 — the embedded path has no owning sequence, so only the
+    // per-channel ceiling and this budget bound its B-spline sampling.
+    let mut sampling = super::bspline::BsplineSampling::new();
+
+    let mut clip = AnimationClip {
+        name: "embedded".to_string(),
+        duration: 0.0,
+        cycle_type: CycleType::Loop,
+        frequency: 1.0,
+        phase: 0.0,
+        weight: 1.0,
+        accum_root_name: None,
+        channels: HashMap::new(),
+        float_channels: Vec::new(),
+        color_channels: Vec::new(),
+        bool_channels: Vec::new(),
+        texture_flip_channels: Vec::new(),
+        text_keys: Vec::new(),
+    };
+    // Set from the first `Some` envelope `walk_controller_chain` hands
+    // us below; every controller after that keeps contributing
+    // channels but no longer touches the clip-level envelope.
+    let mut envelope_taken = false;
+
+    // Track seen controllers so a controller linked into multiple
+    // chains (rare but legal — shared via NiControllerManager) doesn't
+    // produce duplicate channels.
+    let mut seen_controllers = std::collections::HashSet::<usize>::new();
+
+    let property_owners = property_owner_names(scene);
+
+    for (block_idx, block) in scene.blocks.iter().enumerate() {
+        let Some(net) = net_of(block.as_ref()) else {
+            continue;
+        };
+        if net.controller_ref.is_null() {
+            continue;
+        }
+        // Channels bind at runtime by entity `Name`, and entities are the
+        // scene-graph nodes and shapes — never property blocks. A controller
+        // hosted on a property animates the shape(s) that own the property.
+        // Skyrim's effect/lighting shader properties are also unnamed, so
+        // keying by the property's own name dropped every UV scroll on
+        // vanilla rapids, waterfall sheets, and creek foam.
+        let owners: Vec<Arc<str>> = if is_property_block(block.as_ref()) {
+            property_owners.get(&block_idx).cloned().unwrap_or_default()
+        } else {
+            // Unnamed nodes can't receive animation at runtime — the
+            // animation stack keys channels by FixedString(name).
+            net.name.clone().into_iter().collect()
+        };
+        let Some((node_name, other_owners)) = owners.split_first() else {
+            continue;
+        };
+        let node_name = Arc::clone(node_name);
+        let first_new = (
+            clip.float_channels.len(),
+            clip.color_channels.len(),
+            clip.bool_channels.len(),
+            clip.texture_flip_channels.len(),
+        );
+
+        walk_controller_chain(scene, net.controller_ref, |ctrl_idx, ctrl_block, base| {
+            if !seen_controllers.insert(ctrl_idx) {
+                return;
+            }
+            if !envelope_taken {
+                if let Some(b) = base {
+                    // Cycle Type: bits 1-2 of `flags` (nif.xml
+                    // `NiTimeController::flags`, mask 0x0006).
+                    // `duration` is deliberately NOT taken from
+                    // `stop_time`/`start_time` here — see the max-key-time
+                    // computation at the end of this function, which
+                    // predates this fix and is the more accurate source
+                    // (the authored envelope can undershoot the actual
+                    // longest channel; the sampler needs the real extent).
+                    let raw_cycle = (b.flags >> 1) & 0x3;
+                    clip.cycle_type = CycleType::from_u32(raw_cycle as u32);
+                    clip.frequency = b.frequency;
+                    clip.phase = b.phase;
+                    envelope_taken = true;
+                }
+            }
+            import_embedded_controller(scene, ctrl_block, &node_name, &mut clip, &mut sampling);
+        });
+
+        for owner in other_owners {
+            fan_out_channels(&mut clip.float_channels, first_new.0, owner);
+            fan_out_channels(&mut clip.color_channels, first_new.1, owner);
+            fan_out_channels(&mut clip.bool_channels, first_new.2, owner);
+            fan_out_channels(&mut clip.texture_flip_channels, first_new.3, owner);
+        }
+    }
+
+    sampling.log_degraded();
+    if !clip_has_data(&clip) {
+        return None;
+    }
+
+    // Duration = maximum key time across every channel — the looping
+    // sampler wraps around this boundary. Fall back to 1.0 s when every
+    // channel is a single constant key (e.g. NiVisController with a
+    // constant visibility value that still needs a non-zero duration to
+    // avoid a mod-by-zero in the stack sampler).
+    let mut max_time = 0.0_f32;
+    for ch in clip.channels.values() {
+        if let Some(k) = ch.translation_keys.last() {
+            max_time = max_time.max(k.time);
+        }
+        if let Some(k) = ch.rotation_keys.last() {
+            max_time = max_time.max(k.time);
+        }
+        if let Some(k) = ch.scale_keys.last() {
+            max_time = max_time.max(k.time);
+        }
+    }
+    for (_, ch) in &clip.float_channels {
+        if let Some(k) = ch.keys.last() {
+            max_time = max_time.max(k.time);
+        }
+    }
+    for (_, ch) in &clip.color_channels {
+        if let Some(k) = ch.keys.last() {
+            max_time = max_time.max(k.time);
+        }
+    }
+    for (_, ch) in &clip.bool_channels {
+        if let Some(k) = ch.keys.last() {
+            max_time = max_time.max(k.time);
+        }
+    }
+    for (_, ch) in &clip.texture_flip_channels {
+        if let Some(k) = ch.keys.last() {
+            max_time = max_time.max(k.time);
+        }
+    }
+    clip.duration = if max_time > 0.0 { max_time } else { 1.0 };
+
+    crate::import::units::animation(scene, &mut clip);
+    Some(clip)
+}

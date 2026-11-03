@@ -1,0 +1,319 @@
+//! Per-actor actor-value store — the production backing for `GetActorValue`.
+//!
+//! Attach [`ActorValues`] to any actor entity. It is the ECS surface the
+//! M47.1 `GetActorValue` condition function reads from (#1663), and the
+//! store perks / magic effects / `ModActorValue` will compose into.
+//!
+//! Distinct from the string-keyed [`crate`]-external `ActorStats` prototype
+//! under `papyrus_demo`: that one keys by Papyrus source name for one demo
+//! script and stores a flat value. This is the production store — keyed by
+//! the source game's canonical actor-value identifier, layered (base /
+//! permanent / temporary / damage), and shared by every gameplay reader.
+//!
+//! ## Key space
+//!
+//! Every actor value uses its **AVIF FormID in global load-order space**.
+//! Skyrim authors the built-in values as AVIF records too (Health is
+//! `0x000003E8` in vanilla `Skyrim.esm`), so #2987 withdrew the retired TES5
+//! enum-index workaround and restored one key space for all games.
+//! [`ActorVitals`] carries the resolved per-game Health FormID alongside each
+//! actor so gameplay consumers do not need load-order-specific lookup rules.
+//!
+//! ## Composition
+//!
+//! `current = base + set_override + permanent + temporary − damage` (the
+//! Bethesda actor-value layering — see the actor-value-system design).
+//! `base` is the race/class/level result, `set_override` is a deliberate
+//! `SetBase` on a player-derived pool (#5412), `permanent` is perk/enchant
+//! offsets, `temporary` is active effects, and `damage` is a
+//! separately-restored negative offset (e.g. limb or health damage). An AV
+//! the actor doesn't carry composes to `0.0`,
+//! matching Bethesda's "absent actor value → default 0" contract.
+
+use crate::ecs::sparse_set::SparseSetStorage;
+use crate::ecs::storage::Component;
+use std::collections::HashMap;
+
+/// The five composition layers of a single actor value, plus whether the
+/// base layer was ever authored.
+///
+/// `current()` folds them per the actor-value model. All layers default to
+/// `0.0`, so a freshly-inserted entry reads `0.0` until a base is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActorValue {
+    /// Race + class + level result (or formula / editor default).
+    pub base: f32,
+    /// #5412 — a deliberate `SetBase` on a player-derived pool, rerouted
+    /// out of `base` (the per-frame `refresh_player_only_bases` owns that
+    /// half and would revert it one tick later). Its OWN layer, not
+    /// [`Self::permanent_mod`]: the permanent layer is the magic
+    /// runtime's constant-spell sum (`mod_permanent(±amount)` per
+    /// applied/removed ability), and the #5239 redirect that wrote here
+    /// overwrote every active ability bonus on the pool (a +30 Health
+    /// perk vanished under `setav Health 100`; removing the perk then
+    /// subtracted its 30 again from a value that never had it). Required
+    /// field, no `serde(default)` (#1714): saves from before the layer
+    /// are rejected by the v34 format-major bump.
+    pub set_override: f32,
+    /// Permanent offsets — perks, enchantments, equipped gear.
+    pub permanent_mod: f32,
+    /// Temporary offsets — active magic effects (potions, spells).
+    pub temporary_mod: f32,
+    /// Separately-restored negative offset (limb / health damage). Stored as a
+    /// positive magnitude and subtracted by [`ActorValue::current`].
+    pub damage: f32,
+    /// `true` once [`ActorValues::set_base`] wrote `base`. A modifier or
+    /// damage write to an actor value the actor does not carry creates the
+    /// entry with `base_authored == false`: its `base` of `0.0` is a
+    /// placeholder, not data. A stat the per-game ruleset derives must then
+    /// take its base from the formula, not from that placeholder — see
+    /// `CharacterRuleset::actor_value` (#5042).
+    pub base_authored: bool,
+}
+
+impl ActorValue {
+    /// The undamaged ceiling: `base + set_override + permanent + temporary`.
+    /// What a "current / max" reader (HUD bar fraction, vitals panel) must
+    /// use as `max` — composing the layers by hand missed `set_override`
+    /// when #5412 added it (#5508).
+    pub fn undamaged(&self) -> f32 {
+        self.base + self.set_override + self.permanent_mod + self.temporary_mod
+    }
+
+    /// `base + set_override + permanent + temporary − damage`.
+    pub fn current(&self) -> f32 {
+        self.undamaged() - self.damage
+    }
+}
+
+/// An actor's layered actor values, keyed by the game's canonical identifier.
+///
+/// Sparse storage — most entities are not actors. Map-backed because an actor
+/// carries many values (SPECIAL + skills + resistances + resources + derived,
+/// up to the full AVIF set) and reads are by id.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActorValues {
+    values: HashMap<u32, ActorValue>,
+}
+
+/// Canonical keys for an actor's vital resource values.
+///
+/// ActorValues remains a game-agnostic map. This companion supplies the
+/// resolved per-game Health AVIF FormID so combat never hard-codes or guesses
+/// which entry is health.
+///
+/// **`health` is a FormID, not an HP value** — despite how it reads, this is
+/// not where an actor's current/max health lives. It's stamped once at NPC
+/// spawn from static per-game AVIF data and never mutated afterward; the
+/// actual mutable health (base/damage/mods) lives in [`ActorValues`], looked
+/// up using this FormID as the key. See #3027 (SAVE-D1-2026-08-16-02) — this
+/// note exists because the name alone reads as live vital-signs state, which
+/// cost an audit pass a false "is this an oversight?" investigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActorVitals {
+    pub health: u32,
+}
+
+impl Component for ActorVitals {
+    type Storage = SparseSetStorage<Self>;
+}
+
+impl ActorValues {
+    /// An actor with no values set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build from `(avif_form_id, base)` pairs — the common population shape
+    /// (race/class/level produced base values). Later pairs for the same id
+    /// overwrite the base.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (u32, f32)>) -> Self {
+        let mut out = Self::default();
+        for (avif, base) in pairs {
+            out.set_base(avif, base);
+        }
+        out
+    }
+
+    /// Composed `current` value for the actor value identified by its
+    /// global-space AVIF FormID. Returns `0.0` for an actor value this actor
+    /// doesn't carry (Bethesda's absent-AV default).
+    pub fn current(&self, avif_form_id: u32) -> f32 {
+        self.values
+            .get(&avif_form_id)
+            .map_or(0.0, ActorValue::current)
+    }
+
+    /// The raw layered entry for an actor value, if present.
+    pub fn get(&self, avif_form_id: u32) -> Option<&ActorValue> {
+        self.values.get(&avif_form_id)
+    }
+
+    /// Set the base layer, leaving any permanent/temporary/damage untouched,
+    /// and mark it authored.
+    pub fn set_base(&mut self, avif_form_id: u32, base: f32) {
+        let entry = self.values.entry(avif_form_id).or_default();
+        entry.base = base;
+        entry.base_authored = true;
+    }
+
+    /// Add to the permanent-modifier layer (perk / enchant / gear). Negative
+    /// deltas remove a prior permanent bonus.
+    pub fn mod_permanent(&mut self, avif_form_id: u32, delta: f32) {
+        self.values.entry(avif_form_id).or_default().permanent_mod += delta;
+    }
+
+    /// Set the [`ActorValue::set_override`] layer outright — #5412's
+    /// destination for a deliberate `SetBase` on the player's derived
+    /// pools (`refresh_player_only_bases` never touches it, so the write
+    /// survives the per-frame refresh) that keeps the permanent-modifier
+    /// layer — the constant-spell sum — intact ("modifiers are left
+    /// intact", FO4 CK `SetValue`). Replaces any earlier override.
+    pub fn set_override(&mut self, avif_form_id: u32, value: f32) {
+        self.values.entry(avif_form_id).or_default().set_override = value;
+    }
+
+    /// Set the permanent-modifier layer outright — the replace-instead-of-add
+    /// counterpart of `mod_permanent`. #5412: the player `SetBase` reroute no
+    /// longer lands here (an overwrite discarded every active ability bonus
+    /// on the pool — see [`Self::set_override`]). Live caller: the condition
+    /// evaluator's ruleset composition peels the permanent layer off a
+    /// private copy for the M47.2 `GetBaseValue` read in
+    /// `crates/scripting/src/condition/eval.rs`.
+    pub fn set_permanent(&mut self, avif_form_id: u32, value: f32) {
+        self.values.entry(avif_form_id).or_default().permanent_mod = value;
+    }
+
+    /// Add to the temporary-modifier layer (active effects).
+    pub fn mod_temporary(&mut self, avif_form_id: u32, delta: f32) {
+        self.values.entry(avif_form_id).or_default().temporary_mod += delta;
+    }
+
+    /// Apply damage (accumulates; restored separately via [`Self::restore`]).
+    pub fn apply_damage(&mut self, avif_form_id: u32, amount: f32) {
+        self.values.entry(avif_form_id).or_default().damage += amount;
+    }
+
+    /// Restore up to `amount` of accumulated damage (never past the base —
+    /// damage floors at `0.0`).
+    pub fn restore(&mut self, avif_form_id: u32, amount: f32) {
+        let e = self.values.entry(avif_form_id).or_default();
+        e.damage = (e.damage - amount).max(0.0);
+    }
+
+    /// Number of distinct actor values carried.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// `true` when no actor values are set.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Iterate canonical AVIF FormIDs and their layered values.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &ActorValue)> {
+        self.values.iter().map(|(&form_id, value)| (form_id, value))
+    }
+}
+
+impl Component for ActorValues {
+    type Storage = SparseSetStorage<Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stand-in AVIF FormIDs for the test (global space). Real ids come from
+    // `EsmIndex::actor_values`; the component is agnostic to their values.
+    const AV_HEALTH: u32 = 0x0000_02C9;
+    const AV_SNEAK: u32 = 0x0000_02E1;
+
+    #[test]
+    fn current_folds_the_four_layers() {
+        let mut av = ActorValues::new();
+        av.set_base(AV_HEALTH, 100.0);
+        av.mod_permanent(AV_HEALTH, 20.0); // +20 perk
+        av.mod_temporary(AV_HEALTH, 10.0); // +10 potion
+        av.apply_damage(AV_HEALTH, 35.0); // -35 damage
+        assert_eq!(av.current(AV_HEALTH), 95.0, "100 + 20 + 10 − 35");
+    }
+
+    /// #5508 — `undamaged()` is the one composition of the ceiling and
+    /// `current()` is exactly `undamaged() − damage`, override included.
+    #[test]
+    fn undamaged_includes_every_layer_but_damage() {
+        let mut av = ActorValues::new();
+        av.set_base(AV_HEALTH, 105.0);
+        av.set_override(AV_HEALTH, 500.0);
+        av.mod_permanent(AV_HEALTH, 20.0);
+        av.mod_temporary(AV_HEALTH, 10.0);
+        av.apply_damage(AV_HEALTH, 200.0);
+        let health = av.get(AV_HEALTH).unwrap();
+        assert_eq!(health.undamaged(), 635.0);
+        assert_eq!(health.current(), 435.0);
+    }
+
+    /// #5042 — only `set_base` authors the base; a modifier or damage write
+    /// to an uncarried value creates a placeholder-base entry.
+    #[test]
+    fn only_set_base_authors_the_base() {
+        let mut av = ActorValues::new();
+        av.mod_permanent(AV_SNEAK, 5.0);
+        av.apply_damage(AV_HEALTH, 3.0);
+        assert!(!av.get(AV_SNEAK).unwrap().base_authored);
+        assert!(!av.get(AV_HEALTH).unwrap().base_authored);
+        av.set_base(AV_HEALTH, 100.0);
+        let health = av.get(AV_HEALTH).unwrap();
+        assert!(health.base_authored);
+        assert_eq!(health.current(), 97.0, "damage survives the base write");
+    }
+
+    #[test]
+    fn absent_value_is_zero() {
+        let av = ActorValues::new();
+        assert_eq!(av.current(AV_SNEAK), 0.0, "unset actor value → 0.0 default");
+        assert!(av.is_empty());
+        assert_eq!(av.get(AV_SNEAK), None);
+    }
+
+    #[test]
+    fn from_pairs_seeds_bases() {
+        let av = ActorValues::from_pairs([(AV_HEALTH, 150.0), (AV_SNEAK, 40.0)]);
+        assert_eq!(av.current(AV_HEALTH), 150.0);
+        assert_eq!(av.current(AV_SNEAK), 40.0);
+        assert_eq!(av.len(), 2);
+    }
+
+    #[test]
+    fn restore_floors_damage_at_zero() {
+        let mut av = ActorValues::from_pairs([(AV_HEALTH, 100.0)]);
+        av.apply_damage(AV_HEALTH, 30.0);
+        assert_eq!(av.current(AV_HEALTH), 70.0);
+        av.restore(AV_HEALTH, 50.0); // over-restore
+        assert_eq!(
+            av.current(AV_HEALTH),
+            100.0,
+            "damage floors at 0, not negative"
+        );
+        assert_eq!(av.get(AV_HEALTH).unwrap().damage, 0.0);
+    }
+
+    #[test]
+    fn layers_are_independent_per_value() {
+        let mut av = ActorValues::new();
+        av.set_base(AV_HEALTH, 100.0);
+        av.set_base(AV_SNEAK, 25.0);
+        av.mod_permanent(AV_SNEAK, 15.0);
+        assert_eq!(
+            av.current(AV_HEALTH),
+            100.0,
+            "Sneak mod must not touch Health"
+        );
+        assert_eq!(av.current(AV_SNEAK), 40.0);
+    }
+}

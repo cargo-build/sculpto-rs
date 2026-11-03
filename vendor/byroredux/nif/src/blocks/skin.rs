@@ -1,0 +1,1033 @@
+//! Skinning block parsers: NiSkinInstance, NiSkinData, NiSkinPartition.
+//!
+//! These blocks define skeletal deformation for character meshes.
+//! NiTriShape.skin_instance_ref → NiSkinInstance → NiSkinData + NiSkinPartition.
+
+use crate::impl_ni_object;
+use crate::stream::NifStream;
+use crate::types::{BlockRef, NiMatrix3, NiPoint3, NiTransform};
+use crate::version::{bsver, NifVersion};
+use std::io;
+
+// ── NiSkinInstance ───────────────────────────────────────────────────
+
+/// Skinning instance — links a mesh to its skeleton and skin data.
+#[derive(Debug)]
+pub struct NiSkinInstance {
+    /// Reference to NiSkinData (bind-pose bone transforms + vertex weights).
+    pub data_ref: BlockRef,
+    /// Reference to NiSkinPartition (hardware-optimized vertex groups).
+    pub skin_partition_ref: BlockRef,
+    /// Reference to the skeleton root NiNode.
+    pub skeleton_root_ref: BlockRef,
+    /// Bone block references (NiNode pointers).
+    pub bone_refs: Vec<BlockRef>,
+}
+
+impl NiSkinInstance {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let data_ref = stream.read_block_ref()?;
+        // #723 / NIF-D1-04 — `Skin Partition: Ref<NiSkinPartition>` is
+        // gated `since="10.1.0.101"` per nif.xml line 5079. Pre-fix
+        // every pre-Gamebryo (v < 10.1.0.101) NIF would have its
+        // `Skeleton Root` form-ref attributed to the absent
+        // `skin_partition_ref` and then drift the rest of the
+        // record by 4 bytes. Bethesda content (Oblivion 20.0.0.5+,
+        // FO3+) is unaffected; this guards Civ IV / Freedom Force /
+        // pre-Gamebryo NetImmerse compat.
+        let skin_partition_ref = if stream.version() >= NifVersion::V10_1_0_101 {
+            stream.read_block_ref()?
+        } else {
+            BlockRef::NULL
+        };
+        let skeleton_root_ref = stream.read_block_ref()?;
+        let num_bones = stream.read_u32_le()?;
+        let mut bone_refs = stream.allocate_vec_sized::<BlockRef>(num_bones)?;
+        for _ in 0..num_bones {
+            bone_refs.push(stream.read_block_ref()?);
+        }
+        Ok(Self {
+            data_ref,
+            skin_partition_ref,
+            skeleton_root_ref,
+            bone_refs,
+        })
+    }
+}
+
+// ── NiSkinData ──────────────────────────────────────────────────────
+
+/// Per-bone vertex weight entry.
+#[derive(Debug, Clone)]
+pub struct BoneVertWeight {
+    pub vertex_index: u16,
+    pub weight: f32,
+}
+
+/// Per-bone skinning data: bind-pose transform, bounding sphere, vertex weights.
+#[derive(Debug)]
+pub struct BoneData {
+    /// Offset from the bone to the skin in bind pose.
+    pub skin_transform: NiTransform,
+    /// Bounding sphere: [center_x, center_y, center_z, radius].
+    pub bounding_sphere: [f32; 4],
+    /// Vertex weights for this bone.
+    pub vertex_weights: Vec<BoneVertWeight>,
+}
+
+/// Skinning data — per-bone transforms and vertex weights.
+#[derive(Debug)]
+pub struct NiSkinData {
+    /// Overall skin transform (offset from mesh to skeleton root).
+    pub skin_transform: NiTransform,
+    /// Per-bone data: transform, bounds, weights.
+    pub bones: Vec<BoneData>,
+}
+
+impl NiSkinData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        // Both fields are NiTransform STRUCTs (nif.xml `<struct
+        // name="NiTransform" size="52">`), Rotation → Translation →
+        // Scale on disk. Use `read_ni_transform_struct`, NOT the
+        // NiAVObject-ordered `read_ni_transform`. See M41.0 Phase 1b.x
+        // notes on `read_ni_transform_struct` for the bug this fixes.
+        let skin_transform = stream.read_ni_transform_struct()?;
+        let num_bones = stream.read_u32_le()?;
+
+        // Skin Partition ref — nif.xml `until="10.1.0.0"` (later moved to
+        // NiSkinInstance). Old-Oblivion creature skin data carries it
+        // inline here; without this read the 4-byte ref was misparsed as
+        // `has_vertex_weights` and the bone list over-read off the end
+        // (minotaurold.nif, #1337).
+        if stream.version().has_skin_data_partition_ref() {
+            let _skin_partition_ref = stream.read_block_ref()?;
+        }
+
+        // `Has Vertex Weights` — nif.xml `since="4.2.1.0" default="true"`.
+        // Absent below that version, where the weights array is present
+        // unconditionally; reading the byte anyway over-read by one and
+        // misaligned the whole BoneData array (#2168). Always present for
+        // every currently supported title (Oblivion 20.0.0.x, FO3/FNV
+        // 20.2.0.7, Skyrim+ higher), so this gate is correctness hygiene
+        // for the Morrowind-era range rather than a live-content fix.
+        let has_vertex_weights = if stream.version().has_skin_data_vertex_weights_flag() {
+            stream.read_u8()? != 0
+        } else {
+            true
+        };
+
+        // Transform (52) + sphere (16) + weight count (2), before any weights.
+        let mut bones = stream.allocate_vec_min_bytes(num_bones, 70)?;
+        for _ in 0..num_bones {
+            let bone_transform = stream.read_ni_transform_struct()?;
+
+            // Bounding sphere: center (3 floats) + radius (1 float)
+            let cx = stream.read_f32_le()?;
+            let cy = stream.read_f32_le()?;
+            let cz = stream.read_f32_le()?;
+            let radius = stream.read_f32_le()?;
+
+            let num_vertices = stream.read_u16_le()? as u32;
+
+            let vertex_weights = if has_vertex_weights {
+                // Packed u16 + f32 has no Rust alignment padding on disk.
+                let mut weights = stream.allocate_vec_min_bytes(num_vertices, 6)?;
+                for _ in 0..num_vertices {
+                    let vertex_index = stream.read_u16_le()?;
+                    let weight = stream.read_f32_le()?;
+                    weights.push(BoneVertWeight {
+                        vertex_index,
+                        weight,
+                    });
+                }
+                weights
+            } else {
+                Vec::new()
+            };
+
+            bones.push(BoneData {
+                skin_transform: bone_transform,
+                bounding_sphere: [cx, cy, cz, radius],
+                vertex_weights,
+            });
+        }
+
+        Ok(Self {
+            skin_transform,
+            bones,
+        })
+    }
+}
+
+// ── NiSkinPartition ─────────────────────────────────────────────────
+
+/// A single hardware skin partition — bone subset, vertex map, weights, triangles.
+#[derive(Debug)]
+pub struct SkinPartitionEntry {
+    pub num_vertices: u16,
+    pub num_triangles: u16,
+    pub bones: Vec<u16>,
+    pub num_weights_per_vertex: u16,
+    /// Maps partition-local vertex index → mesh-global vertex index.
+    pub vertex_map: Vec<u16>,
+    /// Per-vertex bone weights [num_vertices * num_weights_per_vertex].
+    pub vertex_weights: Vec<f32>,
+    /// Triangle indices (into partition-local vertex space).
+    pub triangles: Vec<[u16; 3]>,
+    /// Per-vertex bone indices [num_vertices * num_weights_per_vertex].
+    pub bone_indices: Vec<u8>,
+}
+
+/// Skyrim SE+ packed-vertex global buffer that fronts the partition
+/// list when `bsver` is in the half-open
+/// `bsver::SKYRIM_SE..bsver::FALLOUT4` range. The buffer holds **all** mesh
+/// vertices in the same packed format `BsTriShape` uses inline; each
+/// `SkinPartitionEntry::vertex_map` translates partition-local indices
+/// into this global array. Pre-#559 the SSE branch in [`NiSkinPartition::parse`]
+/// `stream.skip`'d the bytes — every Skyrim SE NPC body and creature
+/// thus rendered as nothing because the skinned `BsTriShape` ships
+/// with `data_size == 0` and the real geometry lives here. The
+/// importer in `extract_bs_tri_shape` reconstructs vertices and
+/// triangles from this buffer when the inline ones are empty.
+#[derive(Debug, Clone)]
+pub struct SseSkinGlobalBuffer {
+    /// `BSVertexDesc` u64 — same field layout as `BsTriShape.vertex_desc`.
+    /// The low nibble is the per-vertex byte stride / 4; bits 44-55 hold
+    /// the `vertex_attrs` flags (VF_VERTEX, VF_UVS, VF_NORMALS, …).
+    pub vertex_desc: u64,
+    /// Stride per vertex in bytes (redundant with `vertex_desc & 0xF` * 4
+    /// but the parser captures it for cross-checks).
+    pub vertex_size: u32,
+    /// `data_size` raw bytes — `data_size / vertex_size` packed vertices.
+    pub raw_bytes: Vec<u8>,
+}
+
+/// Hardware-optimized skin partitioning data.
+///
+/// Each partition is a subset of the mesh vertices that can be processed
+/// by the GPU with a limited bone palette (typically 4 bones per vertex).
+#[derive(Debug)]
+pub struct NiSkinPartition {
+    pub partitions: Vec<SkinPartitionEntry>,
+    /// Skyrim SE+ global packed-vertex buffer. `Some` when the parsed
+    /// NIF was Skyrim SE / SSE (`bsver::SKYRIM_SE..bsver::FALLOUT4`);
+    /// `None` for legacy FNV/FO3/Oblivion partitions where geometry stays
+    /// inline on the shape. See [`SseSkinGlobalBuffer`] and #559.
+    pub global_vertex_data: Option<SseSkinGlobalBuffer>,
+}
+
+impl NiSkinPartition {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num_partitions = stream.read_u32_le()?;
+
+        // SSE (`SKYRIM_SE..FALLOUT4`): global vertex data before partitions.
+        // The variant classifier maps every value in the named half-open range
+        // to SkyrimSE; the old exact `bsver == bsver::SKYRIM_SE` check dropped
+        // SSE-specific data for every later minor, desynchronising all
+        // subsequent partition reads. See #126 / audit NIF-206.
+        let bsver = stream.bsver();
+        let is_sse = (bsver::SKYRIM_SE..bsver::FALLOUT4).contains(&bsver);
+        // SSE skin partitions store every mesh vertex in this global
+        // packed buffer; per-partition `vertex_map` arrays index into
+        // it. Capture (don't skip) so the importer can reconstruct the
+        // shape's geometry. See #559.
+        let mut global_vertex_data: Option<SseSkinGlobalBuffer> = None;
+        if is_sse {
+            let data_size = stream.read_u32_le()?;
+            let vertex_size = stream.read_u32_le()?;
+            let vertex_desc = stream.read_u64_le()?;
+            if data_size > 0 {
+                let raw_bytes = stream.read_bytes(data_size as usize)?;
+                global_vertex_data = Some(SseSkinGlobalBuffer {
+                    vertex_desc,
+                    vertex_size,
+                    raw_bytes,
+                });
+            }
+        }
+
+        let has_conditionals = stream.version() >= crate::version::NifVersion::V10_1_0_0;
+
+        let mut partitions = stream.allocate_vec(num_partitions)?;
+        for _ in 0..num_partitions {
+            let num_vertices = stream.read_u16_le()?;
+            let num_triangles = stream.read_u16_le()?;
+            let num_bones = stream.read_u16_le()?;
+            let num_strips = stream.read_u16_le()?;
+            let num_weights_per_vertex = stream.read_u16_le()?;
+
+            // `read_u16_array` validates `n * 2 <= remaining` via
+            // `check_alloc`, which is stricter than the per-element
+            // `allocate_vec` budget — no upstream check needed (#831).
+            let bones = stream.read_u16_array(num_bones as usize)?;
+
+            // Vertex map (conditional on has_vertex_map for v >= 10.1.0.0).
+            let vertex_map = if has_conditionals {
+                let has = stream.read_byte_bool()?;
+                if has {
+                    stream.read_u16_array(num_vertices as usize)?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                stream.read_u16_array(num_vertices as usize)?
+            };
+
+            // Vertex weights (conditional).
+            let vertex_weights = if has_conditionals {
+                let has = stream.read_byte_bool()?;
+                if has {
+                    let count = num_vertices as usize * num_weights_per_vertex as usize;
+                    stream.read_f32_array(count)?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                let count = num_vertices as usize * num_weights_per_vertex as usize;
+                stream.read_f32_array(count)?
+            };
+
+            // Strip lengths.
+            let strip_lengths = stream.read_u16_array(num_strips as usize)?;
+
+            // Has faces (conditional) — gates both strips and triangles.
+            let has_faces = if has_conditionals {
+                stream.read_byte_bool()?
+            } else {
+                true
+            };
+
+            // Strips or triangles.
+            let mut triangles = Vec::new();
+            if has_faces {
+                if num_strips > 0 {
+                    // The authored triangle count is available before the
+                    // strip payload. Reserve the de-strip output up front so
+                    // large skin partitions do not repeatedly grow while
+                    // flattening their strips (#3691).
+                    //
+                    // #3918 — the floor is 2 bytes per triangle, NOT
+                    // `size_of::<[u16; 3]>()` (6). These triangles are never
+                    // read from the stream: they are *generated* by `destrip`
+                    // from the u16 strip arrays. A strip of `L` indices
+                    // occupies `2L` bytes and yields at most `L - 2`
+                    // triangles, so the strip payload always costs strictly
+                    // more than 2 bytes per emitted triangle — 2 is an honest
+                    // floor, 6 over-demands by ~3x and rejects valid files
+                    // whose strip payload sits near the end of the stream.
+                    // That cost 296 FO3 blocks (every humanoid hand mesh),
+                    // >=741 FNV and 4,693 Oblivion blocks, and
+                    // `allocate_vec_min_bytes`'s own doc states the rule
+                    // verbatim: the caller-supplied minimum must never exceed
+                    // the actual smallest legitimate on-disk encoding.
+                    triangles =
+                        stream.allocate_vec_min_bytes::<[u16; 3]>(num_triangles as u32, 2)?;
+                    // #1549 — de-strip the jagged strip arrays into a triangle
+                    // list. LE / converted skinned meshes author strips, not
+                    // indexed tris; pre-fix these were skipped, leaving
+                    // `triangles` empty so the SSE reconstructor dropped the
+                    // whole body. #2298 — winding + degenerate-skip logic
+                    // lives once in `crate::blocks::strip::destrip`, the
+                    // same call `NiTriStripsData::to_triangles` and
+                    // `resolve_compressed_mesh`'s chunk-strip walk make.
+                    for &len in &strip_lengths {
+                        let strip = stream.read_u16_array(len as usize)?;
+                        triangles.extend(crate::blocks::strip::destrip(&strip));
+                    }
+                } else {
+                    // Single bulk read into `Vec<[u16; 3]>`; replaces the
+                    // prior `read_u16_array(N*3)` + `chunks_exact(3).map(...)`
+                    // rebuild. #874.
+                    triangles = stream.read_u16_triple_array(num_triangles as usize)?;
+                }
+            }
+
+            // Bone indices: nif.xml `Has Bone Indices` (line 2163) has NO
+            // version gate — unlike `Has Vertex Map` / `Has Vertex Weights`
+            // / `Has Faces` (all `since="10.1.0.0"`), the presence byte is
+            // read UNCONDITIONALLY (matches openmw `Partition::read`, which
+            // reads `get<uint8_t>()` regardless of `hasPresenceFlags`).
+            // #174's `has_conditionals` gate assumed no pre-10.1.0.0
+            // content existed and skipped the byte on v10.0.1.x — which
+            // under-read minotaurold.nif by 1 byte (#1337). v20+ behaviour
+            // is unchanged (it read the byte via the gate anyway).
+            let bone_indices = {
+                let has = stream.read_byte_bool()?;
+                if has {
+                    let count = num_vertices as usize * num_weights_per_vertex as usize;
+                    stream.read_bytes(count)?
+                } else {
+                    Vec::new()
+                }
+            };
+
+            // Skyrim+ trailing fields (bsver > crate::version::bsver::FO3_FNV).
+            if bsver > crate::version::bsver::FO3_FNV {
+                let _lod_level = stream.read_u8()?;
+                let _global_vb = stream.read_byte_bool()?;
+            }
+
+            // SSE (`SKYRIM_SE..FALLOUT4`): per-partition vertex desc + triangles copy.
+            // Same reasoning as the global gate above (#126 / audit NIF-206).
+            if is_sse {
+                let _vertex_desc = stream.read_u64_le()?;
+                // Triangles copy — same data as above, skip.
+                stream.skip(num_triangles as u64 * 6)?;
+            }
+
+            partitions.push(SkinPartitionEntry {
+                num_vertices,
+                num_triangles,
+                bones,
+                num_weights_per_vertex,
+                vertex_map,
+                vertex_weights,
+                triangles,
+                bone_indices,
+            });
+        }
+
+        Ok(Self {
+            partitions,
+            global_vertex_data,
+        })
+    }
+}
+
+// ── BSDismemberSkinInstance (Bethesda extension) ─────────────────────
+
+/// Bethesda's extended skin instance with dismemberment body part flags.
+/// Inherits NiSkinInstance, adds per-partition body part data.
+#[derive(Debug)]
+pub struct BsDismemberSkinInstance {
+    pub base: NiSkinInstance,
+    pub partitions: Vec<BodyPartInfo>,
+}
+
+/// Per-partition body part flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyPartInfo {
+    pub part_flag: u16,
+    pub body_part: u16,
+}
+
+impl BsDismemberSkinInstance {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let base = NiSkinInstance::parse(stream)?;
+        let num_partitions = stream.read_u32_le()?;
+        let mut partitions = stream.allocate_vec_sized::<BodyPartInfo>(num_partitions)?;
+        for _ in 0..num_partitions {
+            let part_flag = stream.read_u16_le()?;
+            let body_part = stream.read_u16_le()?;
+            partitions.push(BodyPartInfo {
+                part_flag,
+                body_part,
+            });
+        }
+        Ok(Self { base, partitions })
+    }
+}
+
+// ── BSSkin::Instance (FO4+ skinning) ────────────────────────────────
+
+/// FO4+ skin instance — replaces NiSkinInstance for BSTriShape meshes.
+///
+/// Key differences: no skin partition ref (partition data is in BSTriShape),
+/// adds per-bone non-uniform scales, skeleton root is first field.
+#[derive(Debug)]
+pub struct BsSkinInstance {
+    pub skeleton_root_ref: BlockRef,
+    pub bone_data_ref: BlockRef,
+    pub bone_refs: Vec<BlockRef>,
+    pub scales: Vec<[f32; 3]>,
+}
+
+impl BsSkinInstance {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let skeleton_root_ref = stream.read_block_ref()?;
+        let bone_data_ref = stream.read_block_ref()?;
+        let num_bones = stream.read_u32_le()?;
+        let mut bone_refs = stream.allocate_vec_sized::<BlockRef>(num_bones)?;
+        for _ in 0..num_bones {
+            bone_refs.push(stream.read_block_ref()?);
+        }
+        let num_scales = stream.read_u32_le()?;
+        let mut scales = stream.allocate_vec_sized::<[f32; 3]>(num_scales)?;
+        for _ in 0..num_scales {
+            scales.push([
+                stream.read_f32_le()?,
+                stream.read_f32_le()?,
+                stream.read_f32_le()?,
+            ]);
+        }
+        Ok(Self {
+            skeleton_root_ref,
+            bone_data_ref,
+            bone_refs,
+            scales,
+        })
+    }
+}
+
+// ── BSSkin::BoneData (FO4+ bone transforms) ─────────────────────────
+
+/// Per-bone transform for FO4+ skinning.
+#[derive(Debug)]
+pub struct BsSkinBoneTrans {
+    /// Bounding sphere: center (3 floats) + radius (1 float).
+    pub bounding_sphere: [f32; 4],
+    /// Bone-to-skin rotation matrix (3x3).
+    pub rotation: [[f32; 3]; 3],
+    /// Bone-to-skin translation.
+    pub translation: [f32; 3],
+    /// Bone scale.
+    pub scale: f32,
+}
+
+/// FO4+ bone data — replaces NiSkinData for BSTriShape meshes.
+///
+/// Simpler than NiSkinData: no overall skin transform, no per-vertex weights
+/// (weights are stored in BSTriShape vertex buffer as bone indices + weights).
+#[derive(Debug)]
+pub struct BsSkinBoneData {
+    pub bones: Vec<BsSkinBoneTrans>,
+}
+
+impl BsSkinBoneData {
+    pub fn parse(stream: &mut NifStream) -> io::Result<Self> {
+        let num_bones = stream.read_u32_le()?;
+        let mut bones = stream.allocate_vec_sized::<BsSkinBoneTrans>(num_bones)?;
+        // Each bone is a fixed 17-float layout (4 bsphere + 9 rotation + 3 translation + 1 scale).
+        let flat = stream.read_f32_array(num_bones as usize * 17)?;
+        for chunk in flat.as_chunks::<17>().0 {
+            let bounding_sphere = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let rotation = [
+                [chunk[4], chunk[5], chunk[6]],
+                [chunk[7], chunk[8], chunk[9]],
+                [chunk[10], chunk[11], chunk[12]],
+            ];
+            // #4621: this bulk layout bypasses the NiTransform readers.
+            let rotation = crate::rotation::sanitize_rotation(NiMatrix3 { rows: rotation }).rows;
+            let mut translation = NiPoint3 {
+                x: chunk[13],
+                y: chunk[14],
+                z: chunk[15],
+            };
+            let mut scale = chunk[16];
+            crate::rotation::sanitize_transform_translation_and_scale(&mut translation, &mut scale);
+            bones.push(BsSkinBoneTrans {
+                bounding_sphere,
+                rotation,
+                translation: [translation.x, translation.y, translation.z],
+                scale,
+            });
+        }
+        Ok(Self { bones })
+    }
+}
+
+impl_ni_object!(
+    NiSkinInstance,
+    NiSkinData,
+    NiSkinPartition,
+    BsDismemberSkinInstance => "BSDismemberSkinInstance",
+    BsSkinInstance => "BSSkin::Instance",
+    BsSkinBoneData => "BSSkin::BoneData",
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::NifHeader;
+    use crate::stream::NifStream;
+    use crate::version::NifVersion;
+
+    #[test]
+    fn bs_bone_data_sanitizes_transforms_and_preserves_valid_bones() {
+        let valid = [
+            2.0f32, 3.0, 4.0, 5.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 6.0, 7.0, 8.0, 2.5,
+        ];
+        let mut nonfinite = valid;
+        nonfinite[4] = f32::NAN;
+        nonfinite[13] = f32::INFINITY;
+        nonfinite[14] = f32::NEG_INFINITY;
+        nonfinite[16] = f32::NAN;
+        let mut scaled = valid;
+        scaled[4] = 3.0;
+        scaled[8] = 3.0;
+        scaled[12] = 3.0;
+        let mut bytes = 3u32.to_le_bytes().to_vec();
+        for bone in [valid, nonfinite, scaled] {
+            for value in bone {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for bsver in [130, 155, 172] {
+            let header = NifHeader::detached(NifVersion::V20_2_0_7, 12, bsver);
+            let mut stream = NifStream::new(&bytes, &header);
+            let parsed = BsSkinBoneData::parse(&mut stream).unwrap();
+            assert_eq!(stream.position() as usize, bytes.len());
+            assert_eq!(parsed.bones[0].translation, [6.0, 7.0, 8.0]);
+            assert_eq!(parsed.bones[0].scale, 2.5);
+            assert_eq!(parsed.bones[0].bounding_sphere, [2.0, 3.0, 4.0, 5.0]);
+            assert_eq!(parsed.bones[1].translation, [0.0, 0.0, 8.0]);
+            assert_eq!(parsed.bones[1].scale, 1.0);
+            for bone in &parsed.bones {
+                assert_eq!(bone.rotation, NiMatrix3::default().rows);
+            }
+        }
+    }
+
+    #[test]
+    fn bs_bone_data_rejects_forged_count_before_reading_payload() {
+        let header = NifHeader::test_fo4();
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 68]); // enough for one bone, not two
+        let mut stream = NifStream::new(&bytes, &header);
+        assert_eq!(
+            BsSkinBoneData::parse(&mut stream).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(stream.position(), 4);
+    }
+
+    #[test]
+    fn parse_skin_partition_fnv_one_partition() {
+        let header = NifHeader::test_fo3_fnv();
+        let mut data = Vec::new();
+
+        // num_partitions = 1
+        data.extend_from_slice(&1u32.to_le_bytes());
+        // Partition 0:
+        let num_verts: u16 = 3;
+        let num_tris: u16 = 1;
+        let num_bones: u16 = 2;
+        let num_strips: u16 = 0;
+        let num_wpv: u16 = 2; // weights per vertex
+        data.extend_from_slice(&num_verts.to_le_bytes());
+        data.extend_from_slice(&num_tris.to_le_bytes());
+        data.extend_from_slice(&num_bones.to_le_bytes());
+        data.extend_from_slice(&num_strips.to_le_bytes());
+        data.extend_from_slice(&num_wpv.to_le_bytes());
+        // Bones: [0, 1]
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        // Has vertex map = true
+        data.push(1u8);
+        // Vertex map: [0, 1, 2]
+        for i in 0..3u16 {
+            data.extend_from_slice(&i.to_le_bytes());
+        }
+        // Has vertex weights = true
+        data.push(1u8);
+        // Weights: 3 verts × 2 weights = 6 floats
+        for w in [0.8f32, 0.2, 0.5, 0.5, 0.3, 0.7] {
+            data.extend_from_slice(&w.to_le_bytes());
+        }
+        // Strip lengths: (none, num_strips=0)
+        // Has faces = true
+        data.push(1u8);
+        // Triangles: 1 triangle [0, 1, 2]
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        // Has bone indices = true
+        data.push(1u8);
+        // Bone indices: 3 verts × 2 = 6 bytes
+        data.extend_from_slice(&[0u8, 1, 0, 1, 1, 0]);
+        // FNV bsver=34: no trailing LOD/Global fields (bsver > crate::version::bsver::FO3_FNV is false)
+
+        let mut stream = NifStream::new(&data, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+
+        assert_eq!(part.partitions.len(), 1);
+        let p = &part.partitions[0];
+        assert_eq!(p.num_vertices, 3);
+        assert_eq!(p.num_triangles, 1);
+        assert_eq!(p.bones, vec![0, 1]);
+        assert_eq!(p.vertex_map, vec![0, 1, 2]);
+        assert_eq!(p.vertex_weights.len(), 6);
+        assert!((p.vertex_weights[0] - 0.8).abs() < 1e-6);
+        assert_eq!(p.triangles.len(), 1);
+        assert_eq!(p.triangles[0], [0, 1, 2]);
+        assert_eq!(p.bone_indices, vec![0, 1, 0, 1, 1, 0]);
+        assert_eq!(stream.position() as usize, data.len());
+    }
+
+    /// #1549 — a strip-authored partition (num_strips > 0) must de-strip into
+    /// a triangle list, not be skipped. Pre-fix `triangles` came back empty,
+    /// so the SSE reconstructor (`try_reconstruct_sse_geometry`) dropped the
+    /// whole skinned mesh.
+    #[test]
+    fn parse_skin_partition_destrips_strip_authored_faces() {
+        let header = NifHeader::test_fo3_fnv();
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_partitions
+        let num_verts: u16 = 4;
+        let num_tris: u16 = 2; // a 4-index strip yields 2 triangles
+        let num_bones: u16 = 1;
+        let num_strips: u16 = 1;
+        let num_wpv: u16 = 1;
+        data.extend_from_slice(&num_verts.to_le_bytes());
+        data.extend_from_slice(&num_tris.to_le_bytes());
+        data.extend_from_slice(&num_bones.to_le_bytes());
+        data.extend_from_slice(&num_strips.to_le_bytes());
+        data.extend_from_slice(&num_wpv.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes()); // bones: [0]
+        data.push(1u8); // has vertex map
+        for i in 0..4u16 {
+            data.extend_from_slice(&i.to_le_bytes());
+        }
+        data.push(1u8); // has vertex weights
+        for w in [1.0f32, 1.0, 1.0, 1.0] {
+            data.extend_from_slice(&w.to_le_bytes());
+        }
+        data.extend_from_slice(&4u16.to_le_bytes()); // strip_lengths: one strip of length 4
+        data.push(1u8); // has faces
+        for i in 0..4u16 {
+            // strip indices [0, 1, 2, 3]
+            data.extend_from_slice(&i.to_le_bytes());
+        }
+        data.push(1u8); // has bone indices
+        data.extend_from_slice(&[0u8, 0, 0, 0]); // 4 verts × 1 wpv
+
+        let mut stream = NifStream::new(&data, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+        let p = &part.partitions[0];
+        // Strip [0,1,2,3] → tris [0,1,2] (even) and [1,3,2] (odd-index swap).
+        assert_eq!(p.triangles, vec![[0, 1, 2], [1, 3, 2]]);
+        assert!(
+            p.triangles.capacity() >= num_tris as usize,
+            "strip de-triangulation should reserve the authored triangle count"
+        );
+        assert_eq!(stream.position() as usize, data.len());
+    }
+
+    /// #3918 — a strip partition whose payload sits near the end of the
+    /// stream must still parse.
+    ///
+    /// The de-strip output is *generated*, never read, so bounding it at
+    /// `size_of::<[u16; 3]>()` = 6 bytes/triangle over-demanded ~3x against
+    /// the bytes remaining and rejected valid files with `UnexpectedEof`.
+    /// On vanilla FO3 that cost 296 `NiSkinPartition` blocks — including
+    /// `characters\_male\lefthand.nif` and `righthand.nif`, the two meshes
+    /// `humanoid_body_paths` loads for every kf-era NPC — plus >=741 FNV and
+    /// 4,693 Oblivion blocks.
+    ///
+    /// The #1549 test above cannot catch this: its single strip of length 4
+    /// clears the buggy bound by exactly one byte. This fixture uses a strip
+    /// of 8, so the buggy demand (6 triangles x 6 = 36) exceeds the 25 bytes
+    /// left at the allocation point while the honest floor (6 x 2 = 12) fits.
+    #[test]
+    fn parse_skin_partition_accepts_strips_ending_near_the_stream_end() {
+        let header = NifHeader::test_fo3_fnv();
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_partitions
+        let num_verts: u16 = 8;
+        let strip_len: u16 = 8;
+        let num_tris: u16 = strip_len - 2; // 6 — what destrip actually yields
+        let num_bones: u16 = 1;
+        let num_strips: u16 = 1;
+        let num_wpv: u16 = 1;
+        data.extend_from_slice(&num_verts.to_le_bytes());
+        data.extend_from_slice(&num_tris.to_le_bytes());
+        data.extend_from_slice(&num_bones.to_le_bytes());
+        data.extend_from_slice(&num_strips.to_le_bytes());
+        data.extend_from_slice(&num_wpv.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes()); // bones: [0]
+        data.push(1u8); // has vertex map
+        for i in 0..num_verts {
+            data.extend_from_slice(&i.to_le_bytes());
+        }
+        data.push(1u8); // has vertex weights
+        for _ in 0..num_verts {
+            data.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        data.extend_from_slice(&strip_len.to_le_bytes()); // strip_lengths: [8]
+        data.push(1u8); // has faces
+                        // ── allocation happens here: 8*2 + 1 + 8 = 25 bytes remain ──
+        for i in 0..strip_len {
+            data.extend_from_slice(&i.to_le_bytes()); // strip [0..8)
+        }
+        data.push(1u8); // has bone indices
+        data.extend_from_slice(&[0u8; 8]); // 8 verts x 1 wpv
+
+        let mut stream = NifStream::new(&data, &header);
+        let part = NiSkinPartition::parse(&mut stream)
+            .expect("a strip payload near the stream end is valid, not truncated");
+        let p = &part.partitions[0];
+        assert_eq!(
+            p.triangles,
+            vec![
+                [0, 1, 2],
+                [1, 3, 2],
+                [2, 3, 4],
+                [3, 5, 4],
+                [4, 5, 6],
+                [5, 7, 6],
+            ],
+            "strip [0..8) must de-strip to 6 alternating-winding triangles"
+        );
+        assert_eq!(stream.position() as usize, data.len());
+    }
+
+    fn make_sse_header(user_version_2: u32) -> NifHeader {
+        NifHeader::detached(NifVersion::V20_2_0_7, 12, user_version_2)
+    }
+
+    /// Build a minimal SSE-shaped NiSkinPartition with a single empty
+    /// partition. The SSE-specific global + per-partition fields MUST be
+    /// consumed for the stream to land at `data.len()`.
+    fn sse_skin_partition_bytes() -> Vec<u8> {
+        let mut d = Vec::new();
+        // num_partitions = 1
+        d.extend_from_slice(&1u32.to_le_bytes());
+        // SSE global: data_size=0, vertex_size=0, vertex_desc=0 (u64).
+        d.extend_from_slice(&0u32.to_le_bytes()); // data_size
+        d.extend_from_slice(&0u32.to_le_bytes()); // vertex_size
+        d.extend_from_slice(&0u64.to_le_bytes()); // vertex_desc
+                                                  // Partition 0 — all zeros: 0 verts, 0 tris, 0 bones, 0 strips, 0 wpv.
+        for _ in 0..5 {
+            d.extend_from_slice(&0u16.to_le_bytes());
+        }
+        // has_vertex_map=false, has_vertex_weights=false, has_faces=false, has_bone_indices=false.
+        d.extend(&[0u8, 0, 0, 0]);
+        // Skyrim+ trailing (bsver > crate::version::bsver::FO3_FNV): lod_level(u8) + global_vb(bool).
+        d.push(0u8);
+        d.push(0u8);
+        // SSE per-partition: vertex_desc(u64) + triangles copy (0 bytes since num_tris=0).
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d
+    }
+
+    /// Regression: #126 / audit NIF-206 — SSE-specific partition fields
+    /// must be consumed at `bsver::SKYRIM_SE` and throughout the gap up to
+    /// `bsver::FALLOUT4` (the variant classifier maps those values to
+    /// `SkyrimSE`). Previously gated on exact equality with `SKYRIM_SE`, so
+    /// any later minor produced a stream desync on the first partition.
+    #[test]
+    fn skin_partition_sse_100_consumes_sse_fields() {
+        let header = make_sse_header(bsver::SKYRIM_SE);
+        let bytes = sse_skin_partition_bytes();
+        let mut stream = NifStream::new(&bytes, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+        assert_eq!(part.partitions.len(), 1);
+        assert_eq!(stream.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn skin_partition_sse_105_consumes_sse_fields() {
+        // 101-129 is the "unknown gap" the classifier folds into SkyrimSE;
+        // pick 105 as a representative value inside the gap.
+        let header = make_sse_header(105);
+        let bytes = sse_skin_partition_bytes();
+        let mut stream = NifStream::new(&bytes, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+        assert_eq!(part.partitions.len(), 1);
+        assert_eq!(stream.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn skin_partition_sse_129_consumes_sse_fields() {
+        // Upper edge of the named SSE range.
+        let header = make_sse_header(bsver::FALLOUT4 - 1);
+        let bytes = sse_skin_partition_bytes();
+        let mut stream = NifStream::new(&bytes, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+        assert_eq!(part.partitions.len(), 1);
+        assert_eq!(stream.position() as usize, bytes.len());
+    }
+
+    /// Regression for #559 — non-zero SSE global vertex data must
+    /// populate `NiSkinPartition.global_vertex_data` (was silently
+    /// `stream.skip`'d). Build a minimal SSE partition whose global
+    /// buffer carries 3 vertices × 16-byte stride.
+    #[test]
+    fn skin_partition_sse_captures_global_vertex_buffer() {
+        let header = make_sse_header(bsver::SKYRIM_SE);
+        let mut d = Vec::new();
+        // num_partitions = 1
+        d.extend_from_slice(&1u32.to_le_bytes());
+        // SSE global header: data_size=48 (3 verts × 16 bytes), vertex_size=16,
+        // vertex_desc=0xDEAD_BEEF_0000_0010 (low nibble = 4 quads = 16 bytes;
+        // upper bits arbitrary — round-trip what we wrote).
+        let vertex_desc: u64 = 0xDEAD_BEEF_0000_0010;
+        d.extend_from_slice(&48u32.to_le_bytes());
+        d.extend_from_slice(&16u32.to_le_bytes());
+        d.extend_from_slice(&vertex_desc.to_le_bytes());
+        // 48 bytes of placeholder vertex data.
+        for i in 0..48u8 {
+            d.push(i);
+        }
+        // Empty partition body (same shape as `sse_skin_partition_bytes`).
+        for _ in 0..5 {
+            d.extend_from_slice(&0u16.to_le_bytes());
+        }
+        d.extend(&[0u8, 0, 0, 0]); // has_vertex_map / weights / faces / bone_indices
+        d.push(0u8); // lod_level
+        d.push(0u8); // global_vb
+        d.extend_from_slice(&0u64.to_le_bytes()); // per-partition vertex_desc
+
+        let mut stream = NifStream::new(&d, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+
+        let buf = part
+            .global_vertex_data
+            .as_ref()
+            .expect("non-zero data_size must populate global_vertex_data");
+        assert_eq!(buf.vertex_desc, vertex_desc);
+        assert_eq!(buf.vertex_size, 16);
+        assert_eq!(buf.raw_bytes.len(), 48);
+        // Confirm round-trip — first byte 0, last byte 47.
+        assert_eq!(buf.raw_bytes[0], 0);
+        assert_eq!(buf.raw_bytes[47], 47);
+        assert_eq!(stream.position() as usize, d.len());
+    }
+
+    /// Companion to the above: a SSE partition with `data_size == 0`
+    /// keeps `global_vertex_data == None` so the importer can short-
+    /// circuit reconstruction. Locks the negative branch.
+    #[test]
+    fn skin_partition_sse_zero_data_size_leaves_global_buffer_none() {
+        let header = make_sse_header(bsver::SKYRIM_SE);
+        let bytes = sse_skin_partition_bytes();
+        let mut stream = NifStream::new(&bytes, &header);
+        let part = NiSkinPartition::parse(&mut stream).unwrap();
+        assert!(part.global_vertex_data.is_none());
+    }
+
+    /// Regression for #723 / NIF-D1-04. nif.xml line 5079 gates
+    /// `NiSkinInstance.Skin Partition` on `since="10.1.0.101"`. Pre-fix
+    /// the parser read the ref unconditionally; on a pre-Gamebryo NIF
+    /// (v < 10.1.0.101) that consumed the `Skeleton Root` ref's bytes
+    /// as the absent partition slot. This test pins both directions
+    /// of the gate using a header at v10.1.0.0 (below the boundary).
+    #[test]
+    fn ni_skin_instance_skin_partition_absent_pre_10_1_0_101() {
+        // Header at v10.1.0.0 — below the since=10.1.0.101 boundary.
+        let header = NifHeader::detached(NifVersion::V10_1_0_0, 0, 0);
+        let mut data = Vec::new();
+        // data_ref (i32 block ref) = 7
+        data.extend_from_slice(&7i32.to_le_bytes());
+        // No skin_partition_ref on disk (gated out at v < 10.1.0.101).
+        // skeleton_root_ref = 13
+        data.extend_from_slice(&13i32.to_le_bytes());
+        // num_bones = 1
+        data.extend_from_slice(&1u32.to_le_bytes());
+        // bone_refs = [42]
+        data.extend_from_slice(&42i32.to_le_bytes());
+
+        let mut stream = NifStream::new(&data, &header);
+        let inst = NiSkinInstance::parse(&mut stream).unwrap();
+        assert_eq!(inst.data_ref.index(), Some(7));
+        assert!(
+            inst.skin_partition_ref.is_null(),
+            "pre-10.1.0.101 NIFs must have NULL skin_partition_ref \
+             (field absent on disk)"
+        );
+        assert_eq!(inst.skeleton_root_ref.index(), Some(13));
+        assert_eq!(inst.bone_refs.len(), 1);
+        assert_eq!(inst.bone_refs[0].index(), Some(42));
+        assert_eq!(stream.position() as usize, data.len());
+    }
+
+    /// Companion: at v10.1.0.101 (boundary inclusive — `since=` is
+    /// inclusive, opposite of `until=`) and beyond, the partition ref
+    /// IS present.
+    #[test]
+    fn ni_skin_instance_skin_partition_present_at_10_1_0_101() {
+        let header = NifHeader::detached(NifVersion::V10_1_0_101, 0, 0);
+        let mut data = Vec::new();
+        data.extend_from_slice(&7i32.to_le_bytes()); // data_ref
+        data.extend_from_slice(&99i32.to_le_bytes()); // skin_partition_ref
+        data.extend_from_slice(&13i32.to_le_bytes()); // skeleton_root_ref
+        data.extend_from_slice(&0u32.to_le_bytes()); // num_bones = 0
+
+        let mut stream = NifStream::new(&data, &header);
+        let inst = NiSkinInstance::parse(&mut stream).unwrap();
+        assert_eq!(inst.data_ref.index(), Some(7));
+        assert_eq!(inst.skin_partition_ref.index(), Some(99));
+        assert_eq!(inst.skeleton_root_ref.index(), Some(13));
+        assert!(inst.bone_refs.is_empty());
+        assert_eq!(stream.position() as usize, data.len());
+    }
+
+    // ── #2168 — NiSkinData pre-Bethesda version gates ───────────────
+
+    fn make_header(version: NifVersion) -> NifHeader {
+        NifHeader::detached(version, 0, 0)
+    }
+
+    /// A zero-bone `NiSkinData` body: the 52-byte NiTransform struct,
+    /// `num_bones = 0`, then optionally the inline Skin Partition ref and
+    /// the Has Vertex Weights byte, per the version's layout.
+    fn skin_data_bytes(with_partition_ref: bool, with_weights_flag: bool) -> Vec<u8> {
+        let mut d = Vec::new();
+        // NiTransform STRUCT: 3x3 rotation + translation + scale = 13 f32.
+        for _ in 0..13 {
+            d.extend_from_slice(&0f32.to_le_bytes());
+        }
+        d.extend_from_slice(&0u32.to_le_bytes()); // num_bones = 0
+        if with_partition_ref {
+            d.extend_from_slice(&(-1i32).to_le_bytes());
+        }
+        if with_weights_flag {
+            d.push(1u8);
+        }
+        d
+    }
+
+    /// #2168 — at `V4_0_0_2` the inline Skin Partition ref IS present but
+    /// the Has Vertex Weights byte is NOT (`since="4.2.1.0"`).
+    ///
+    /// The exact-position assertion is the point: an over-read leaves the
+    /// stream past `data.len()` and every subsequent float in a real
+    /// (non-empty) BoneData array would be shifted. This era predates the
+    /// `block_sizes` table (`>= 20.2.0.5`), so nothing downstream would
+    /// resync it.
+    #[test]
+    fn skin_data_v4_0_0_2_has_partition_ref_but_no_weights_flag() {
+        let header = make_header(NifVersion::V4_0_0_2);
+        let bytes = skin_data_bytes(true, false);
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiSkinData::parse(&mut stream).expect("parses");
+        assert!(data.bones.is_empty());
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "the Has Vertex Weights byte is absent below 4.2.1.0 — reading it \
+             anyway over-reads by one and misaligns the BoneData array (#2168)"
+        );
+    }
+
+    /// #2168 — at exactly `V4_0_0_0` (below `since="4.0.0.2"`) neither
+    /// optional field is on disk. Pre-fix the partition-ref predicate had
+    /// no lower bound, so this over-read 5 bytes.
+    #[test]
+    fn skin_data_v4_0_0_0_has_neither_optional_field() {
+        let header = make_header(NifVersion::V4_0_0_0);
+        let bytes = skin_data_bytes(false, false);
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiSkinData::parse(&mut stream).expect("parses");
+        assert!(data.bones.is_empty());
+        assert_eq!(
+            stream.position() as usize,
+            bytes.len(),
+            "below since=4.0.0.2 the inline Skin Partition ref is absent too — \
+             pre-#2168 this over-read 4 + 1 bytes"
+        );
+    }
+
+    /// The supported-title layout is unchanged: no inline partition ref
+    /// (`until=10.1.0.0`), weights flag present. Guards against the fix
+    /// over-correcting into the range every real game actually uses.
+    #[test]
+    fn skin_data_modern_layout_is_unchanged() {
+        let header = make_header(NifVersion::V20_2_0_7);
+        let bytes = skin_data_bytes(false, true);
+        let mut stream = NifStream::new(&bytes, &header);
+        let data = NiSkinData::parse(&mut stream).expect("parses");
+        assert!(data.bones.is_empty());
+        assert_eq!(stream.position() as usize, bytes.len());
+    }
+}

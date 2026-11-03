@@ -1,0 +1,204 @@
+//! Byte-exact regression coverage for #2345 / NIF-OBL-D1-02 — the
+//! pre-10.1.0.106 `NiSequence` / `ControlledBlock` layout.
+//!
+//! Before this fix the parser implemented only the `>= 10.1.0.104`
+//! `ControlledBlock` shape and read every `NiControllerSequence` field
+//! unconditionally. On a sub-10.1.0.106 file that meant:
+//!
+//! * the `until="10.1.0.103"` `NiSequence` prologue (Accum Root Name +
+//!   Text Keys) was never read — an under-read;
+//! * `Target Name` (`until="10.1.0.103"`) was never read — an under-read;
+//! * `Interpolator` (`since="10.1.0.106"`) was read anyway — an over-read;
+//! * `Priority` was gated on `bsver > 0` alone, missing its
+//!   `since="10.1.0.106"` half — a phantom byte on Bethesda content;
+//! * the five IDTag strings (`since="10.1.0.104"`) were read anyway;
+//! * every `NiControllerSequence` field (all `since="10.1.0.106"`) was
+//!   read anyway — ~30 phantom bytes.
+//!
+//! Those errors do not cancel out, and this version band has no
+//! per-block size anchor to resynchronise from, so the whole rest of the
+//! file was lost. Gates transcribed from `nif.xml`
+//! (`<niobject name="NiSequence">` / `<niobject name="NiControllerSequence">`
+//! / `<struct name="ControlledBlock">`), the authority named in
+//! `docs/engine/` for wire-format questions.
+//!
+//! Empirically unreached on vanilla content — Oblivion's sub-10.1.0.106
+//! files carry no controller sequences — so this test is the only thing
+//! exercising the band. Exposure is mod / non-Bethesda Gamebryo content.
+
+use super::sequence::NiControllerSequence;
+use crate::header::NifHeader;
+use crate::stream::NifStream;
+use crate::version::NifVersion;
+
+/// v10.1.0.101 with `bsver = 4` — the exact configuration the issue names:
+/// old enough that every gate above excludes its field, but Bethesda-flagged
+/// (`bsver > 0`) so the `Priority` byte would have been read on the old
+/// `bsver`-only gate.
+fn pre_106_header() -> NifHeader {
+    NifHeader::detached(NifVersion::V10_1_0_101, 0, 4)
+}
+
+fn push_inline_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+#[test]
+fn pre_10_1_0_106_sequence_layout_is_byte_exact() {
+    let mut data = Vec::new();
+
+    // ── NiSequence ──
+    push_inline_string(&mut data, "Seq"); //  7 B  Name
+    push_inline_string(&mut data, "Root"); //  8 B  Accum Root Name (until 10.1.0.103)
+    data.extend_from_slice(&3i32.to_le_bytes()); //  4 B  Text Keys ref (until 10.1.0.103)
+                                                 //        #3468: a REAL index, not -1. The
+                                                 //        original fixture wrote NULL, so the
+                                                 //        `is_null()` assertion below passed
+                                                 //        both before and after the payload was
+                                                 //        carried forward — it could not fail.
+    data.extend_from_slice(&1u32.to_le_bytes()); //  4 B  Num Controlled Blocks
+                                                 //        Array Grow By ABSENT (since 10.1.0.106)
+
+    // ── ControlledBlock[0] ──
+    push_inline_string(&mut data, "Target"); // 10 B  Target Name (until 10.1.0.103)
+                                             //        Interpolator ABSENT (since 10.1.0.106)
+    data.extend_from_slice(&7i32.to_le_bytes()); //  4 B  Controller ref
+                                                 //        Blend Interpolator/Index ABSENT (since 10.1.0.104)
+                                                 //        Priority ABSENT (since 10.1.0.106)
+                                                 //        IDTag strings ABSENT (since 10.1.0.104)
+
+    // ── NiControllerSequence's own fields: ALL ABSENT (since 10.1.0.106) ──
+    // ── Deprecated string palette ABSENT (since 10.1.0.113) ──
+    // ── Anim notes ABSENT (bsver 4 < 24) ──
+
+    let expected_len = 7 + 8 + 4 + 4 + 10 + 4;
+    assert_eq!(
+        data.len(),
+        expected_len,
+        "fixture bookkeeping: the hand-counted layout and the emitted bytes disagree"
+    );
+
+    let header = pre_106_header();
+    let mut stream = NifStream::new(&data, &header);
+    let seq = NiControllerSequence::parse(&mut stream).expect("pre-10.1.0.106 sequence parses");
+
+    // The load-bearing assertion: the parser consumed the block EXACTLY.
+    // In this version band there is no per-block size to resynchronise on,
+    // so any drift here silently destroys every following block.
+    assert_eq!(
+        stream.position(),
+        expected_len as u64,
+        "stream must land exactly on the block end — over/under-read here is \
+         unrecoverable in a sizeless-format version band (#2345)"
+    );
+
+    assert_eq!(seq.name.as_deref(), Some("Seq"));
+    // Sourced from the NiSequence base field, not the derived class's
+    // same-named one (which is `since=10.1.0.106` and absent here).
+    assert_eq!(seq.accum_root_name.as_deref(), Some("Root"));
+    assert_eq!(seq.array_grow_by, 0, "Array Grow By is since=10.1.0.106");
+
+    assert_eq!(seq.controlled_blocks.len(), 1);
+    let cb = &seq.controlled_blocks[0];
+    assert!(
+        cb.interpolator_ref.is_null(),
+        "Interpolator is since=10.1.0.106 — must not be read, and must not \
+         alias the Controller ref that follows it on disk"
+    );
+    assert_eq!(
+        cb.controller_ref.index(),
+        Some(7),
+        "the Controller ref must land on its own u32, not one shifted by a \
+         phantom Interpolator read"
+    );
+    assert_eq!(cb.priority, 0, "Priority is since=10.1.0.106 && #BSSTREAM#");
+    // #3468 SIBLING — also retargeted. The IDTag strings really are
+    // `since="10.1.0.104"` and absent here, but `Target Name`
+    // (`until="10.1.0.103"`, read in the prologue) is the same
+    // "which node does this block drive" concept for this band. Leaving
+    // `node_name` None short-circuited `anim/controlled_block.rs`'s target
+    // resolution, so no channel in the sequence bound at all.
+    assert_eq!(
+        cb.node_name.as_deref(),
+        Some("Target"),
+        "#3468: Target Name must back node_name below 10.1.0.104"
+    );
+    assert!(cb.interpolator_id.is_none());
+
+    // nif.xml's own defaults for the absent derived-class fields.
+    assert_eq!(seq.weight, 1.0);
+    assert_eq!(seq.frequency, 1.0);
+    // #3437 — was `0`, decoded as CYCLE_LOOP by `CycleType::from_u32`.
+    // nif.xml's CycleType enum is CYCLE_LOOP=0 / CYCLE_REVERSE=1 /
+    // CYCLE_CLAMP=2, and CYCLE_CLAMP is the block's actual stated default.
+    assert_eq!(seq.cycle_type, 2, "CYCLE_CLAMP");
+    assert_eq!(seq.start_time, f32::MAX);
+    assert_eq!(seq.stop_time, f32::MIN);
+    // #3468 — retargeted from `is_null()`. The prologue ref
+    // (`until="10.1.0.103"`) is the NiSequence-side declaration of the field
+    // NiControllerSequence re-declares `since="10.1.0.106"`; exactly one is
+    // present for any version, so it must reach the same slot the way
+    // `accum_root_name` already does. Dropping it yielded zero text-key
+    // events (footstep / hit / sound) for every sequence on this band.
+    assert_eq!(
+        seq.text_keys_ref.index(),
+        Some(3),
+        "#3468: the pre-10.1.0.104 Text Keys ref must back text_keys_ref, \
+         mirroring Accum Root Name backing accum_root_name"
+    );
+    assert!(seq.manager_ref.is_null());
+    assert!(
+        seq.anim_note_refs.is_empty(),
+        "bsver 4 carries no anim notes"
+    );
+}
+
+/// #3437 — the two-part fix must survive `import_sequence`, not just the
+/// raw parse. `cycle_type`'s corrected default (CYCLE_CLAMP=2) alone would
+/// route `duration = stop_time - start_time = FLT_MIN - FLT_MAX` (which
+/// overflows f32 range to `-inf`) into the `Clamp` cycle arm's
+/// `local_time.min(duration)`, freezing every such clip at its first tick.
+/// Both halves — the corrected `cycle_type` AND a finite `duration` — must
+/// hold together on the resulting `AnimationClip`.
+#[test]
+fn pre_10_1_0_106_sequence_yields_clamp_cycle_and_finite_duration() {
+    use crate::anim::{import_sequence, CycleType};
+    use crate::scene::NifScene;
+
+    let mut data = Vec::new();
+    push_inline_string(&mut data, "Seq");
+    push_inline_string(&mut data, "Root");
+    data.extend_from_slice(&(-1i32).to_le_bytes()); // Text Keys ref (null)
+    data.extend_from_slice(&0u32.to_le_bytes()); // Num Controlled Blocks = 0
+
+    let header = pre_106_header();
+    let mut stream = NifStream::new(&data, &header);
+    let seq = NiControllerSequence::parse(&mut stream).expect("pre-10.1.0.106 sequence parses");
+
+    assert!(
+        seq.start_time.is_finite() && seq.stop_time.is_finite(),
+        "nif.xml's own FLT_MAX/FLT_MIN neutral defaults are themselves finite \
+         individually — only their difference overflows"
+    );
+
+    let scene = NifScene::default();
+    let clip = import_sequence(&scene, &seq, &mut crate::anim::BsplineSampling::new());
+
+    assert_eq!(
+        clip.cycle_type,
+        CycleType::Clamp,
+        "#3437: pre-10.1.0.106 sequences must default to CYCLE_CLAMP, not Loop"
+    );
+    assert!(
+        clip.duration.is_finite(),
+        "#3437: FLT_MIN - FLT_MAX overflows to -inf; import_sequence must not \
+         let that reach the AnimationClip — got {}",
+        clip.duration
+    );
+    assert_eq!(
+        clip.duration, 0.0,
+        "a non-finite raw duration collapses to 0.0, the same neutral value \
+         every cycle arm already treats as \"no wrap / no fold\""
+    );
+}
