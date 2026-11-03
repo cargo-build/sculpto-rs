@@ -231,6 +231,8 @@ source units. A separation uses one geometry-derived minimum separating axis, mo
 the smaller face in full and its immediate neighbours at half strength, and is
 refused when the required translation exceeds the bound, an incident face would
 invert or collapse, or any contact remains.
+Both modes require all four fields. Under `reject`, the three numeric values
+are retained in the receipt but no displacement is attempted.
 
 `guide_segments` and every anchor share one declared frame: `source-local-z-up`
 (the extracted object's own coordinates) or `sculpto-display-y-up` (the Y-up OBJ
