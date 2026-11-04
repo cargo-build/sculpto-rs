@@ -345,5 +345,11 @@ fn moving_corner_aliases_and_their_neighbors_remain_connected() {
     assert_eq!(result.positions[3], result.positions[5]);
     assert_eq!(&result.positions[..3], &positions[..3]);
     assert!(check::self_intersection_witnesses(&result.positions, &faces).is_empty());
-    assert!(result.separation.moved.iter().any(|v| v.vertex == 6 && v.share == 0.5));
+    assert!(
+        result
+            .separation
+            .moved
+            .iter()
+            .any(|v| v.vertex == 6 && v.share == 0.5)
+    );
 }
