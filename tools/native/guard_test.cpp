@@ -75,13 +75,13 @@ bool inside(const Eigen::RowVector3d& probe, const Triangle& triangle, double ma
 
 int main() {
     // Fixture: one collapse edge (a, b) and two fan triangles that contain a and b.
-    //   a = (0,-1.5,0)   b = (0,1,0)   midpoint placement M = (0,0,0)
+    //   a = (0,-1.5,0)   b = (0,1.5,0)   midpoint placement M = (0,0,0)
     //   f = (a, A, B) with A = (0.5,0.5,-1), B = (0.5,0.5,1)
     //   g = (b, X, Y) with X = (2,0,0),     Y = (0,2,0)
     // After the collapse f becomes (M,A,B) and g becomes (M,X,Y): they share M, and
     // f's opposite edge A-B stabs g at (0.5,0.5,0), which is strictly inside g.
     Eigen::MatrixXd positions(6, 3);
-    positions << 0.0, -1.5, 0.0, 0.0, 1.0, 0.0, 0.5, 0.5, -1.0, 0.5, 0.5, 1.0, 2.0,
+    positions << 0.0, -1.5, 0.0, 0.0, 1.5, 0.0, 0.5, 0.5, -1.0, 0.5, 0.5, 1.0, 2.0,
         0.0, 0.0, 0.0, 2.0, 0.0;
     Eigen::MatrixXi faces(2, 3);
     faces << 0, 2, 3, 1, 4, 5;
@@ -95,6 +95,7 @@ int main() {
     const Eigen::RowVector3d X = positions.row(4);
     const Eigen::RowVector3d Y = positions.row(5);
     const Eigen::RowVector3d M = (a + b) * 0.5;
+    expect(M.isZero(), "midpoint matches the analytic origin");
 
     Triangle first_before{a, A, B};
     Triangle second_before{b, X, Y};
