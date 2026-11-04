@@ -406,13 +406,9 @@ fn recovery_respects_the_initial_source_repair_authorization() {
         exterior_control(&positions, &triangles, &profile),
         Err(ControlError::IncidentalLimit { loops: 1, limit: 0 })
     );
-    assert!(
-        source_selection(&positions, &triangles, &profile)
-            .unwrap()
-            .recovery
-            .disks
-            .is_empty(),
-        "no disk is recovered under an unauthorized source plan"
+    assert_eq!(
+        source_selection(&positions, &triangles, &profile).unwrap_err(),
+        ControlError::IncidentalLimit { loops: 1, limit: 0 }
     );
 
     // The published count authorizes one closure, which the disk consumes.

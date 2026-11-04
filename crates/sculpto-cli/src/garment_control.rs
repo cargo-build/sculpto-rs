@@ -225,10 +225,13 @@ pub fn check_inner(args: &[String]) -> Result<(), String> {
             &profile.coverage,
         )
     });
-    let coverage = deviations.as_ref().map(|deviations| match deviations {
-        Ok(deviations) => coverage_check(deviations, &profile),
-        Err(error) => Err(format!("deviation measurement failed: {error}")),
-    });
+    let coverage = match &selection {
+        Err(error) => Some(Err(format!("source selection failed: {error}"))),
+        Ok(_) => deviations.as_ref().map(|deviations| match deviations {
+            Ok(deviations) => coverage_check(deviations, &profile),
+            Err(error) => Err(format!("deviation measurement failed: {error}")),
+        }),
+    };
     let verdict = match (qualification.as_ref(), coverage.as_ref()) {
         (Some(Ok(_)), Some(Ok(()))) => Ok(()),
         (Some(Ok(_)), Some(Err(reason))) => Err(reason.clone()),

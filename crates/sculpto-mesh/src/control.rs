@@ -1633,25 +1633,20 @@ pub fn source_selection(
         let kept = pruned.faces.iter().copied().collect::<HashSet<_>>();
         // The source stage's own plan decides which loops it is authorized to close: it
         // owns the incidental count, closure and fill limits. A recovered disk consumes
-        // exactly the fill authorization it replaces. An unauthorized initial plan
-        // recovers nothing and leaves its error to the closure planner.
+        // exactly the fill authorization it replaces.
         let fillable = repair_actions(
             surface.positions(),
             &pruned.triangles,
             &loops,
             &apertures,
             &profile.source_repair,
-        )
-        .map(|actions| {
-            actions
-                .iter()
-                .filter_map(|action| match action {
-                    RepairAction::Fill { loop_index, .. } => Some(*loop_index),
-                    RepairAction::Collapse { .. } => None,
-                })
-                .collect::<HashSet<_>>()
+        )?
+        .iter()
+        .filter_map(|action| match action {
+            RepairAction::Fill { loop_index, .. } => Some(*loop_index),
+            RepairAction::Collapse { .. } => None,
         })
-        .unwrap_or_default();
+        .collect::<HashSet<_>>();
         let mut added = Vec::new();
         for index in apertures.incidental.clone() {
             if !fillable.contains(&index) {

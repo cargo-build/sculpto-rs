@@ -1194,3 +1194,37 @@ fn recovered_disk_vertices_are_measured_by_the_coverage_gate() {
     );
     fs::remove_dir_all(&directory).unwrap();
 }
+
+#[test]
+fn source_recovery_authorization_errors_reach_the_check_report() {
+    let directory = directory();
+    let source = directory.join("source.obj");
+    let profile = directory.join("profile.json");
+    let control = directory.join("control.obj");
+    let report = directory.join("report.json");
+    let (positions, triangles) = box_with_fan_cap();
+    write_obj(&source, &positions, &triangles);
+    write_obj(&control, &positions, &triangles[..triangles.len() - 2]);
+    let mut declared: Value = serde_json::from_str(&box_profile_json()).unwrap();
+    declared["source_repair"]["max_incidental_loops"] = 0.into();
+    fs::write(&profile, serde_json::to_string(&declared).unwrap()).unwrap();
+
+    let check = run(&[
+        "garment",
+        "control-check",
+        "--control",
+        control.to_str().unwrap(),
+        "--source",
+        source.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert!(!check.status.success());
+    let evidence = read_json(&report);
+    let reason = evidence["verdict"]["reason"].as_str().unwrap();
+    assert!(reason.contains("source selection failed"), "{reason}");
+    assert!(reason.contains("declared limit of 0"), "{reason}");
+    fs::remove_dir_all(&directory).unwrap();
+}
