@@ -298,7 +298,11 @@ fn a_shared_anchor_cannot_be_moved_with_the_claimed_fixed_face() {
     let mut split = positions.to_vec();
     split.push(positions[0]);
     assert_eq!(
-        separate(&split, &[[0, 1, 2], [5, 3, 4]], &policy(ContactMode::Separate)),
+        separate(
+            &split,
+            &[[0, 1, 2], [5, 3, 4]],
+            &policy(ContactMode::Separate)
+        ),
         expected,
         "render seams do not make shared physical anchors independently movable"
     );
