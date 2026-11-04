@@ -38,6 +38,6 @@ fn requested_self_check_is_an_exit_gate() {
     assert!(
         String::from_utf8(full.stderr)
             .unwrap()
-            .contains("nonadjacent garment triangle pairs intersect")
+            .contains("garment triangle pairs intersect beyond shared features")
     );
 }

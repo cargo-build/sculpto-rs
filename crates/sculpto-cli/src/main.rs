@@ -1104,7 +1104,7 @@ fn garment_check_inner(args: &[String]) -> Result<(), String> {
     }
     if self_requested && self_pairs > 0 {
         return Err(format!(
-            "{self_pairs} nonadjacent garment triangle pairs intersect"
+            "{self_pairs} garment triangle pairs intersect beyond shared features"
         ));
     }
     Ok(())

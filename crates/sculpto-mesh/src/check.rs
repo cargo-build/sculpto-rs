@@ -169,6 +169,12 @@ impl Bvh {
 
 type Vec3d = [f64; 3];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContactScope {
+    Any,
+    BeyondSharedFeatures,
+}
+
 fn sub64(a: Vec3d, b: Vec3d) -> Vec3d {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -218,7 +224,12 @@ fn point_in_triangle_2d(p: [f64; 2], tri: &[[f64; 2]; 3]) -> bool {
     d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0
 }
 
-fn coplanar_triangles_intersect(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3], normal: Vec3d) -> bool {
+fn coplanar_triangles_intersect(
+    a: &[[f64; 3]; 3],
+    b: &[[f64; 3]; 3],
+    normal: Vec3d,
+    scope: ContactScope,
+) -> bool {
     let axis = (0..3)
         .max_by(|&i, &j| {
             normal[i]
@@ -239,8 +250,11 @@ fn coplanar_triangles_intersect(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3], normal: Ve
         }
     }
 
-    a_2d.iter().any(|&p| point_in_triangle_2d(p, &b_2d))
-        || b_2d.iter().any(|&p| point_in_triangle_2d(p, &a_2d))
+    a.iter().zip(&a_2d).any(|(corner, &p)| {
+        (scope == ContactScope::Any || !b.contains(corner)) && point_in_triangle_2d(p, &b_2d)
+    }) || b.iter().zip(&b_2d).any(|(corner, &p)| {
+        (scope == ContactScope::Any || !a.contains(corner)) && point_in_triangle_2d(p, &a_2d)
+    })
 }
 
 fn triangle_plane_interval(p_t: [f64; 3], h: [f64; 3], eps: f64) -> Option<[f64; 2]> {
@@ -323,7 +337,7 @@ fn triangle_plane_interval(p_t: [f64; 3], h: [f64; 3], eps: f64) -> Option<[f64;
 
 /// Whether two triangles intersect (Möller-style interval testing in f64
 /// with coplanar 2D overlap fallback).
-fn triangles_intersect(a: &Trie, b: &Trie) -> bool {
+fn triangles_intersect(a: &Trie, b: &Trie, scope: ContactScope) -> bool {
     let a_corners = [to64(a.corners[0]), to64(a.corners[1]), to64(a.corners[2])];
     let b_corners = [to64(b.corners[0]), to64(b.corners[1]), to64(b.corners[2])];
 
@@ -359,16 +373,16 @@ fn triangles_intersect(a: &Trie, b: &Trie) -> bool {
             sub64(b_corners[2], b_corners[1]),
         ))
         .sqrt();
-    let scale = scale_a.max(scale_b).max(1e-9);
-    let eps_plane = 1e-10 * scale;
+    let eps_a = 1e-10 * scale_a.max(1e-9);
+    let eps_b = 1e-10 * scale_b.max(1e-9);
 
     let h_a = [
         dot64(unit_nb, sub64(a_corners[0], b_corners[0])),
         dot64(unit_nb, sub64(a_corners[1], b_corners[0])),
         dot64(unit_nb, sub64(a_corners[2], b_corners[0])),
     ];
-    if (h_a[0] > eps_plane && h_a[1] > eps_plane && h_a[2] > eps_plane)
-        || (h_a[0] < -eps_plane && h_a[1] < -eps_plane && h_a[2] < -eps_plane)
+    if (h_a[0] > eps_a && h_a[1] > eps_a && h_a[2] > eps_a)
+        || (h_a[0] < -eps_a && h_a[1] < -eps_a && h_a[2] < -eps_a)
     {
         return false;
     }
@@ -378,8 +392,8 @@ fn triangles_intersect(a: &Trie, b: &Trie) -> bool {
         dot64(unit_na, sub64(b_corners[1], a_corners[0])),
         dot64(unit_na, sub64(b_corners[2], a_corners[0])),
     ];
-    if (h_b[0] > eps_plane && h_b[1] > eps_plane && h_b[2] > eps_plane)
-        || (h_b[0] < -eps_plane && h_b[1] < -eps_plane && h_b[2] < -eps_plane)
+    if (h_b[0] > eps_b && h_b[1] > eps_b && h_b[2] > eps_b)
+        || (h_b[0] < -eps_b && h_b[1] < -eps_b && h_b[2] < -eps_b)
     {
         return false;
     }
@@ -387,8 +401,11 @@ fn triangles_intersect(a: &Trie, b: &Trie) -> bool {
     let line_dir = cross64(unit_na, unit_nb);
     let len_dir = dot64(line_dir, line_dir).sqrt();
 
-    if len_dir < 1e-6 {
-        return coplanar_triangles_intersect(&a_corners, &b_corners, unit_na);
+    if h_a.iter().all(|h| h.abs() <= eps_a) && h_b.iter().all(|h| h.abs() <= eps_b) {
+        return coplanar_triangles_intersect(&a_corners, &b_corners, unit_na, scope);
+    }
+    if len_dir <= f64::EPSILON {
+        return false;
     }
 
     let d_line = [
@@ -397,27 +414,48 @@ fn triangles_intersect(a: &Trie, b: &Trie) -> bool {
         line_dir[2] / len_dir,
     ];
     let a_t = [
-        dot64(a_corners[0], d_line),
-        dot64(a_corners[1], d_line),
-        dot64(a_corners[2], d_line),
+        0.0,
+        dot64(sub64(a_corners[1], a_corners[0]), d_line),
+        dot64(sub64(a_corners[2], a_corners[0]), d_line),
     ];
     let b_t = [
-        dot64(b_corners[0], d_line),
-        dot64(b_corners[1], d_line),
-        dot64(b_corners[2], d_line),
+        dot64(sub64(b_corners[0], a_corners[0]), d_line),
+        dot64(sub64(b_corners[1], a_corners[0]), d_line),
+        dot64(sub64(b_corners[2], a_corners[0]), d_line),
     ];
 
-    let interval_a = match triangle_plane_interval(a_t, h_a, eps_plane) {
+    let interval_a = match triangle_plane_interval(a_t, h_a, eps_a) {
         Some(iv) => iv,
-        None => return coplanar_triangles_intersect(&a_corners, &b_corners, unit_na),
+        None => return false,
     };
-    let interval_b = match triangle_plane_interval(b_t, h_b, eps_plane) {
+    let interval_b = match triangle_plane_interval(b_t, h_b, eps_b) {
         Some(iv) => iv,
-        None => return coplanar_triangles_intersect(&a_corners, &b_corners, unit_na),
+        None => return false,
     };
 
-    let eps_line = 1e-10 * scale;
-    interval_a[0] <= interval_b[1] + eps_line && interval_b[0] <= interval_a[1] + eps_line
+    let eps_line = 1e-10 * scale_a.min(scale_b).max(1e-9);
+    let overlap = [
+        interval_a[0].max(interval_b[0]),
+        interval_a[1].min(interval_b[1]),
+    ];
+    if overlap[0] > overlap[1] + eps_line {
+        return false;
+    }
+    match scope {
+        ContactScope::Any => true,
+        ContactScope::BeyondSharedFeatures => {
+            let shared = a_corners
+                .iter()
+                .zip(a_t)
+                .filter(|(corner, _)| b_corners.contains(corner))
+                .map(|(_, t)| [t, t])
+                .reduce(|a, b| [a[0].min(b[0]), a[1].max(b[1])]);
+            match shared {
+                Some([start, end]) => overlap[0] < start - eps_line || overlap[1] > end + eps_line,
+                None => true,
+            }
+        }
+    }
 }
 
 fn triangles(pos: &[[f32; 3]], tris: &[[u32; 3]]) -> Vec<Trie> {
@@ -442,7 +480,7 @@ pub fn intersection_pair_list(
     let mut found = Vec::new();
     for (index, probe) in a.iter().enumerate() {
         let mut visit = |candidate: usize| {
-            if triangles_intersect(probe, &bvh.tries[candidate]) {
+            if triangles_intersect(probe, &bvh.tries[candidate], ContactScope::Any) {
                 found.push((index, candidate));
             }
         };
@@ -591,33 +629,16 @@ pub(crate) fn nearest_triangle_indices(
         .collect()
 }
 
-/// Body triangle indices that participate in the body's own internal
-/// crossings (coincident never-nude layers, fused subsurfaces). Comparing a
-/// garment against these triangles reports contamination, not fit defects.
+/// Source face indices involved in physical self contacts, using the shared
+/// witness semantics including exact-position seams. @req DECL0013
 pub fn internally_crossing_triangles(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> Vec<u32> {
-    if tris.len() < 2 {
-        return Vec::new();
-    }
-    let tries = triangles(positions, tris);
-    let bvh = Bvh::build(tries.clone());
     let mut flagged = vec![false; tris.len()];
-    for (index, probe) in tries.iter().enumerate() {
-        let own = tris[index];
-        let mut visit = |candidate: usize| {
-            if candidate <= index {
-                return;
-            }
-            let other = tris[candidate];
-            if own.iter().any(|v| other.contains(v)) {
-                return;
-            }
-            if triangles_intersect(probe, &tries[candidate]) {
-                flagged[index] = true;
-                flagged[candidate] = true;
-            }
-        };
-        bvh.query(probe, 1e-6, &mut visit);
-    }
+    self_intersection_witnesses(positions, tris)
+        .into_iter()
+        .for_each(|witness| {
+            flagged[witness.left] = true;
+            flagged[witness.right] = true;
+        });
     flagged
         .iter()
         .enumerate()
@@ -641,7 +662,7 @@ pub fn intersection_pairs(
     let mut pairs = 0usize;
     for probe in &a {
         let mut visit = |candidate: usize| {
-            if triangles_intersect(probe, &bvh.tries[candidate]) {
+            if triangles_intersect(probe, &bvh.tries[candidate], ContactScope::Any) {
                 pairs += 1;
             }
         };
@@ -653,7 +674,7 @@ pub fn intersection_pairs(
 /// What kind of physical self contact a pair is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WitnessKind {
-    /// Nonadjacent triangles that intersect: a real crossing.
+    /// Triangles intersect beyond any shared vertex or edge.
     Crossing,
     /// Coincident duplicate faces: zero enclosed volume, never a legal surface.
     Duplicate,
@@ -692,24 +713,21 @@ pub fn self_intersection_witnesses(positions: &[[f32; 3]], tris: &[[u32; 3]]) ->
     let bvh = Bvh::build(tries.clone());
     let mut witnesses = Vec::new();
     for (index, probe) in tries.iter().enumerate() {
-        let own = tris[index];
         let mut visit = |candidate: usize| {
             if candidate <= index {
                 return;
             }
-            let other = tris[candidate];
-            let shares_vertex = own.iter().any(|v| other.contains(v));
-            if shares_vertex {
-                if face_keys[index] == face_keys[candidate] {
-                    witnesses.push(Witness {
-                        left: index,
-                        right: candidate,
-                        kind: WitnessKind::Duplicate,
-                    });
-                }
-                return;
-            }
-            if triangles_intersect(probe, &tries[candidate]) {
+            if face_keys[index] == face_keys[candidate] {
+                witnesses.push(Witness {
+                    left: index,
+                    right: candidate,
+                    kind: WitnessKind::Duplicate,
+                });
+            } else if triangles_intersect(
+                probe,
+                &tries[candidate],
+                ContactScope::BeyondSharedFeatures,
+            ) {
                 witnesses.push(Witness {
                     left: index,
                     right: candidate,
