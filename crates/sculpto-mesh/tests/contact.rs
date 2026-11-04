@@ -278,3 +278,28 @@ fn coplanar_overlap_separates_without_an_input_triggered_panic() {
         .expect("the overlap needs separation");
     assert!(check::self_intersection_witnesses(&result.positions, &triangles).is_empty());
 }
+
+#[test]
+fn a_shared_anchor_cannot_be_moved_with_the_claimed_fixed_face() {
+    let positions = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.99, 0.001, -0.1],
+        [0.99, 0.001, 0.1],
+    ];
+    let triangles = [[0, 1, 2], [0, 3, 4]];
+    assert_eq!(check::self_intersection_pairs(&positions, &triangles), 1);
+    let expected = Err(ContactError::SharedFeature { left: 0, right: 1 });
+    assert_eq!(
+        separate(&positions, &triangles, &policy(ContactMode::Separate)),
+        expected
+    );
+    let mut split = positions.to_vec();
+    split.push(positions[0]);
+    assert_eq!(
+        separate(&split, &[[0, 1, 2], [5, 3, 4]], &policy(ContactMode::Separate)),
+        expected,
+        "render seams do not make shared physical anchors independently movable"
+    );
+}

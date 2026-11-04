@@ -7,6 +7,7 @@
 //! fixed. Every moved vertex, the chosen axis and the residual state are reported,
 //! and the result is rejected when it exceeds the declared bound, inverts or
 //! degenerates an incident face, or leaves any contact.
+//! Shared physical anchors cannot obey that rigid translation and are refused.
 //!
 //! Witness detection is not implemented here: it reuses
 //! [`crate::check::self_intersection_witnesses`], the same predicate the final
@@ -92,6 +93,8 @@ pub enum ContactError {
     },
     /// A coincident duplicate face cannot be separated by moving geometry.
     DuplicateFace { left: usize, right: usize },
+    /// Translating one face would also move a shared anchor of the fixed face.
+    SharedFeature { left: usize, right: usize },
     /// More witnessed pairs than the policy allows: coupled or excessive.
     CoupledContacts { pairs: usize, limit: usize },
     /// The smallest analytic separation is larger than the declared bound.
@@ -115,6 +118,10 @@ impl fmt::Display for ContactError {
             Self::DuplicateFace { left, right } => write!(
                 formatter,
                 "triangles {left} and {right} are coincident duplicate faces; geometry separation cannot repair them"
+            ),
+            Self::SharedFeature { left, right } => write!(
+                formatter,
+                "triangles {left} and {right} share a physical anchor; rigid separation cannot hold the opposing face fixed"
             ),
             Self::CoupledContacts { pairs, limit } => write!(
                 formatter,
@@ -247,6 +254,12 @@ pub fn separate(
 
     let a = corners(positions, triangles[first.left]);
     let b = corners(positions, triangles[first.right]);
+    if a.iter().any(|point| b.contains(point)) {
+        return Err(ContactError::SharedFeature {
+            left: first.left,
+            right: first.right,
+        });
+    }
     let moving_face = match area(a) <= area(b) {
         true => first.left,
         false => first.right,
