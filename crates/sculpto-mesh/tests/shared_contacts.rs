@@ -55,6 +55,25 @@ fn contact_only_at_a_shared_vertex_is_legal() {
 }
 
 #[test]
+fn synthetic_tube_planes_touch_only_at_their_shared_corner() {
+    let positions = [
+        [1031611792, 3192047296, 3196059648],
+        [1042657227, 3186672063, 3204448256],
+        [1042657226, 3186672064, 1040187392],
+        [1031611792, 3192047296, 0],
+        [1031611792, 3192047296, 1048576000],
+    ]
+    .map(|point| point.map(f32::from_bits));
+    let faces = [[0, 1, 2], [3, 2, 4]];
+    assert_pair(&positions, &faces, 0);
+    assert_pair(&positions.map(|[x, y, z]| [x, z, -y]), &faces, 0);
+    assert_eq!(
+        check::intersection_pairs(&positions, &[faces[0]], &positions, &[faces[1]]),
+        1
+    );
+}
+
+#[test]
 fn coplanar_overlap_beyond_a_shared_vertex_or_edge_is_reported() {
     let positions = [
         [0.0, 0.0, 0.0],

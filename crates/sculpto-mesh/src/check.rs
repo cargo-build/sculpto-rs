@@ -288,19 +288,21 @@ fn triangle_plane_interval(p_t: [f64; 3], h: [f64; 3], eps: f64) -> Option<[f64;
         return None;
     }
 
-    let interp = |i: usize, j: usize| -> f64 { match (s[i], s[j]) {
-        (0, _) => p_t[i],
-        (_, 0) => p_t[j],
-        _ => {
-            let denom = h[i] - h[j];
-            let factor = if denom.abs() < 1e-15 {
-                0.5
-            } else {
-                h[i] / denom
-            };
-            p_t[i] + (p_t[j] - p_t[i]) * factor
+    let interp = |i: usize, j: usize| -> f64 {
+        match (s[i], s[j]) {
+            (0, _) => p_t[i],
+            (_, 0) => p_t[j],
+            _ => {
+                let denom = h[i] - h[j];
+                let factor = if denom.abs() < 1e-15 {
+                    0.5
+                } else {
+                    h[i] / denom
+                };
+                p_t[i] + (p_t[j] - p_t[i]) * factor
+            }
         }
-    }};
+    };
 
     let (t1, t2) = if s[0] != 0 && s[0] == s[1] {
         (interp(2, 0), interp(2, 1))

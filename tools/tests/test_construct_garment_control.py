@@ -264,17 +264,15 @@ with tempfile.TemporaryDirectory(prefix="sculpto-control-native-") as temporary:
             assert stage["note"] and stage["verified"] is True
             continue
         assert len(stage["sha256"]) == 64 and stage["triangles"] > 0
-    assert receipt["separation"]["applied"] is True, "reduction creates one shared-anchor crossing"
-    separation = receipt["separation"]["separation"]
-    assert separation["shared_anchors"], "the repair must retain the shared physical anchors"
+    assert receipt["separation"]["applied"] is False, "the synthetic tube has only legal adjacency"
+    assert receipt["separation"]["pairs"] == 0
     before_vertices, before_faces = adapter.read_obj(output / "pre_separation.obj")
     after_vertices, after_faces = adapter.read_obj(output / "reduced_control.obj")
     assert np.array_equal(before_faces, after_faces), "separation changed ordered topology"
-    fixed = np.asarray(before_faces[separation["fixed_face"]])
     assert np.array_equal(
-        np.asarray(before_vertices, dtype=np.float32)[fixed],
-        np.asarray(after_vertices, dtype=np.float32)[fixed],
-    ), "the fixed face moved during the native repair"
+        np.asarray(before_vertices, dtype=np.float32),
+        np.asarray(after_vertices, dtype=np.float32),
+    ), "a contact-free surface moved during separation"
     assert receipt["validation"]["verdict"]["passed"] is True
 
     # 2. The same shell under another name, offset and scale decides the same way.
