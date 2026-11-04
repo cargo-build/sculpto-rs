@@ -143,7 +143,7 @@ pub fn qualify(triangles: &[[[f32; 2]; 3]]) -> Result<Qualification, NonFiniteCo
     Ok(report)
 }
 
-/// Nonpositive half-plane support separates interiors while allowing shared boundaries.
+/// Both triangles are CCW; nonpositive support separates interiors, allowing shared boundaries.
 fn separates(left: &[Coord<f64>; 3], right: &[Coord<f64>; 3]) -> bool {
     (0..3).any(|edge| {
         right

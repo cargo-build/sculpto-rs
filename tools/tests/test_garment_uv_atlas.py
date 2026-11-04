@@ -69,6 +69,26 @@ with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     assert (failed / "uv-before-report.json").is_file()
     assert (failed / "uv-after-report.json").is_file()
     assert not failure["after"]["verdict"]["passed"]
+    target = fixture()
+    distorted = root / "distorted"
+    distorted.mkdir()
+    distortion = {}
+    native_pack = atlas.pack_once
+    def distort_pack(obj):
+        native_pack(obj)
+        uv = atlas.coordinates(obj.data)
+        uv[:, 0] *= 0.5
+        obj.data.uv_layers.active.data.foreach_set("uv", uv.ravel())
+    with patch.object(atlas, "pack_once", side_effect=distort_pack):
+        try:
+            atlas.qualify_atlas(target, binary, distorted, distortion)
+        except ValueError as error:
+            assert "distorted unaffected chart" in str(error)
+        else:
+            raise AssertionError("accepted a nonuniform chart deformation")
+    assert distortion["after"]["verdict"]["passed"]
+    assert distortion["unaffected_adjacency_preserved"]
+    assert distortion["unaffected_edge_ratio_max_error"] > distortion["unaffected_edge_ratio_error_limit"]
     bpy.ops.wm.read_factory_settings(use_empty=True)
     mesh = bpy.data.meshes.new("Collapsed UV")
     mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])

@@ -156,7 +156,9 @@ writes its report and returns nonzero. Existing report paths are exclusive.
 After Smart Project, the baker qualifies **every** face. A clean atlas stays
 unchanged. Otherwise only diagnosed overlapping/collapsed faces become separate
 geometry-derived triangle charts, followed by one native island pack. Physical
-topology and unaffected chart interiors remain intact. Complete qualification
+topology and unaffected chart interiors remain intact. Packing refuses a change
+above `1e-3` in an unaffected edge's normalized perimeter share; this float32
+roundoff allowance does not relax the exact-sign overlap check. Complete qualification
 runs again; residual failure stops before the first bake. No small positive
 area is ignored, and no second pack is attempted.
 

@@ -8,6 +8,9 @@ import bpy
 import numpy as np
 
 
+MAX_UNAFFECTED_EDGE_RATIO_ERROR = 1e-3
+
+
 def coordinates(mesh):
     return np.asarray([tuple(loop.uv) for loop in mesh.uv_layers.active.data], dtype=np.float32)
 
@@ -121,6 +124,7 @@ def qualify_atlas(target, binary, output, record):
     excluded = set(affected)
     edges = adjacency(mesh, before, excluded)
     record.update(operation="isolate diagnosed triangle charts; native pack once", affected_faces=affected,
+                  unaffected_edge_ratio_error_limit=MAX_UNAFFECTED_EDGE_RATIO_ERROR,
                   pack_settings=dict(udim_source="ACTIVE_UDIM", rotate=True, rotate_method="CARDINAL", margin=0.02,
                       margin_method="FRACTION", scale=True, merge_overlap=False, pin=False, shape_method="CONCAVE"))
     density, basis = isolate_faces(target, before.copy(), affected)
@@ -144,5 +148,7 @@ def qualify_atlas(target, binary, output, record):
         record["unaffected_edge_ratio_max_error"] = 0.0
     if not record["unaffected_adjacency_preserved"]:
         raise ValueError("native packing changed unaffected chart interiors")
+    if record["unaffected_edge_ratio_max_error"] > MAX_UNAFFECTED_EDGE_RATIO_ERROR:
+        raise ValueError("native packing distorted unaffected chart edge ratios")
     if not record["after"]["verdict"]["passed"]:
         raise ValueError("UV atlas failed complete qualification after one native repack")
