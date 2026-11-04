@@ -233,7 +233,13 @@ fn exterior_reconstructs_a_thick_shell_and_check_accepts_it() {
     assert_eq!(report["measured"]["euler"].as_i64().unwrap(), 0);
     assert_eq!(report["measured"]["self_contacts"].as_u64().unwrap(), 0);
     assert_eq!(report["measured"]["loop_vertex_space"], "exact-position");
-    assert_eq!(report["measured"]["vertex_sources"].as_array().unwrap().len(), 24);
+    assert_eq!(
+        report["measured"]["vertex_sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        24
+    );
     assert_eq!(
         report["qualification"]["apertures"]
             .as_array()

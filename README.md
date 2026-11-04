@@ -314,12 +314,13 @@ magnitude. Cuts act on a private derivative; the original source and its maps
 remain intact. Source coverage still includes deliberately removed cap areas.
 
 `control-check` writes its report and then fails when the declaration is not met;
+the report's `verdict` combines aperture/topology/winding/bounds qualification
+with coverage. Diagnostics are always written before the failure is reported.
+
 `measured.loops[*].vertices` use the declared `exact-position` index space.
 Map each ID through `measured.vertex_sources` to obtain its lowest original
 input vertex index. This preserves correspondence after seam welding or
 triangle-first-use reordering; loop centers remain source-local coordinates.
-the report's `verdict` combines aperture/topology/winding/bounds qualification
-with coverage. Diagnostics are always written before the failure is reported.
 
 The native adapter runs the whole stage list for one digest-pinned object:
 
