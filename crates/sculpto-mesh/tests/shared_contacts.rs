@@ -123,17 +123,19 @@ fn tiny_crossing_and_separated_triangles_against_a_large_face() {
         [100.0, -100.0, 0.0],
         [0.0, 100.0, 0.0],
     ];
-    let crossing = [
-        [0.0, 0.0, -1e-9],
-        [1e-6, 0.0, 1e-9],
-        [0.0, 1e-6, 1e-9],
-    ];
+    let crossing = [[0.0, 0.0, -1e-9], [1e-6, 0.0, 1e-9], [0.0, 1e-6, 1e-9]];
     let separated = crossing.map(|[x, y, _]| [x, y, 1e-9]);
     let face = [[0, 1, 2]];
     [(&crossing, 1), (&separated, 0)]
         .into_iter()
         .for_each(|(small, expected)| {
-            assert_eq!(check::intersection_pairs(small, &face, &large, &face), expected);
-            assert_eq!(check::intersection_pairs(&large, &face, small, &face), expected);
+            assert_eq!(
+                check::intersection_pairs(small, &face, &large, &face),
+                expected
+            );
+            assert_eq!(
+                check::intersection_pairs(&large, &face, small, &face),
+                expected
+            );
         });
 }
