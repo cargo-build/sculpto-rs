@@ -1,7 +1,9 @@
 //! The control profile is data: it validates, converts frames and rejects typos.
 
 use sculpto_mesh::control::profile::ControlProfile;
-use sculpto_mesh::control::{ContactMode, ControlError, ControlFrame, GuideSegment, RetainSide};
+use sculpto_mesh::control::{
+    ContactMode, ControlError, ControlFrame, GuideSegment, RetainSide, SourceRecovery,
+};
 
 const VALID: &str = r#"{
   "frame": "source-local-z-up",
@@ -57,6 +59,66 @@ fn a_complete_profile_round_trips_its_declared_values() {
     assert_eq!(profile.contact.max_pairs, 1);
     assert_eq!(profile.reduction.target_triangles, 1800);
     assert_eq!(profile.coverage.minimum, 0.95);
+}
+
+#[test]
+fn source_recovery_and_declared_genus_are_optional_and_strict() {
+    // Absence preserves the published route and the genus-zero expectation.
+    let absent = profile(VALID).unwrap();
+    assert_eq!(absent.source_recovery, SourceRecovery::None);
+    assert_eq!(absent.source_recovery.name(), "none");
+    assert_eq!(absent.expected_genus, 0);
+
+    let declared = profile(&with_fields(
+        r#""source_recovery": "incidental-disks", "expected_genus": 4"#,
+    ))
+    .unwrap();
+    assert_eq!(declared.source_recovery, SourceRecovery::IncidentalDisks);
+    assert_eq!(declared.source_recovery.name(), "incidental-disks");
+    assert_eq!(declared.expected_genus, 4);
+
+    let explicit_none = profile(&with_fields(r#""source_recovery": "none""#)).unwrap();
+    assert_eq!(explicit_none.source_recovery, SourceRecovery::None);
+
+    for (member, field, fragment) in [
+        (
+            r#""source_recovery": "nearest-disk""#,
+            "source_recovery",
+            "none or incident-disks",
+        ),
+        (
+            r#""source_recovery": 1"#,
+            "source_recovery",
+            "expected a string",
+        ),
+        (
+            r#""expected_genus": "one""#,
+            "expected_genus",
+            "nonnegative integer",
+        ),
+        (
+            r#""expected_genus": -1"#,
+            "expected_genus",
+            "nonnegative integer",
+        ),
+        (
+            r#""expected_genus": 1.5"#,
+            "expected_genus",
+            "nonnegative integer",
+        ),
+        (
+            r#""expected_genus": 4294967296"#,
+            "expected_genus",
+            "does not fit a genus count",
+        ),
+    ] {
+        let error = profile(&with_fields(member)).unwrap_err();
+        assert!(
+            matches!(&error, ControlError::InvalidProfile { field: named, .. } if named == field),
+            "{member}: {error:?}"
+        );
+        assert!(error.to_string().contains(fragment), "{member}: {error}");
+    }
 }
 
 #[test]
@@ -241,6 +303,12 @@ const CUTS: &str = r#"[
     {"label": "waist", "plane_point": [0.0, 0.0, 0.6], "normal": [0.0, 0.0, 2.0], "retain": "negative"},
     {"label": "left-cuff", "plane_point": [0.0, 0.0, 0.4], "normal": [0.0, 0.0, -1.0], "retain": "positive"}
   ]"#;
+
+/// `VALID` with extra members appended.
+fn with_fields(members: &str) -> String {
+    let body = VALID.trim_end().strip_suffix('}').unwrap();
+    format!("{body},\n  {members}\n}}")
+}
 
 /// `VALID` with an optional `source_cuts` member appended.
 fn with_cuts(cuts: &str) -> String {

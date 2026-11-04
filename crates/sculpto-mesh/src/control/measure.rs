@@ -83,14 +83,38 @@ pub struct ControlDiagnostics {
     pub bounds: [[f32; 3]; 2],
 }
 
+/// Genus of a connected orientable surface; only valid after the manifold checks.
+pub fn genus_of(euler: i64, loops: i64) -> i64 {
+    (2 - loops - euler) / 2
+}
+
 /// What the profile's apertures matched on a surface that passed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qualification {
     pub apertures: Vec<ApertureMatch>,
     pub incidental: usize,
+    /// Genus measured from the Euler characteristic and the opening count.
+    pub genus: i64,
+    /// Genus the profile declared; the surface must match it.
+    pub expected_genus: u32,
 }
 
 impl ControlDiagnostics {
+    /// Genus this surface would have if it is one oriented manifold shell.
+    ///
+    /// `None` states that the surface is too broken for the Euler/boundary relation to
+    /// mean anything; the value is reported, never used as a repair decision.
+    pub fn measured_genus(&self) -> Option<i64> {
+        let valid = self.components == 1
+            && self.non_manifold_vertices == 0
+            && self.non_manifold_edges == 0
+            && self.orientation_conflicts == 0;
+        match valid {
+            true => Some(genus_of(self.euler, self.loops.len() as i64)),
+            false => None,
+        }
+    }
+
     /// Measure a candidate control; invalid geometry is rejected, not repaired.
     pub fn measure(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Result<Self, ControlError> {
         let surface = SourceSurface::identify(positions, triangles)?;
@@ -240,11 +264,17 @@ impl ControlDiagnostics {
                 apertures: resolution.matched.len(),
             });
         }
-        let expected = 2 - self.loops.len() as i64;
+        // Connected, oriented and manifold were established above, so this quotient is
+        // exact: an orientable surface with `b` boundaries has `euler = 2 - 2g - b`.
+        let loops = self.loops.len() as i64;
+        let genus = genus_of(self.euler, loops);
+        let expected = 2 - 2 * i64::from(profile.expected_genus) - loops;
         if self.euler != expected {
-            return Err(ControlError::NonGenusZero {
+            return Err(ControlError::UnexpectedTopology {
                 euler: self.euler,
                 loops: self.loops.len(),
+                genus,
+                expected_genus: profile.expected_genus,
             });
         }
         if self.triangles < profile.reduction.minimum_triangles {
@@ -262,6 +292,8 @@ impl ControlDiagnostics {
         Ok(Qualification {
             apertures: resolution.matched,
             incidental: resolution.incidental.len(),
+            genus,
+            expected_genus: profile.expected_genus,
         })
     }
 }

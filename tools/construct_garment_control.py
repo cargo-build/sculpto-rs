@@ -1314,6 +1314,10 @@ def main(recipe_path, out_dir):
                 "verified": True,
             }
         receipt["exterior"] = plan["composition"]
+        # Requested topology and the recovered original disks travel with the plan, so
+        # the receipt states which faces came back and why without re-deriving them.
+        receipt["topology"] = plan["topology"]
+        receipt["source_recovery"] = plan["recovery"]
         receipt["apertures"] = plan["apertures"]["matched"]
         receipt["incidental"] = plan["incidental"]
         receipt["reduction_plan"] = plan["reduction"]

@@ -209,6 +209,13 @@ fn exterior_reconstructs_a_thick_shell_and_check_accepts_it() {
     );
     assert_eq!(plan["vertices"].as_u64().unwrap(), 24);
     assert_eq!(plan["reduction"]["ratio"].as_f64().unwrap(), 1.0);
+    assert_eq!(plan["topology"]["source_recovery"], "none");
+    assert_eq!(plan["topology"]["expected_genus"], 0);
+    assert_eq!(plan["recovery"]["recovered_faces"], 0);
+    assert!(
+        plan["recovery"]["disks"].as_array().unwrap().is_empty(),
+        "no recovery is declared, so no disk may be claimed"
+    );
 
     let check = run(&[
         "garment",
@@ -246,6 +253,150 @@ fn exterior_reconstructs_a_thick_shell_and_check_accepts_it() {
             .unwrap()
             .len(),
         2
+    );
+    assert_eq!(report["topology"]["expected_genus"], 0);
+    assert_eq!(report["topology"]["measured_genus"], 0);
+    assert_eq!(report["topology"]["loops"], 2);
+    assert_eq!(report["source_selection"]["recovery"]["recovered_faces"], 0);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+/// A closed unit box in source coordinates: bottom cap, walls, top cap.
+fn box_shell() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    (
+        vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        vec![
+            [0, 3, 2],
+            [0, 2, 1],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+            [4, 5, 6],
+            [4, 6, 7],
+        ],
+    )
+}
+
+/// The box profile: one vertical guide, one declared opening, recovery declared.
+fn box_profile_json() -> String {
+    r#"{
+  "frame": "source-local-z-up",
+  "source_recovery": "incidental-disks",
+  "expected_genus": 0,
+  "guide_segments": [[[0.5, 0.5, -1.0], [0.5, 0.5, 2.0]]],
+  "apertures": [
+    {"role": "waist", "anchor": [0.5, 0.5, 1.0], "radius": 0.1}
+  ],
+  "source_repair": {
+    "max_incidental_loops": 2,
+    "collapse_below_edges": 0,
+    "max_fill_edges": 32,
+    "max_tip_removal_share": 0.05
+  },
+  "reduced_repair": {
+    "max_incidental_loops": 2,
+    "collapse_below_edges": 10,
+    "max_fill_edges": 32,
+    "max_tip_removal_share": 0.05
+  },
+  "reduction": {
+    "target_triangles": 10,
+    "minimum_triangles": 4,
+    "maximum_triangles": 140
+  },
+  "coverage": {"tolerance": 0.01, "minimum": 0.5},
+  "contact": {"mode": "reject", "clearance": 0.000001, "max_displacement": 0.001, "max_pairs": 1}
+}"#
+    .to_string()
+}
+
+#[test]
+fn a_recovered_source_disk_is_reported_in_the_plan_and_the_check_report() {
+    let directory = directory();
+    let source = directory.join("source.obj");
+    let profile = directory.join("profile.json");
+    let control = directory.join("control.obj");
+    let plan = directory.join("plan.json");
+    let report = directory.join("report.json");
+
+    let (positions, triangles) = box_shell();
+    write_obj(&source, &positions, &triangles);
+    fs::write(&profile, box_profile_json()).unwrap();
+
+    let exterior = run(&[
+        "garment",
+        "control-exterior",
+        "--source",
+        source.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--out",
+        control.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(
+        exterior.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exterior.stderr)
+    );
+    let plan = read_json(&plan);
+    assert_eq!(plan["topology"]["source_recovery"], "incidental-disks");
+    assert_eq!(plan["topology"]["expected_genus"], 0);
+    assert_eq!(plan["recovery"]["recovered_faces"], 2);
+    let disks = plan["recovery"]["disks"].as_array().unwrap();
+    assert_eq!(disks.len(), 1);
+    assert_eq!(disks[0]["faces"], serde_json::json!([0, 1]));
+    assert_eq!(disks[0]["euler"], 1);
+    assert_eq!(disks[0]["boundary_vertices"].as_array().unwrap().len(), 4);
+    assert_eq!(plan["composition"]["recovered_triangles"], 2);
+    assert_eq!(plan["composition"]["interior_removed"], 2);
+    assert_eq!(plan["composition"]["exterior_triangles"], 10);
+    assert!(plan["actions"].as_array().unwrap().is_empty());
+
+    let check = run(&[
+        "garment",
+        "control-check",
+        "--control",
+        control.to_str().unwrap(),
+        "--source",
+        source.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        check.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let report = read_json(&report);
+    assert!(report["qualification"]["passed"].as_bool().unwrap());
+    assert_eq!(report["topology"]["source_recovery"], "incidental-disks");
+    assert_eq!(report["topology"]["expected_genus"], 0);
+    assert_eq!(report["topology"]["measured_genus"], 0);
+    assert_eq!(report["topology"]["euler"], 1);
+    assert_eq!(report["topology"]["loops"], 1);
+    assert_eq!(report["source_selection"]["recovery"]["recovered_faces"], 2);
+    assert_eq!(
+        report["source_selection"]["recovery"]["disks"][0]["faces"],
+        serde_json::json!([0, 1])
     );
     fs::remove_dir_all(&directory).unwrap();
 }

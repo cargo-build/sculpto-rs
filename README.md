@@ -225,8 +225,9 @@ boundary loops against `reduced_repair`. `control-separate` applies the profile'
 single bounded local contact separation, if one is declared. `control-check`
 measures the finished surface and enforces the acceptance conjunction: one
 manifold disk shell, consistent directed winding, exactly the declared apertures,
-the genus-0 Euler characteristic, zero coincident vertices, zero residual contacts,
-the declared triangle bounds and the declared bidirectional coverage.
+the Euler characteristic of the declared topology (`expected_genus` with that many
+openings), zero coincident vertices, zero residual contacts, the declared triangle
+bounds and the declared bidirectional coverage.
 
 The profile is data, not a search space:
 
@@ -234,6 +235,8 @@ The profile is data, not a search space:
 {
   "frame": "source-local-z-up",
   "surface": "guide",
+  "source_recovery": "none",
+  "expected_genus": 0,
   "source_cuts": [],
   "guide_segments": [[[0.0, 0.0, -0.55], [0.0, 0.0, 0.5]]],
   "apertures": [
@@ -282,12 +285,27 @@ remains. The current planner supports one pair; coupled components are refused.
 Both modes require all four fields. Under `reject`, the three numeric values
 are retained in the receipt but no displacement is attempted.
 
+`source_recovery` is the only way an original face the guide-facing selection
+omitted may re-enter the control. `"none"` (the default) keeps the published
+selection route. `"incidental-disks"` may retain an excluded component, and only
+one that is a connected oriented manifold disk whose entire boundary is exactly an
+incidental loop already eligible for a source-stage fill, joining the kept faces
+with opposite directed winding and touching no named aperture; the original
+positions and source-face lineage are kept, and nothing is welded, moved or
+invented. Any other component keeps the native fill/refusal path, and every
+recovery or refusal is reported with its loop, faces, boundary-edge count and
+Euler characteristic. `expected_genus` is the topology the finished control must
+have: the accepted value is `2 - 2 * expected_genus - boundary_loops`. Omitted
+means `0`, so unexpected handles are still refused; a deliberately open or
+multi-handle garment declares its real genus.
+
 `guide_segments` and every anchor share one declared frame: `source-local-z-up`
 (the extracted object's own coordinates) or `sculpto-display-y-up` (the Y-up OBJ
 frame). A declared display point `(x, y, z)` converts to source-local
 `(x, -z, y)`; the inverse source-to-display map is `(x, z, -y)`. Missing required
 fields and unknown fields are errors. Omitted `surface` means `guide`; omitted
-`source_cuts` means no cuts. An aperture is a declared garment landmark: two boundary loops inside one
+`source_cuts` means no cuts; omitted `source_recovery` means `none`; omitted
+`expected_genus` means `0`. An aperture is a declared garment landmark: two boundary loops inside one
 radius are ambiguous, and an opening with no loop is reported — never filled. No
 model name, asset path or vertex number is part of the algorithm.
 Opening centers use edge-length-weighted midpoints of the complete boundary,

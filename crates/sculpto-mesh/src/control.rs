@@ -20,6 +20,9 @@ use crate::topology::position_topology;
 pub mod contact;
 pub mod measure;
 pub mod profile;
+pub mod recovery;
+
+pub use recovery::{RecoveredDisk, RecoveryRefusal, RecoveryReport};
 
 pub use contact::{
     ContactError, ContactMode, ContactPolicy, Separation, SeparationOutcome, VertexMove,
@@ -112,8 +115,13 @@ pub enum ControlError {
     MultipleComponents { components: usize },
     /// Coincident render vertices survived; the layers are still ambiguous.
     CoincidentVertices { vertices: usize },
-    /// Euler characteristic is not the genus-0 value for this opening count.
-    NonGenusZero { euler: i64, loops: usize },
+    /// Euler characteristic does not match the profile's declared topology.
+    UnexpectedTopology {
+        euler: i64,
+        loops: usize,
+        genus: i64,
+        expected_genus: u32,
+    },
     /// Coverage tolerance or minimum share is out of range.
     InvalidCoverage { tolerance: f32, minimum: f32 },
     /// The profile file is missing a field, mistyped or carries an unknown one.
@@ -248,9 +256,14 @@ impl fmt::Display for ControlError {
                 formatter,
                 "{vertices} coincident render vertices remain; the layers are still ambiguous"
             ),
-            Self::NonGenusZero { euler, loops } => write!(
+            Self::UnexpectedTopology {
+                euler,
+                loops,
+                genus,
+                expected_genus,
+            } => write!(
                 formatter,
-                "Euler characteristic {euler} does not match a genus-0 surface with {loops} openings"
+                "Euler characteristic {euler} with {loops} openings is genus {genus}, but the profile declares genus {expected_genus}"
             ),
             Self::InvalidCoverage { tolerance, minimum } => write!(
                 formatter,
@@ -731,6 +744,18 @@ pub fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Bou
         adjacency.entry(*left).or_default().push(*right);
         adjacency.entry(*right).or_default().push(*left);
     }
+    walk_loops(positions, boundary, adjacency)
+}
+
+/// Walk sorted boundary edges into loops, deterministic order.
+///
+/// Shared by the whole-surface walk and the kept-face walk, so a recovered disk is
+/// matched against exactly the loop the construction already reported.
+fn walk_loops(
+    positions: &[[f32; 3]],
+    boundary: Vec<(u32, u32)>,
+    adjacency: HashMap<u32, Vec<u32>>,
+) -> Vec<BoundaryLoop> {
     let mut visited: HashMap<(u32, u32), bool> = HashMap::new();
     let mut loops = Vec::new();
     for (start_left, start_right) in boundary {
@@ -777,6 +802,33 @@ pub fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Bou
             .then_with(|| left.vertices.first().cmp(&right.vertices.first()))
     });
     loops
+}
+
+/// Boundary loops of a set of kept surface faces, in surface vertex space.
+fn kept_boundary_loops(surface: &SourceSurface, kept: &HashSet<u32>) -> Vec<BoundaryLoop> {
+    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
+    for face in kept {
+        let triangle = surface.triangles()[*face as usize];
+        for corner in 0..3 {
+            let left = triangle[corner];
+            let right = triangle[(corner + 1) % 3];
+            *counts
+                .entry((left.min(right), left.max(right)))
+                .or_default() += 1;
+        }
+    }
+    let mut boundary = counts
+        .into_iter()
+        .filter(|(_, count)| *count == 1)
+        .map(|(edge, _)| edge)
+        .collect::<Vec<_>>();
+    boundary.sort_unstable();
+    let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (left, right) in &boundary {
+        adjacency.entry(*left).or_default().push(*right);
+        adjacency.entry(*right).or_default().push(*left);
+    }
+    walk_loops(surface.positions(), boundary, adjacency)
 }
 
 /// Length-weighted midpoint of one walked boundary curve plus its length.
@@ -1242,6 +1294,29 @@ impl SurfacePolicy {
     }
 }
 
+/// Whether original excluded source disks may be recovered at concave folds.
+///
+/// Guide-facing selection can omit real fabric at a fold and leave its outline as an
+/// incidental loop; a declared `IncidentalDisks` policy may retain exactly such a
+/// disk instead of filling over it. Absence preserves the existing selection route.
+/// @req DECL0013
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRecovery {
+    /// No recovery: the published selection and repair path.
+    None,
+    /// Recover original excluded disks that close one eligible incidental loop.
+    IncidentalDisks,
+}
+
+impl SourceRecovery {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::IncidentalDisks => "incidental-disks",
+        }
+    }
+}
+
 /// Which half-space a source cut keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainSide {
@@ -1287,6 +1362,8 @@ pub struct Composition {
     pub island_components_removed: usize,
     pub island_triangles_removed: usize,
     pub tip_triangles_removed: usize,
+    /// Original excluded faces that source-disk recovery retained instead of removing.
+    pub recovered_triangles: usize,
 }
 
 /// Classify the source shell's outward triangles without any other decision.
@@ -1343,6 +1420,8 @@ pub struct ExteriorOutcome {
     pub apertures: ApertureResolution,
     /// Native closures the source stage requires, already limit-checked.
     pub actions: Vec<RepairAction>,
+    /// Original disks the declared policy recovered, with their evidence.
+    pub recovery: RecoveryReport,
     pub reduction: ReductionPlan,
 }
 
@@ -1356,83 +1435,10 @@ pub fn exterior_control(
     triangles: &[[u32; 3]],
     profile: &ControlProfile,
 ) -> Result<ExteriorOutcome, ControlError> {
-    let (surface, kept_indices) =
-        source_surface(positions, triangles, &profile.guide, profile.surface)?;
-    let degenerate = surface
-        .welded_degenerate()
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let mut removals = degenerate
-        .iter()
-        .map(|triangle| Removal {
-            triangle: *triangle,
-            reason: RemovalReason::WeldedDegenerate,
-        })
-        .collect::<Vec<_>>();
-    let kept_set = kept_indices.iter().copied().collect::<HashSet<_>>();
-    removals.extend(
-        (0..surface.triangles.len() as u32)
-            .filter(|index| !degenerate.contains(index) && !kept_set.contains(index))
-            .map(|triangle| Removal {
-                triangle,
-                reason: RemovalReason::Interior,
-            }),
-    );
-
-    let kept = kept_indices
-        .iter()
-        .map(|index| surface.triangles[*index as usize])
-        .collect::<Vec<_>>();
-    let component = largest_component(&kept);
-    let component_set = component.kept.iter().copied().collect::<HashSet<_>>();
-    removals.extend(
-        (0..kept.len() as u32)
-            .filter(|index| !component_set.contains(index))
-            .map(|index| Removal {
-                triangle: kept_indices[index as usize],
-                reason: RemovalReason::Island,
-            }),
-    );
-
-    let component_triangles = component
-        .kept
-        .iter()
-        .map(|index| kept[*index as usize])
-        .collect::<Vec<_>>();
-    let component_faces = component
-        .kept
-        .iter()
-        .map(|index| kept_indices[*index as usize])
-        .collect::<Vec<_>>();
-    let tips = non_manifold_tips(&component_triangles);
-    let tip_set = tips.removed.iter().copied().collect::<HashSet<_>>();
-    removals.extend(tips.removed.iter().map(|index| Removal {
-        triangle: component_faces[*index as usize],
-        reason: RemovalReason::CornerFlare,
-    }));
-    removals.sort_by_key(|removal| removal.triangle);
-
-    let pruned = component_triangles
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !tip_set.contains(&(*index as u32)))
-        .map(|(_, triangle)| *triangle)
-        .collect::<Vec<_>>();
-    let selected_faces = component_faces
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !tip_set.contains(&(*index as u32)))
-        .map(|(_, face)| *face)
-        .collect::<Vec<_>>();
-    let share = tips.removed.len() as f32 / pruned.len().max(1) as f32;
-    if share > profile.source_repair.max_tip_removal_share {
-        return Err(ControlError::TipRemovalLimit {
-            removed: tips.removed.len(),
-            triangles: component_triangles.len(),
-            limit: profile.source_repair.max_tip_removal_share,
-        });
-    }
-    let (positions, triangles, kept_vertices) = compact(&surface.positions, &pruned);
+    let selection = source_selection(positions, triangles, profile)?;
+    let surface = &selection.surface;
+    let (positions, triangles, kept_vertices) =
+        compact(&surface.positions, &selection.selected_triangles);
     let vertex_sources = kept_vertices
         .iter()
         .map(|index| surface.vertex_sources[*index as usize])
@@ -1451,27 +1457,229 @@ pub fn exterior_control(
         positions,
         triangles,
         vertex_sources,
-        selected_faces,
-        removals,
+        selected_faces: selection.selected_faces.clone(),
+        removals: selection.removals.clone(),
         composition: Composition {
             source_triangles: surface.source_triangles,
             source_vertices: surface.source_vertices,
             coincident_vertices: surface.coincident_vertices(),
-            exterior_triangles: pruned.len(),
-            interior_removed: surface
-                .triangles
-                .len()
-                .saturating_sub(degenerate.len())
-                .saturating_sub(kept.len()),
-            welded_degenerate_removed: degenerate.len(),
-            island_components_removed: component.removed_components,
-            island_triangles_removed: component.removed_triangles,
-            tip_triangles_removed: tips.removed.len(),
+            exterior_triangles: selection.selected_triangles.len(),
+            interior_removed: selection.interior_removed,
+            welded_degenerate_removed: selection.welded_degenerate_removed,
+            island_components_removed: selection.island_components_removed,
+            island_triangles_removed: selection.island_triangles_removed,
+            tip_triangles_removed: selection.tip_triangles_removed,
+            recovered_triangles: selection.recovery.recovered_faces,
         },
         loops,
         apertures,
         actions,
         reduction,
+        recovery: selection.recovery.clone(),
+    })
+}
+
+/// Source faces a selection keeps, what it removed, and the resulting boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSelection {
+    pub surface: SourceSurface,
+    /// Selected surface faces, in construction order.
+    pub selected_faces: Vec<u32>,
+    /// The same faces as triangles, in the same order.
+    pub selected_triangles: Vec<[u32; 3]>,
+    pub removals: Vec<Removal>,
+    pub interior_removed: usize,
+    pub welded_degenerate_removed: usize,
+    pub island_components_removed: usize,
+    pub island_triangles_removed: usize,
+    pub tip_triangles_removed: usize,
+    /// Kept-boundary loops in surface vertex space, largest first.
+    pub loops: Vec<BoundaryLoop>,
+    pub apertures: ApertureResolution,
+    pub recovery: RecoveryReport,
+}
+
+/// One pruned selection before compaction.
+struct Pruned {
+    faces: Vec<u32>,
+    triangles: Vec<[u32; 3]>,
+    removals: Vec<Removal>,
+    interior_removed: usize,
+    island_components_removed: usize,
+    island_triangles_removed: usize,
+    tip_triangles_removed: usize,
+}
+
+/// Degenerate removal, guide removal, largest component and corner flares, in order.
+fn prune(
+    surface: &SourceSurface,
+    kept_indices: &[u32],
+    degenerate: &HashSet<u32>,
+    profile: &ControlProfile,
+) -> Result<Pruned, ControlError> {
+    let mut removals = degenerate
+        .iter()
+        .map(|triangle| Removal {
+            triangle: *triangle,
+            reason: RemovalReason::WeldedDegenerate,
+        })
+        .collect::<Vec<_>>();
+    let kept_set = kept_indices.iter().copied().collect::<HashSet<_>>();
+    let interior = (0..surface.triangles.len() as u32)
+        .filter(|index| !degenerate.contains(index) && !kept_set.contains(index))
+        .count();
+    removals.extend(
+        (0..surface.triangles.len() as u32)
+            .filter(|index| !degenerate.contains(index) && !kept_set.contains(index))
+            .map(|triangle| Removal {
+                triangle,
+                reason: RemovalReason::Interior,
+            }),
+    );
+    let kept = kept_indices
+        .iter()
+        .map(|index| surface.triangles[*index as usize])
+        .collect::<Vec<_>>();
+    let component = largest_component(&kept);
+    let component_set = component.kept.iter().copied().collect::<HashSet<_>>();
+    removals.extend(
+        (0..kept.len() as u32)
+            .filter(|index| !component_set.contains(index))
+            .map(|index| Removal {
+                triangle: kept_indices[index as usize],
+                reason: RemovalReason::Island,
+            }),
+    );
+    let component_triangles = component
+        .kept
+        .iter()
+        .map(|index| kept[*index as usize])
+        .collect::<Vec<_>>();
+    let component_faces = component
+        .kept
+        .iter()
+        .map(|index| kept_indices[*index as usize])
+        .collect::<Vec<_>>();
+    let tips = non_manifold_tips(&component_triangles);
+    let tip_set = tips.removed.iter().copied().collect::<HashSet<_>>();
+    removals.extend(tips.removed.iter().map(|index| Removal {
+        triangle: component_faces[*index as usize],
+        reason: RemovalReason::CornerFlare,
+    }));
+    removals.sort_by_key(|removal| removal.triangle);
+    let triangles = component_triangles
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !tip_set.contains(&(*index as u32)))
+        .map(|(_, triangle)| *triangle)
+        .collect::<Vec<_>>();
+    let faces = component_faces
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !tip_set.contains(&(*index as u32)))
+        .map(|(_, face)| *face)
+        .collect::<Vec<_>>();
+    let share = tips.removed.len() as f32 / triangles.len().max(1) as f32;
+    if share > profile.source_repair.max_tip_removal_share {
+        return Err(ControlError::TipRemovalLimit {
+            removed: tips.removed.len(),
+            triangles: component_triangles.len(),
+            limit: profile.source_repair.max_tip_removal_share,
+        });
+    }
+    Ok(Pruned {
+        faces,
+        triangles,
+        removals,
+        interior_removed: interior,
+        island_components_removed: component.removed_components,
+        island_triangles_removed: component.removed_triangles,
+        tip_triangles_removed: tips.removed.len(),
+    })
+}
+
+/// Source faces the constructor and the coverage check both treat as the surface.
+///
+/// This is the single owner of the selection rule: guide or retained-boundary surface,
+/// component and tip pruning, then the declared source-disk recovery. `exterior_control`
+/// and the CLI coverage path call it, so a recovered disk cannot be visible to one and
+/// invisible to the other. @req DECL0013
+pub fn source_selection(
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+    profile: &ControlProfile,
+) -> Result<SourceSelection, ControlError> {
+    let (surface, kept_indices) =
+        source_surface(positions, triangles, &profile.guide, profile.surface)?;
+    let degenerate = surface
+        .welded_degenerate()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut pruned = prune(&surface, &kept_indices, &degenerate, profile)?;
+    let mut recovery = RecoveryReport::default();
+    let mut loops = kept_boundary_loops(&surface, &pruned.faces.iter().copied().collect());
+    let mut apertures = resolve_apertures(&loops, &profile.apertures)?;
+    if profile.source_recovery == SourceRecovery::IncidentalDisks {
+        let aperture_vertices = apertures
+            .matched
+            .iter()
+            .flat_map(|matched| loops[matched.loop_index].vertices.iter().copied())
+            .collect::<HashSet<_>>();
+        let kept = pruned.faces.iter().copied().collect::<HashSet<_>>();
+        let mut added = Vec::new();
+        for index in apertures.incidental.clone() {
+            let boundary = &loops[index];
+            // Only a loop the published repair path would have filled is eligible; a
+            // collapse or an over-limit loop keeps the existing behaviour.
+            let fillable = boundary.closed
+                && boundary.edges > profile.source_repair.collapse_below_edges
+                && boundary.edges <= profile.source_repair.max_fill_edges;
+            if !fillable {
+                continue;
+            }
+            match recovery::recover_disk(
+                &surface,
+                &degenerate,
+                &kept,
+                index,
+                &boundary.vertices,
+                boundary.closed,
+                &aperture_vertices,
+            ) {
+                Ok(Some(disk)) => {
+                    added.extend(disk.faces.iter().copied());
+                    recovery.disks.push(disk);
+                }
+                Ok(None) => {}
+                Err(refusal) => recovery.refused.push((index, refusal)),
+            }
+        }
+        if !added.is_empty() {
+            added.sort_unstable();
+            added.dedup();
+            recovery.recovered_faces = added.len();
+            let mut augmented = kept_indices.clone();
+            augmented.extend(added);
+            augmented.sort_unstable();
+            augmented.dedup();
+            pruned = prune(&surface, &augmented, &degenerate, profile)?;
+            loops = kept_boundary_loops(&surface, &pruned.faces.iter().copied().collect());
+            apertures = resolve_apertures(&loops, &profile.apertures)?;
+        }
+    }
+    Ok(SourceSelection {
+        surface,
+        selected_faces: pruned.faces,
+        selected_triangles: pruned.triangles,
+        removals: pruned.removals,
+        interior_removed: pruned.interior_removed,
+        welded_degenerate_removed: degenerate.len(),
+        island_components_removed: pruned.island_components_removed,
+        island_triangles_removed: pruned.island_triangles_removed,
+        tip_triangles_removed: pruned.tip_triangles_removed,
+        loops,
+        apertures,
+        recovery,
     })
 }
 

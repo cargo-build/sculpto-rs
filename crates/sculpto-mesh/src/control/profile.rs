@@ -12,7 +12,7 @@ use super::contact::{ContactMode, ContactPolicy};
 use super::measure::CoverageLimits;
 use super::{
     ApertureSpec, ControlCut, ControlError, Guide, GuideSegment, ReductionLimits, RepairLimits,
-    RetainSide, SurfacePolicy, validate_apertures,
+    RetainSide, SourceRecovery, SurfacePolicy, validate_apertures,
 };
 
 const FIELDS: &[&str] = &[
@@ -26,6 +26,8 @@ const FIELDS: &[&str] = &[
     "contact",
     "source_cuts",
     "surface",
+    "source_recovery",
+    "expected_genus",
 ];
 const REPAIR_FIELDS: &[&str] = &[
     "max_incidental_loops",
@@ -105,13 +107,18 @@ pub struct ControlProfile {
     pub contact: ContactPolicy,
     /// Explicit source-opening cuts; empty means the source keeps its closed shell.
     pub source_cuts: Vec<ControlCut>,
+    /// Whether original excluded source disks may be recovered; absent means `none`.
+    pub source_recovery: SourceRecovery,
+    /// Genus the finished control must have; absent means 0 (no unexpected handles).
+    pub expected_genus: u32,
 }
 
 impl ControlProfile {
     /// Parse and validate a profile.
     ///
     /// Every required member must be present; only `source_cuts` (no cut is declared,
-    /// so no derivative is built) and `surface` (the published guide route) have a
+    /// so no derivative is built), `surface` (the published guide route),
+    /// `source_recovery` (no recovery) and `expected_genus` (genus zero) have a
     /// documented absence. @req DECL0013
     pub fn from_json(bytes: &[u8]) -> Result<Self, ControlError> {
         let text = std::str::from_utf8(bytes).map_err(|error| ControlError::InvalidProfile {
@@ -148,6 +155,14 @@ impl ControlProfile {
             Some(value) => source_cuts(value, &frame)?,
             None => Vec::new(),
         };
+        let source_recovery = match object.get("source_recovery") {
+            Some(value) => source_recovery(value)?,
+            None => SourceRecovery::None,
+        };
+        let expected_genus = match object.get("expected_genus") {
+            Some(value) => genus(value)?,
+            None => 0,
+        };
         Ok(Self {
             frame,
             guide,
@@ -159,6 +174,8 @@ impl ControlProfile {
             coverage,
             contact,
             source_cuts,
+            source_recovery,
+            expected_genus,
         })
     }
 }
@@ -185,6 +202,33 @@ fn surface_policy(value: &Value) -> Result<SurfacePolicy, ControlError> {
             ),
         }),
     }
+}
+
+/// Parse the declared source-recovery policy; only the two named values exist.
+fn source_recovery(value: &Value) -> Result<SourceRecovery, ControlError> {
+    let name = string(value, "source_recovery")?;
+    match name {
+        "none" => Ok(SourceRecovery::None),
+        "incidental-disks" => Ok(SourceRecovery::IncidentalDisks),
+        other => Err(ControlError::InvalidProfile {
+            field: "source_recovery".to_string(),
+            reason: format!(
+                "`{other}` is not a declared recovery policy; expected none or incident-disks"
+            ),
+        }),
+    }
+}
+
+/// Parse the declared topology genus; a value that is not a `u32` is refused.
+fn genus(value: &Value) -> Result<u32, ControlError> {
+    let number = value.as_u64().ok_or_else(|| ControlError::InvalidProfile {
+        field: "expected_genus".to_string(),
+        reason: "expected a nonnegative integer".to_string(),
+    })?;
+    u32::try_from(number).map_err(|_| ControlError::InvalidProfile {
+        field: "expected_genus".to_string(),
+        reason: "does not fit a genus count".to_string(),
+    })
 }
 
 /// Parse and validate the optional source-opening cuts.

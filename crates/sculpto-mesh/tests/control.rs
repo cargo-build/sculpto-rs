@@ -19,9 +19,9 @@ use sculpto_mesh::control::measure::{ControlDiagnostics, CoverageLimits};
 use sculpto_mesh::control::profile::{ControlFrame, ControlProfile};
 use sculpto_mesh::control::{
     ApertureResolution, ApertureSpec, BoundaryLoop, ClosureKind, ContactMode, ContactPolicy,
-    ControlError, Guide, GuideSegment, ReductionLimits, RepairAction, RepairLimits, SurfacePolicy,
-    boundary_loops, exterior_control, largest_component, non_manifold_tips, repair_actions,
-    repair_control, resolve_apertures, source_surface,
+    ControlError, Guide, GuideSegment, ReductionLimits, RepairAction, RepairLimits, SourceRecovery,
+    SurfacePolicy, boundary_loops, exterior_control, largest_component, non_manifold_tips,
+    repair_actions, repair_control, resolve_apertures, source_surface,
 };
 
 #[test]
@@ -297,6 +297,8 @@ fn profile(shell: &Shell) -> ControlProfile {
         },
         source_cuts: Vec::new(),
         surface: SurfacePolicy::Guide,
+        source_recovery: SourceRecovery::None,
+        expected_genus: 0,
     }
 }
 
@@ -617,6 +619,8 @@ fn a_centroid_on_the_guide_has_no_outward_side() {
         },
         source_cuts: Vec::new(),
         surface: SurfacePolicy::Guide,
+        source_recovery: SourceRecovery::None,
+        expected_genus: 0,
     };
     assert_eq!(
         exterior_control(&positions, &[[0, 1, 2]], &profile),
@@ -1021,6 +1025,8 @@ fn profile_for_box() -> ControlProfile {
             max_pairs: 1,
         },
         source_cuts: Vec::new(),
+        source_recovery: SourceRecovery::None,
+        expected_genus: 0,
     }
 }
 
@@ -1194,4 +1200,110 @@ fn a_zero_length_loop_reports_its_shared_point() {
     assert_eq!(boundary.perimeter, 0.0);
     assert_eq!(boundary.center, [0.25, 0.5, 0.75]);
     assert!(boundary.center.iter().all(|value| value.is_finite()));
+}
+
+/// A closed torus: no boundary, Euler characteristic zero, genus one.
+fn torus(segments: usize, sides: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let mut positions = Vec::new();
+    for segment in 0..segments {
+        let around = std::f32::consts::TAU * segment as f32 / segments as f32;
+        for side in 0..sides {
+            let tube = std::f32::consts::TAU * side as f32 / sides as f32;
+            positions.push([
+                (1.0 + 0.35 * tube.cos()) * around.cos(),
+                (1.0 + 0.35 * tube.cos()) * around.sin(),
+                0.35 * tube.sin(),
+            ]);
+        }
+    }
+    let index =
+        |segment: usize, side: usize| ((segment % segments) * sides + (side % sides)) as u32;
+    let mut triangles = Vec::new();
+    for segment in 0..segments {
+        for side in 0..sides {
+            let a = index(segment, side);
+            let b = index(segment + 1, side);
+            let c = index(segment + 1, side + 1);
+            let d = index(segment, side + 1);
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    (positions, triangles)
+}
+
+/// The smallest profile a surface with one declared opening is measured against.
+fn one_opening_profile(anchor: [f32; 3]) -> ControlProfile {
+    ControlProfile {
+        frame: ControlFrame::SourceLocalZUp,
+        guide: Guide::new([GuideSegment {
+            start: [0.0, 0.0, -1.0],
+            end: [0.0, 0.0, 1.0],
+        }])
+        .unwrap(),
+        surface: SurfacePolicy::Guide,
+        apertures: vec![ApertureSpec {
+            role: "handle".to_string(),
+            anchor,
+            radius: 0.5,
+        }],
+        source_repair: RepairLimits::default(),
+        reduced_repair: RepairLimits::default(),
+        reduction: ReductionLimits {
+            target_triangles: 40,
+            minimum_triangles: 20,
+            maximum_triangles: 60,
+        },
+        coverage: CoverageLimits {
+            tolerance: 0.01,
+            minimum: 0.5,
+        },
+        contact: ContactPolicy {
+            mode: ContactMode::Reject,
+            clearance: 1e-6,
+            max_displacement: 1e-3,
+            max_pairs: 1,
+        },
+        source_cuts: Vec::new(),
+        source_recovery: SourceRecovery::None,
+        expected_genus: 0,
+    }
+}
+
+#[test]
+fn the_declared_genus_replaces_the_implicit_genus_zero() {
+    // A torus with one quad removed: one boundary, Euler -1, genus one.
+    let (positions, mut triangles) = torus(6, 4);
+    triangles.drain(0..2);
+    let diagnostics = ControlDiagnostics::measure(&positions, &triangles).unwrap();
+    assert_eq!(diagnostics.euler, -1);
+    assert_eq!(diagnostics.loops.len(), 1);
+    assert_eq!(diagnostics.measured_genus(), Some(1));
+
+    // The absent declaration is still genus zero, so an unexpected handle is refused.
+    let mut profile = one_opening_profile(diagnostics.loops[0].center);
+    assert_eq!(profile.expected_genus, 0);
+    let error = diagnostics.qualify(&profile).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ControlError::UnexpectedTopology {
+                euler: -1,
+                loops: 1,
+                genus: 1,
+                expected_genus: 0
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("is genus 1") && error.to_string().contains("declares genus 0"),
+        "{error}"
+    );
+
+    // Declaring the measured topology accepts the same surface.
+    profile.expected_genus = 1;
+    let qualification = diagnostics.qualify(&profile).unwrap();
+    assert_eq!(qualification.genus, 1);
+    assert_eq!(qualification.expected_genus, 1);
 }

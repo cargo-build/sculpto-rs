@@ -11,8 +11,9 @@ use sculpto_mesh::control::contact::separate;
 use sculpto_mesh::control::measure::{ControlDiagnostics, Deviation, Deviations};
 use sculpto_mesh::control::profile::ControlProfile;
 use sculpto_mesh::control::{
-    ApertureResolution, BoundaryLoop, ControlError, ExteriorOutcome, Qualification, RemovalReason,
-    RepairAction, RepairOutcome, exterior_control, repair_control, source_surface,
+    ApertureResolution, BoundaryLoop, ControlError, ExteriorOutcome, Qualification, RecoveryReport,
+    RemovalReason, RepairAction, RepairOutcome, SourceSelection, exterior_control, repair_control,
+    source_selection,
 };
 use serde_json::{Value, json};
 
@@ -36,7 +37,7 @@ pub fn exterior_inner(args: &[String]) -> Result<(), String> {
     })?;
     write_obj(&out, &outcome.positions, &outcome.triangles)
         .map_err(|error| format!("{}: {error}", out.display()))?;
-    let plan = exterior_plan(&source_path, &profile_path, &outcome);
+    let plan = exterior_plan(&source_path, &profile_path, &profile, &outcome);
     write_json(&plan_path, &plan)?;
     print_exterior(&out, &outcome, &plan_path);
     Ok(())
@@ -210,11 +211,13 @@ pub fn check_inner(args: &[String]) -> Result<(), String> {
     let measured = ControlDiagnostics::measure(&control, &control_triangles);
     let diagnostics = measured.as_ref().ok();
     let qualification = diagnostics.map(|diagnostics| diagnostics.qualify(&profile));
-    let exterior = source_surface(&source, &source_triangles, &profile.guide, profile.surface);
-    let deviations = exterior.as_ref().ok().map(|(surface, kept)| {
+    // The coverage path consumes the constructor's own selection, recovery included,
+    // so a recovered disk is never measured against a surface it is part of.
+    let selection = source_selection(&source, &source_triangles, &profile);
+    let deviations = selection.as_ref().ok().map(|selection| {
         sculpto_mesh::control::measure::deviations(
-            surface,
-            kept,
+            &selection.surface,
+            &selection.selected_faces,
             &control,
             &control_triangles,
             &profile.coverage,
@@ -239,7 +242,8 @@ pub fn check_inner(args: &[String]) -> Result<(), String> {
             diagnostics,
             qualification: qualification.as_ref(),
             deviations: deviations.as_ref(),
-            source_error: exterior.as_ref().err(),
+            selection: selection.as_ref().ok(),
+            source_error: selection.as_ref().err(),
             verdict: &verdict,
         },
         &profile,
@@ -358,13 +362,47 @@ fn incidental_json(loops: &[BoundaryLoop], resolution: &ApertureResolution) -> V
     )
 }
 
-fn exterior_plan(source: &Path, profile: &Path, outcome: &ExteriorOutcome) -> Value {
+/// Recovered original disks and the refusals that left a loop to the native path.
+fn recovery_json(recovery: &RecoveryReport) -> Value {
+    json!({
+        "recovered_faces": recovery.recovered_faces,
+        "disks": recovery
+            .disks
+            .iter()
+            .map(|disk| json!({
+                "loop": disk.loop_index,
+                "faces": disk.faces,
+                "boundary_vertices": disk.boundary_vertices,
+                "vertices": disk.vertices,
+                "edges": disk.edges,
+                "euler": disk.euler,
+            }))
+            .collect::<Vec<_>>(),
+        "refused": recovery
+            .refused
+            .iter()
+            .map(|(index, refusal)| json!({"loop": index, "reason": refusal.name()}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn exterior_plan(
+    source: &Path,
+    profile_path: &Path,
+    profile: &ControlProfile,
+    outcome: &ExteriorOutcome,
+) -> Value {
     json!({
         "stage": "exterior",
         "source": source.display().to_string(),
-        "profile": profile.display().to_string(),
+        "profile": profile_path.display().to_string(),
         "vertices": outcome.positions.len(),
         "triangles": outcome.triangles.len(),
+        "topology": {
+            "source_recovery": profile.source_recovery.name(),
+            "expected_genus": profile.expected_genus,
+        },
+        "recovery": recovery_json(&outcome.recovery),
         "composition": {
             "source_triangles": outcome.composition.source_triangles,
             "source_vertices": outcome.composition.source_vertices,
@@ -375,6 +413,7 @@ fn exterior_plan(source: &Path, profile: &Path, outcome: &ExteriorOutcome) -> Va
             "island_components_removed": outcome.composition.island_components_removed,
             "island_triangles_removed": outcome.composition.island_triangles_removed,
             "tip_triangles_removed": outcome.composition.tip_triangles_removed,
+            "recovered_triangles": outcome.composition.recovered_triangles,
         },
         "vertex_sources": outcome.vertex_sources,
         "selected_faces": outcome.selected_faces,
@@ -495,6 +534,7 @@ struct CheckEvidence<'a> {
     diagnostics: Option<&'a ControlDiagnostics>,
     qualification: Option<&'a Result<Qualification, ControlError>>,
     deviations: Option<&'a Result<Deviations, ControlError>>,
+    selection: Option<&'a SourceSelection>,
     source_error: Option<&'a ControlError>,
     verdict: &'a Result<(), String>,
 }
@@ -520,6 +560,7 @@ fn check_report(
             "loop_vertex_space": "exact-position",
             "vertex_sources": diagnostics.vertex_sources,
             "self_contacts": diagnostics.self_contacts,
+            "measured_genus": diagnostics.measured_genus(),
             "bounds": diagnostics.bounds,
             "extent": diagnostics.extent(),
             "loops": loops_json(&diagnostics.loops),
@@ -534,6 +575,8 @@ fn check_report(
                 "distance": matched.distance,
             })).collect::<Vec<_>>(),
             "incidental": qualification.incidental,
+            "genus": qualification.genus,
+            "expected_genus": qualification.expected_genus,
         }),
         Err(error) => json!({"passed": false, "error": error.to_string()}),
     });
@@ -561,6 +604,22 @@ fn check_report(
         "measured": measurement.unwrap_or(Value::Null),
         "qualification": qualification.unwrap_or(Value::Null),
         "deviations": deviations.unwrap_or(Value::Null),
+        "topology": {
+            "source_recovery": profile.source_recovery.name(),
+            "expected_genus": profile.expected_genus,
+            "measured_genus": evidence
+                .diagnostics
+                .and_then(|diagnostics| diagnostics.measured_genus()),
+            "euler": evidence.diagnostics.map(|diagnostics| diagnostics.euler),
+            "loops": evidence.diagnostics.map(|diagnostics| diagnostics.loops.len()),
+        },
+        "source_selection": match evidence.selection {
+            Some(selection) => json!({
+                "selected_faces": selection.selected_faces.len(),
+                "recovery": recovery_json(&selection.recovery),
+            }),
+            None => Value::Null,
+        },
         "coverage": {
             "tolerance": profile.coverage.tolerance,
             "minimum": profile.coverage.minimum,
@@ -593,13 +652,15 @@ fn print_exterior(out: &Path, outcome: &ExteriorOutcome, plan: &Path) {
         outcome.composition.source_triangles
     );
     println!(
-        "kept {} exterior of {} (interior {}, welded degenerate {}, islands {}, tips {})",
+        "kept {} exterior of {} (interior {}, welded degenerate {}, islands {}, tips {}, \
+         recovered source disks {})",
         outcome.composition.exterior_triangles,
         outcome.composition.source_triangles,
         outcome.composition.interior_removed,
         outcome.composition.welded_degenerate_removed,
         outcome.composition.island_triangles_removed,
-        outcome.composition.tip_triangles_removed
+        outcome.composition.tip_triangles_removed,
+        outcome.composition.recovered_triangles
     );
     println!("apertures: {roles}");
     println!(
