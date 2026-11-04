@@ -8,9 +8,11 @@ Requires the CLI build (`cargo build -p sculpto-cli`) at target/debug/sculpto.
 
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 import bmesh
 import bpy
@@ -1337,3 +1339,153 @@ def cut_pipeline_tests():
 
 
 cut_pipeline_tests()
+
+
+# --- optional protected native reduction backend -----------------------------
+
+def protected_backend_recipe(root, name, backend):
+    """A published thick-shell recipe with one declared reduction backend."""
+    recipe_path, recipe = write_recipe(root, name, (0.0, 0.0, 0.0), 1.0)
+    if backend is not None:
+        recipe["reduction_backend"] = backend
+    recipe_path.write_text(json.dumps(recipe, indent=2))
+    return recipe_path, recipe
+
+
+def protected_backend_tests(root):
+    """Declared backend: strict data, digest before output, failure never falls back."""
+    _, recipe = write_recipe(root, "BackendProbe", (0.0, 0.0, 0.0), 1.0)
+    # A hermetic failing backend: no host path, a real digest, one non-zero exit.
+    failing = root / "failing-reducer.sh"
+    failing.write_text("#!/bin/sh\nexit 3\n")
+    failing.chmod(0o755)
+    good = {
+        "kind": "libigl-protected",
+        "executable": str(failing),
+        "sha256": sha256(failing),
+        "timeout_seconds": 30,
+    }
+    assert adapter.reduction_backend(dict(recipe)) is None, "absence keeps the Blender route"
+    assert adapter.reduction_backend({**recipe, "reduction_backend": good})["kind"] == "libigl-protected"
+    for name, declared, fragment in [
+        ("unknown kind", {**good, "kind": "qem-guess"}, "is not declared"),
+        ("missing field", {k: v for k, v in good.items() if k != "sha256"}, "missing"),
+        ("unknown field", {**good, "ratio": 0.5}, "unknown field"),
+        ("digest mismatch", {**good, "sha256": "0" * 64}, "digest does not match"),
+        ("zero timeout", {**good, "timeout_seconds": 0}, "positive and finite"),
+        ("negative timeout", {**good, "timeout_seconds": -5}, "positive and finite"),
+        ("non-numeric timeout", {**good, "timeout_seconds": "300"}, "must be a number"),
+        ("missing executable", {**good, "executable": str(root / "absent")}, "does not exist"),
+    ]:
+        try:
+            adapter.reduction_backend({**recipe, "reduction_backend": declared})
+        except ValueError as error:
+            assert fragment in str(error), (name, error)
+        else:
+            raise AssertionError(f"{name} was accepted")
+    print("PROTECTED_BACKEND_DATA ok", flush=True)
+
+    # A digest mismatch must be refused before the output directory is created.
+    recipe_path, _ = protected_backend_recipe(root, "BackendDigest", {**good, "sha256": "0" * 64})
+    output = root / "backend-digest"
+    try:
+        main(recipe_path, output)
+    except ValueError as error:
+        assert "digest does not match" in str(error), error
+    else:
+        raise AssertionError("a mismatched backend digest was accepted")
+    assert not output.exists(), "the output directory must not exist after a refused recipe"
+    print("PROTECTED_BACKEND_DIGEST ok", flush=True)
+
+    # An explicit backend failure stops the construction and keeps its receipt.
+    recipe_path, _ = protected_backend_recipe(root, "BackendFails", good)
+    output = root / "backend-fails"
+    try:
+        main(recipe_path, output)
+    except RuntimeError as error:
+        assert "no fallback route is used" in str(error), error
+        assert "exit 3" in str(error), error
+    else:
+        raise AssertionError("a failing backend still produced a control")
+    receipt = json.loads((output / "receipt.json").read_text())
+    assert receipt["status"] == "failed; diagnostics retained"
+    assert receipt["reduction_backend"]["kind"] == "libigl-protected"
+    assert not (output / "decimated.obj").exists(), "no stage may follow a failed reduction"
+    print("PROTECTED_BACKEND_FAILURE ok", flush=True)
+
+    # A backend that never returns is stopped by the host backstop, not by a fallback.
+    slow = root / "slow-reducer.sh"
+    slow.write_text("#!/bin/sh\nsleep 30\n")
+    slow.chmod(0o755)
+    recipe_path, _ = protected_backend_recipe(
+        root,
+        "BackendSlow",
+        {**good, "executable": str(slow), "sha256": sha256(slow), "timeout_seconds": 0.01},
+    )
+    output = root / "backend-slow"
+    started = time.monotonic()
+    try:
+        main(recipe_path, output)
+    except RuntimeError as error:
+        assert "did not exit" in str(error), error
+        assert "no fallback route is used" in str(error), error
+    else:
+        raise AssertionError("a hanging backend still produced a control")
+    assert time.monotonic() - started < 20.0, "the host backstop must be bounded"
+    receipt = json.loads((output / "receipt.json").read_text())
+    assert receipt["status"] == "failed; diagnostics retained"
+    print("PROTECTED_BACKEND_TIMEOUT ok", flush=True)
+
+    # The selected route still passes through the same final validator: a candidate
+    # that the core rejects fails the construction, so native success alone cannot
+    # construct.
+    native = os.environ.get("SCULPTO_PROTECTED_REDUCE")
+    if not native:
+        print("PROTECTED_BACKEND_PIPELINE skip: SCULPTO_PROTECTED_REDUCE is not set", flush=True)
+        return
+    backend = {
+        "kind": "libigl-protected",
+        "executable": native,
+        "sha256": sha256(Path(native)),
+        "timeout_seconds": 120,
+    }
+    # The cut pipeline reduced to 30 triangles, with the coverage gate declared above
+    # what the declared trim can reach, must fail at the shared validator.
+    recipe_path, recipe, _ = y_cut_recipe(root / "native", target=45, minimum=10, maximum=100)
+    profile = json.loads(Path(recipe["profile"]).read_text())
+    profile["coverage"]["minimum"] = 0.999
+    Path(recipe["profile"]).write_text(json.dumps(profile, indent=2))
+    recipe["profile_sha256"] = sha256(Path(recipe["profile"]))
+    recipe["reduction_backend"] = backend
+    recipe_path.write_text(json.dumps(recipe, indent=2))
+    output = root / "native-gate"
+    try:
+        main(recipe_path, output)
+    except RuntimeError as error:
+        message = str(error)
+        assert "coverage" in message or "control-check" in message, message
+    else:
+        raise AssertionError("the declared coverage gate accepted the native candidate")
+    receipt = json.loads((output / "receipt.json").read_text())
+    assert receipt["status"] == "failed; diagnostics retained"
+    assert receipt["decimation"]["operator"] == "libigl-protected", receipt["decimation"]
+    assert receipt["decimation"]["settings"]["target_triangles"] == 45
+    assert receipt["decimation"]["native"]["target_reached"] is True
+    assert receipt["decimation"]["native"]["candidate_faces"] > 0
+    assert receipt["decimation"]["after_sha256"] == sha256(output / "decimated.obj")
+    print(
+        "PROTECTED_BACKEND_PIPELINE ok",
+        json.dumps(
+            {
+                "operator": receipt["decimation"]["operator"],
+                "native_faces": receipt["decimation"]["native"]["candidate_faces"],
+                "after_triangles": receipt["decimation"]["after_triangles"],
+                "guards": receipt["decimation"]["native"]["guards"],
+                "seconds": round(receipt["decimation"]["native"]["seconds"], 3),
+            }
+        ),
+        flush=True,
+    )
+
+
+protected_backend_tests(Path(tempfile.mkdtemp(prefix="sculpto-backend-")))

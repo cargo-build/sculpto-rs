@@ -342,6 +342,80 @@ blender --background --factory-startup -t 2 --python-exit-code 1 \
   --python tools/tests/test_construct_garment_control.py
 ```
 
+### Optional protected native reduction backend
+
+The constructor reduces the high control with Blender's `DECIMATE`/`COLLAPSE` modifier
+unless the recipe declares a backend:
+
+```json
+"reduction_backend": {
+  "kind": "libigl-protected",
+  "executable": "/build/native/protected_reduce",
+  "sha256": "<SHA256 of that executable>",
+  "timeout_seconds": 300
+}
+```
+
+The declaration is optional and strict. An absent member keeps the Blender route.
+A present one must name the declared `kind`, an existing executable whose digest
+matches, and a finite positive time bound; unknown fields, an unknown kind, a
+digest mismatch and an invalid bound are refused *before* the output directory is
+created. The receipt records the backend path and digest, the exact command, its
+settings, the native receipt, the candidate digest and the stage hashes.
+
+`tools/native/protected_reduce.cpp` is that operation: a self-contained executable
+that runs libigl's geometric-quadric collapse (`igl::qslim`) with prospective
+protection — one operation, no cost switch and no runtime fallback. It takes a
+triangular display-frame OBJ, a target triangle count, a positive source-space
+deviation tolerance, a finite time bound and a fresh output directory, and writes
+`candidate.obj`, `progress.json` and `result.json` (actual counts, the operation and
+cost name, guard counters, time, stop reason, thread setting, and the libigl content
+identity this build read). Guards are prospective one-ring checks — orientation and
+shared-feature crossings, plus corner/edge-midpoint/centroid samples against the
+original input — on top of libigl's global self-intersection blocker, which excludes
+the changed one-ring.
+
+The face contract is deliberately narrow: three corners per face, each a bare
+positive vertex index (`f 1 2 3`), which is exactly what the constructor writes.
+Slash-separated (`f 1/1/1 2/2/1 3/3/1`), signed, non-numeric and non-triangular
+forms are refused with their own message; this is not a general OBJ reader.
+
+Exit codes: `0` target reached, `2` target not reached, `1` invalid input or I/O,
+`124` deadline. Any non-zero exit, a partial budget or a receipt that disagrees
+with the written file stops the construction; there is no fallback to another
+reducer, and a native result still has to pass the shared repair, aperture,
+winding, contact, coverage and budget gates in Rust.
+
+Build it against the supplied header pins (no network fetch). The build records a
+**content identity** of the libigl tree it actually reads — every `.h/.hpp/.cpp`
+file listed by relative path, sorted, hashed per file and the manifest hashed once
+more — so the receipt states what was measured, and `b41f1944a703653ae0da81e6588650ba14c270ea`
+is reported separately as the upstream revision that tree was *qualified against*,
+never as a fact the binary verified:
+
+```sh
+cmake -S tools/native -B build/native \
+  -DIGL_INCLUDE_DIR=<libigl-b41f1944a703653ae0da81e6588650ba14c270ea>/include \
+  -DEIGEN3_INCLUDE_DIR=<eigen> \
+  -DNLOHMANN_JSON_INCLUDE_DIR=<nlohmann_json>/include \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/native --target protected_reduce protected_reduce_guard_test -j 2
+build/native/protected_reduce_guard_test
+SCULPTO_PROTECTED_REDUCE=build/native/protected_reduce \
+  python3 -B tools/tests/test_protected_reduce.py
+```
+
+`protected_reduce_guard_test` compiles the same `tools/native/guard.h` the reducer
+uses and states one shared-vertex fold analytically: a legal pre-collapse pair whose
+midpoint placement makes an opposite edge stab the other triangle at `(0.5,0.5,0)`
+(midpoint of that edge, inside the other triangle), which the production guard must
+refuse, while legal shared-edge adjacency stays allowed.
+
+The upstream reference is libigl `b41f1944a703653ae0da81e6588650ba14c270ea`
+(headers only; MPL-2.0), with Eigen (MPL2) and nlohmann/json (MIT). The test file
+skips with `PROTECTED_REDUCE_SKIP` when `SCULPTO_PROTECTED_REDUCE` is unset, so the
+Rust gate never needs a native toolchain.
+
 ## License and provenance
 
 First-party code is [GPL-3.0-only](LICENSE). Third-party source retains its

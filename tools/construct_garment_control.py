@@ -17,6 +17,7 @@ implicit and the original object is never modified.
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -953,6 +954,54 @@ def render_views(source, control, matrix, out_dir, label):
     return written
 
 
+BACKEND_KIND = "libigl-protected"
+BACKEND_FIELDS = ("kind", "executable", "sha256", "timeout_seconds")
+
+
+def reduction_backend(recipe):
+    """Validate the optional native reduction backend before any output exists.
+
+    Absence is the published Blender route. A declared backend must name the one
+    qualified kind, an existing executable with a matching digest, and a finite
+    positive time bound; nothing is defaulted and nothing is fetched.
+    """
+    declared = recipe.get("reduction_backend")
+    if declared is None:
+        return None
+    if not isinstance(declared, dict):
+        raise ValueError("reduction_backend must be an object")
+    unknown = sorted(set(declared) - set(BACKEND_FIELDS))
+    if unknown:
+        raise ValueError(f"reduction_backend has unknown field(s) {unknown}")
+    missing = [field for field in BACKEND_FIELDS if field not in declared]
+    if missing:
+        raise ValueError(f"reduction_backend is missing {missing}")
+    if declared["kind"] != BACKEND_KIND:
+        raise ValueError(
+            f"reduction_backend kind {declared['kind']!r} is not declared; expected {BACKEND_KIND!r}"
+        )
+    executable = Path(declared["executable"])
+    if not executable.is_file():
+        raise ValueError(f"reduction_backend executable {executable} does not exist")
+    digest = sha256(executable)
+    if declared["sha256"] != digest:
+        raise ValueError(
+            f"reduction_backend executable {executable} digest does not match the recipe"
+        )
+    timeout = declared["timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("reduction_backend timeout_seconds must be a number")
+    timeout = float(timeout)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("reduction_backend timeout_seconds must be positive and finite")
+    return {
+        "kind": BACKEND_KIND,
+        "executable": str(executable.resolve()),
+        "sha256": digest,
+        "timeout_seconds": timeout,
+    }
+
+
 def recipe_inputs(recipe):
     source = Path(recipe["source"])
     profile = Path(recipe["profile"])
@@ -969,13 +1018,137 @@ def recipe_inputs(recipe):
     declared = read_json(profile)
     if declared.get("frame") not in FRAMES:
         raise ValueError(f"profile frame must be one of {FRAMES}")
-    return source, profile, binary, declared, binary_digest
+    backend = reduction_backend(recipe)
+    return source, profile, binary, declared, binary_digest, backend
+
+
+def blender_collapse(control, ratio):
+    """The published Blender COLLAPSE route: a ratio modifier on the control object."""
+    if ratio < 1.0:
+        bpy.context.view_layer.objects.active = control
+        control.select_set(True)
+        modifier = control.modifiers.new("Decimate", "DECIMATE")
+        modifier.decimate_type = "COLLAPSE"
+        modifier.ratio = ratio
+        bpy.ops.object.modifier_apply(modifier=modifier.name)
+        control.select_set(False)
+    return {"operator": "bpy Decimate COLLAPSE", "settings": {"ratio": ratio}}
+
+
+def native_protected_reduce(control, *, high_obj, target, tolerance, output, backend):
+    """Run the declared native backend, load its candidate, and refuse anything less.
+
+    The backend owns only the reduction operation: the candidate still has to pass the
+    shared repair, contact and coverage gates. A non-zero exit, a digest change, a
+    partial budget or a receipt that disagrees with the written file is a failure;
+    there is no fallback to another reducer.
+    """
+    if sha256(backend["executable"]) != backend["sha256"]:
+        raise RuntimeError("reduction backend digest changed after recipe validation")
+    native_output = output / "native-reduction"
+    command = [
+        backend["executable"],
+        "--input",
+        str(high_obj),
+        "--target",
+        str(target),
+        "--tolerance",
+        repr(float(tolerance)),
+        "--timeout",
+        repr(float(backend["timeout_seconds"])),
+        "--output",
+        str(native_output),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            # The backend enforces its own deadline; this is only the host backstop
+            # for a process that never returns at all.
+            timeout=float(backend["timeout_seconds"]) + max(5.0, 0.1 * float(backend["timeout_seconds"])),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"protected reduction backend did not exit within its {backend['timeout_seconds']}s "
+            "deadline plus the host grace period; no fallback route is used"
+        ) from error
+    receipt_path = native_output / "result.json"
+    native = read_json(receipt_path) if receipt_path.is_file() else None
+    if result.returncode != 0:
+        reason = (
+            native.get("stop_reason")
+            if isinstance(native, dict)
+            else result.stderr.strip()[:400] or "no receipt"
+        )
+        raise RuntimeError(
+            f"protected reduction backend failed (exit {result.returncode}, {reason}); "
+            "no fallback route is used"
+        )
+    if not isinstance(native, dict):
+        raise RuntimeError("protected reduction backend wrote no receipt")
+    if native.get("target_reached") is not True:
+        raise RuntimeError(
+            "protected reduction backend did not reach the declared budget "
+            f"({native.get('stop_reason')}); the result is not a control surface"
+        )
+    if native.get("target_triangles") != target:
+        raise RuntimeError(
+            f"backend targeted {native.get('target_triangles')} triangles, the plan declared {target}"
+        )
+    if native.get("source_faces") != len(read_obj(high_obj)[1]):
+        raise RuntimeError("backend receipt does not describe the high control it was given")
+    if float(native.get("source_tolerance", -1.0)) != float(tolerance):
+        raise RuntimeError("backend receipt does not carry the declared source tolerance")
+    candidate_path = native_output / "candidate.obj"
+    candidate = read_obj(candidate_path)
+    if native.get("candidate_vertices") != len(candidate[0]) or native.get(
+        "candidate_faces"
+    ) != len(candidate[1]):
+        raise RuntimeError("backend receipt disagrees with the candidate it wrote")
+    if not candidate[1]:
+        raise RuntimeError("protected reduction returned no triangles")
+    set_geometry(control, *candidate)
+    return {
+        "operator": "libigl-protected",
+        "settings": {
+            "target_triangles": target,
+            "source_tolerance": float(tolerance),
+            "timeout_seconds": float(backend["timeout_seconds"]),
+        },
+        "backend": {
+            "kind": backend["kind"],
+            "executable": backend["executable"],
+            "sha256": backend["sha256"],
+        },
+        "command": command,
+        "native": native,
+        "candidate_sha256": sha256(candidate_path),
+        "uv": "not carried by the native intermediate; geometry stages only",
+    }
+
+
+def reduce_control(control, *, high_obj, ratio, target, tolerance, output, backend):
+    """Run the declared reduction route; the caller validates either result the same way."""
+    if backend is None:
+        return blender_collapse(control, ratio)
+    if ratio >= 1.0:
+        return {"operator": "none: the plan declares no reduction", "settings": {"ratio": ratio}}
+    return native_protected_reduce(
+        control,
+        high_obj=high_obj,
+        target=target,
+        tolerance=tolerance,
+        output=output,
+        backend=backend,
+    )
 
 
 def main(recipe_path, out_dir):
     started = time.monotonic()
     recipe = read_json(recipe_path)
-    source_path, profile_path, binary, declared, binary_digest = recipe_inputs(recipe)
+    source_path, profile_path, binary, declared, binary_digest, backend = recipe_inputs(recipe)
     output = Path(out_dir)
     if output.exists():
         raise FileExistsError(f"{output} already exists; exclusive output only")
@@ -997,6 +1170,7 @@ def main(recipe_path, out_dir):
             "npz": "sculpto-display-y-up",
         },
         "renders_note": RENDER_NOTE,
+        "reduction_backend": backend,
     }
     try:
         bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -1181,14 +1355,15 @@ def main(recipe_path, out_dir):
         )
 
         ratio = float(plan["reduction"]["ratio"])
-        if ratio < 1.0:
-            bpy.context.view_layer.objects.active = control
-            control.select_set(True)
-            modifier = control.modifiers.new("Decimate", "DECIMATE")
-            modifier.decimate_type = "COLLAPSE"
-            modifier.ratio = ratio
-            bpy.ops.object.modifier_apply(modifier=modifier.name)
-            control.select_set(False)
+        reduction = reduce_control(
+            control,
+            high_obj=output / "high_control.obj",
+            ratio=ratio,
+            target=int(plan["reduction"]["target_triangles"]),
+            tolerance=float(declared["coverage"]["tolerance"]),
+            output=output,
+            backend=backend,
+        )
         decimated_positions, decimated_triangles = triangulated(control)
         write_obj(output / "decimated.obj", decimated_positions, decimated_triangles)
         # QEM output is a new surface, not the source faces: record the operation
@@ -1197,7 +1372,7 @@ def main(recipe_path, out_dir):
             output / "decimated.obj", len(decimated_positions), len(decimated_triangles)
         )
         receipt["decimation"] = {
-            "operator": "bpy Decimate COLLAPSE",
+            **reduction,
             "ratio": ratio,
             "target_triangles": plan["reduction"]["target_triangles"],
             "before_triangles": len(high_triangles),
