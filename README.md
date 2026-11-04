@@ -97,6 +97,8 @@ Example recipe (paths are explicitly supplied local fixtures):
 
 ```json
 {
+  "sculpto": "/absolute/path/to/sculpto",
+  "sculpto_sha256": "<SHA256 of that executable>",
   "source": "/assets/original-parts.blend",
   "source_sha256": "<SHA256 of original-parts.blend>",
   "object": "OriginalGarment",
@@ -140,6 +142,30 @@ Measured misses remain reported; a produced bake does not qualify appearance,
 fit, body clearance or animation. Failed bake diagnostics remain in their new
 output directory. Existing output directories are rejected.
 
+The required `sculpto` executable and digest pin the shared UV qualifier:
+
+```sh
+sculpto garment uv-check --uv triangle-corners.json --report qualification.json
+```
+
+Input is `{"triangles": [[[u,v],[u,v],[u,v]], ...]}` in mesh face order. The core
+reports sorted positive-area pairs, collapsed triangles and corners outside
+`[0,1]`; shared edges/points, including T touches, are legal. A geometric refusal
+writes its report and returns nonzero. Existing report paths are exclusive.
+
+After Smart Project, the baker qualifies **every** face. A clean atlas stays
+unchanged. Otherwise only diagnosed overlapping/collapsed faces become separate
+geometry-derived triangle charts, followed by one native island pack. Physical
+topology and unaffected chart interiors remain intact. Complete qualification
+runs again; residual failure stops before the first bake. No small positive
+area is ignored, and no second pack is attempted.
+
+Output staging starts after recipe/digest/source/frame validation, before UV
+qualification, so failed atlas diagnostics and a failed `receipt.json` remain.
+`uv-before*` and repaired `uv-after*` files retain the complete corner arrays and
+core reports. The receipt records affected IDs, operation, executable pin and
+pre/post UV identities. Invalid recipes or digests still create no output.
+
 Optional `fitted` and `fitted_sha256` fields require an explicit `fitted_frame`
 from the same four frame names. Actor-world Y-up fitted output uses
 `sculpto-world-y-up`; it must not inherit the original source object's transform.
@@ -152,7 +178,9 @@ Run the focused native regression with:
 
 ```sh
 blender --background --factory-startup -t 2 --python-exit-code 1 \
-  --python tools/tests/test_bake_garment_materials.py
+  --python tools/tests/test_bake_garment_materials.py -- /absolute/path/to/sculpto
+blender --background --factory-startup -t 2 --python-exit-code 1 \
+  --python tools/tests/test_garment_uv_atlas.py -- /absolute/path/to/sculpto
 ```
 
 ### Reconstruct a source-guided control surface

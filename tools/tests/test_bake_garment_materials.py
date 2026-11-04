@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 import bpy
 import numpy as np
@@ -11,6 +12,13 @@ from mathutils import Euler, Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bake_garment_materials import main, sha256
+import bake_garment_materials as baker
+import garment_uv_atlas as atlas
+
+arguments = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+if len(arguments) != 1:
+    raise SystemExit("expected explicit sculpto executable argument")
+binary = Path(arguments[0]).resolve()
 
 
 def rejected(root, recipe, name, expected, existing=False):
@@ -83,6 +91,7 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     fitted[:, 2] *= -1
     np.savez(root / "fitted.npz", vertices=fitted, triangles=triangles)
     recipe = dict(source=str(source), source_sha256=sha256(source), object=obj.name,
+                  sculpto=str(binary), sculpto_sha256=sha256(binary),
                   control=str(root / "control.npz"), control_sha256=sha256(root / "control.npz"),
                   control_frame="blender-source-local-z-up", resolution=32, margin=2,
                   frame_max_distance=0.001, cage_extrusion=0.01, max_ray_distance=0.02)
@@ -91,6 +100,8 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     main(path, root / "baked")
     receipt = json.loads((root / "baked/receipt.json").read_text())
     assert receipt["coverage"]["uncovered_texels"] == 0
+    assert receipt["atlas"]["operation"] == "retain"
+    assert receipt["atlas"]["before_sha256"] == receipt["atlas"]["after_sha256"]
     assert receipt["coverage"]["footprint_texels"] > 100
     assert receipt["frame"]["vertex_nearest_distance"]["max"] < 1e-5
     for channel, expected in (("roughness", 0.3), ("metallic", 0.7)):
@@ -117,6 +128,9 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     assert abs(actual_shader.inputs["IOR"].default_value - 1.8) < 1e-6
     assert sha256(source) == recipe["source_sha256"]
     rejected(root, recipe, "existing", "refusing to overwrite", existing=True)
+    rejected(root, {key: value for key, value in recipe.items() if key != "sculpto"}, "missing-cli", "requires sculpto")
+    rejected(root, {key: value for key, value in recipe.items() if key != "sculpto_sha256"}, "missing-cli-hash", "requires sculpto")
+    rejected(root, dict(recipe, sculpto_sha256="0" * 64), "wrong-cli-hash", "sculpto binary digest")
     rejected(root, dict(recipe, object="absent"), "missing-object", "source mesh not found")
     rejected(root, dict(recipe, control_frame="guess"), "invalid-frame", "control_frame")
     rejected(root, dict(recipe, control_frame="blender-world-z-up"), "wrong-frame", "declared frame exceeds")
@@ -138,4 +152,21 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     unsupported = root / "unsupported.blend"
     bpy.ops.wm.save_as_mainfile(filepath=str(unsupported))
     rejected(root, dict(recipe, source=str(unsupported), source_sha256=sha256(unsupported)), "unsupported-graph", "unsupported source channel graph")
+    original_qualify = baker.qualify_atlas
+    def failed_atlas(target, binary, output, record):
+        target.data.uv_layers.active.data.foreach_set("uv", [0, 0, .4, 0, 0, .4] * 2)
+        original_qualify(target, binary, output, record)
+    path.write_text(json.dumps(recipe))
+    with patch.object(baker, "qualify_atlas", failed_atlas), patch.object(atlas, "pack_once", return_value=None):
+        try:
+            main(path, root / "atlas-refused")
+        except ValueError as error:
+            assert "after one native repack" in str(error)
+        else:
+            raise AssertionError("unqualified atlas reached baking")
+    failure = json.loads((root / "atlas-refused/receipt.json").read_text())
+    assert failure["maps"] == {} and failure["status"] == "failed; retained diagnostics"
+    assert not (root / "atlas-refused/footprint.png").exists()
+    assert not (root / "atlas-refused/baked-control.blend").exists()
+    assert sha256(source) == recipe["source_sha256"]
     print("PASS: native PBR values, nonidentity source frame, exact fitted topology/UV/maps, immutable source and explicit rejection boundaries")

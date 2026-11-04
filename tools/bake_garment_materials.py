@@ -7,6 +7,7 @@ See README.md for the explicit source/frame recipe. No fitting is performed.
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -15,6 +16,9 @@ import bpy
 import numpy as np
 from mathutils import Matrix
 from mathutils.bvhtree import BVHTree
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from garment_uv_atlas import qualify_atlas
 
 
 CHANNELS = {"basecolor": "Base Color", "roughness": "Roughness", "metallic": "Metallic"}
@@ -244,6 +248,11 @@ def main(recipe_path, output):
     recipe = json.loads(recipe_path.read_text())
     if output.exists():
         raise FileExistsError(f"refusing to overwrite {output}")
+    if "sculpto" not in recipe or "sculpto_sha256" not in recipe:
+        raise ValueError("recipe requires sculpto and sculpto_sha256")
+    binary = Path(recipe["sculpto"]).resolve()
+    if not binary.is_file() or not os.access(binary, os.X_OK) or sha256(binary) != recipe["sculpto_sha256"]:
+        raise ValueError("sculpto binary digest differs from recipe or executable is missing")
     source_path = Path(recipe["source"]).resolve()
     control_path = Path(recipe["control"]).resolve()
     for path, key in ((source_path, "source_sha256"), (control_path, "control_sha256")):
@@ -325,7 +334,9 @@ def main(recipe_path, output):
     bake.normal_space = "TANGENT"
     output.mkdir(parents=True)
     report = dict(recipe=recipe, recipe_sha256=sha256(recipe_path), source_images=source_images,
+                  sculpto=str(binary), sculpto_sha256=recipe["sculpto_sha256"], atlas={},
                   adapter_sha256=sha256(__file__), unbaked_principled_settings=settings,
+                  atlas_adapter_sha256=sha256(Path(__file__).with_name("garment_uv_atlas.py")),
                   blender_version=bpy.app.version_string, frame=frame,
                   vertices=len(vertices), triangles=len(triangles), ordered_triangles_sha256=array_hash(triangles),
                   source_positions_sha256=array_hash(vertices), uv_sha256=array_hash(uv), uv_layer=mesh.uv_layers.active.name,
@@ -334,6 +345,9 @@ def main(recipe_path, output):
                       normal_space="TANGENT", uv="smart_project", angle_limit=1.151917306, island_margin=0.02), maps={})
     images = {}
     try:
+        qualify_atlas(target, binary, output, report["atlas"])
+        uv = np.asarray([tuple(loop.uv) for loop in mesh.uv_layers.active.data], dtype=np.float32)
+        report["uv_sha256"] = array_hash(uv)
         for channel in ("footprint", "coverage", "basecolor", "roughness", "metallic", "normal"):
             tick = time.monotonic()
             image = bpy.data.images.new("BakedControl_" + channel, width=size, height=size, alpha=True)

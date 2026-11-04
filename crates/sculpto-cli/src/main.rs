@@ -6,6 +6,7 @@
 
 mod actor;
 mod garment_control;
+mod garment_uv;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -48,6 +49,7 @@ commands:
   garment control-check [options] measure and gate a finished control surface
   garment control-separate [options] apply the declared bounded local contact repair
   garment control-cuts [options] validate declared source-opening cuts and print the plan
+  garment uv-check [options] qualify triangle-corner UV area and atlas bounds
   version               print the Sculpto implementation version
   help                  print this help
 
@@ -476,7 +478,8 @@ fn garment(args: &[String]) -> ExitCode {
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
        sculpto garment control-separate --control <obj> --profile <json> --out <obj> --report <json>
-       sculpto garment control-cuts --profile <json> --report <json>";
+       sculpto garment control-cuts --profile <json> --report <json>
+       sculpto garment uv-check --uv <json> --report <json>";
 
     let result = match args {
         [action, rest @ ..] if action == "fit" => garment_fit_inner(rest),
@@ -498,6 +501,7 @@ fn garment(args: &[String]) -> ExitCode {
             garment_control::separate_inner(rest)
         }
         [action, rest @ ..] if action == "control-cuts" => garment_control::cuts_inner(rest),
+        [action, rest @ ..] if action == "uv-check" => garment_uv::check(rest),
         _ => Err(usage.to_string()),
     };
     match result {
