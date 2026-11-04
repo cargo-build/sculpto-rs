@@ -75,6 +75,8 @@ pub struct ControlDiagnostics {
     pub orientation_conflicts: usize,
     /// Render vertices that identify with another position.
     pub coincident_vertices: usize,
+    /// Lowest input vertex index for each exact-position ID in `loops`. @req DECL0013
+    pub vertex_sources: Vec<u32>,
     pub loops: Vec<BoundaryLoop>,
     /// Nonadjacent triangle pairs that intersect at rest.
     pub self_contacts: usize,
@@ -174,6 +176,7 @@ impl ControlDiagnostics {
             non_manifold_edges,
             orientation_conflicts,
             coincident_vertices: surface.coincident_vertices(),
+            vertex_sources: surface.vertex_sources().to_vec(),
             loops: boundary_loops(mesh_positions, mesh_triangles),
             self_contacts: check::self_intersection_pairs(positions, triangles),
             bounds,

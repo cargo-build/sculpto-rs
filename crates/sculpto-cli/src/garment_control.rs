@@ -517,6 +517,8 @@ fn check_report(
             "non_manifold_edges": diagnostics.non_manifold_edges,
             "orientation_conflicts": diagnostics.orientation_conflicts,
             "coincident_vertices": diagnostics.coincident_vertices,
+            "loop_vertex_space": "exact-position",
+            "vertex_sources": diagnostics.vertex_sources,
             "self_contacts": diagnostics.self_contacts,
             "bounds": diagnostics.bounds,
             "extent": diagnostics.extent(),

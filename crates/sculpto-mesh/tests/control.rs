@@ -24,6 +24,30 @@ use sculpto_mesh::control::{
     repair_control, resolve_apertures, source_surface,
 };
 
+#[test]
+fn diagnostic_loop_ids_map_to_input_vertices_after_reordering_and_seam_welding() {
+    let positions = [
+        [9.0, 9.0, 9.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+    ];
+    let diagnostics = ControlDiagnostics::measure(&positions, &[[3, 4, 5], [3, 1, 2]])
+        .expect("a quad with a render seam remains physically manifold");
+    assert_eq!(diagnostics.vertex_sources, [3, 4, 1, 2]);
+    assert_eq!(diagnostics.loops.len(), 1);
+    let input_vertices = diagnostics.loops[0]
+        .vertices
+        .iter()
+        .map(|&vertex| diagnostics.vertex_sources[vertex as usize])
+        .collect::<Vec<_>>();
+    assert_eq!(input_vertices, [3, 4, 1, 2]);
+    assert_eq!(diagnostics.loops[0].center, [0.5, 0.5, 0.0]);
+    assert_eq!(diagnostics.loops[0].perimeter, 4.0);
+}
+
 /// A closed thick shell plus the counts its construction is made of.
 struct Shell {
     positions: Vec<[f32; 3]>,
