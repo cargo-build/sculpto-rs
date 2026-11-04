@@ -112,6 +112,7 @@ pub fn separate_inner(args: &[String]) -> Result<(), String> {
                     "witness": [separation.witness.left, separation.witness.right],
                     "moving_face": separation.moving_face,
                     "fixed_face": separation.fixed_face,
+                    "shared_anchors": separation.shared_anchors,
                     "axis": separation.axis,
                     "normal": separation.normal,
                     "overlap": separation.overlap,

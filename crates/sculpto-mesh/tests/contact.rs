@@ -280,7 +280,7 @@ fn coplanar_overlap_separates_without_an_input_triggered_panic() {
 }
 
 #[test]
-fn a_shared_anchor_cannot_be_moved_with_the_claimed_fixed_face() {
+fn a_shared_anchor_stays_fixed_during_separation() {
     let positions = [
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
@@ -290,20 +290,60 @@ fn a_shared_anchor_cannot_be_moved_with_the_claimed_fixed_face() {
     ];
     let triangles = [[0, 1, 2], [0, 3, 4]];
     assert_eq!(check::self_intersection_pairs(&positions, &triangles), 1);
-    let expected = Err(ContactError::SharedFeature { left: 0, right: 1 });
-    assert_eq!(
-        separate(&positions, &triangles, &policy(ContactMode::Separate)),
-        expected
-    );
+    let result = separate(&positions, &triangles, &policy(ContactMode::Separate))
+        .unwrap()
+        .expect("the free vertices can separate while preserving the anchor");
+    assert_eq!(result.separation.shared_anchors, vec![0]);
+    assert_eq!(&result.positions[..3], &positions[..3]);
+    assert!(check::self_intersection_witnesses(&result.positions, &triangles).is_empty());
     let mut split = positions.to_vec();
     split.push(positions[0]);
-    assert_eq!(
-        separate(
-            &split,
-            &[[0, 1, 2], [5, 3, 4]],
-            &policy(ContactMode::Separate)
-        ),
-        expected,
-        "render seams do not make shared physical anchors independently movable"
-    );
+    let split_faces = [[0, 1, 2], [5, 3, 4]];
+    let result = separate(&split, &split_faces, &policy(ContactMode::Separate))
+        .unwrap()
+        .expect("render aliases preserve the same anchors");
+    assert_eq!(result.separation.shared_anchors, vec![0, 5]);
+    assert_eq!(&result.positions[..3], &positions[..3]);
+    assert_eq!(result.positions[5], positions[0]);
+    assert!(check::self_intersection_witnesses(&result.positions, &split_faces).is_empty());
+}
+
+#[test]
+fn coplanar_overlap_lifts_the_free_corner_without_moving_the_shared_edge() {
+    let positions = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.25, 0.25, 0.0],
+    ];
+    let faces = [[0, 1, 2], [0, 1, 3]];
+    let result = separate(&positions, &faces, &policy(ContactMode::Separate))
+        .unwrap()
+        .expect("the free corner can leave the shared plane");
+    assert_eq!(&result.positions[..3], &positions[..3]);
+    assert_eq!(result.separation.shared_anchors, vec![0, 1]);
+    assert!(result.positions[3][2].abs() >= 1e-3);
+    assert!(check::self_intersection_witnesses(&result.positions, &faces).is_empty());
+}
+
+#[test]
+fn moving_corner_aliases_and_their_neighbors_remain_connected() {
+    let positions = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.99, 0.001, -0.1],
+        [0.99, 0.001, 0.1],
+        [0.99, 0.001, -0.1],
+        [0.99, -1.0, -0.1],
+        [0.99, -1.0, -0.2],
+    ];
+    let faces = [[0, 1, 2], [0, 3, 4], [5, 6, 7]];
+    let result = separate(&positions, &faces, &policy(ContactMode::Separate))
+        .unwrap()
+        .expect("the local correction preserves physical aliases");
+    assert_eq!(result.positions[3], result.positions[5]);
+    assert_eq!(&result.positions[..3], &positions[..3]);
+    assert!(check::self_intersection_witnesses(&result.positions, &faces).is_empty());
+    assert!(result.separation.moved.iter().any(|v| v.vertex == 6 && v.share == 0.5));
 }

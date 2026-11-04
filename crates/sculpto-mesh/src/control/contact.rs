@@ -2,12 +2,13 @@
 //!
 //! Decimation can fold a boundary ear through a neighbouring triangle. The
 //! profile may authorize a single, measured separation instead of rejecting the
-//! control: one geometry-derived minimum separating axis, the smaller face moving
-//! in full with its immediate neighbours at half strength, the opposing face
+//! control: one geometry-derived axis, the smaller face's free vertices moving
+//! in full with their immediate neighbours at half strength, the opposing face
 //! fixed. Every moved vertex, the chosen axis and the residual state are reported,
 //! and the result is rejected when it exceeds the declared bound, inverts or
 //! degenerates an incident face, or leaves any contact.
-//! Shared physical anchors cannot obey that rigid translation and are refused.
+//! Shared anchors stay fixed while the moving face's free vertices enter one
+//! half-space of the opposing face; exact-position aliases move together.
 //!
 //! Witness detection is not implemented here: it reuses
 //! [`crate::check::self_intersection_witnesses`], the same predicate the final
@@ -93,8 +94,6 @@ pub enum ContactError {
     },
     /// A coincident duplicate face cannot be separated by moving geometry.
     DuplicateFace { left: usize, right: usize },
-    /// Translating one face would also move a shared anchor of the fixed face.
-    SharedFeature { left: usize, right: usize },
     /// More witnessed pairs than the policy allows: coupled or excessive.
     CoupledContacts { pairs: usize, limit: usize },
     /// The smallest analytic separation is larger than the declared bound.
@@ -118,10 +117,6 @@ impl fmt::Display for ContactError {
             Self::DuplicateFace { left, right } => write!(
                 formatter,
                 "triangles {left} and {right} are coincident duplicate faces; geometry separation cannot repair them"
-            ),
-            Self::SharedFeature { left, right } => write!(
-                formatter,
-                "triangles {left} and {right} share a physical anchor; rigid separation cannot hold the opposing face fixed"
             ),
             Self::CoupledContacts { pairs, limit } => write!(
                 formatter,
@@ -168,10 +163,12 @@ pub struct Separation {
     pub pairs: usize,
     /// The witness addressed by this correction.
     pub witness: Witness,
-    /// Triangle that moved in full (the smaller of the pair).
+    /// Smaller triangle whose free vertices move; shared anchors stay fixed.
     pub moving_face: usize,
     /// Triangle held fixed.
     pub fixed_face: usize,
+    /// Original vertex indices held fixed in both faces, including render aliases.
+    pub shared_anchors: Vec<u32>,
     /// Which analytic axis produced the minimum.
     pub axis: &'static str,
     /// Unit translation direction.
@@ -180,7 +177,7 @@ pub struct Separation {
     pub overlap: f32,
     /// Declared margin added to the overlap.
     pub clearance: f32,
-    /// Full translation applied to the moving face.
+    /// Full translation applied to the moving face's free vertices.
     pub translation: f32,
     /// Largest displacement of any vertex.
     pub max_displacement: f32,
@@ -254,12 +251,6 @@ pub fn separate(
 
     let a = corners(positions, triangles[first.left]);
     let b = corners(positions, triangles[first.right]);
-    if a.iter().any(|point| b.contains(point)) {
-        return Err(ContactError::SharedFeature {
-            left: first.left,
-            right: first.right,
-        });
-    }
     let moving_face = match area(a) <= area(b) {
         true => first.left,
         false => first.right,
@@ -272,8 +263,16 @@ pub fn separate(
         corners(positions, triangles[moving_face]),
         corners(positions, triangles[fixed_face]),
     );
-    let (axis, normal, overlap) =
-        minimum_axis(moving, fixed).ok_or(ContactError::NoSeparatingAxis)?;
+    let fixed_vertices = physical_vertices(positions, &triangles[fixed_face]);
+    let moving_aliases = physical_vertices(positions, &triangles[moving_face]);
+    let (shared_anchors, moving_vertices): (Vec<_>, Vec<_>) = moving_aliases
+        .into_iter()
+        .partition(|vertex| fixed_vertices.contains(vertex));
+    let (axis, normal, overlap) = match shared_anchors.is_empty() {
+        true => minimum_axis(moving, fixed),
+        false => anchored_axis(moving, fixed),
+    }
+    .ok_or(ContactError::NoSeparatingAxis)?;
     let required = overlap + f64::from(policy.clearance);
     if required > f64::from(policy.max_displacement) {
         return Err(ContactError::DisplacementBeyondBound {
@@ -282,11 +281,10 @@ pub fn separate(
         });
     }
 
-    // The moving face moves in full; vertices of faces sharing a vertex with it
-    // move at half strength; the opposing face stays fixed.
-    let moving_vertices: Vec<u32> = triangles[moving_face].to_vec();
-    let fixed_vertices: Vec<u32> = triangles[fixed_face].to_vec();
-    let neighbours = neighbour_vertices(triangles, &moving_vertices, &fixed_vertices);
+    let neighbours = physical_vertices(
+        positions,
+        &neighbour_vertices(triangles, &moving_vertices, &fixed_vertices),
+    );
     let translation: Vec3 = normal.map(|component| component * required);
     let mut updated = positions.to_vec();
     let mut moved = Vec::new();
@@ -355,6 +353,7 @@ pub fn separate(
             witness: first,
             moving_face,
             fixed_face,
+            shared_anchors,
             axis,
             normal: normal.map(|component| component as f32),
             overlap: overlap as f32,
@@ -369,6 +368,36 @@ pub fn separate(
 
 fn corners(positions: &[[f32; 3]], triangle: [u32; 3]) -> [Point; 3] {
     triangle.map(|vertex| positions[vertex as usize].map(f64::from))
+}
+
+/// Synchronize render aliases without welding the caller's arrays. @req DECL0013
+fn physical_vertices(positions: &[[f32; 3]], vertices: &[u32]) -> Vec<u32> {
+    positions
+        .iter()
+        .enumerate()
+        .filter(|(_, point)| vertices.iter().any(|&i| positions[i as usize] == **point))
+        .map(|(index, _)| index as u32)
+        .collect()
+}
+
+/// Keep shared anchors in-plane while free vertices enter one half-space. @req DECL0013
+fn anchored_axis(moving: [Point; 3], fixed: [Point; 3]) -> Option<(&'static str, Vec3, f64)> {
+    let normal = unit(normal_of(fixed));
+    if normal == [0.0; 3] {
+        return None;
+    }
+    [1.0, -1.0]
+        .into_iter()
+        .filter_map(|sign| {
+            let direction = normal.map(|value| value * sign);
+            moving
+                .iter()
+                .filter(|point| !fixed.contains(point))
+                .map(|&point| dot(sub(point, fixed[0]), direction))
+                .reduce(f64::min)
+                .map(|minimum| ("fixed-face-normal", direction, (-minimum).max(0.0)))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
 }
 
 fn neighbour_vertices(triangles: &[[u32; 3]], moving: &[u32], fixed: &[u32]) -> Vec<u32> {
@@ -388,7 +417,7 @@ fn neighbour_vertices(triangles: &[[u32; 3]], moving: &[u32], fixed: &[u32]) -> 
     neighbours
 }
 
-/// The minimum separating translation over the 13 triangle-pair axes.
+/// The minimum separating translation over the 11 triangle-pair axes.
 fn minimum_axis(a: [Point; 3], b: [Point; 3]) -> Option<(&'static str, Vec3, f64)> {
     let edges_a = [sub(a[1], a[0]), sub(a[2], a[1]), sub(a[0], a[2])];
     let edges_b = [sub(b[1], b[0]), sub(b[2], b[1]), sub(b[0], b[2])];

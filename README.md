@@ -242,10 +242,13 @@ different resolutions; each is checked *before* its native fills or collapses, s
 an out-of-limit stage is refused instead of silently expanded. `contact` is either
 `mode: "reject"` (any rest contact fails) or `mode: "separate"` with a
 finite clearance, a maximum vertex displacement and a maximum pair count, all in
-source units. A separation uses one geometry-derived minimum separating axis, moves
-the smaller face in full and its immediate neighbours at half strength, and is
-refused when the required translation exceeds the bound, an incident face would
-invert or collapse, or any contact remains.
+source units. For disjoint faces, separation uses a geometry-derived minimum
+axis. For a shared vertex or edge, those anchors stay fixed and the smaller
+face's free vertices move to one side of the fixed face's plane. Immediate
+neighbors move at half strength; exact-position aliases move together. Receipts
+record the shared anchors and every actual displacement. A correction is refused
+when its bound is exceeded, an incident face inverts or collapses, or any contact
+remains. The current planner supports one pair; coupled components are refused.
 Both modes require all four fields. Under `reject`, the three numeric values
 are retained in the receipt but no displacement is attempted.
 
