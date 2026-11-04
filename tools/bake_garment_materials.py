@@ -280,6 +280,12 @@ def main(recipe_path, output):
         raise ValueError("resolution must be an integer in 32..8192")
     if type(margin) is not int or not 0 <= margin <= size // 16:
         raise ValueError("margin must be a nonnegative integer <= resolution/16")
+    if "atlas_padding_px" not in recipe:
+        raise ValueError("recipe requires atlas_padding_px")
+    padding_px = recipe["atlas_padding_px"]
+    if type(padding_px) is not int or not margin <= padding_px <= size // 16:
+        raise ValueError("atlas_padding_px must be an integer >= margin and <= resolution/16")
+    padding = dict(pixels=padding_px, resolution=size, fraction=padding_px / size)
     if not all(np.isfinite(value) and value > 0 for value in (extrusion, distance, tolerance)) or distance <= extrusion:
         raise ValueError("finite positive native ray settings require max_ray_distance > cage_extrusion")
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -311,7 +317,7 @@ def main(recipe_path, output):
     select(target)
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.uv.smart_project(angle_limit=1.151917306, island_margin=0.02, margin_method="FRACTION", correct_aspect=True)
+    bpy.ops.uv.smart_project(angle_limit=1.151917306, island_margin=padding["fraction"], margin_method="FRACTION", correct_aspect=True)
     bpy.ops.object.mode_set(mode="OBJECT")
     uv = np.asarray([tuple(loop.uv) for loop in mesh.uv_layers.active.data], dtype=np.float32)
     material = bpy.data.materials.new("BakedControlPBR")
@@ -333,7 +339,7 @@ def main(recipe_path, output):
     bake.margin = 0
     bake.normal_space = "TANGENT"
     output.mkdir(parents=True)
-    report = dict(recipe=recipe, recipe_sha256=sha256(recipe_path), source_images=source_images,
+    report = dict(recipe=recipe, recipe_sha256=sha256(recipe_path), source_images=source_images, atlas_padding=padding,
                   sculpto=str(binary), sculpto_sha256=recipe["sculpto_sha256"], atlas={},
                   adapter_sha256=sha256(__file__), unbaked_principled_settings=settings,
                   atlas_adapter_sha256=sha256(Path(__file__).with_name("garment_uv_atlas.py")),
@@ -342,10 +348,10 @@ def main(recipe_path, output):
                   source_positions_sha256=array_hash(vertices), uv_sha256=array_hash(uv), uv_layer=mesh.uv_layers.active.name,
                   native_settings=dict(engine="CYCLES", device="CPU", samples=1, selected_to_active=True,
                       cage_extrusion=extrusion, max_ray_distance=distance, use_cage=False, margin=margin, coverage_margin=0,
-                      normal_space="TANGENT", uv="smart_project", angle_limit=1.151917306, island_margin=0.02), maps={})
+                      normal_space="TANGENT", uv="smart_project", angle_limit=1.151917306, island_margin=padding["fraction"]), maps={})
     images = {}
     try:
-        qualify_atlas(target, binary, output, report["atlas"])
+        qualify_atlas(target, binary, output, report["atlas"], padding)
         uv = np.asarray([tuple(loop.uv) for loop in mesh.uv_layers.active.data], dtype=np.float32)
         report["uv_sha256"] = array_hash(uv)
         for channel in ("footprint", "coverage", "basecolor", "roughness", "metallic", "normal"):

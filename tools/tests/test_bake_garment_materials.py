@@ -93,7 +93,7 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     recipe = dict(source=str(source), source_sha256=sha256(source), object=obj.name,
                   sculpto=str(binary), sculpto_sha256=sha256(binary),
                   control=str(root / "control.npz"), control_sha256=sha256(root / "control.npz"),
-                  control_frame="blender-source-local-z-up", resolution=32, margin=2,
+                  control_frame="blender-source-local-z-up", resolution=32, margin=2, atlas_padding_px=2,
                   frame_max_distance=0.001, cage_extrusion=0.01, max_ray_distance=0.02)
     path = root / "recipe.json"
     path.write_text(json.dumps(recipe))
@@ -102,6 +102,7 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     assert receipt["coverage"]["uncovered_texels"] == 0
     assert receipt["atlas"]["operation"] == "retain"
     assert receipt["atlas"]["before_sha256"] == receipt["atlas"]["after_sha256"]
+    assert receipt["atlas_padding"] == receipt["atlas"]["padding"] == dict(pixels=2, resolution=32, fraction=2 / 32)
     assert receipt["coverage"]["footprint_texels"] > 100
     assert receipt["frame"]["vertex_nearest_distance"]["max"] < 1e-5
     for channel, expected in (("roughness", 0.3), ("metallic", 0.7)):
@@ -127,6 +128,34 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     actual_shader = actual.materials[0].node_tree.nodes.get("Principled BSDF")
     assert abs(actual_shader.inputs["IOR"].default_value - 1.8) < 1e-6
     assert sha256(source) == recipe["source_sha256"]
+    class PaddingObserved(Exception):
+        pass
+    for resolution, padding_px in ((32, 2), (64, 2), (64, 0)):
+        margin = min(padding_px, 2)
+        expected = dict(pixels=padding_px, resolution=resolution, fraction=padding_px / resolution)
+        def capture_initial(target, executable, output, record, padding):
+            assert padding == expected
+            uv = atlas.coordinates(target.data)
+            assert abs(float(uv.min()) - expected["fraction"]) < 1e-6
+            raise PaddingObserved
+        propagation = dict(recipe, resolution=resolution, margin=margin, atlas_padding_px=padding_px)
+        path.write_text(json.dumps(propagation))
+        output = root / f"padding-{resolution}-{padding_px}"
+        with patch.object(baker, "qualify_atlas", capture_initial):
+            try:
+                main(path, output)
+            except PaddingObserved:
+                pass
+            else:
+                raise AssertionError("padding observation did not stop before baking")
+        observed = json.loads((output / "receipt.json").read_text())
+        assert observed["atlas_padding"] == expected
+        assert observed["native_settings"]["island_margin"] == expected["fraction"]
+        assert observed["maps"] == {}
+    with patch.object(bpy.ops.wm, "read_factory_settings", side_effect=AssertionError("invalid padding mutated native state")):
+        rejected(root, {key: value for key, value in recipe.items() if key != "atlas_padding_px"}, "missing-padding", "requires atlas_padding_px")
+        for index, value in enumerate((True, False, None, "2", 2.0, 0.5, float("nan"), float("inf"), -1, 1, 3)):
+            rejected(root, dict(recipe, atlas_padding_px=value), f"invalid-padding-{index}", "atlas_padding_px must be an integer")
     rejected(root, recipe, "existing", "refusing to overwrite", existing=True)
     rejected(root, {key: value for key, value in recipe.items() if key != "sculpto"}, "missing-cli", "requires sculpto")
     rejected(root, {key: value for key, value in recipe.items() if key != "sculpto_sha256"}, "missing-cli-hash", "requires sculpto")
@@ -153,9 +182,9 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     bpy.ops.wm.save_as_mainfile(filepath=str(unsupported))
     rejected(root, dict(recipe, source=str(unsupported), source_sha256=sha256(unsupported)), "unsupported-graph", "unsupported source channel graph")
     original_qualify = baker.qualify_atlas
-    def failed_atlas(target, binary, output, record):
+    def failed_atlas(target, binary, output, record, padding):
         target.data.uv_layers.active.data.foreach_set("uv", [0, 0, .4, 0, 0, .4] * 2)
-        original_qualify(target, binary, output, record)
+        original_qualify(target, binary, output, record, padding)
     path.write_text(json.dumps(recipe))
     with patch.object(baker, "qualify_atlas", failed_atlas), patch.object(atlas, "pack_once", return_value=None):
         try:
@@ -169,4 +198,4 @@ with tempfile.TemporaryDirectory(prefix="sculpto-material-native-") as temporary
     assert not (root / "atlas-refused/footprint.png").exists()
     assert not (root / "atlas-refused/baked-control.blend").exists()
     assert sha256(source) == recipe["source_sha256"]
-    print("PASS: native PBR values, nonidentity source frame, exact fitted topology/UV/maps, immutable source and explicit rejection boundaries")
+    print("PASS: required pixel padding before native mutation; propagation at two resolutions; native PBR/frame/fitted identity and refusal boundaries")

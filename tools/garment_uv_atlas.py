@@ -93,7 +93,7 @@ def isolate_faces(target, uv, affected):
     return density, basis
 
 
-def pack_once(target):
+def pack_once(target, padding):
     bpy.ops.object.select_all(action="DESELECT")
     target.select_set(True)
     bpy.context.view_layer.objects.active = target
@@ -103,16 +103,16 @@ def pack_once(target):
         bpy.ops.mesh.select_all(action="SELECT")
         bpy.ops.uv.select_all(action="SELECT")
         bpy.ops.uv.pack_islands(udim_source="ACTIVE_UDIM", rotate=True, rotate_method="CARDINAL",
-            scale=True, merge_overlap=False, margin_method="FRACTION", margin=0.02,
+            scale=True, merge_overlap=False, margin_method="FRACTION", margin=padding["fraction"],
             pin=False, shape_method="CONCAVE")
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
 
 
-def qualify_atlas(target, binary, output, record):
+def qualify_atlas(target, binary, output, record, padding):
     mesh = target.data
     before = coordinates(mesh)
-    record.update(operation="retain", before_sha256=digest(before))
+    record.update(operation="retain", before_sha256=digest(before), padding=padding)
     record["before"] = check(mesh, binary, output, "before")
     if record["before"]["verdict"]["passed"]:
         record.update(after_sha256=digest(before), affected_faces=[], after=record["before"])
@@ -125,7 +125,7 @@ def qualify_atlas(target, binary, output, record):
     edges = adjacency(mesh, before, excluded)
     record.update(operation="isolate diagnosed triangle charts; native pack once", affected_faces=affected,
                   unaffected_edge_ratio_error_limit=MAX_UNAFFECTED_EDGE_RATIO_ERROR,
-                  pack_settings=dict(udim_source="ACTIVE_UDIM", rotate=True, rotate_method="CARDINAL", margin=0.02,
+                  pack_settings=dict(udim_source="ACTIVE_UDIM", rotate=True, rotate_method="CARDINAL", margin=padding["fraction"],
                       margin_method="FRACTION", scale=True, merge_overlap=False, pin=False, shape_method="CONCAVE"))
     density, basis = isolate_faces(target, before.copy(), affected)
     record.update(triangle_chart_density=density, triangle_chart_density_basis=basis)
@@ -135,7 +135,7 @@ def qualify_atlas(target, binary, output, record):
         isolated[unaffected], before.reshape(-1, 3, 2)[unaffected]))
     if not record["unaffected_corners_before_pack_preserved"]:
         raise ValueError("triangle-chart isolation changed unaffected UV interiors")
-    pack_once(target)
+    pack_once(target, padding)
     after = coordinates(mesh)
     record["after_sha256"] = digest(after)
     record["after"] = check(mesh, binary, output, "after")

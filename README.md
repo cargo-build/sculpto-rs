@@ -107,11 +107,22 @@ Example recipe (paths are explicitly supplied local fixtures):
   "control_frame": "sculpto-source-local-y-up",
   "resolution": 2048,
   "margin": 8,
+  "atlas_padding_px": 18,
   "frame_max_distance": 0.002,
   "cage_extrusion": 0.0015,
   "max_ray_distance": 0.003
 }
 ```
+
+Required `atlas_padding_px` is an integer native atlas-padding request in texels,
+separate from bake-dilation `margin`. It must be at least `margin` and at most
+`resolution // 16` (zero is allowed when `margin` is zero); booleans, missing,
+nonintegral and invalid values reject before native mutation or output creation.
+The adapter resolves `atlas_padding_px / resolution` once and uses that same
+configuration for initial unwrap and any bounded repair pack, recording the
+pixel request, resolution and fraction in both receipts. This request does not
+prove an equal inter-chart gap, safe raster dilation or arbitrary mip filtering;
+those need separate actual gap/filter evidence.
 
 `sculpto-source-local-y-up` means control `(x,y,z)` maps to source-local Blender
 `(x,-z,y)`, then through the original object's actual world matrix.

@@ -15,6 +15,7 @@ arguments = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 if len(arguments) != 1:
     raise SystemExit("expected explicit sculpto executable argument")
 binary = Path(arguments[0]).resolve()
+padding = dict(pixels=18, resolution=2048, fraction=18 / 2048)
 
 
 def fixture():
@@ -30,6 +31,46 @@ def fixture():
     return obj
 
 
+def many_charts():
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    vertices = [(2 * i + x, y, 0) for i in range(64) for x, y in ((0, 0), (1, 0), (0, .7))]
+    triangles = [(3 * i, 3 * i + 1, 3 * i + 2) for i in range(64)]
+    mesh = bpy.data.meshes.new("Many triangle charts")
+    mesh.from_pydata(vertices, [], triangles)
+    uv = np.asarray([[(i % 8) * .1 + .02 + x, (i // 8) * .1 + .02 + y]
+                     for i in range(64) for x, y in ((0, 0), (.05, 0), (0, .035))], dtype=np.float32)
+    uv[3:6] = uv[:3]
+    mesh.uv_layers.new().data.foreach_set("uv", uv.ravel())
+    obj = bpy.data.objects.new("Many triangle charts", mesh)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+
+def measured_square_envelopes(uv, resolution, radius):
+    """This fixture has one triangle per chart; measure all segment pairs in L-infinity."""
+    corners = uv.reshape(-1, 3, 2).astype(np.float64)
+    segments = np.stack((corners, np.roll(corners, 1, axis=1)), axis=2).reshape(-1, 2, 2)
+    a, b = segments[:, None, 0], segments[:, None, 1]
+    c, d = segments[None, :, 0], segments[None, :, 1]
+    def point_segment(point, first, second):
+        delta, edge = point - first, second - first
+        result = np.minimum(np.max(np.abs(delta), axis=-1), np.max(np.abs(delta - edge), axis=-1))
+        for sign in (-1, 1):
+            numerator = delta[..., 0] + sign * delta[..., 1]
+            denominator = edge[..., 0] + sign * edge[..., 1]
+            t = np.clip(np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0), 0, 1)
+            result = np.minimum(result, np.max(np.abs(delta - t[..., None] * edge), axis=-1))
+        return result
+    distances = np.minimum.reduce([point_segment(a, c, d), point_segment(b, c, d),
+                                   point_segment(c, a, b), point_segment(d, a, b)])
+    owners = np.repeat(np.arange(len(corners)), 3)
+    distances[owners[:, None] == owners[None, :]] = np.inf
+    gap = float(distances.min()) * resolution
+    border = float(min(uv.min(), 1 - uv.max())) * resolution
+    assert gap > 2 * radius and border > radius, (gap, border, radius)
+    return dict(square_gap_texels=gap, border_texels=border, radius_texels=radius)
+
+
 with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     root = Path(temporary)
     target = fixture()
@@ -38,7 +79,9 @@ with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     record = {}
     output = root / "repair"
     output.mkdir()
-    atlas.qualify_atlas(target, binary, output, record)
+    atlas.qualify_atlas(target, binary, output, record, padding)
+    assert record["padding"] is padding
+    assert record["pack_settings"]["margin"] == padding["fraction"]
     assert record["before"]["overlap_pairs"] == [[0, 1]]
     assert record["affected_faces"] == [0, 1]
     assert record["after"]["verdict"]["passed"]
@@ -52,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     clean_output.mkdir()
     clean_record = {}
     with patch.object(atlas, "pack_once", side_effect=AssertionError("clean atlas was repacked")):
-        atlas.qualify_atlas(target, binary, clean_output, clean_record)
+        atlas.qualify_atlas(target, binary, clean_output, clean_record, padding)
     assert np.array_equal(clean, atlas.coordinates(target.data))
     assert clean_record["before_sha256"] == clean_record["after_sha256"]
     target = fixture()
@@ -61,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     failure = {}
     with patch.object(atlas, "pack_once", return_value=None):
         try:
-            atlas.qualify_atlas(target, binary, failed, failure)
+            atlas.qualify_atlas(target, binary, failed, failure, padding)
         except ValueError as error:
             assert "after one native repack" in str(error)
         else:
@@ -74,14 +117,14 @@ with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     distorted.mkdir()
     distortion = {}
     native_pack = atlas.pack_once
-    def distort_pack(obj):
-        native_pack(obj)
+    def distort_pack(obj, padding):
+        native_pack(obj, padding)
         uv = atlas.coordinates(obj.data)
         uv[:, 0] *= 0.5
         obj.data.uv_layers.active.data.foreach_set("uv", uv.ravel())
     with patch.object(atlas, "pack_once", side_effect=distort_pack):
         try:
-            atlas.qualify_atlas(target, binary, distorted, distortion)
+            atlas.qualify_atlas(target, binary, distorted, distortion, padding)
         except ValueError as error:
             assert "distorted unaffected chart" in str(error)
         else:
@@ -98,7 +141,27 @@ with tempfile.TemporaryDirectory(prefix="sculpto-atlas-native-") as temporary:
     collapsed = root / "collapsed"
     collapsed.mkdir()
     record = {}
-    atlas.qualify_atlas(target, binary, collapsed, record)
+    atlas.qualify_atlas(target, binary, collapsed, record, padding)
     assert record["before"]["degenerate_triangles"] == [0]
     assert record["after"]["verdict"]["passed"]
-    print("PASS: diagnosed charts repair once; clean UVs stay exact; physical topology/unaffected chart adjacency remain; failed pack refuses")
+    for resolution in (1024, 2048):
+        target = many_charts()
+        config = dict(pixels=18, resolution=resolution, fraction=18 / resolution)
+        output = root / f"many-{resolution}"
+        output.mkdir()
+        record = {}
+        with patch.object(atlas, "pack_once", wraps=atlas.pack_once) as packing:
+            atlas.qualify_atlas(target, binary, output, record, config)
+        packing.assert_called_once_with(target, config)
+        assert record["before"]["overlap_pairs"] == [[0, 1]] and record["after"]["verdict"]["passed"]
+        assert record["padding"] is config and record["pack_settings"]["margin"] == config["fraction"]
+        packed = atlas.coordinates(target.data).copy()
+        measured = measured_square_envelopes(packed, resolution, 8)
+        clean_output = root / f"many-clean-{resolution}"
+        clean_output.mkdir()
+        with patch.object(atlas, "pack_once", side_effect=AssertionError("clean many-chart atlas was repacked")):
+            atlas.qualify_atlas(target, binary, clean_output, {}, config)
+        assert np.array_equal(packed, atlas.coordinates(target.data))
+        assert measured_square_envelopes(atlas.coordinates(target.data), resolution, 8) == measured
+        print("MEASURED_BASE_LEVEL_FIXTURE", resolution, measured)
+    print("PASS: explicit padding propagation; many-chart repaired/retained base-level envelopes; complete UV/shape/topology and one-pack refusal")
