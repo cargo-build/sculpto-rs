@@ -998,3 +998,199 @@ fn declared_and_plane_frames_report_the_same_planes() {
         "the same plane declared in two frames must emit identical mesh-frame planes"
     );
 }
+
+/// Two separated equal squares in source coordinates: two source components.
+fn two_squares() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    (
+        vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+            [11.0, 1.0, 0.0],
+            [10.0, 1.0, 0.0],
+        ],
+        vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+    )
+}
+
+fn two_component_profile_json() -> String {
+    r#"{
+  "frame": "source-local-z-up",
+  "surface": "boundary",
+  "guide_segments": [[[0.5, 0.5, -1.0], [0.5, 0.5, 2.0]]],
+  "apertures": [
+    {"role": "opening", "anchor": [0.5, 0.5, 0.0], "radius": 0.2}
+  ],
+  "source_repair": {
+    "max_incidental_loops": 0,
+    "collapse_below_edges": 0,
+    "max_fill_edges": 32,
+    "max_tip_removal_share": 0.05
+  },
+  "reduced_repair": {
+    "max_incidental_loops": 0,
+    "collapse_below_edges": 0,
+    "max_fill_edges": 32,
+    "max_tip_removal_share": 0.05
+  },
+  "reduction": {
+    "target_triangles": 2,
+    "minimum_triangles": 2,
+    "maximum_triangles": 140
+  },
+  "coverage": {"tolerance": 0.01, "minimum": 0.8},
+  "contact": {"mode": "reject", "clearance": 0.000001, "max_displacement": 0.001, "max_pairs": 1}
+}"#
+    .to_string()
+}
+
+#[test]
+fn a_discarded_source_island_stays_in_the_coverage_denominator() {
+    let directory = directory();
+    let source = directory.join("source.obj");
+    let control = directory.join("control.obj");
+    let profile = directory.join("profile.json");
+    let report = directory.join("report.json");
+
+    let (positions, triangles) = two_squares();
+    write_obj(&source, &positions, &triangles);
+    // The control reproduces only the first square; the second is a discarded island.
+    write_obj(&control, &positions[..4], &[[0, 1, 2], [0, 2, 3]]);
+    fs::write(&profile, two_component_profile_json()).unwrap();
+
+    let check = run(&[
+        "garment",
+        "control-check",
+        "--control",
+        control.to_str().unwrap(),
+        "--source",
+        source.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        !check.status.success(),
+        "a control covering half the source must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("source exterior to control coverage 50.0%"),
+        "{stderr}"
+    );
+    let report = read_json(&report);
+    assert_eq!(
+        report["source_selection"]["selected_faces"], 2,
+        "the constructor keeps one component"
+    );
+    assert_eq!(
+        report["source_selection"]["reference_faces"], 4,
+        "coverage keeps the discarded island"
+    );
+    assert_eq!(
+        report["deviations"]["source_exterior_to_control"]["coverage"],
+        0.5
+    );
+    assert!(!report["verdict"]["passed"].as_bool().unwrap());
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+/// A box whose bottom cap is a fan around one interior vertex.
+fn box_with_fan_cap() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let mut positions = box_shell().0;
+    positions.push([0.5, 0.5, 0.0]);
+    let triangles = vec![
+        [0, 3, 8],
+        [3, 2, 8],
+        [2, 1, 8],
+        [1, 0, 8],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+        [4, 5, 6],
+        [4, 6, 7],
+    ];
+    (positions, triangles)
+}
+
+#[test]
+fn recovered_disk_vertices_are_measured_by_the_coverage_gate() {
+    let directory = directory();
+    let source = directory.join("source.obj");
+    let profile = directory.join("profile.json");
+    let control = directory.join("control.obj");
+    let plan = directory.join("plan.json");
+    let report = directory.join("report.json");
+
+    let (positions, triangles) = box_with_fan_cap();
+    write_obj(&source, &positions, &triangles);
+    fs::write(&profile, box_profile_json()).unwrap();
+
+    let exterior = run(&[
+        "garment",
+        "control-exterior",
+        "--source",
+        source.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--out",
+        control.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(
+        exterior.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exterior.stderr)
+    );
+    let plan = read_json(&plan);
+    let disks = plan["recovery"]["disks"].as_array().unwrap();
+    assert_eq!(disks.len(), 1);
+    assert_eq!(
+        disks[0]["faces"].as_array().unwrap().len(),
+        4,
+        "the fan cap is four original faces"
+    );
+
+    // A control that omits the recovered fan: its centre vertex is only in the
+    // recovered disk, so the reference denominator must still count it.
+    let walls = &triangles[4..];
+    let partial = directory.join("partial.obj");
+    write_obj(&partial, &positions, walls);
+    let check = run(&[
+        "garment",
+        "control-check",
+        "--control",
+        partial.to_str().unwrap(),
+        "--source",
+        source.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        !check.status.success(),
+        "a control missing the fan leaves an opening"
+    );
+    let report = read_json(&report);
+    assert_eq!(report["source_selection"]["reference_faces"], 12);
+    assert_eq!(
+        report["deviations"]["source_exterior_to_control"]["points"], 9,
+        "the recovered fan's centre is a reference vertex"
+    );
+    assert_eq!(
+        report["deviations"]["source_exterior_to_control"]["covered"], 8,
+        "the centre is not covered by a control that omits the disk"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}

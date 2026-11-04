@@ -1497,6 +1497,11 @@ pub struct SourceSelection {
     pub loops: Vec<BoundaryLoop>,
     pub apertures: ApertureResolution,
     pub recovery: RecoveryReport,
+    /// Faces a control must reproduce: the eligible exterior before component/tip
+    /// pruning, plus every recovered original disk. Coverage measures this set, so a
+    /// discarded island still counts as missing surface; the constructor's own faces
+    /// remain `selected_faces`. @req DECL0013
+    pub reference_faces: Vec<u32>,
 }
 
 /// One pruned selection before compaction.
@@ -1626,17 +1631,33 @@ pub fn source_selection(
             .flat_map(|matched| loops[matched.loop_index].vertices.iter().copied())
             .collect::<HashSet<_>>();
         let kept = pruned.faces.iter().copied().collect::<HashSet<_>>();
+        // The source stage's own plan decides which loops it is authorized to close: it
+        // owns the incidental count, closure and fill limits. A recovered disk consumes
+        // exactly the fill authorization it replaces. An unauthorized initial plan
+        // recovers nothing and leaves its error to the closure planner.
+        let fillable = repair_actions(
+            surface.positions(),
+            &pruned.triangles,
+            &loops,
+            &apertures,
+            &profile.source_repair,
+        )
+        .map(|actions| {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    RepairAction::Fill { loop_index, .. } => Some(*loop_index),
+                    RepairAction::Collapse { .. } => None,
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
         let mut added = Vec::new();
         for index in apertures.incidental.clone() {
-            let boundary = &loops[index];
-            // Only a loop the published repair path would have filled is eligible; a
-            // collapse or an over-limit loop keeps the existing behaviour.
-            let fillable = boundary.closed
-                && boundary.edges > profile.source_repair.collapse_below_edges
-                && boundary.edges <= profile.source_repair.max_fill_edges;
-            if !fillable {
+            if !fillable.contains(&index) {
                 continue;
             }
+            let boundary = &loops[index];
             match recovery::recover_disk(
                 &surface,
                 &degenerate,
@@ -1667,6 +1688,18 @@ pub fn source_selection(
             apertures = resolve_apertures(&loops, &profile.apertures)?;
         }
     }
+    // Re-pruning after recovery only grows the kept component and only merges face
+    // fans, so it can drop a previously selected face only through a defect; the
+    // reference set keeps the full pre-prune exterior either way.
+    let mut reference_faces = kept_indices;
+    reference_faces.extend(
+        recovery
+            .disks
+            .iter()
+            .flat_map(|disk| disk.faces.iter().copied()),
+    );
+    reference_faces.sort_unstable();
+    reference_faces.dedup();
     Ok(SourceSelection {
         surface,
         selected_faces: pruned.faces,
@@ -1680,6 +1713,7 @@ pub fn source_selection(
         loops,
         apertures,
         recovery,
+        reference_faces,
     })
 }
 

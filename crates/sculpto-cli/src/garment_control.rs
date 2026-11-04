@@ -214,10 +214,12 @@ pub fn check_inner(args: &[String]) -> Result<(), String> {
     // The coverage path consumes the constructor's own selection, recovery included,
     // so a recovered disk is never measured against a surface it is part of.
     let selection = source_selection(&source, &source_triangles, &profile);
+    // Coverage measures the reference exterior, not the constructor's pruned subset:
+    // a discarded island or a recovered disk stays in the denominator.
     let deviations = selection.as_ref().ok().map(|selection| {
         sculpto_mesh::control::measure::deviations(
             &selection.surface,
-            &selection.selected_faces,
+            &selection.reference_faces,
             &control,
             &control_triangles,
             &profile.coverage,
@@ -616,6 +618,7 @@ fn check_report(
         "source_selection": match evidence.selection {
             Some(selection) => json!({
                 "selected_faces": selection.selected_faces.len(),
+                "reference_faces": selection.reference_faces.len(),
                 "recovery": recovery_json(&selection.recovery),
             }),
             None => Value::Null,

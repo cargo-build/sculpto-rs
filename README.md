@@ -227,7 +227,10 @@ measures the finished surface and enforces the acceptance conjunction: one
 manifold disk shell, consistent directed winding, exactly the declared apertures,
 the Euler characteristic of the declared topology (`expected_genus` with that many
 openings), zero coincident vertices, zero residual contacts, the declared triangle
-bounds and the declared bidirectional coverage.
+bounds and the declared bidirectional coverage. Coverage samples the *reference*
+exterior — the eligible source faces before component/tip pruning plus every recovered
+disk — so a control that omits a discarded island or a recovered fold is measured as
+missing surface; the pruned construction selection is reported separately.
 
 The profile is data, not a search space:
 
@@ -292,7 +295,9 @@ one that is a connected oriented manifold disk whose entire boundary is exactly 
 incidental loop already eligible for a source-stage fill, joining the kept faces
 with opposite directed winding and touching no named aperture; the original
 positions and source-face lineage are kept, and nothing is welded, moved or
-invented. Any other component keeps the native fill/refusal path, and every
+invented. Recovery is authorized exactly where the declared `source_repair` plan would
+itself close the loop: a recovered disk consumes the fill it replaces, so an
+unauthorized count, closure or fill limit still refuses before any disk is claimed. Any other component keeps the native fill/refusal path, and every
 recovery or refusal is reported with its loop, faces, boundary-edge count and
 Euler characteristic. `expected_genus` is the topology the finished control must
 have: the accepted value is `2 - 2 * expected_genus - boundary_loops`. Omitted

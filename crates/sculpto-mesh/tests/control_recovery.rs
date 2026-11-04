@@ -212,6 +212,17 @@ fn a_recovered_disk_keeps_its_original_faces_corners_and_first_use_vertices() {
     let selection = source_selection(&positions, &triangles, &declared).unwrap();
     assert_eq!(selection.recovery, outcome.recovery);
     assert_eq!(selection.selected_faces, outcome.selected_faces);
+
+    // Recovery only adds fabric: every face the published route keeps stays kept.
+    let published =
+        source_selection(&positions, &triangles, &profile(SourceRecovery::None)).unwrap();
+    assert!(
+        published
+            .selected_faces
+            .iter()
+            .all(|face| outcome.selected_faces.contains(face)),
+        "the second prune must not drop a previously selected face"
+    );
 }
 
 #[test]
@@ -381,5 +392,87 @@ fn an_ineligible_loop_keeps_the_existing_refusal_path() {
     assert!(
         profile.source_repair.max_fill_edges < 4,
         "recovery eligibility follows the same declared limit"
+    );
+}
+
+#[test]
+fn recovery_respects_the_initial_source_repair_authorization() {
+    let (positions, triangles) = box_shell();
+    let mut profile = profile(SourceRecovery::IncidentalDisks);
+    // One incidental loop exists; a zero-count source stage is not authorized to close
+    // it, so the disk it would replace is not eligible either.
+    profile.source_repair.max_incidental_loops = 0;
+    assert_eq!(
+        exterior_control(&positions, &triangles, &profile),
+        Err(ControlError::IncidentalLimit { loops: 1, limit: 0 })
+    );
+    assert!(
+        source_selection(&positions, &triangles, &profile)
+            .unwrap()
+            .recovery
+            .disks
+            .is_empty(),
+        "no disk is recovered under an unauthorized source plan"
+    );
+
+    // The published count authorizes one closure, which the disk consumes.
+    profile.source_repair.max_incidental_loops = 1;
+    let outcome = exterior_control(&positions, &triangles, &profile).unwrap();
+    assert_eq!(outcome.recovery.disks.len(), 1);
+    assert_eq!(outcome.actions.len(), 0);
+}
+
+#[test]
+fn the_coverage_reference_set_keeps_the_unpruned_exterior_and_recovered_disks() {
+    // Two separated squares: the guide/boundary surface keeps both, pruning keeps one.
+    let positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [11.0, 0.0, 0.0],
+        [11.0, 1.0, 0.0],
+        [10.0, 1.0, 0.0],
+    ];
+    let triangles = vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]];
+    let mut unresolved = profile(SourceRecovery::None);
+    unresolved.surface = SurfacePolicy::Boundary;
+    unresolved.source_repair.max_incidental_loops = 0;
+    unresolved.apertures[0].anchor = [0.5, 0.5, 0.0];
+    unresolved.apertures[0].radius = 0.2;
+    let selection = source_selection(&positions, &triangles, &unresolved).unwrap();
+    assert_eq!(selection.selected_faces.len(), 2, "one island is discarded");
+    assert_eq!(
+        selection.reference_faces.len(),
+        4,
+        "the discarded island stays in the coverage denominator"
+    );
+
+    // A recovered disk is part of the reference set even though it is not a kept
+    // face of the pre-recovery exterior.
+    let (positions, triangles) = box_shell();
+    let with_recovery = source_selection(
+        &positions,
+        &triangles,
+        &profile(SourceRecovery::IncidentalDisks),
+    )
+    .unwrap();
+    let disk_faces = with_recovery.recovery.disks[0]
+        .faces
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert!(
+        disk_faces
+            .iter()
+            .all(|face| with_recovery.reference_faces.contains(face)),
+        "recovered faces are reference faces"
+    );
+    assert!(
+        with_recovery
+            .selected_faces
+            .iter()
+            .all(|face| with_recovery.reference_faces.contains(face))
     );
 }
