@@ -14,6 +14,7 @@ struct Channel {
     property: Property,
     times: Vec<f64>,
     values: Values,
+    step: bool,
 }
 
 #[derive(Debug)]
@@ -112,10 +113,11 @@ fn apply(
                 }
                 _ => {}
             }
-            match channel.sampler().interpolation() {
-                Interpolation::Linear => {}
+            let step = match channel.sampler().interpolation() {
+                Interpolation::Linear => false,
+                Interpolation::Step => true,
                 value => return Err(unsupported(&context, format!("{value:?} interpolation"))),
-            }
+            };
             match transforms[node] {
                 Transform::Matrix(_) => {
                     return Err(invalid(&context, "animation targets a static matrix node"));
@@ -165,6 +167,7 @@ fn apply(
                 property,
                 times,
                 values,
+                step,
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -179,15 +182,30 @@ fn apply(
 }
 
 fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result<(), ActorError> {
-    let upper = channel
-        .times
-        .partition_point(|&value| value <= time)
-        .min(channel.times.len() - 1);
-    let lower = upper.saturating_sub(1);
-    let alpha = match lower == upper {
-        true => 0.0,
-        false => ((time - channel.times[lower]) / (channel.times[upper] - channel.times[lower]))
-            .clamp(0.0, 1.0),
+    let last = channel.times.len() - 1;
+    let (lower, upper, alpha) = match channel.step {
+        true => {
+            let index = channel
+                .times
+                .partition_point(|&value| value <= time)
+                .saturating_sub(1)
+                .min(last);
+            (index, index, 0.0)
+        }
+        false => {
+            let upper = channel
+                .times
+                .partition_point(|&value| value <= time)
+                .min(last);
+            let lower = upper.saturating_sub(1);
+            let alpha = match lower == upper {
+                true => 0.0,
+                false => ((time - channel.times[lower])
+                    / (channel.times[upper] - channel.times[lower]))
+                    .clamp(0.0, 1.0),
+            };
+            (lower, upper, alpha)
+        }
     };
     let Transform::Trs {
         translation,

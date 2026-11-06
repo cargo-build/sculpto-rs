@@ -388,6 +388,28 @@ fn invalid_skin_indices_weights_and_selected_features_are_rejected() {
 }
 
 #[test]
+fn step_interpolation_holds_the_lower_key_until_the_next_one() {
+    let mut fixture = Fixture::triangle();
+    fixture.channel(0, "translation", &[0.25, 0.75], &[2., 0., 0., 4., 0., 0.]);
+    fixture.json["animations"][0]["samplers"][0]["interpolation"] = json!("STEP");
+    let actor = Actor::from_glb(&fixture.bytes()).unwrap();
+    for (time, expected) in [
+        (0.3, [3., 0., 0.]),
+        (0.5, [3., 0., 0.]),
+        (0.75, [5., 0., 0.]),
+        (0.7, [3., 0., 0.]),
+    ] {
+        near(
+            actor
+                .sample(&["Body"], Pose::Clip { name: "Run", time })
+                .unwrap()
+                .vertices[0],
+            expected,
+        );
+    }
+}
+
+#[test]
 fn duplicate_channels_invalid_times_and_unsupported_interpolation_fail() {
     (0..5).for_each(|case| {
         let mut fixture = Fixture::triangle();
@@ -400,7 +422,9 @@ fn duplicate_channels_invalid_times_and_unsupported_interpolation_fail() {
                     .unwrap()
                     .push(channel);
             }
-            1 => fixture.json["animations"][0]["samplers"][0]["interpolation"] = json!("STEP"),
+            1 => {
+                fixture.json["animations"][0]["samplers"][0]["interpolation"] = json!("CUBICSPLINE")
+            }
             2 => {
                 let i = fixture.json["animations"][0]["samplers"][0]["input"]
                     .as_u64()
