@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "tools/span-manifest"]
-exclude = ["vendor/byroredux"]
+exclude = ["vendor/byroredux", "tools/bevy-viewer"]
 resolver = "3"
 
 [workspace.package]
