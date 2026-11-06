@@ -9,11 +9,29 @@ fn env_f32(key: &str, default: f32) -> f32 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+#[derive(Resource)]
+struct Units(usize);
+
+#[derive(Resource)]
+struct Bench(bool);
+
 fn main() {
+    // The ordinary proof runs at 60 Hz so captures land on stable ticks. The
+    // units benchmark must not be capped: a 16.7 ms sleep would hide the real
+    // playback cost.
+    let interval = if std::env::var("SCULPTO_VIEWER_UNCAPPED").is_ok() {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_secs_f64(1.0 / 60.0)
+    };
     App::new()
-        .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
-            std::time::Duration::from_secs_f64(1.0 / 60.0),
-        ))
+        .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(interval))
+        .insert_resource(Units(env_usize("SCULPTO_VIEWER_UNITS", 1)))
+        .insert_resource(Bench(std::env::var("SCULPTO_VIEWER_BENCH").is_ok()))
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -55,7 +73,7 @@ fn main() {
             ..default()
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, (advance_animation, capture_once))
+        .add_systems(Update, (advance_animation, capture_once, benchmark))
         .run();
 }
 
@@ -74,6 +92,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     asset_server: Res<AssetServer>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
+    units: Res<Units>,
 ) {
     let mut image = Image::new(
         Extent3d { width: 960, height: 900, depth_or_array_layers: 1 },
@@ -88,11 +107,21 @@ fn setup(
         | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
     let handle = images.add(image);
     commands.insert_resource(Target(handle.clone()));
+    let count = units.0.max(1);
+    let columns = (count as f32).sqrt().ceil() as usize;
+    let rows = count.div_ceil(columns);
+    let spacing = 0.9_f32;
+    let (camera_eye, camera_target) = if count > 1 {
+        let extent = (columns.max(rows) as f32 - 1.0) * spacing + 1.5;
+        (Vec3::new(extent * 1.4, 1.4, extent * 1.8), Vec3::new(0.0, 0.9, 0.0))
+    } else {
+        (Vec3::new(2.2, 1.3, 2.8), Vec3::new(0.0, 0.9, 0.0))
+    };
     commands.spawn((
         Camera3d::default(),
         bevy::core_pipeline::tonemapping::Tonemapping::None,
         Camera { target: handle.into(), ..default() },
-        Transform::from_xyz(2.2, 1.3, 2.8).looking_at(Vec3::new(0.0, 0.9, 0.0), Vec3::Y),
+        Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
     commands.spawn((
         DirectionalLight { illuminance: 10_000.0, ..default() },
@@ -117,7 +146,14 @@ fn setup(
         handle: graphs.add(graph),
         nodes: vec![actor_node, cloth_node],
     });
-    commands.spawn(SceneRoot(asset_server.load(format!("{asset}#Scene0"))));
+    let scene = asset_server.load(format!("{asset}#Scene0"));
+    for index in 0..count {
+        let column = index % columns;
+        let row = index / columns;
+        let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
+        let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
+        commands.spawn((SceneRoot(scene.clone()), Transform::from_xyz(x, 0.0, z)));
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -164,12 +200,16 @@ fn parse_series(spec: &str) -> Option<(u32, u32, u32)> {
 
 fn capture_once(
     target: Res<Target>,
+    bench: Res<Bench>,
     mut frames: Local<u32>,
     mut captured: Local<bool>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
     mut commands: Commands,
     mut exit: EventWriter<AppExit>,
 ) {
+    if bench.0 {
+        return;
+    }
     *frames += 1;
     if *frames < 240 {
         return;
@@ -224,4 +264,49 @@ fn capture_once(
             "SCULPTO_VIEWER_PNG",
             "/tmp/sculpto-classify/cloth/bevy_combined_240.png",
         )));
+}
+
+/// Units benchmark: N scene instances, a warmup, then p50/p95 frame time and
+/// the process RSS. It exits through the same `AppExit` path as the captures.
+fn benchmark(
+    time: Res<Time>,
+    units: Res<Units>,
+    bench: Res<Bench>,
+    mut frames: Local<u32>,
+    mut samples: Local<Vec<f32>>,
+    mut exit: EventWriter<AppExit>,
+) {
+    if !bench.0 {
+        return;
+    }
+    *frames += 1;
+    if *frames > 240 {
+        samples.push(time.delta_secs());
+    }
+    if *frames <= 540 {
+        return;
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_by(f32::total_cmp);
+    let mean = sorted.iter().sum::<f32>() / sorted.len().max(1) as f32;
+    let p50 = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
+    let p95 = sorted.get((sorted.len() as f32 * 0.95) as usize).copied().unwrap_or(0.0);
+    let rss = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .map(|line| line.trim().to_owned())
+        })
+        .unwrap_or_else(|| "VmRSS: unknown".to_owned());
+    info!(
+        "BENCH units={} ticks={} mean_ms={:.3} p50_ms={:.3} p95_ms={:.3} {}",
+        units.0,
+        sorted.len(),
+        mean * 1000.0,
+        p50 * 1000.0,
+        p95 * 1000.0,
+        rss
+    );
+    exit.write(AppExit::Success);
 }
