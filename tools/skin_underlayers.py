@@ -42,6 +42,10 @@ actor_path = cfg["actor"]
 out_path = cfg["out"]
 unders = [v for k, v in (a.split("=", 1) for a in argv if a.startswith("under="))]
 align_path = cfg.get("align")
+# lift=x,y,z replaces align= when no same-topology body OBJ exists (e.g.
+# skinned garments onto a replacement-body actor): the OBJ-family -> GLB
+# scene offset, applied without measurement.
+lift_override = cfg.get("lift")
 color_hex = cfg.get("color", "7a6a58")
 # replace_body=1 drops every existing skinned mesh after their weights are
 # collected: the under= meshes then ARE the actor's body (male actor build —
@@ -146,10 +150,13 @@ for part in parts:
         skin_polygons.append([part_offsets[part.name] + int(i) for i in polygon.vertices])
 skin = BVHTree.FromPolygons(flat, skin_polygons)
 
-if not align_path:
-    raise SystemExit("align=<body.obj> is required (frame offset is measured, not guessed)")
+if not align_path and not lift_override:
+    raise SystemExit("align=<body.obj> or lift=<x,y,z> is required (frame offset is measured or declared, never guessed)")
 lift = None
-if True:
+if lift_override:
+    lift = Vector(tuple(float(c) for c in lift_override.split(",")))
+    print(f"align lift (declared): {[round(c, 4) for c in lift]}")
+elif True:
     ref, _ = read_obj(align_path)
     ref_world = to_world(ref)
     if len(ref) != len(body.data.vertices):
