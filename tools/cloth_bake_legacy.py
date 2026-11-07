@@ -42,6 +42,11 @@ clip = cfg["clip"]
 frame_end_cap = int(cfg.get("frame_end", 60))
 sample = int(cfg.get("sample", 1))
 pin_z = float(cfg.get("pin_z", "1.406"))
+# pin_back=1 also pins the back yoke/hood above pin_back_z (the hood is a
+# second cloth layer over the back panel; a partial pin tears it across the
+# boundary and the two layers fold through each other on broad backs).
+pin_back = int(cfg.get("pin_back", "0"))
+pin_back_z = float(cfg.get("pin_back_z", "1.0"))
 body_name = cfg.get("body", "BaseShape")
 bending = float(cfg.get("bending", "20"))
 structural = float(cfg.get("structural", "200"))
@@ -76,6 +81,14 @@ garment.name = "SculptoGarment0"
 pinned = [
     v.index for v in garment.data.vertices if (garment.matrix_world @ v.co).z >= pin_z
 ]
+if pin_back:
+    pinned += [
+        v.index
+        for v in garment.data.vertices
+        if (garment.matrix_world @ v.co).z >= pin_back_z
+        and (garment.matrix_world @ v.co).y >= 0.0
+        and v.index not in set(pinned)
+    ]
 if not pinned:
     raise SystemExit(f"no vertices at or above pin_z={pin_z}; the garment would fall")
 garment.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
