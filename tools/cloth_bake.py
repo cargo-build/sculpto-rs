@@ -49,6 +49,8 @@ constraint_steps = int(cfg.get("constraint_steps", 15))
 stretchiness = float(cfg.get("stretchiness", 0.0))
 pin_band = float(cfg.get("pin_band", 0.12))
 collider_friction = float(cfg.get("collider_friction", 0.2))
+collider_margin = float(cfg.get("collider_margin", 0.0))
+edge_contacts = int(cfg.get("edge_contacts", 0))
 sample = int(cfg.get("sample", 10))
 
 # `system_resource` resolves directories; file paths must be joined on.
@@ -95,7 +97,12 @@ body.hide_render = False
 collider = body.modifiers.new("XpbdCollider", "NODES")
 collider.node_group = collider_group
 collider_mod_inputs = collider.properties.inputs
-collider_mod_inputs[socket_ids(collider_group)["Deforming"]]["value"] = True
+collider_ids = socket_ids(collider_group)
+collider_mod_inputs[collider_ids["Deforming"]]["value"] = True
+collider_mod_inputs[collider_ids["Margin"]]["value"] = collider_margin
+collider_mod_inputs[collider_ids["Edge Contacts"]]["value"] = bool(edge_contacts)
+collider_mod_inputs[collider_ids["Friction"]]["value"] = collider_friction
+report["contact"] = {"margin": collider_margin, "edge_contacts": bool(edge_contacts)}
 
 effectors = bpy.data.collections.new("Effectors")
 scene.collection.children.link(effectors)
