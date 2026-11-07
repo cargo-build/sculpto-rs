@@ -4,6 +4,8 @@ Usage (headless, meters-scale actor scene):
   blender --background <character.blend> --python cloth_bake.py -- \
       garment=<fitted.obj> out=<dir> clip=Combat_Idle \
       [body=BaseShape] [settle=24] [frame_end=140] [pin_height=0.85] [sample=10]
+      [pin_mode=auto|above] [pin_contact=0.02] [bendiness=0] [gravity=1]
+      [collide=1] [pin_all=0]
 
 Uses Blender 5.2's Geometry Nodes XPBD physics (the experimental
 `Cloth Dynamics (Experimental)` and `Collider` node-group assets). The legacy
@@ -33,6 +35,7 @@ import time
 from math import radians
 
 import bpy
+from mathutils.bvhtree import BVHTree
 
 argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
 cfg = dict(arg.split("=", 1) for arg in argv if "=" in arg)
@@ -47,7 +50,14 @@ pin_height = float(cfg.get("pin_height", 0.85))
 substeps = int(cfg.get("substeps", 5))
 constraint_steps = int(cfg.get("constraint_steps", 15))
 stretchiness = float(cfg.get("stretchiness", 0.0))
+bendiness = float(cfg.get("bendiness", 0.0))
+linear_damping = float(cfg.get("linear_damping", 1.0))
+gravity = int(cfg.get("gravity", 1))
+collide = int(cfg.get("collide", 1))
 pin_band = float(cfg.get("pin_band", 0.12))
+pin_contact = float(cfg.get("pin_contact", 0.02))
+pin_all = int(cfg.get("pin_all", 0))
+pin_mode = cfg.get("pin_mode", "auto")
 collider_friction = float(cfg.get("collider_friction", 0.2))
 collider_margin = float(cfg.get("collider_margin", 0.0))
 edge_contacts = int(cfg.get("edge_contacts", 0))
@@ -105,10 +115,15 @@ collider_mod_inputs[collider_ids["Edge Contacts"]]["value"] = bool(edge_contacts
 collider_mod_inputs[collider_ids["Friction"]]["value"] = collider_friction
 report["contact"] = {"margin": collider_margin, "edge_contacts": bool(edge_contacts),
                      "collision_radius": collision_radius}
+report["cloth"] = {"substeps": substeps, "constraint_steps": constraint_steps,
+                   "stretchiness": stretchiness, "bendiness": bendiness,
+                   "linear_damping": linear_damping, "gravity": bool(gravity), "collide": bool(collide),
+                   "pin_contact": pin_contact}
 
 effectors = bpy.data.collections.new("Effectors")
 scene.collection.children.link(effectors)
-effectors.objects.link(body)
+if collide:
+    effectors.objects.link(body)
 
 # --- garment --------------------------------------------------------------
 bpy.ops.wm.obj_import(filepath=os.path.abspath(garment_path))
@@ -155,30 +170,81 @@ def boundary_verts(obj):
     return sorted({v for edge, uses in edge_uses.items() if uses == 1 for v in edge})
 
 
-def pin_shell(obj, threshold_z, ring_fraction):
+def body_tree(obj):
+    """World-space BVH of the posed body for contact pinning."""
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    verts = [evaluated.matrix_world @ vertex.co for vertex in mesh.vertices]
+    polygons = [tuple(polygon.vertices) for polygon in mesh.polygons]
+    tree = BVHTree.FromPolygons(verts, polygons)
+    evaluated.to_mesh_clear()
+    return tree
+
+
+def pin_shell(obj, threshold_z, ring_fraction, tree, contact):
     """Pin boundary verts above `threshold_z`, or the shell's own top ring
     when the shell never reaches the body's shoulder line (a skirt pins at
-    its waist ring)."""
+    its waist ring). A closed lined shell has no boundary, so it pins the
+    vertices that rest on the body above the chest line: a cloak is carried by
+    its shoulders and clasp, not by a horizontal slice through free cloth."""
     z = [v.co.z for v in obj.data.vertices]
+    top = max(z)
+    bottom = min(z)
+    pinned = []
+    level = 0.0
+    rule = "boundary"
     candidates = boundary_verts(obj)
-    if not candidates:
-        return 0, 0.0
-    top = max(v.co.z for v in obj.data.vertices)
-    if top >= threshold_z:
-        level = threshold_z
-    else:
-        level = top - ring_fraction * (max(z) - min(z))
-    pinned = [v for v in candidates if obj.data.vertices[v].co.z >= level]
-    obj.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
-    return len(pinned), level
+    if candidates:
+        if top >= threshold_z:
+            level = threshold_z
+        else:
+            level = top - ring_fraction * (top - bottom)
+        pinned = [v for v in candidates if obj.data.vertices[v].co.z >= level]
+    if contact > 0.0:
+        # A draped cloak also rests on the shoulders, which have no boundary:
+        # without that support the whole weight hangs from the neck ring and
+        # the surface pleats into strips.
+        seen = set(pinned)
+        resting = []
+        for vertex in obj.data.vertices:
+            world = obj.matrix_world @ vertex.co
+            if world.z < threshold_z:
+                continue
+            hit = tree.find_nearest(world)
+            if hit[0] is not None and hit[3] <= contact and vertex.index not in seen:
+                seen.add(vertex.index)
+                resting.append(vertex.index)
+        if resting:
+            pinned += resting
+            rule = "boundary+contact" if candidates else "contact"
+    if not pinned:
+        rule = "band"
+        band_bottom = max(bottom, threshold_z - 0.02)
+        band_top = min(top, threshold_z + 0.06)
+        pinned = [v.index for v in obj.data.vertices if band_bottom <= v.co.z <= band_top]
+        level = round(band_bottom, 4)
+    if pinned:
+        obj.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
+    return len(pinned), level, rule
 
 
 report["pin"] = {"height_fraction": pin_height, "world_z": round(shoulder_z, 4), "shells": {}}
 report["shells"] = {}
+bvh = body_tree(body)
 for shell in shells:
     if len(shell.data.vertices) < 32:
         continue
-    pinned, level = pin_shell(shell, shoulder_z, pin_band)
+    if pin_mode == "above":
+        pinned = [v.index for v in shell.data.vertices if (shell.matrix_world @ v.co).z >= shoulder_z]
+        level, rule = shoulder_z, "above"
+        shell.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
+    elif pin_all:
+        pinned = [v.index for v in shell.data.vertices]
+        level, rule = shoulder_z, "all"
+        shell.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
+    else:
+        pinned, level, rule = pin_shell(shell, shoulder_z, pin_band, bvh, pin_contact)
     if pinned == 0:
         raise SystemExit(f"shell `{shell.name}` has no pinnable boundary ring; it would fall")
     dynamics = shell.modifiers.new("ClothDynamics", "NODES")
@@ -189,14 +255,18 @@ for shell in shells:
     inputs[dyn_ids["Substeps"]]["value"] = substeps
     inputs[dyn_ids["Constraint Steps"]]["value"] = constraint_steps
     inputs[dyn_ids["Stretchiness"]]["value"] = stretchiness
+    inputs[dyn_ids["Bendiness"]]["value"] = bendiness
+    inputs[dyn_ids["Linear Damping"]]["value"] = linear_damping
+    inputs[dyn_ids["Gravity"]]["value"] = bool(gravity)
     inputs[dyn_ids["Friction"]]["value"] = collider_friction
     # The collection must be bound as a datablock; a name string is stored
     # but never resolved (probe: cloth falls straight through the body).
     inputs[dyn_ids["Effectors Collection"]]["value"] = effectors
     report["shells"][shell.name] = {
         "verts": len(shell.data.vertices),
-        "pinned": pinned,
+        "pinned": len(pinned) if isinstance(pinned, list) else pinned,
         "pin_level": round(level, 4),
+        "pin_rule": rule,
     }
     report["pin"]["shells"][shell.name] = round(level, 4)
 
