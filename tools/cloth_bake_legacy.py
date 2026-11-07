@@ -5,7 +5,7 @@ Usage (headless, meters-scale actor scene):
       garment=<fitted.obj> out=<dir> clip=Idle \
       [frame_end=60] [sample=1] [pin_z=1.406] [body=BaseShape] \
       [bending=20] [structural=200] [mass=0.006] [self_min=0.0015] \
-      [body_min=0.002] [self_collision=1] [quality=10]
+      [body_min=0.002] [self_collision=1] [quality=10] [ground=0]
 
 Why this exists next to `cloth_bake.py`: the XPBD asset has no cloth
 self-collision and no bending stiffness that survives open flaps, so a cape's
@@ -50,6 +50,7 @@ self_min = float(cfg.get("self_min", "0.0015"))
 body_min = float(cfg.get("body_min", "0.002"))
 self_collision = int(cfg.get("self_collision", 1))
 quality = int(cfg.get("quality", 10))
+ground = int(cfg.get("ground", 0))
 os.makedirs(out_dir, exist_ok=True)
 
 scene = bpy.context.scene
@@ -80,6 +81,16 @@ if not pinned:
 garment.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
 
 body.modifiers.new("Collision", "COLLISION")
+if ground:
+    # A floor-length garment pools on the ground; without a floor the hem
+    # keeps falling below the feet through the whole clip.
+    floor_z = min((body.matrix_world @ v.co).z for v in body.data.vertices)
+    bpy.ops.mesh.primitive_plane_add(size=6, location=(0.0, 0.0, floor_z))
+    floor = bpy.context.object
+    floor.modifiers.new("Collision", "COLLISION")
+    floor.collision.thickness_outer = 0.002
+    floor.collision.cloth_friction = 5.0
+    floor.hide_render = True
 body.collision.thickness_outer = 0.005
 body.collision.cloth_friction = 5.0
 
@@ -121,7 +132,7 @@ report = {
         "mass": mass,
         "self_collision": bool(self_collision),
         "self_distance_min": self_min,
-        "body_distance_min": body_min,
+        "body_distance_min": body_min, "ground": bool(ground),
     },
     "frame_range": [0, frame_end],
     "frames": {},
