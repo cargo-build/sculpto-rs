@@ -213,35 +213,65 @@ def trousers_placement(body, garment):
 
 
 def footwear_placement(body, garment, foot_side):
-    """Sole length sets the scale; one boot rests on the chosen foot."""
+    """Sole length sets the scale; a PAIR splits per side and lands each
+    boot on its own foot. Single pieces keep the explicit side. The old
+    whole-mesh rule scaled a two-boot mesh to half size at one foot."""
     body_y = [v[1] for v in body]
     min_y, max_y = min(body_y), max(body_y)
-    foot = [v for v in body if v[1] <= min_y + FOOT_BAND * (max_y - min_y)]
+    band = FOOT_BAND * (max_y - min_y)
+    foot = [v for v in body if v[1] <= min_y + band]
     if not foot:
         raise SystemExit("body has no vertices in the foot band; cannot place footwear")
     split = sum(v[0] for v in foot) / len(foot)
-    side = [v for v in foot if (v[0] < split) == (foot_side == "left")]
-    if not side:
-        raise SystemExit(f"body has no `{foot_side}` foot in the band; cannot place footwear")
-    cx = sum(v[0] for v in side) / len(side)
-    cz = sum(v[2] for v in side) / len(side)
-    body_sole_z = max(v[2] for v in side) - min(v[2] for v in side)
-
     garment_y = [v[1] for v in garment]
     garment_min = min(garment_y)
-    span = max(garment_y) - garment_min
-    sole = [v for v in garment if v[1] <= garment_min + FOOT_BAND * span]
-    if not sole:
-        raise SystemExit("garment has no sole band; cannot place footwear")
-    garment_sole_z = max(v[2] for v in sole) - min(v[2] for v in sole)
-    if garment_sole_z <= 0.0:
-        raise SystemExit("garment sole band has no length; cannot scale footwear")
-    gcx = sum(v[0] for v in sole) / len(sole)
-    gcz = sum(v[2] for v in sole) / len(sole)
-    scale = body_sole_z / garment_sole_z
+    gsplit = sum(v[0] for v in garment) / len(garment)
+    left_g = [v for v in garment if v[0] < gsplit]
+    right_g = [v for v in garment if v[0] >= gsplit]
+    pair = (
+        foot_side == "auto"
+        and len(left_g) >= 0.15 * len(garment)
+        and len(right_g) >= 0.15 * len(garment)
+    )
+
+    def side_placement(gpart, side):
+        if not gpart:
+            raise SystemExit(f"garment has no `{side}` boot; cannot place a pair")
+        body_side = [v for v in foot if (v[0] < split) == (side == "left")]
+        if not body_side:
+            raise SystemExit(f"body has no `{side}` foot in the band; cannot place footwear")
+        cx = sum(v[0] for v in body_side) / len(body_side)
+        cz = sum(v[2] for v in body_side) / len(body_side)
+        body_sole_z = max(v[2] for v in body_side) - min(v[2] for v in body_side)
+        g_min = min(v[1] for v in gpart)
+        g_span = max(v[1] for v in gpart) - g_min
+        sole = [v for v in gpart if v[1] <= g_min + FOOT_BAND * g_span]
+        if not sole:
+            raise SystemExit(f"garment `{side}` boot has no sole band")
+        g_sole_z = max(v[2] for v in sole) - min(v[2] for v in sole)
+        if g_sole_z <= 0.0:
+            raise SystemExit(f"garment `{side}` sole has no length")
+        gcx = sum(v[0] for v in sole) / len(sole)
+        gcz = sum(v[2] for v in sole) / len(sole)
+        scale = body_sole_z / g_sole_z
+        return cx, cz, g_min, gcx, gcz, scale
+
+    if pair:
+        left = side_placement(left_g, "left")
+        right = side_placement(right_g, "right")
+        scale = (left[5] + right[5]) / 2
+
+        def place(x, y, z):
+            cx, cz, g_min, gcx, gcz, sc = left if x < gsplit else right
+            return (cx + (x - gcx) * sc, min_y + (y - g_min) * sc, cz + (z - gcz) * sc)
+
+        return place, scale, min_y
+
+    side_name = "left" if foot_side in ("auto", "left") else "right"
+    cx, cz, g_min, gcx, gcz, scale = side_placement(garment, side_name)
 
     def place(x, y, z):
-        return (cx + (x - gcx) * scale, min_y + (y - garment_min) * scale, cz + (z - gcz) * scale)
+        return (cx + (x - gcx) * scale, min_y + (y - g_min) * scale, cz + (z - gcz) * scale)
 
     return place, scale, min_y
 
@@ -252,7 +282,7 @@ def main():
     parser.add_argument("--body", required=True)
     parser.add_argument("--class", dest="kind", required=True, choices=KINDS)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--foot", choices=("left", "right"), default="left",
+    parser.add_argument("--foot", choices=("auto", "left", "right"), default="auto",
                         help="which foot a single footwear piece anchors on")
     args = parser.parse_args()
 
