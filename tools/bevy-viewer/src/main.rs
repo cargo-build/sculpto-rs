@@ -73,7 +73,7 @@ fn main() {
             ..default()
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, (advance_animation, capture_once, benchmark))
+        .add_systems(Update, (advance_animation, capture_once, benchmark, debug_scene))
         .run();
 }
 
@@ -264,6 +264,45 @@ fn capture_once(
             "SCULPTO_VIEWER_PNG",
             "/tmp/sculpto-classify/cloth/bevy_combined_240.png",
         )));
+}
+
+/// One-shot scene dump (SCULPTO_VIEWER_DEBUG_SCENE=1): every mesh entity
+/// with its glTF name, visibility components, bounding box and world
+/// transform — catches assets that load silently but never draw.
+fn debug_scene(
+    mut done: Local<bool>,
+    meshes: Query<(
+        Option<&Name>,
+        Option<&bevy::gltf::GltfMeshName>,
+        Option<&Visibility>,
+        Option<&InheritedVisibility>,
+        Option<&bevy::camera::primitives::Aabb>,
+        &GlobalTransform,
+    ), With<Mesh3d>>,
+) {
+    if *done || std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_err() {
+        return;
+    }
+    if meshes.is_empty() {
+        return; // scene spawns asynchronously; wait for it
+    }
+    *done = true;
+    for (name, gltf_name, vis, inherited, aabb, transform) in &meshes {
+        info!(
+            "mesh name={:?} gltf={:?} vis={:?} inherited={} aabb={} at {:?}",
+            name.map(|n| n.to_string()),
+            gltf_name.map(|g| g.0.clone()),
+            vis.copied(),
+            inherited
+                .copied()
+                .map(|v| format!("{}", v.get()))
+                .unwrap_or_else(|| "ABSENT".into()),
+            aabb
+                .map(|a| format!("{:.2}..={:.2}", a.min(), a.max()))
+                .unwrap_or_else(|| "NONE".into()),
+            transform.translation()
+        );
+    }
 }
 
 /// Units benchmark: N scene instances, a warmup, then p50/p95 frame time and
