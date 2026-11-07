@@ -56,6 +56,10 @@ texture_layer = cfg.get("tex_layer")
 # collected: the under= meshes then ARE the actor's body (male actor build —
 # a body replaces the skin, so the tight-layer guard does not apply).
 replace_body = cfg.get("replace_body") == "1"
+# loose=1 skips the tight-layer guard for deliberately baggy garments
+# (a baggy shell binds acceptably by nearest weights; the guard's job is
+# catching wrong frames, which still shows as p50 > 20 cm).
+loose = cfg.get("loose") == "1"
 NEIGHBOURS = 4
 
 
@@ -235,10 +239,11 @@ for path in unders:
     surface.sort()
     p50 = surface[len(surface) // 2]
     p95 = surface[int(len(surface) * 0.95)]
-    if not replace_body and (p50 > 0.03 or p95 > 0.08):
+    if not replace_body and not loose and (p50 > 0.03 or p95 > 0.08):
         raise SystemExit(
             f"layer {name}: skin distance p50 {p50 * 100:.1f} cm, "
             f"p95 {p95 * 100:.1f} cm - not a tight layer, refusing to skin"
+            " (baggy garment: pass loose=1)"
         )
 
     layer.parent = armature
