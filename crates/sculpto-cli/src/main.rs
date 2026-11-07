@@ -452,7 +452,7 @@ fn export_obj_inner(args: &[String]) -> Result<(), String> {
     let bytes = std::fs::read(&nif).map_err(|e| format!("{}: {e}", nif.display()))?;
     let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
     let shape = pick_shape(&document.shapes, flags.get("shape").map(String::as_str))?;
-    write_obj(&out, &shape.positions, &shape.triangles)
+    write_obj_uv(&out, &shape.positions, &shape.triangles, &shape.uvs)
         .map_err(|e| format!("{}: {e}", out.display()))?;
     println!(
         "{}: {} vertices, {} triangles (shape `{}`)",
@@ -1250,6 +1250,18 @@ fn pick_shape<'a>(shapes: &'a [NifShape], name: Option<&str>) -> Result<&'a NifS
 /// Wavefront OBJ in a Y-up display frame: source positions are Z-up, so they are
 /// converted as `(x, z, -y)` here. Both comparison exports use the same frame.
 fn write_obj(path: &Path, positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> std::io::Result<()> {
+    write_obj_uv(path, positions, triangles, &[])
+}
+
+/// Like [`write_obj`], plus per-vertex UVs as `vt`/`v/vt` pairs when the
+/// source shape authors them. NIF UVs are D3D-style (top-left origin), so
+/// `v` is emitted as `1 - v` for OBJ's bottom-left convention.
+fn write_obj_uv(
+    path: &Path,
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+    uvs: &[[f32; 2]],
+) -> std::io::Result<()> {
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
@@ -1258,8 +1270,19 @@ fn write_obj(path: &Path, positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> std
     for [x, y, z] in positions {
         writeln!(out, "v {x} {z} {}", -y)?;
     }
+    let with_uv = !uvs.is_empty() && uvs.len() == positions.len();
+    if with_uv {
+        for [u, v] in uvs {
+            writeln!(out, "vt {u} {}", 1.0 - v)?;
+        }
+    }
     for [a, b, c] in triangles {
-        writeln!(out, "f {} {} {}", a + 1, b + 1, c + 1)?;
+        if with_uv {
+            let (ai, bi, ci) = (a + 1, b + 1, c + 1);
+            writeln!(out, "f {ai}/{ai} {bi}/{bi} {ci}/{ci}")?;
+        } else {
+            writeln!(out, "f {} {} {}", a + 1, b + 1, c + 1)?;
+        }
     }
     out.flush()
 }

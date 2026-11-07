@@ -47,6 +47,11 @@ align_path = cfg.get("align")
 # scene offset, applied without measurement.
 lift_override = cfg.get("lift")
 color_hex = cfg.get("color", "7a6a58")
+# tex=<png> + tex_layer=<layer name>: attach a baked basecolor atlas to that
+# layer's material (the layer must carry UVs; OBJ files that pass through
+# uv-preserving writers keep their f v/vt pairs).
+texture_path = cfg.get("tex")
+texture_layer = cfg.get("tex_layer")
 # replace_body=1 drops every existing skinned mesh after their weights are
 # collected: the under= meshes then ARE the actor's body (male actor build —
 # a body replaces the skin, so the tight-layer guard does not apply).
@@ -245,6 +250,12 @@ for path in unders:
     rgb = [int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
     bsdf = next(n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
     bsdf.inputs["Base Color"].default_value = (*rgb, 1.0)
+    if texture_path and (texture_layer is None or texture_layer == name):
+        image = bpy.data.images.load(texture_path)
+        tex_node = material.node_tree.nodes.new("ShaderNodeTexImage")
+        tex_node.image = image
+        material.node_tree.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+        print(f"texture: {texture_path} -> {name}")
     layer.data.materials.append(material)
 
     report["layers"].append(
