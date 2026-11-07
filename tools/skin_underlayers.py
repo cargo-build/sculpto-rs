@@ -34,6 +34,8 @@ import bpy
 from mathutils import Vector, kdtree
 from mathutils.bvhtree import BVHTree
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
 cfg = dict(arg.split("=", 1) for arg in argv if "=" in arg)
 actor_path = cfg["actor"]
@@ -95,14 +97,17 @@ def z_span(mesh):
 # The body is the tallest dense mesh: every skinned part carries the full
 # joint set as vertex groups, so weight count cannot discriminate, and the
 # densest mesh is usually the hair.
-candidates = {
-    o.name: z_span(o)
-    for o in bpy.data.objects
-    if o.type == "MESH" and len(o.data.vertices) >= 1000
-}
-body = bpy.data.objects[max(candidates, key=candidates.get)]
-if candidates[body.name] < 1.2:
-    raise SystemExit(f"no body-height mesh among: {candidates}")
+# The body is the tallest dense SKINNED mesh: vertex-group counts cannot
+# discriminate (every skinned part carries all joints), the densest mesh is
+# usually the hair, and morph-driven cloth shells span the body height while
+# carrying no weights at all.
+candidates = {}
+for o in bpy.data.objects:
+    if o.type == "MESH" and len(o.data.vertices) >= 1000 and len(o.vertex_groups) >= 8:
+        candidates[o.name] = z_span(o)
+body = bpy.data.objects[max(candidates, key=candidates.get)] if candidates else None
+if body is None or candidates[body.name] < 1.2:
+    raise SystemExit(f"no body-height skinned mesh among: {candidates or '{}'}")
 
 # Weight source is every skinned part: bodies like CBBE split feet, hands
 # and head into their own meshes, and a boot's sole must weigh against the
@@ -173,6 +178,10 @@ for path in unders:
     name = path.rsplit("/", 1)[-1].removesuffix(".obj")
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata([tuple(c) for c in coords], [], faces)
+    # Smooth shading: flat facets triple the exported vertex count (one
+    # corner per triangle) and read as broken geometry in engine captures.
+    for polygon in mesh.polygons:
+        polygon.use_smooth = True
     mesh.validate()
     mesh.update()
     layer = bpy.data.objects.new(name, mesh)
@@ -235,7 +244,12 @@ bpy.ops.export_scene.gltf(
     filepath=out_path,
     export_format="GLB",
     export_animations=True,
+    export_morph=True,
+    export_morph_animation=True,
     export_yup=True,
 )
+from glb_sanitize import sanitize_texcoord
+
+sanitize_texcoord(out_path)
 report["bytes"] = Path(out_path).stat().st_size
 print("UNDER " + json.dumps(report))
