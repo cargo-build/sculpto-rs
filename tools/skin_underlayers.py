@@ -43,6 +43,10 @@ out_path = cfg["out"]
 unders = [v for k, v in (a.split("=", 1) for a in argv if a.startswith("under="))]
 align_path = cfg.get("align")
 color_hex = cfg.get("color", "7a6a58")
+# replace_body=1 drops every existing skinned mesh after their weights are
+# collected: the under= meshes then ARE the actor's body (male actor build —
+# a body replaces the skin, so the tight-layer guard does not apply).
+replace_body = cfg.get("replace_body") == "1"
 NEIGHBOURS = 4
 
 
@@ -113,6 +117,8 @@ if body is None or candidates[body.name] < 1.2:
 # and head into their own meshes, and a boot's sole must weigh against the
 # feet mesh, not the nearest ankle vertex.
 parts = [o for o in bpy.data.objects if o.type == "MESH" and len(o.vertex_groups) >= 8]
+body_name = body.name
+part_names = [p.name for p in parts]
 world = []
 body_weights = []
 for part in parts:
@@ -162,14 +168,19 @@ if True:
         )
     lift = deltas[0]
     print(f"align lift: {[round(c, 4) for c in lift]}")
+if replace_body:
+    for mesh in [o for o in bpy.data.objects if o.type == "MESH"]:
+        bpy.data.objects.remove(mesh, do_unlink=True)
+    print(f"replace_body: dropped the old skinned body set; armature and clips kept")
 
 report = {
     "actor": actor_path,
     "out": out_path,
-    "body": body.name,
+    "body": body_name,
     "dropped": junk,
     "lift": [round(c, 4) for c in lift] if lift else None,
-    "skin_parts": [p.name for p in parts],
+    "skin_parts": part_names,
+    "replace_body": replace_body,
     "layers": [],
 }
 for path in unders:
@@ -212,7 +223,7 @@ for path in unders:
     surface.sort()
     p50 = surface[len(surface) // 2]
     p95 = surface[int(len(surface) * 0.95)]
-    if p50 > 0.03 or p95 > 0.08:
+    if not replace_body and (p50 > 0.03 or p95 > 0.08):
         raise SystemExit(
             f"layer {name}: skin distance p50 {p50 * 100:.1f} cm, "
             f"p95 {p95 * 100:.1f} cm - not a tight layer, refusing to skin"
