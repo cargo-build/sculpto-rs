@@ -31,6 +31,7 @@ import argparse
 
 KINDS = (
     "upper-body",
+    "bodice",
     "trousers",
     "skirt",
     "dress",
@@ -85,6 +86,40 @@ def height_placement(body, garment):
         )
 
     return place, scale, base_y
+
+
+def bodice_placement(body, garment):
+    """Strap-top bodices: the garment's own height sets the scale against the
+    body's torso span. Width-band ratios are meaningless on thin straps (they
+    scale a corset x3 too large), so height is the only stable anchor."""
+    body_y = [v[1] for v in body]
+    min_y, max_y = min(body_y), max(body_y)
+    height = max_y - min_y
+    torso_lo = min_y + TORSO_BAND[0] * height
+    torso_hi = min_y + 0.90 * height
+    torso = [v for v in body if torso_lo <= v[1] <= torso_hi]
+    if not torso:
+        raise SystemExit("body has no vertices in the torso band; cannot place a bodice")
+    cx = sum(v[0] for v in torso) / len(torso)
+    cz = sum(v[2] for v in torso) / len(torso)
+    garment_y = [v[1] for v in garment]
+    span = max(garment_y) - min(garment_y)
+    if span <= 0.0:
+        raise SystemExit("garment has no height; cannot scale a bodice")
+    scale = (torso_hi - torso_lo) / span
+    center_y = (torso_lo + torso_hi) / 2
+    gcx = sum(v[0] for v in garment) / len(garment)
+    gcz = sum(v[2] for v in garment) / len(garment)
+    gcy = (max(garment_y) + min(garment_y)) / 2
+
+    def place(x, y, z):
+        return (
+            cx + (x - gcx) * scale,
+            center_y + (y - gcy) * scale,
+            cz + (z - gcz) * scale,
+        )
+
+    return place, scale, center_y
 
 
 def upper_body_placement(body, garment):
@@ -199,6 +234,8 @@ def main():
     garment, lines = load_vertices(args.garment)
     if args.kind == "upper-body":
         place, scale, anchor = upper_body_placement(body, garment)
+    elif args.kind == "bodice":
+        place, scale, anchor = bodice_placement(body, garment)
     elif args.kind == "trousers":
         place, scale, anchor = trousers_placement(body, garment)
     elif args.kind == "footwear":
@@ -217,7 +254,7 @@ def main():
                 sink.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
             else:
                 sink.write(line)
-    label = {"upper-body": "collar_y", "trousers": "waist_y", "footwear": "sole_y"}.get(args.kind, "base_y")
+    label = {"upper-body": "collar_y", "bodice": "chest_y", "trousers": "waist_y", "footwear": "sole_y"}.get(args.kind, "base_y")
     suffix = f" foot={args.foot}" if args.kind == "footwear" else ""
     print(f"align: class={args.kind} scale={scale:.4f} {label}={anchor:.4f} verts={len(garment)}{suffix}")
 

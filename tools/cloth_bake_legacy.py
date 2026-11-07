@@ -110,15 +110,23 @@ if pin_components:
             if ra != rb:
                 parent[ra] = rb
     comp_z = {}
+    comp_lo = {}
     for vertex in garment.data.vertices:
         root = find(vertex.index)
         z = (garment.matrix_world @ vertex.co).z
         comp_z[root] = max(comp_z.get(root, -1.0), z)
+        comp_lo[root] = min(comp_lo.get(root, 1e9), z)
+    # The pin band must scale with the piece: a fixed 10 cm band freezes
+    # small strips entirely (the corset case: 88% pinned, rigid bands).
+    comp_gh = {
+        root: min(pin_component_band, 0.25 * (comp_z[root] - comp_lo[root]))
+        for root in comp_z
+    }
     comp_extra = [
         v.index
         for v in garment.data.vertices
         if (garment.matrix_world @ v.co).z
-        >= comp_z[find(v.index)] - pin_component_band
+        >= comp_z[find(v.index)] - comp_gh[find(v.index)]
     ]
     pinned += [i for i in comp_extra if i not in set(pinned)]
 if not pinned:
