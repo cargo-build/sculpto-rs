@@ -25,6 +25,8 @@ pub mod classify;
 pub mod conform;
 pub mod control;
 pub mod intake;
+pub mod skin;
 pub mod surface;
 mod topology;
 pub mod uv;
+pub mod wrap;

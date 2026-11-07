@@ -42,7 +42,7 @@ impl Trie {
 }
 
 /// Median-split BVH over triangles.
-struct Bvh {
+pub(crate) struct Bvh {
     nodes: Vec<Node>,
     order: Vec<usize>,
     tries: Vec<Trie>,
@@ -59,6 +59,11 @@ struct Node {
 }
 
 impl Bvh {
+    /// Build directly from a mesh, for crate modules that need the query.
+    pub(crate) fn build_for_triangles(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> Self {
+        Self::build(triangles(positions, faces))
+    }
+
     fn build(tries: Vec<Trie>) -> Self {
         let count = tries.len();
         let mut order: Vec<usize> = (0..count).collect();
@@ -470,6 +475,13 @@ fn triangles(pos: &[[f32; 3]], tris: &[[u32; 3]]) -> Vec<Trie> {
         .collect()
 }
 
+/// Build the shared triangle BVH plus its corners for closest-point queries.
+pub(crate) fn triangle_corners(pos: &[[f32; 3]], tris: &[[u32; 3]]) -> (Bvh, Vec<[[f32; 3]; 3]>) {
+    let tries = triangles(pos, tris);
+    let corners = tries.iter().map(|t| t.corners).collect();
+    (Bvh::build(tries), corners)
+}
+
 /// Intersecting triangle pairs (index within each list), for diagnosis.
 pub fn intersection_pair_list(
     a_positions: &[[f32; 3]],
@@ -568,7 +580,7 @@ fn box_distance(point: [f32; 3], min: [f32; 3], max: [f32; 3]) -> f32 {
 
 impl Bvh {
     /// Exact nearest triangle distance by bbox-distance-pruned traversal.
-    fn nearest(&self, point: [f32; 3]) -> Option<(usize, f32)> {
+    pub(crate) fn nearest(&self, point: [f32; 3]) -> Option<(usize, f32)> {
         if self.tries.is_empty() {
             return None;
         }

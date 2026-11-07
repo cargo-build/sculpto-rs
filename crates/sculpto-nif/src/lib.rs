@@ -42,6 +42,10 @@ pub struct NifShape {
     pub bone_indices: Vec<[u16; 4]>,
     /// Per-vertex weights, parallel to `bone_indices`.
     pub weights: Vec<[f32; 4]>,
+    /// Base-color texture path from the shader, when authored.
+    pub texture_base_color: String,
+    /// Normal-map texture path from the shader, when authored.
+    pub texture_normal: String,
 }
 
 impl NifShape {
@@ -169,6 +173,20 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                texture_base_color: mesh
+                    .material
+                    .textures
+                    .base_color
+                    .and_then(|symbol| pool.resolve(symbol))
+                    .unwrap_or_default()
+                    .to_string(),
+                texture_normal: mesh
+                    .material
+                    .textures
+                    .normal
+                    .and_then(|symbol| pool.resolve(symbol))
+                    .unwrap_or_default()
+                    .to_string(),
                 bone_indices: mesh
                     .skin
                     .as_ref()
