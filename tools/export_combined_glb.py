@@ -126,6 +126,18 @@ if material_blend:
     material_name = material.name
     for shell in weights_curve:
         bpy.data.objects[shell].data.materials.append(material)
+else:
+    # Baked shells carry no material of their own; without one the glTF gets
+    # a default doubleSided=false material, so interior cloth faces vanish
+    # into black holes (the chainmail chest case). A plain double-sided cloth
+    # material keeps thin shells readable from both sides.
+    material = bpy.data.materials.get("sculpto-cloth") or bpy.data.materials.new("sculpto-cloth")
+    material.use_nodes = True
+    material.use_backface_culling = False
+    bsdf = next(n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+    bsdf.inputs["Base Color"].default_value = (0.82, 0.80, 0.76, 1.0)
+    for shell in weights_curve:
+        bpy.data.objects[shell].data.materials.append(material)
 
 shared_animation_root(scene)
 bpy.ops.export_scene.gltf(
