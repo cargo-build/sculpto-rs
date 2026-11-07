@@ -6,11 +6,17 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Resource)]
@@ -62,7 +68,6 @@ fn main() {
         .register_type::<bevy::mesh::morph::MeshMorphWeights>()
         .register_type::<bevy::gltf::GltfMeshExtras>()
         .register_type::<bevy::mesh::morph::MorphWeights>()
-
         .register_type::<Name>()
         .register_type::<Visibility>()
         .register_type::<InheritedVisibility>()
@@ -73,7 +78,10 @@ fn main() {
             ..default()
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, (advance_animation, capture_once, benchmark, debug_scene))
+        .add_systems(
+            Update,
+            (advance_animation, capture_once, benchmark, debug_scene),
+        )
         .run();
 }
 
@@ -95,7 +103,11 @@ fn setup(
     units: Res<Units>,
 ) {
     let mut image = Image::new(
-        Extent3d { width: 960, height: 900, depth_or_array_layers: 1 },
+        Extent3d {
+            width: 960,
+            height: 900,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         vec![0; 960 * 900 * 4],
         TextureFormat::Rgba8UnormSrgb,
@@ -113,18 +125,27 @@ fn setup(
     let spacing = 0.9_f32;
     let (camera_eye, camera_target) = if count > 1 {
         let extent = (columns.max(rows) as f32 - 1.0) * spacing + 1.5;
-        (Vec3::new(extent * 1.4, 1.4, extent * 1.8), Vec3::new(0.0, 0.9, 0.0))
+        (
+            Vec3::new(extent * 1.4, 1.4, extent * 1.8),
+            Vec3::new(0.0, 0.9, 0.0),
+        )
     } else {
         (Vec3::new(2.2, 1.3, 2.8), Vec3::new(0.0, 0.9, 0.0))
     };
     commands.spawn((
         Camera3d::default(),
         bevy::core_pipeline::tonemapping::Tonemapping::None,
-        Camera { target: handle.into(), ..default() },
+        Camera {
+            target: handle.into(),
+            ..default()
+        },
         Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
     commands.spawn((
-        DirectionalLight { illuminance: 10_000.0, ..default() },
+        DirectionalLight {
+            illuminance: 10_000.0,
+            ..default()
+        },
         Transform::from_xyz(3.0, 5.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     // The glTF loader spawns AnimationPlayer on each animation root inside
@@ -217,9 +238,7 @@ fn capture_once(
     // Series mode: one pose every `stride` ticks, one view per following
     // tick, so a review gets 10-20 distinct poses across the clip without
     // rewinding the animation.
-    if let Some((start, count, stride)) =
-        parse_series(&env_or("SCULPTO_VIEWER_SERIES", ""))
-    {
+    if let Some((start, count, stride)) = parse_series(&env_or("SCULPTO_VIEWER_SERIES", "")) {
         let views: Vec<String> = env_or("SCULPTO_VIEWER_VIEWS", "quarter")
             .split(',')
             .map(str::to_string)
@@ -237,7 +256,10 @@ fn capture_once(
                     transform.look_at(Vec3::new(0.0, 0.95, 0.0), Vec3::Y);
                 }
                 let pose_tick = *frames - pose;
-                info!("viewer: series pose {} view {} at tick {}", pose_tick, view, *frames);
+                info!(
+                    "viewer: series pose {} view {} at tick {}",
+                    pose_tick, view, *frames
+                );
                 commands
                     .spawn(Screenshot::image(target.0.clone()))
                     .observe(save_to_disk(format!("{dir}/pose{pose_tick:04}_{view}.png")));
@@ -271,14 +293,17 @@ fn capture_once(
 /// transform — catches assets that load silently but never draw.
 fn debug_scene(
     mut done: Local<bool>,
-    meshes: Query<(
-        Option<&Name>,
-        Option<&bevy::gltf::GltfMeshName>,
-        Option<&Visibility>,
-        Option<&InheritedVisibility>,
-        Option<&bevy::camera::primitives::Aabb>,
-        &GlobalTransform,
-    ), With<Mesh3d>>,
+    meshes: Query<
+        (
+            Option<&Name>,
+            Option<&bevy::gltf::GltfMeshName>,
+            Option<&Visibility>,
+            Option<&InheritedVisibility>,
+            Option<&bevy::camera::primitives::Aabb>,
+            &GlobalTransform,
+        ),
+        With<Mesh3d>,
+    >,
 ) {
     if *done || std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_err() {
         return;
@@ -297,8 +322,7 @@ fn debug_scene(
                 .copied()
                 .map(|v| format!("{}", v.get()))
                 .unwrap_or_else(|| "ABSENT".into()),
-            aabb
-                .map(|a| format!("{:.2}..={:.2}", a.min(), a.max()))
+            aabb.map(|a| format!("{:.2}..={:.2}", a.min(), a.max()))
                 .unwrap_or_else(|| "NONE".into()),
             transform.translation()
         );
@@ -329,7 +353,10 @@ fn benchmark(
     sorted.sort_by(f32::total_cmp);
     let mean = sorted.iter().sum::<f32>() / sorted.len().max(1) as f32;
     let p50 = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
-    let p95 = sorted.get((sorted.len() as f32 * 0.95) as usize).copied().unwrap_or(0.0);
+    let p95 = sorted
+        .get((sorted.len() as f32 * 0.95) as usize)
+        .copied()
+        .unwrap_or(0.0);
     let rss = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|text| {
