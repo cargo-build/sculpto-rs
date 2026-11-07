@@ -47,6 +47,11 @@ pin_z = float(cfg.get("pin_z", "1.406"))
 # boundary and the two layers fold through each other on broad backs).
 pin_back = int(cfg.get("pin_back", "0"))
 pin_back_z = float(cfg.get("pin_back_z", "1.0"))
+# pin_components=1 pins each connected component's own top band (default
+# 10 cm): multi-piece garments (HDT skirt panels, sleeves, trims) hang
+# from their own top edge instead of falling as free cloth.
+pin_components = int(cfg.get("pin_components", "0"))
+pin_component_band = float(cfg.get("pin_component_band", "0.10"))
 body_name = cfg.get("body", "BaseShape")
 bending = float(cfg.get("bending", "20"))
 structural = float(cfg.get("structural", "200"))
@@ -89,6 +94,33 @@ if pin_back:
         and (garment.matrix_world @ v.co).y >= 0.0
         and v.index not in set(pinned)
     ]
+if pin_components:
+    parent = list(range(len(garment.data.vertices)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for polygon in garment.data.polygons:
+        verts = list(polygon.vertices)
+        for a, b in zip(verts, verts[1:] + verts[:1]):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+    comp_z = {}
+    for vertex in garment.data.vertices:
+        root = find(vertex.index)
+        z = (garment.matrix_world @ vertex.co).z
+        comp_z[root] = max(comp_z.get(root, -1.0), z)
+    comp_extra = [
+        v.index
+        for v in garment.data.vertices
+        if (garment.matrix_world @ v.co).z
+        >= comp_z[find(v.index)] - pin_component_band
+    ]
+    pinned += [i for i in comp_extra if i not in set(pinned)]
 if not pinned:
     raise SystemExit(f"no vertices at or above pin_z={pin_z}; the garment would fall")
 garment.vertex_groups.new(name="pin").add(pinned, 1.0, "REPLACE")
