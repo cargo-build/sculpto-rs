@@ -147,6 +147,25 @@ for mesh in doc.get("meshes", []):
     if mesh.get("weights"):
         mesh["weights"] = [0.0] * len(mesh["weights"])
         changed = True
+# Blender 5.2 writes texCoord -1 for material textures whose UV map does not
+# resolve on the cloth mesh; engines reject the GLB (u32 expected). UV set 0
+# is the only set the cloth shells carry, so clamp it there, at any depth.
+def clamp_texcoord(node):
+    changed_here = False
+    if isinstance(node, dict):
+        if node.get("texCoord") == -1:
+            node["texCoord"] = 0
+            changed_here = True
+        for value in node.values():
+            changed_here |= clamp_texcoord(value)
+    elif isinstance(node, list):
+        for value in node:
+            changed_here |= clamp_texcoord(value)
+    return changed_here
+
+
+for material in doc.get("materials", []):
+    changed |= clamp_texcoord(material)
 if changed:
     payload = json.dumps(doc, separators=(",", ":")).encode()
     payload += b" " * ((-len(payload)) % 4)
