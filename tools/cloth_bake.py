@@ -51,6 +51,7 @@ pin_band = float(cfg.get("pin_band", 0.12))
 collider_friction = float(cfg.get("collider_friction", 0.2))
 collider_margin = float(cfg.get("collider_margin", 0.0))
 edge_contacts = int(cfg.get("edge_contacts", 0))
+collision_radius = float(cfg.get("collision_radius", 0.004))
 sample = int(cfg.get("sample", 10))
 
 # `system_resource` resolves directories; file paths must be joined on.
@@ -102,7 +103,8 @@ collider_mod_inputs[collider_ids["Deforming"]]["value"] = True
 collider_mod_inputs[collider_ids["Margin"]]["value"] = collider_margin
 collider_mod_inputs[collider_ids["Edge Contacts"]]["value"] = bool(edge_contacts)
 collider_mod_inputs[collider_ids["Friction"]]["value"] = collider_friction
-report["contact"] = {"margin": collider_margin, "edge_contacts": bool(edge_contacts)}
+report["contact"] = {"margin": collider_margin, "edge_contacts": bool(edge_contacts),
+                     "collision_radius": collision_radius}
 
 effectors = bpy.data.collections.new("Effectors")
 scene.collection.children.link(effectors)
@@ -183,7 +185,7 @@ for shell in shells:
     dynamics.node_group = cloth_group
     inputs = dynamics.properties.inputs
     inputs[dyn_ids["Pin Group"]]["attribute_name"] = "pin"
-    inputs[dyn_ids["Collision Radius"]]["value"] = 0.004
+    inputs[dyn_ids["Collision Radius"]]["value"] = collision_radius
     inputs[dyn_ids["Substeps"]]["value"] = substeps
     inputs[dyn_ids["Constraint Steps"]]["value"] = constraint_steps
     inputs[dyn_ids["Stretchiness"]]["value"] = stretchiness
