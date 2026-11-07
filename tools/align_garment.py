@@ -42,7 +42,8 @@ KINDS = (
     "composite",
     "unknown",
 )
-HEIGHT_PLACED = ("skirt", "dress", "robe", "cape", "composite", "unknown")
+HEIGHT_PLACED = ("skirt", "dress", "robe", "composite", "unknown")
+CAPE_SPAN = 0.62
 
 # Placement constants, fractions of body height.
 SHOULDER_BAND = 0.15
@@ -120,6 +121,31 @@ def bodice_placement(body, garment):
         )
 
     return place, scale, center_y
+
+
+def cape_placement(body, garment):
+    """Capes hang from the neck to the hips/thighs: scale so the garment
+    spans CAPE_SPAN of body height, top edge at the collar line. The
+    height-ratio rule inflates a cape into a floor-length tent."""
+    body_y = [v[1] for v in body]
+    min_y, max_y = min(body_y), max(body_y)
+    height = max_y - min_y
+    garment_y = [v[1] for v in garment]
+    span = max(garment_y) - min(garment_y)
+    if span <= 0.0:
+        raise SystemExit("garment has no height; cannot scale a cape")
+    scale = CAPE_SPAN * height / span
+    center = [v for v in body if min_y + 0.55 * height <= v[1] <= min_y + 0.85 * height]
+    cx = sum(v[0] for v in center) / len(center)
+    cz = sum(v[2] for v in center) / len(center)
+    gcx = sum(v[0] for v in garment) / len(garment)
+    gcz = sum(v[2] for v in garment) / len(garment)
+    collar_y = min_y + COLLAR * height
+    top_off = (max(garment_y) - (min(garment_y)))  # full span above; top lands at collar
+    def place(x, y, z):
+        yy = collar_y - (max(garment_y) - y) * scale
+        return (cx + (x - gcx) * scale, yy, cz + (z - gcz) * scale)
+    return place, scale, collar_y
 
 
 def upper_body_placement(body, garment):
@@ -240,6 +266,8 @@ def main():
         place, scale, anchor = trousers_placement(body, garment)
     elif args.kind == "footwear":
         place, scale, anchor = footwear_placement(body, garment, args.foot)
+    elif args.kind == "cape":
+        place, scale, anchor = cape_placement(body, garment)
     elif args.kind in HEIGHT_PLACED:
         place, scale, anchor = height_placement(body, garment)
     else:
