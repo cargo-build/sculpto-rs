@@ -79,6 +79,7 @@ export-obj options:
   --nif <path>       NIF to read
   --shape <name>     shape to export (defaults to the largest)
   --out <obj>        output path
+  --list <1>         print every shape and its counts, then stop (no OBJ)
 
 garment fit options:
   --nif <path>         garment NIF
@@ -448,9 +449,23 @@ fn export_obj(args: &[String]) -> ExitCode {
 fn export_obj_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
     let nif = PathBuf::from(required(&flags, "nif")?);
-    let out = PathBuf::from(required(&flags, "out")?);
     let bytes = std::fs::read(&nif).map_err(|e| format!("{}: {e}", nif.display()))?;
     let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
+    if flags.contains_key("list") {
+        // A BodySlide NIF carries the body and the garment together; the largest
+        // shape is often the body, so the caller must see the names before
+        // choosing. @req DECL0013
+        for shape in &document.shapes {
+            println!(
+                "{}: {} vertices, {} triangles",
+                shape.name,
+                shape.positions.len(),
+                shape.triangles.len()
+            );
+        }
+        return Ok(());
+    }
+    let out = PathBuf::from(required(&flags, "out")?);
     let shape = pick_shape(&document.shapes, flags.get("shape").map(String::as_str))?;
     write_obj_uv(&out, &shape.positions, &shape.triangles, &shape.uvs)
         .map_err(|e| format!("{}: {e}", out.display()))?;
