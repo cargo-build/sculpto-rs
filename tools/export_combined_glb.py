@@ -234,7 +234,9 @@ for shell in shell_names:
     if not frames:
         continue
     rest_path = os.path.join(bake_dir, f"rest_{shell}.obj")
-    bpy.ops.wm.obj_import(filepath=os.path.abspath(rest_path))
+    bpy.ops.wm.obj_import(
+        filepath=os.path.abspath(rest_path), forward_axis="Y", up_axis="Z"
+    )
     obj = bpy.context.selected_objects[0] if bpy.context.selected_objects else bpy.context.active_object
     obj.name = shell
     obj.rotation_euler = (0.0, 0.0, 0.0)
@@ -249,7 +251,9 @@ for shell in shell_names:
     obj.shape_key_add(name="Basis", from_mix=False)
     baked_frames = {}
     for frame in sorted(frames):
-        bpy.ops.wm.obj_import(filepath=os.path.abspath(frames[frame]))
+        bpy.ops.wm.obj_import(
+            filepath=os.path.abspath(frames[frame]), forward_axis="Y", up_axis="Z"
+        )
         other = bpy.context.selected_objects[0]
         other.rotation_euler = (0.0, 0.0, 0.0)
         if len(other.data.vertices) != len(obj.data.vertices):
