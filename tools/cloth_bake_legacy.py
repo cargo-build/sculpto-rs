@@ -182,6 +182,11 @@ rest = [v.co.copy() for v in garment.data.vertices]
 report = {
     "solver": "legacy-cloth",
     "clip": clip,
+    "fps": scene.render.fps,
+    # The bake scene and the GLB import disagree on the action's first frame;
+    # the exporter derives its frame shift from these two values.
+    "action_start": action.frame_range[0],
+    "action_end": action.frame_range[1],
     "garment_verts": len(garment.data.vertices),
     "shells": {"SculptoGarment0": {"verts": len(garment.data.vertices)}},
     "pin": {"z": pin_z, "pinned": len(pinned)},
