@@ -20,6 +20,8 @@ dense mesh inflates itself. `mass` is per vertex, so a dense garment needs
 `mass` scaled down with vertex count (22,676 vertices -> 0.006).
 
 Outputs: out/rest_<shell>.obj, out/frame_<n>_<shell>.obj, out/report.json.
+Rest and frame OBJs repeat the garment's `vt` block when the fitted mesh
+carries one, so the downstream GLB keeps its texture coordinates.
 """
 
 import json
@@ -29,6 +31,9 @@ import sys
 import time
 
 import bpy
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obj_uv_sequence import write_obj  # noqa: E402
 
 argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
 cfg = dict(arg.split("=", 1) for arg in argv if "=" in arg)
@@ -82,6 +87,7 @@ garment.rotation_euler = (math.radians(90.0), 0.0, 0.0)
 bpy.context.view_layer.objects.active = garment
 bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 garment.name = "SculptoGarment0"
+uv_layer = garment.data.uv_layers.active
 
 pinned = [
     v.index for v in garment.data.vertices if (garment.matrix_world @ v.co).z >= pin_z
@@ -191,11 +197,12 @@ report = {
     "frames": {},
 }
 
-with open(os.path.join(out_dir, "rest_SculptoGarment0.obj"), "w", encoding="utf-8") as sink:
-    for co in rest:
-        sink.write(f"v {co.x:.6f} {co.y:.6f} {co.z:.6f}\n")
-    for polygon in garment.data.polygons:
-        sink.write("f " + " ".join(str(i + 1) for i in polygon.vertices) + "\n")
+write_obj(
+    os.path.join(out_dir, "rest_SculptoGarment0.obj"),
+    rest,
+    garment.data.polygons,
+    uv_layer,
+)
 
 samples = set(range(0, frame_end + 1, sample)) | {frame_end}
 start = time.time()
@@ -207,13 +214,12 @@ for frame in range(0, frame_end + 1):
     sim = [garment.matrix_world @ vertex.co for vertex in mesh.vertices]
     evaluated.to_mesh_clear()
     if frame in samples:
-        with open(
-            os.path.join(out_dir, f"frame_{frame}_SculptoGarment0.obj"), "w", encoding="utf-8"
-        ) as sink:
-            for co in sim:
-                sink.write(f"v {co.x:.6f} {co.y:.6f} {co.z:.6f}\n")
-            for polygon in garment.data.polygons:
-                sink.write("f " + " ".join(str(i + 1) for i in polygon.vertices) + "\n")
+        write_obj(
+            os.path.join(out_dir, f"frame_{frame}_SculptoGarment0.obj"),
+            sim,
+            garment.data.polygons,
+            uv_layer,
+        )
         displacements = sorted((sim[i] - rest[i]).length for i in range(len(rest)))
         report["frames"][str(frame)] = {
             "displacement": {
