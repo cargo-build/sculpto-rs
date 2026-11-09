@@ -195,6 +195,17 @@ fn to64(v: Vec3) -> Vec3d {
     [v[0] as f64, v[1] as f64, v[2] as f64]
 }
 
+/// Cross-product magnitude below which a triangle carries no surface.
+const DEGENERATE_SPAN: f64 = 1e-15;
+
+/// Whether a position triangle has zero area: repeated corners, coincident
+/// corners or a cross product under [`DEGENERATE_SPAN`] in f64. The same
+/// threshold the intersection tests use to skip unsurfaceable triangles.
+pub(crate) fn zero_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+    let normal = cross64(sub64(to64(b), to64(a)), sub64(to64(c), to64(a)));
+    dot64(normal, normal).sqrt() < DEGENERATE_SPAN
+}
+
 fn orient2d(p: [f64; 2], q: [f64; 2], r: [f64; 2]) -> f64 {
     (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
 }
@@ -351,7 +362,7 @@ fn triangles_intersect(a: &Trie, b: &Trie, scope: ContactScope) -> bool {
     let e_a2 = sub64(a_corners[2], a_corners[0]);
     let n_a = cross64(e_a1, e_a2);
     let len_na = dot64(n_a, n_a).sqrt();
-    if len_na < 1e-15 {
+    if len_na < DEGENERATE_SPAN {
         return false;
     }
     let unit_na = [n_a[0] / len_na, n_a[1] / len_na, n_a[2] / len_na];
@@ -360,7 +371,7 @@ fn triangles_intersect(a: &Trie, b: &Trie, scope: ContactScope) -> bool {
     let e_b2 = sub64(b_corners[2], b_corners[0]);
     let n_b = cross64(e_b1, e_b2);
     let len_nb = dot64(n_b, n_b).sqrt();
-    if len_nb < 1e-15 {
+    if len_nb < DEGENERATE_SPAN {
         return false;
     }
     let unit_nb = [n_b[0] / len_nb, n_b[1] / len_nb, n_b[2] / len_nb];

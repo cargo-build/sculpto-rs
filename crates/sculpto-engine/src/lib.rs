@@ -36,6 +36,8 @@ pub enum CommandId {
     ExportObj,
     /// Bake one shape at both weight endpoints and write them as NIFs.
     ExportPair,
+    /// Audit a raw garment export and report its topology defect counts.
+    IntakeCheck,
     /// Export an asset as a NIF.
     ExportNif,
 }
@@ -50,6 +52,7 @@ impl CommandId {
             CommandId::OutfitFit => "outfit.fit",
             CommandId::ExportObj => "export.obj",
             CommandId::ExportPair => "export.pair",
+            CommandId::IntakeCheck => "intake.check",
             CommandId::ExportNif => "export.nif",
         }
     }
@@ -244,6 +247,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::export_pair,
     },
     Spec {
+        id: CommandId::IntakeCheck,
+        summary: "Audit a raw garment export (.glb/.gltf/.obj) and report its topology defect counts against the declared limits.",
+        mutates: false,
+        stub: false,
+        schema: handlers::intake_check_schema,
+        handler: handlers::intake_check,
+    },
+    Spec {
         id: CommandId::ExportNif,
         summary: "Export an asset as a Skyrim NIF.",
         mutates: true,
@@ -339,6 +350,7 @@ mod tests {
             "export.obj",
             "export.pair",
             "export.nif",
+            "intake.check",
         ] {
             let error = dispatch(id, &Value::Null).expect_err("missing params are an error");
             assert_ne!(error.kind(), ErrorKind::NotImplemented, "{id} is not wired");
