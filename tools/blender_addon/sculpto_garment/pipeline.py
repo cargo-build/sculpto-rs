@@ -17,22 +17,24 @@ from pathlib import Path
 from mathutils import Vector, bvhtree
 
 from . import cli_bridge
+from . import rules
 
-# TODO(F03): these rules still live in the add-on and must move behind command
-# ids (DECL0002 — Blender keeps only bmesh/modifier operations):
-#   - GARMENT_OFFSET / BOUNDARY_RELIEF surface offsets,
-#   - place_raw class fractions (collar 0.87, waist 0.62, sole 0.01, scale
-#     targets 1.15 / 1.1 / 2.4 / 0.42),
-#   - select_region band cut (majority-in-band, |x| <= 0.21 arm exclusion),
-#   - project_texture ray-cast barycentric fill and miss snap (0.5, 0.5),
-#   - wire_animation nearest-vertex weight transfer and _unpose_garment
-#     skin-matrix inversion.
-
-# Garment offset from the body surface, meters.
-GARMENT_OFFSET = 0.008
-# Extra offset at boundary rings so openings do not cut into the body when
-# the mesh deforms with the armature.
-BOUNDARY_RELIEF = 0.004
+# F03 gap register (DECL0002): every measure/normalise/decide rule this file
+# still applies is a declared gap — the command id that will own it does not
+# exist in the closed registry (crates/sculpto-engine/src/lib.rs COMMANDS)
+# yet, so the values live once, named, in `rules.py` and the functions below
+# consume that table. The ids are proposed, not registered:
+#   garment.offset  -> GARMENT_OFFSET / BOUNDARY_RELIEF surface offsets,
+#   garment.place   -> place_raw class fractions (collar 0.87, waist 0.62,
+#                      sole 0.01, scale targets 1.15 / 1.1 / 2.4 / 0.42),
+#   garment.region  -> select_region band cut (majority-in-band, |x| <= 0.21
+#                      arm exclusion),
+#   garment.project -> project_texture ray-cast barycentric fill and miss
+#                      snap (0.5, 0.5),
+#   garment.weights -> wire_animation nearest-vertex weight transfer and
+#                      _unpose_garment skin-matrix inversion.
+# tools/tests/test_sculpto_rules.py asserts none of these ids is registered;
+# when one lands, delete the add-on copy behind it.
 
 
 def posed_body(body, armature, clip):
@@ -153,13 +155,17 @@ def import_raw(path):
 def place_raw(raw, body, kind, width_reference=None):
     """Scale and move the raw asset in front of the body it will dress.
 
-    Returns world-space coverage: (hem_z, collar_z, width). The placement
-    follows the class rules: upper-body hangs the collar at the neck base,
-    footwear rests the sole on the ground, trousers anchor at the waist.
-    `width_reference` (the rest-pose body) supplies the width the garment
-    class is scaled against: a posed body with arms tucked measures
-    narrower and shrinks the garment into a crop top.
+    Returns world-space coverage: (hem_z, collar_z, width). The class table
+    (`rules.GARMENT_KINDS`, gap `garment.place`) owns every fraction: the
+    upper-body class hangs the collar at the neck base, footwear rests the
+    sole on the ground, trousers anchor at the waist. `width_reference` (the
+    rest-pose body) supplies the width the garment class is scaled against: a
+    posed body with arms tucked measures narrower and shrinks the garment
+    into a crop top.
     """
+    rule = rules.kind(kind)
+    if rule is None:
+        raise RuntimeError(f"no placement rule for kind `{kind}`")
     zs = [(body.matrix_world @ v.co).z for v in body.data.vertices]
     zmin, zmax = min(zs), max(zs)
     height = zmax - zmin
@@ -177,49 +183,24 @@ def place_raw(raw, body, kind, width_reference=None):
     if rw <= 1e-6 or rh <= 1e-6:
         raise RuntimeError("raw asset is degenerate")
 
-    if kind == "upper-body":
-        # The relief spans the shoulders incl. sleeves in its width; scale so
-        # the torso part (~40% of the width) matches the body torso.
-        target_width = 1.15 * (max(xs) - min(xs))
-        scale = target_width / rw
-        collar_z = zmin + 0.87 * height
-        hem_z = None  # assigned after the chain from the raw proportions
-    elif kind == "footwear":
-        target_width = 2.4 * 0.10 * height  # one foot sole length, generous
-        scale = target_width / rw
+    width_base = (max(xs) - min(xs)) if rule["width_basis"] == "body-width" else height
+    scale = (rule["width_factor"] * width_base) / rw
+    if rule["hem_from_sole"]:
         # Sole on the floor, shaft rises by the item's own proportions:
         # anchoring the collar at ankle height buries a knee-high shaft
         # below the ground.
-        hem_z = zmin + 0.01
+        hem_z = zmin + rule["sole_offset_m"]
         collar_z = hem_z + rh * scale
-        raw.scale = (scale, scale, scale)
-        raw.location = (
-            body_cx - (min(p.x for p in world) + rw / 2) * scale,
-            front_y - 0.05 - height * 0.02,
-            hem_z - min(p.z for p in world) * scale,
-        )
-        bpy.context.view_layer.update()
-        bpy.context.view_layer.objects.active = raw
-        for obj in bpy.data.objects:
-            obj.select_set(False)
-        raw.select_set(True)
-        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-        return hem_z, collar_z, rw * scale
-    elif kind == "trousers":
-        target_width = 1.1 * 0.42 * height  # hip width approx
-        scale = target_width / rw
-        collar_z = zmin + 0.62 * height
-        # A waist-anchored hem cannot go through the floor.
-        hem_z = max(collar_z - rh * scale, zmin + 0.02)
     else:
-        raise RuntimeError(f"no placement rule for kind `{kind}`")
-
-    if hem_z is None:
+        collar_z = zmin + rule["collar_frac"] * height
         hem_z = collar_z - rh * scale
+        if rule["floor_clamp_m"] is not None:
+            # A waist-anchored hem cannot go through the floor.
+            hem_z = max(hem_z, zmin + rule["floor_clamp_m"])
     raw.scale = (scale, scale, scale)
     raw.location = (
         body_cx - (min(p.x for p in world) + rw / 2) * scale,
-        front_y - 0.05 - height * 0.02,
+        front_y - rules.PLACE_FRONT_GAP_M - height * rules.PLACE_FRONT_RISE_FRAC,
         hem_z - min(p.z for p in world) * scale,
     )
     bpy.context.view_layer.update()
@@ -236,10 +217,14 @@ def place_raw(raw, body, kind, width_reference=None):
 def select_region(body, hem_z, collar_z, kind="upper-body"):
     """Body faces whose vertices all sit between the hem and collar lines.
 
-    Non-upper classes exclude the arms: the band of a trousers or footwear
+    Arm-excluding classes (`rules.GARMENT_KINDS`, gap `garment.region`) drop
+    faces beyond the sagittal limit: the band of a trousers or footwear
     garment overlaps hanging arms, which would sew arm tubes onto legs.
     Returns face indices; BMFace references die with their bmesh.
     """
+    rule = rules.kind(kind)
+    if rule is None:
+        raise RuntimeError(f"no region rule for kind `{kind}`")
     bm = bmesh.new()
     bm.from_mesh(body.data)
     bm.faces.ensure_lookup_table()
@@ -249,10 +234,12 @@ def select_region(body, hem_z, collar_z, kind="upper-body"):
     faces = [
         face.index
         for face in bm.faces
-        if sum(1 for v in face.verts if hem_z <= (world @ v.co).z <= collar_z) >= 2
+        if sum(1 for v in face.verts if hem_z <= (world @ v.co).z <= collar_z)
+        >= rules.REGION_MAJORITY
         and (
-            kind == "upper-body"
-            or abs(sum((world @ v.co).x for v in face.verts) / len(face.verts)) <= 0.21
+            not rule["arm_exclusion"]
+            or abs(sum((world @ v.co).x for v in face.verts) / len(face.verts))
+            <= rules.REGION_ARM_LIMIT_M
         )
     ]
     bm.free()
@@ -274,7 +261,9 @@ def build_garment(body, face_indices):
             bm.verts.remove(vert)
     boundary = {v.index for v in bm.verts if v.is_boundary}
     for vert in bm.verts:
-        offset = GARMENT_OFFSET + (BOUNDARY_RELIEF if vert.index in boundary else 0.0)
+        offset = rules.GARMENT_OFFSET + (
+            rules.BOUNDARY_RELIEF if vert.index in boundary else 0.0
+        )
         vert.co += vert.normal * offset
     mesh = bpy.data.meshes.new("SculptoGarment")
     bm.to_mesh(mesh)
@@ -317,7 +306,7 @@ def project_texture(garment, raw, material):
     uv_layer = bm.loops.layers.uv.get("SculptoProjected")
     if uv_layer is None:
         uv_layer = bm.loops.layers.uv.new("SculptoProjected")
-    axis = Vector((0.0, -1.0, 0.0))
+    axis = Vector(rules.PROJECT_AXIS)
     hits = 0
     for face in bm.faces:
         for loop in face.loops:
@@ -349,7 +338,7 @@ def project_texture(garment, raw, material):
                     )
                 hits += 1
             else:
-                loop[uv_layer].uv = (0.5, 0.5)
+                loop[uv_layer].uv = rules.PROJECT_MISS_UV
     bm.to_mesh(garment.data)
     bm.free()
     raw_bm.free()
