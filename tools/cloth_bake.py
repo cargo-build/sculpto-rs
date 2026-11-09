@@ -35,6 +35,9 @@ import time
 from math import radians
 
 import bpy
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obj_uv_sequence import write_obj  # noqa: E402
 from mathutils.bvhtree import BVHTree
 
 argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
@@ -281,48 +284,6 @@ report["frame_range"] = [scene.frame_start, frame_end]
 start = time.time()
 depsgraph = bpy.context.evaluated_depsgraph_get()
 rest = {shell.name: [v.co.copy() for v in shell.data.vertices] for shell in shells}
-
-
-def write_obj(path, coords, polygons, uv_layer=None):
-    """Write positions, faces and — when the mesh carries one — loop UVs.
-
-    The OBJ importer keeps one vertex per `v` line and stores UVs per loop, so
-    deduplicating the rounded loop UVs keeps the `vt` block small while the
-    per-corner indices survive the combined export's re-import.
-    """
-    uv_rows = []
-    uv_index = {}
-    corners = []
-    if uv_layer is not None:
-        loop_uvs = [datum.uv for datum in uv_layer.data]
-        for polygon in polygons:
-            row = []
-            for loop in range(polygon.loop_start, polygon.loop_start + polygon.loop_total):
-                key = (round(loop_uvs[loop][0], 6), round(loop_uvs[loop][1], 6))
-                index = uv_index.get(key)
-                if index is None:
-                    index = len(uv_rows)
-                    uv_index[key] = index
-                    uv_rows.append(key)
-                row.append(index)
-            corners.append(row)
-    with open(path, "w", encoding="utf-8") as sink:
-        for co in coords:
-            sink.write(f"v {co.x:.6f} {co.y:.6f} {co.z:.6f}\n")
-        for u, v in uv_rows:
-            sink.write(f"vt {u:.6f} {v:.6f}\n")
-        for index, polygon in enumerate(polygons):
-            if uv_layer is None:
-                sink.write("f " + " ".join(str(i + 1) for i in polygon.vertices) + "\n")
-            else:
-                sink.write(
-                    "f "
-                    + " ".join(
-                        f"{vertex + 1}/{corner + 1}"
-                        for vertex, corner in zip(polygon.vertices, corners[index])
-                    )
-                    + "\n"
-                )
 
 
 def pct(sorted_seq, q):

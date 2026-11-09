@@ -7,7 +7,7 @@ texel, which was the white-cloak defect.
 """
 
 
-def write_obj(path, coords, polygons, uv_layer):
+def write_obj(path, coords, polygons, uv_layer=None):
     """Write positions, faces and the garment's loop UVs."""
     uv_rows = []
     uv_index = {}
