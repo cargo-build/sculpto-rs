@@ -36,7 +36,7 @@ impl NifTarget {
 }
 
 /// Why a header cannot be written or read.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NifWriteError {
     /// The user version belongs to a game the writer does not support.
     UnsupportedGame { user_version: u32 },
@@ -63,6 +63,16 @@ pub enum NifWriteError {
         attribute: &'static str,
         vertex: usize,
     },
+    /// A skin palette entry has no name, so no consumer can bind it.
+    UnnamedBone { index: usize },
+    /// Two palette entries share a name, so a consumer cannot tell them apart.
+    DuplicateBone { name: String },
+    /// A bone name does not fit the string table's length prefix.
+    NameTooLong { name: String },
+    /// The palette exceeds the `u8` bone index stored per vertex.
+    TooManyBones { bones: usize },
+    /// A bind matrix has zero scale and cannot be decomposed.
+    SingularBind { bone: usize },
 }
 
 impl fmt::Display for NifWriteError {
@@ -100,6 +110,24 @@ impl fmt::Display for NifWriteError {
             }
             Self::ZeroVector { attribute, vertex } => {
                 write!(formatter, "vertex {vertex} has a zero-length {attribute}")
+            }
+            Self::UnnamedBone { index } => {
+                write!(formatter, "skin palette entry {index} has no name")
+            }
+            Self::DuplicateBone { name } => {
+                write!(formatter, "skin palette repeats the bone name `{name}`")
+            }
+            Self::NameTooLong { name } => {
+                write!(
+                    formatter,
+                    "bone name `{name}` does not fit the string table"
+                )
+            }
+            Self::TooManyBones { bones } => {
+                write!(formatter, "{bones} bones exceed the u8 per-vertex index")
+            }
+            Self::SingularBind { bone } => {
+                write!(formatter, "bone {bone} has a singular bind matrix")
             }
         }
     }

@@ -50,6 +50,17 @@ fn shape(seed: u64) -> NifShape {
         bones: vec!["root".into(), "spine".into()],
         bone_indices: vec![[0, 1, 0, 0]; vertices],
         weights: vec![[0.75, 0.25, 0.0, 0.0]; vertices],
+        bind_inverse: (0..2)
+            .map(|bone| {
+                let mut matrix = [[0.0f32; 4]; 4];
+                matrix[0][0] = 1.0;
+                matrix[1][1] = 1.0;
+                matrix[2][2] = 1.0;
+                matrix[3][3] = 1.0;
+                matrix[3][bone] = bone as f32;
+                matrix
+            })
+            .collect(),
     }
 }
 

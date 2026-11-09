@@ -1,18 +1,22 @@
 //! Skyrim SE `BSTriShape` writer for one shape.
 //!
-//! C03 wrote positions and triangles, C05 added UVs and C06 adds byte normals
-//! and, when the model carries them, SE tangents/bitangents. Skin, shader and
-//! morph blocks arrive later (C07–C12). `sculpto_nif::read` undoes the reader's
-//! frame conversion, so positions, normals and tangents round-trip.
+//! C03 wrote positions and triangles, C05 added UVs, C06 byte normals and SE
+//! tangents, and C07 adds the skin: `VF_SKINNED` in the packed vertex stream,
+//! one `NiSkinInstance` + `NiSkinData`, and one named `NiNode` per bone. Shader
+//! and morph blocks arrive later (C08–C12). `sculpto_nif::read` undoes the
+//! reader's frame conversion, so every written attribute round-trips.
 
 use sculpto_core::mesh::MeshAsset;
 
 use super::header::{NifTarget, NifWriteError, write_header};
+use super::skin;
+use super::strings::StringTable;
 
 const VF_VERTEX: u64 = 0x001;
 const VF_UVS: u64 = 0x002;
 const VF_NORMALS: u64 = 0x008;
 const VF_TANGENTS: u64 = 0x010;
+const VF_SKINNED: u64 = 0x040;
 const BLOCK_TYPE: &str = "BSTriShape";
 
 /// Write a complete SE NIF containing one `BSTriShape`.
@@ -20,7 +24,9 @@ const BLOCK_TYPE: &str = "BSTriShape";
 /// The model is validated first; a refused model leaves no bytes. Normals are
 /// byte-encoded, so they round-trip within the format's 8-bit precision;
 /// tangents are only written when the model carries both normals and tangents.
-/// Morphs and skin are deliberately not written yet (C07 onward).
+/// A skinned model writes the influences into the packed vertex stream and the
+/// palette/bind matrices into `NiSkinData`; morphs are deliberately not written
+/// yet (C08 onward).
 pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     asset.validate().map_err(NifWriteError::InvalidModel)?;
     let vertices =
@@ -52,11 +58,37 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         flags |= VF_TANGENTS;
         vertex_size += 4;
     }
+    let skin_plan = skin::plan(asset)?;
+    if skin_plan.is_some() {
+        flags |= VF_SKINNED;
+        vertex_size += 12;
+    }
     let vertex_desc = (flags << 44) | (vertex_size / 4);
 
+    let mut strings = StringTable::new();
+    let name_index = match asset.name.is_empty() {
+        true => -1,
+        false => strings.intern(&asset.name) as i32,
+    };
+    let bone_names: Vec<i32> = skin_plan
+        .as_ref()
+        .map(|plan| {
+            plan.names
+                .iter()
+                .map(|name| strings.intern(name) as i32)
+                .collect()
+        })
+        .unwrap_or_default();
+    let bone_count = bone_names.len();
+    // Block 0 is the shape; a skin adds the instance (1), the data (2) and one
+    // node per bone (3..).
+    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 4 + offset as i32).collect();
+    let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
+    let skin_ref = skin_plan.as_ref().map_or(-1, |_| 1);
+
     let mut body = Vec::new();
-    // NiObjectNET: name=-1, no extra data, no controller.
-    push_i32(&mut body, -1);
+    // NiObjectNET: name, no extra data, no controller.
+    push_i32(&mut body, name_index);
     push_u32(&mut body, 0);
     push_i32(&mut body, -1);
     // NiAVObject: flags, identity transform, no collision.
@@ -75,7 +107,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     for value in [0.0f32, 0.0, 0.0, 0.0] {
         push_f32(&mut body, value);
     }
-    push_i32(&mut body, -1); // skin
+    push_i32(&mut body, skin_ref);
     push_i32(&mut body, -1); // shader
     push_i32(&mut body, -1); // alpha
     push_u64(&mut body, vertex_desc);
@@ -127,6 +159,14 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             // Tangent W carries Bitangent Z.
             push_u8(&mut body, encode_normal(bitangent[2]));
         }
+        if let Some(skin) = &asset.skin {
+            for weight in skin.weights[index] {
+                push_u16(&mut body, half::f16::from_f32(weight).to_bits());
+            }
+            for bone in skin.indices[index] {
+                push_u8(&mut body, bone as u8);
+            }
+        }
     }
     for triangle in &asset.triangles {
         push_u16(&mut body, triangle[0] as u16);
@@ -135,25 +175,72 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     }
     push_u32(&mut body, 0); // SSE particle_data_size
 
+    let (instance, data, root, nodes) = match &skin_plan {
+        Some(plan) => (
+            skin::instance(2, skeleton_root, &bone_refs),
+            skin::data(plan)?,
+            skin::node(-1, &[0]),
+            plan.names
+                .iter()
+                .zip(&bone_names)
+                .map(|(_name, index)| skin::node(*index, &[]))
+                .collect::<Vec<_>>(),
+        ),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    let mut type_names: Vec<&str> = vec![BLOCK_TYPE];
+    let mut type_indices: Vec<u16> = vec![0];
+    if skin_plan.is_some() {
+        type_names.extend(["NiSkinInstance", "NiSkinData", "NiNode"]);
+        type_indices.extend([1, 2]);
+        type_indices.extend(std::iter::repeat_n(3, bone_count + 1));
+    }
+
     let mut file = write_header(NifTarget::Se);
     // Block count precedes BSStreamHeader in the parsed layout.
-    push_u32(&mut file, 1);
+    push_u32(&mut file, type_indices.len() as u32);
     // BSStreamHeader: SE bsver, empty author/process/export strings.
     push_u32(&mut file, 100);
     file.push(0); // author
     file.push(0); // process script
     file.push(0); // export script
     // Block type table.
-    push_u16(&mut file, 1);
-    push_u32(&mut file, BLOCK_TYPE.len() as u32);
-    file.extend_from_slice(BLOCK_TYPE.as_bytes());
-    push_u16(&mut file, 0); // block type index
+    push_u16(&mut file, type_names.len() as u16);
+    for name in &type_names {
+        push_u32(&mut file, name.len() as u32);
+        file.extend_from_slice(name.as_bytes());
+    }
+    for index in &type_indices {
+        push_u16(&mut file, *index);
+    }
     push_u32(&mut file, body.len() as u32);
-    // Empty string table.
-    push_u32(&mut file, 0);
-    push_u32(&mut file, 0);
+    if skin_plan.is_some() {
+        push_u32(&mut file, instance.len() as u32);
+        push_u32(&mut file, data.len() as u32);
+        push_u32(&mut file, root.len() as u32);
+        for node in &nodes {
+            push_u32(&mut file, node.len() as u32);
+        }
+    }
+    // String table: index 0 is empty, then the shape and bone names.
+    let max_length = strings.iter().map(str::len).max().unwrap_or(0);
+    push_u32(&mut file, strings.len() as u32);
+    push_u32(&mut file, max_length as u32);
+    for value in strings.iter() {
+        push_u32(&mut file, value.len() as u32);
+        file.extend_from_slice(value.as_bytes());
+    }
     push_u32(&mut file, 0); // num_groups
     file.extend_from_slice(&body);
+    if skin_plan.is_some() {
+        file.extend_from_slice(&instance);
+        file.extend_from_slice(&data);
+        file.extend_from_slice(&root);
+        for node in &nodes {
+            file.extend_from_slice(node);
+        }
+    }
     Ok(file)
 }
 
@@ -218,7 +305,7 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sculpto_core::mesh::PartitionId;
+    use sculpto_core::mesh::{PartitionId, Skin};
 
     fn triangle() -> MeshAsset {
         MeshAsset {
@@ -318,6 +405,78 @@ mod tests {
             let dot = actual[0] * expected[0] + actual[1] * expected[1] + actual[2] * expected[2];
             assert!(dot > 0.99, "tangent direction drifted: {dot}");
         }
+    }
+
+    fn skinned() -> MeshAsset {
+        let mut asset = triangle();
+        asset.name = "Skinned".into();
+        let mut bind = vec![skin::identity(), skin::identity()];
+        bind[1][3] = [0.0, 0.0, 1.0, 1.0];
+        asset.skin = Some(Skin {
+            bones: vec!["Root".into(), "Spine".into()],
+            bind_inverse: bind,
+            indices: vec![[0, 1, 0, 0]; 3],
+            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+        });
+        asset
+    }
+
+    #[test]
+    fn se_skin_roundtrips_names_weights_and_bind_matrices() {
+        let asset = skinned();
+        let bytes = write_se_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("parses");
+        let shape = &document.shapes[0];
+        assert_eq!(shape.name, "Skinned");
+        assert_eq!(shape.bones, vec!["Root", "Spine"]);
+        assert_eq!(
+            shape.bone_indices,
+            asset.skin.as_ref().expect("skin").indices
+        );
+        for (actual, expected) in shape
+            .weights
+            .iter()
+            .zip(&asset.skin.as_ref().expect("skin").weights)
+        {
+            for (left, right) in actual.iter().zip(expected) {
+                assert!((left - right).abs() <= 1e-3, "weight drift");
+            }
+        }
+        assert_eq!(shape.bind_inverse.len(), 2);
+        for (actual, expected) in shape
+            .bind_inverse
+            .iter()
+            .zip(&asset.skin.as_ref().expect("skin").bind_inverse)
+        {
+            for column in 0..4 {
+                for row in 0..4 {
+                    assert!(
+                        (actual[column][row] - expected[column][row]).abs() <= 1e-5,
+                        "bind matrix drift at [{column}][{row}]"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unnamed_bones_are_refused() {
+        let mut asset = skinned();
+        asset.skin.as_mut().expect("skin").bones[1] = "  ".into();
+        assert!(matches!(
+            write_se_shape(&asset),
+            Err(NifWriteError::UnnamedBone { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn duplicate_bones_are_refused() {
+        let mut asset = skinned();
+        asset.skin.as_mut().expect("skin").bones[1] = "Root".into();
+        assert!(matches!(
+            write_se_shape(&asset),
+            Err(NifWriteError::DuplicateBone { .. })
+        ));
     }
 
     #[test]

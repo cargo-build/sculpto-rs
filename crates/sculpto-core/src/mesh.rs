@@ -38,6 +38,10 @@ pub struct MorphTarget {
 pub struct Skin {
     /// Bone names, indexed by [`Self::indices`].
     pub bones: Vec<String>,
+    /// Per-bone bind matrices in mesh space, column-major (mesh -> bone at
+    /// bind). Empty means the identity fallback for every bone; otherwise one
+    /// matrix per bone.
+    pub bind_inverse: Vec<[[f32; 4]; 4]>,
     /// Four bone indices per vertex.
     pub indices: Vec<[u16; 4]>,
     /// Four weights per vertex, parallel to [`Self::indices`].
@@ -292,6 +296,10 @@ pub enum MeshError {
     WeightSumOutOfRange { vertex: usize, sum: f32 },
     /// A vertex's skin weights sum to zero, so they cannot be normalized.
     ZeroWeightSum { vertex: usize },
+    /// The bind-matrix array is neither empty nor one per bone.
+    BindLengthMismatch { bind: usize, bones: usize },
+    /// A bind matrix cell is not finite.
+    NonFiniteBind { bone: usize },
     /// A triangle carries the reader's unmatched-partition sentinel.
     UnmatchedPartition { triangle: usize },
     /// A material slot violates a named rule.
@@ -342,6 +350,19 @@ impl MeshAsset {
                 || skin.weights.len() != self.positions.len())
         {
             return Err(MeshError::SkinLengthMismatch);
+        }
+        if let Some(skin) = &self.skin {
+            if !skin.bind_inverse.is_empty() && skin.bind_inverse.len() != skin.bones.len() {
+                return Err(MeshError::BindLengthMismatch {
+                    bind: skin.bind_inverse.len(),
+                    bones: skin.bones.len(),
+                });
+            }
+            for (bone, matrix) in skin.bind_inverse.iter().enumerate() {
+                if !matrix.iter().flatten().all(|value| value.is_finite()) {
+                    return Err(MeshError::NonFiniteBind { bone });
+                }
+            }
         }
 
         for (index, position) in self.positions.iter().enumerate() {
@@ -606,6 +627,7 @@ impl MeshAsset {
         let tangents = self.gather(&chunk.vertices, &self.tangents);
         let skin = self.skin.as_ref().map(|skin| Skin {
             bones: skin.bones.clone(),
+            bind_inverse: skin.bind_inverse.clone(),
             indices: self.gather(&chunk.vertices, &skin.indices),
             weights: self.gather(&chunk.vertices, &skin.weights),
         });
@@ -812,6 +834,7 @@ mod tests {
             tangents: (0..6).map(|i| [1.0, 0.0, 0.0, i as f32]).collect(),
             skin: Some(Skin {
                 bones: vec!["root".into()],
+                bind_inverse: Vec::new(),
                 indices: vec![[0, 0, 0, 0]; 6],
                 weights: vec![[1.0, 0.0, 0.0, 0.0]; 6],
             }),
@@ -867,6 +890,7 @@ mod tests {
         let mut mesh = one_triangle();
         mesh.skin = Some(Skin {
             bones: vec!["root".into()],
+            bind_inverse: Vec::new(),
             indices: vec![[0, 0, 0, 0]; 3],
             weights: vec![[0.25, 0.25, 0.25, 0.25]; 3],
         });
