@@ -1,0 +1,8 @@
+preset=HIMBO Chonky
+set=HIMBO Body 1st
+shape=HIMBO - First
+vertices=2958
+triangles=5632
+bones=16
+morphs=0
+positions_fnv1a64=939cbcc754d0a34d
