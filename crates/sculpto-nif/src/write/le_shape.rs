@@ -1,15 +1,18 @@
 //! Skyrim LE `NiTriShape` + `NiTriShapeData` writer for one shape.
 //!
 //! The LE wire format keeps geometry in a separate data block. C04 wrote
-//! positions and triangles, C05 added UVs and C06 adds `f32` normals. Tangents
-//! need the NBT layout, which this writer does not emit yet, so they are
-//! refused instead of dropped; skin follows in C07.
+//! positions and triangles, C05 added UVs, C06 `f32` normals and C07 adds the
+//! skin: `NiSkinInstance` + sparse `NiSkinData` weights and one named `NiNode`
+//! per bone. Tangents need the NBT layout, which this writer does not emit yet,
+//! so they are refused instead of dropped.
 
 use sculpto_core::mesh::MeshAsset;
 
 use super::header::{NifTarget, NifWriteError, write_header};
+use super::skin;
+use super::strings::StringTable;
 
-/// Write a complete LE NIF containing one position-only `NiTriShape`.
+/// Write a complete LE NIF containing one `NiTriShape`.
 pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     asset.validate().map_err(NifWriteError::InvalidModel)?;
     let vertices =
@@ -21,8 +24,37 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             triangles: asset.triangles.len(),
         })?;
 
+    let has_uvs = !asset.uvs.is_empty();
+    let has_normals = !asset.normals.is_empty();
+    if !asset.tangents.is_empty() {
+        return Err(NifWriteError::TangentsUnsupported {
+            target: NifTarget::Le,
+        });
+    }
+    let skin_plan = skin::plan(asset)?;
+    let mut strings = StringTable::new();
+    let name_index = match asset.name.is_empty() {
+        true => -1,
+        false => strings.intern(&asset.name) as i32,
+    };
+    let bone_names: Vec<i32> = skin_plan
+        .as_ref()
+        .map(|plan| {
+            plan.names
+                .iter()
+                .map(|name| strings.intern(name) as i32)
+                .collect()
+        })
+        .unwrap_or_default();
+    let bone_count = bone_names.len();
+    // Block 0 is the shape, 1 its data; a skin adds the instance (2), the skin
+    // data (3), a root node (4) that parents the shape, and one node per bone.
+    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 5 + offset as i32).collect();
+    let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
+    let skin_ref = skin_plan.as_ref().map_or(-1, |_| 2);
+
     let mut shape = Vec::new();
-    push_i32(&mut shape, -1); // name
+    push_i32(&mut shape, name_index);
     push_u32(&mut shape, 0); // extra data
     push_i32(&mut shape, -1); // controller
     push_u32(&mut shape, 0); // flags
@@ -37,20 +69,13 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     push_f32(&mut shape, 1.0);
     push_i32(&mut shape, -1); // collision
     push_i32(&mut shape, 1); // data block
-    push_i32(&mut shape, -1); // skin
+    push_i32(&mut shape, skin_ref);
     push_u32(&mut shape, 0); // num_materials
     push_u32(&mut shape, 0); // active_material_index
     shape.push(0); // dirty flag
     push_i32(&mut shape, -1); // shader
     push_i32(&mut shape, -1); // alpha
 
-    let has_uvs = !asset.uvs.is_empty();
-    let has_normals = !asset.normals.is_empty();
-    if !asset.tangents.is_empty() {
-        return Err(NifWriteError::TangentsUnsupported {
-            target: NifTarget::Le,
-        });
-    }
     let mut data = Vec::new();
     push_i32(&mut data, 0); // group id
     push_u16(&mut data, vertices);
@@ -94,26 +119,69 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     }
     push_u16(&mut data, 0); // match groups
 
+    let (instance, skin_data, root, nodes) = match &skin_plan {
+        Some(plan) => (
+            skin::instance(3, skeleton_root, &bone_refs),
+            skin::data(plan)?,
+            skin::node(-1, &[0]),
+            bone_names
+                .iter()
+                .map(|index| skin::node(*index, &[]))
+                .collect::<Vec<_>>(),
+        ),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    let mut type_names: Vec<&str> = vec!["NiTriShape", "NiTriShapeData"];
+    let mut type_indices: Vec<u16> = vec![0, 1];
+    if skin_plan.is_some() {
+        type_names.extend(["NiSkinInstance", "NiSkinData", "NiNode"]);
+        type_indices.extend([2, 3]);
+        type_indices.extend(std::iter::repeat_n(4, bone_count + 1));
+    }
+
     let mut file = write_header(NifTarget::Le);
-    push_u32(&mut file, 2); // block count
+    push_u32(&mut file, type_indices.len() as u32);
     push_u32(&mut file, 83); // LE bsver
     file.push(0); // author
     file.push(0); // process script
     file.push(0); // export script
-    push_u16(&mut file, 2); // block types
-    for name in ["NiTriShape", "NiTriShapeData"] {
+    push_u16(&mut file, type_names.len() as u16);
+    for name in &type_names {
         push_u32(&mut file, name.len() as u32);
         file.extend_from_slice(name.as_bytes());
     }
-    push_u16(&mut file, 0);
-    push_u16(&mut file, 1);
+    for index in &type_indices {
+        push_u16(&mut file, *index);
+    }
     push_u32(&mut file, shape.len() as u32);
     push_u32(&mut file, data.len() as u32);
-    push_u32(&mut file, 0); // string count
-    push_u32(&mut file, 0); // max string length
+    if skin_plan.is_some() {
+        push_u32(&mut file, instance.len() as u32);
+        push_u32(&mut file, skin_data.len() as u32);
+        push_u32(&mut file, root.len() as u32);
+        for node in &nodes {
+            push_u32(&mut file, node.len() as u32);
+        }
+    }
+    let max_length = strings.iter().map(str::len).max().unwrap_or(0);
+    push_u32(&mut file, strings.len() as u32);
+    push_u32(&mut file, max_length as u32);
+    for value in strings.iter() {
+        push_u32(&mut file, value.len() as u32);
+        file.extend_from_slice(value.as_bytes());
+    }
     push_u32(&mut file, 0); // num_groups
     file.extend_from_slice(&shape);
     file.extend_from_slice(&data);
+    if skin_plan.is_some() {
+        file.extend_from_slice(&instance);
+        file.extend_from_slice(&skin_data);
+        file.extend_from_slice(&root);
+        for node in &nodes {
+            file.extend_from_slice(node);
+        }
+    }
     Ok(file)
 }
 
@@ -136,7 +204,7 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sculpto_core::mesh::PartitionId;
+    use sculpto_core::mesh::{PartitionId, Skin};
 
     fn triangle() -> MeshAsset {
         MeshAsset {
@@ -189,6 +257,56 @@ mod tests {
                 target: NifTarget::Le
             })
         ));
+    }
+
+    fn skinned() -> MeshAsset {
+        let mut asset = triangle();
+        asset.name = "Skinned".into();
+        let mut bind = vec![skin::identity(), skin::identity()];
+        bind[1][3] = [0.0, 0.0, 1.0, 1.0];
+        asset.skin = Some(Skin {
+            bones: vec!["Root".into(), "Spine".into()],
+            bind_inverse: bind,
+            indices: vec![[0, 1, 0, 0]; 3],
+            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+        });
+        asset
+    }
+
+    #[test]
+    fn le_skin_roundtrips_names_weights_and_bind_matrices() {
+        let asset = skinned();
+        let bytes = write_le_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("parses");
+        let shape = &document.shapes[0];
+        assert_eq!(shape.name, "Skinned");
+        assert_eq!(shape.bones, vec!["Root", "Spine"]);
+        for vertex in 0..shape.positions.len() {
+            let mut weights: std::collections::BTreeMap<&str, f32> =
+                std::collections::BTreeMap::new();
+            for (slot, bone) in shape.bone_indices[vertex].iter().enumerate() {
+                *weights
+                    .entry(shape.bones[*bone as usize].as_str())
+                    .or_default() += shape.weights[vertex][slot];
+            }
+            assert!((weights["Root"] - 0.75).abs() <= 1e-5, "root weight");
+            assert!((weights["Spine"] - 0.25).abs() <= 1e-5, "spine weight");
+        }
+        assert_eq!(shape.bind_inverse.len(), 2);
+        for (actual, expected) in shape
+            .bind_inverse
+            .iter()
+            .zip(&asset.skin.as_ref().expect("skin").bind_inverse)
+        {
+            for column in 0..4 {
+                for row in 0..4 {
+                    assert!(
+                        (actual[column][row] - expected[column][row]).abs() <= 1e-5,
+                        "bind matrix drift at [{column}][{row}]"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -50,6 +50,9 @@ pub struct NifShape {
     pub bone_indices: Vec<[u16; 4]>,
     /// Per-vertex weights, parallel to `bone_indices`.
     pub weights: Vec<[f32; 4]>,
+    /// Per-bone bind matrices in the source Z-up frame, column-major
+    /// (mesh -> bone at bind). Empty when the mesh carries no skin.
+    pub bind_inverse: Vec<[[f32; 4]; 4]>,
 }
 
 impl NifShape {
@@ -103,6 +106,20 @@ impl fmt::Display for NifError {
 }
 
 impl std::error::Error for NifError {}
+
+/// Convert a column-major Y-up bind matrix back to the source Z-up frame.
+///
+/// The importer applies the basis change `C` (`(x, y, z) -> (x, z, -y)`), so the
+/// source frame is recovered with `C^T * M * C`.
+fn yup_matrix_to_zup(matrix: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let right = [
+        matrix[0],
+        [-matrix[2][0], -matrix[2][1], -matrix[2][2], -matrix[2][3]],
+        matrix[1],
+        matrix[3],
+    ];
+    right.map(|column| [column[0], -column[2], column[1], column[3]])
+}
 
 fn parse_header(bytes: &[u8]) -> Result<NifHeader, NifError> {
     let newline = bytes
@@ -194,6 +211,16 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
                     .skin
                     .as_ref()
                     .map(|skin| skin.vertex_bone_weights.clone())
+                    .unwrap_or_default(),
+                bind_inverse: mesh
+                    .skin
+                    .as_ref()
+                    .map(|skin| {
+                        skin.bones
+                            .iter()
+                            .map(|bone| yup_matrix_to_zup(&bone.bind_inverse))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             })
         })

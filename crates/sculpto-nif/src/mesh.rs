@@ -11,6 +11,7 @@ impl From<&NifShape> for MeshAsset {
     fn from(shape: &NifShape) -> Self {
         let skin = (!shape.bones.is_empty()).then(|| Skin {
             bones: shape.bones.clone(),
+            bind_inverse: shape.bind_inverse.clone(),
             indices: shape.bone_indices.clone(),
             weights: shape.weights.clone(),
         });
@@ -36,6 +37,13 @@ impl From<&NifShape> for MeshAsset {
 /// `NifShape -> MeshAsset -> NifShape` preserves every field `NifShape` owns.
 /// Materials and morphs have no `NifShape` slot and are dropped by this
 /// projection.
+fn mesh_skin_bind(mesh: &MeshAsset) -> Vec<[[f32; 4]; 4]> {
+    mesh.skin
+        .as_ref()
+        .map(|skin| skin.bind_inverse.clone())
+        .unwrap_or_default()
+}
+
 impl From<&MeshAsset> for NifShape {
     fn from(mesh: &MeshAsset) -> Self {
         let (bones, bone_indices, weights) = match &mesh.skin {
@@ -56,6 +64,7 @@ impl From<&MeshAsset> for NifShape {
             bones,
             bone_indices,
             weights,
+            bind_inverse: mesh_skin_bind(mesh),
         }
     }
 }
@@ -75,6 +84,7 @@ mod tests {
             bones: vec!["root".into(), "spine".into()],
             bone_indices: vec![[0, 1, 0, 0]; 3],
             weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+            bind_inverse: vec![[[0.0; 4]; 4]; 2],
         }
     }
 

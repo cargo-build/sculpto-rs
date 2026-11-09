@@ -84,6 +84,7 @@ fn generated(seed: u64) -> MeshAsset {
         .collect();
     let skin = Some(Skin {
         bones: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        bind_inverse: Vec::new(),
         indices: (0..vertices)
             .map(|_| {
                 [
