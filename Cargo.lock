@@ -516,6 +516,7 @@ dependencies = [
  "glam 0.33.12",
  "gltf",
  "robust",
+ "sculpto-core",
  "serde_json",
 ]
 
