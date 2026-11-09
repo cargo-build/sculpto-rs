@@ -543,6 +543,7 @@ dependencies = [
  "gltf",
  "robust",
  "sculpto-core",
+ "sculpto-gltf",
  "serde_json",
 ]
 

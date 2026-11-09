@@ -14,7 +14,9 @@
 //! a garment into its [`classify::GarmentKind`](classify::GarmentKind) and
 //! resolving its corset-aura profile. [`intake`](intake) audits a garment
 //! mesh's arrival state — components, openings, interior chains, rest
-//! self-intersections — and names the fit/repair/split route. [`check`](check)
+//! self-intersections — and names the fit/repair/split route. [`intake_gltf`]
+//! reads the raw generated export (`.glb`, `.gltf`, `.obj`) behind that audit
+//! and normalises it to the declared metre scale. [`check`](check)
 //! adds the measured gates: triangle-pair intersections that vertex-inside
 //! counting cannot see.
 
@@ -25,6 +27,7 @@ pub mod classify;
 pub mod conform;
 pub mod control;
 pub mod intake;
+pub mod intake_gltf;
 pub mod surface;
 mod topology;
 pub mod uv;
