@@ -1,13 +1,14 @@
-"""The add-on's rules table: one copy, gaps declared, panel items derived.
+"""The add-on's class table: identity only, every rule id registered.
 
-F03/F04/F07 seed: the table in
-tools/blender_addon/sculpto_garment/rules.py owns every garment decision the
-add-on still makes, each labelled with the proposed command id that will own
-it. Runs with plain `python3 -m unittest` — no Blender: the module is pure
-data. The optional registry case dispatches the real `sculpto commands`
-output when `target/debug/sculpto` exists and fails the day a gap id becomes
-registered, because the add-on copy behind it must then be deleted, not
-doubled.
+F03 moved the five garment rule groups into the core
+(`crates/sculpto-mesh/src/garment.rs`) behind `outfit.offsets`,
+`outfit.place`, `outfit.band`, `outfit.projection` and `outfit.weights`.
+`rules.py` now carries what the panel needs to name a class and nothing
+numeric; the optional registry case dispatches the real `sculpto commands`
+output and fails if an id disappears, because the add-on would then have to
+carry the rule again.
+
+Runs with plain `python3 -m unittest` — no Blender: the module is pure data.
 """
 
 import importlib.util
@@ -29,13 +30,22 @@ spec.loader.exec_module(rules)
 ROOT = Path(__file__).resolve().parents[2]
 SCULPTO = ROOT / "target" / "debug" / "sculpto"
 
-# The panel exposed exactly these choices before the table existed; the one
-# table must keep them (F04: one table-driven definition, stable surface).
+# The panel exposed exactly these choices before the rules moved; the one table
+# must keep them (F04: one table-driven definition, stable surface).
 EXPECTED_ITEMS = (
     ("upper-body", "Upper body", "Tunic, shirt, bodice"),
     ("trousers", "Trousers", "Waist-to-ankle legs"),
     ("footwear", "Footwear", "Boots and shoes (left foot)"),
 )
+
+# The rule groups the dress flow dispatches, and the pipeline step behind each.
+EXPECTED_COMMANDS = {
+    "outfit.offsets": "surface offsets and boundary relief (build_garment)",
+    "outfit.place": "class placement fractions (place_raw)",
+    "outfit.band": "band cut with arm exclusion (select_region)",
+    "outfit.projection": "projection fill and miss snap (project_texture)",
+    "outfit.weights": "weight transfer and unpose inversion (wire_animation)",
+}
 
 
 class KindTableTest(unittest.TestCase):
@@ -46,71 +56,35 @@ class KindTableTest(unittest.TestCase):
         ids = [entry["id"] for entry in rules.GARMENT_KINDS]
         self.assertEqual(len(ids), len(set(ids)))
 
-    def test_every_kind_carries_place_and_region_values(self):
+    def test_the_table_carries_identity_only(self):
         for entry in rules.GARMENT_KINDS:
-            self.assertIn(entry["width_basis"], ("body-width", "height"))
-            self.assertGreater(entry["width_factor"], 0.0)
-            self.assertIn(entry["hem_from_sole"], (True, False))
-            self.assertIsInstance(entry["arm_exclusion"], bool)
+            self.assertEqual(set(entry), {"id", "label", "tip"})
 
     def test_unknown_kind_has_no_rule(self):
         self.assertIsNone(rules.kind("hat"))
         self.assertIsNone(rules.kind(""))
 
-    def test_upper_body_keeps_arms(self):
-        self.assertFalse(rules.kind("upper-body")["arm_exclusion"])
-
-    def test_leg_and_foot_kinds_exclude_arms(self):
-        for kind_id in ("trousers", "footwear"):
-            self.assertTrue(rules.kind(kind_id)["arm_exclusion"])
-
-    def test_placement_fractions_match_the_documented_values(self):
-        upper = rules.kind("upper-body")
-        self.assertEqual(upper["width_basis"], "body-width")
-        self.assertEqual(upper["width_factor"], 1.15)
-        self.assertEqual(upper["collar_frac"], 0.87)
-        self.assertIsNone(upper["floor_clamp_m"])
-        trousers = rules.kind("trousers")
-        self.assertAlmostEqual(trousers["width_factor"], 1.1 * 0.42)
-        self.assertEqual(trousers["collar_frac"], 0.62)
-        self.assertEqual(trousers["floor_clamp_m"], 0.02)
-        footwear = rules.kind("footwear")
-        self.assertAlmostEqual(footwear["width_factor"], 2.4 * 0.10)
-        self.assertTrue(footwear["hem_from_sole"])
-        self.assertEqual(footwear["sole_offset_m"], 0.01)
+    def test_no_numeric_garment_rule_is_left_in_the_table(self):
+        numbers = {
+            name: value
+            for name, value in vars(rules).items()
+            if not name.startswith("_")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        }
+        self.assertEqual(numbers, {}, "a numeric garment rule returned to the add-on")
 
 
-class RuleGapTest(unittest.TestCase):
-    def test_offsets_are_the_documented_constants(self):
-        self.assertEqual(rules.GARMENT_OFFSET, 0.008)
-        self.assertEqual(rules.BOUNDARY_RELIEF, 0.004)
+class RuleCommandTest(unittest.TestCase):
+    def test_commands_cover_every_pipeline_step(self):
+        self.assertEqual(rules.RULE_COMMANDS, EXPECTED_COMMANDS)
 
-    def test_projection_miss_snaps_to_the_documented_uv(self):
-        self.assertEqual(rules.PROJECT_MISS_UV, (0.5, 0.5))
-        self.assertEqual(rules.PROJECT_AXIS, (0.0, -1.0, 0.0))
-
-    def test_region_majority_and_arm_limit_are_named(self):
-        self.assertEqual(rules.REGION_MAJORITY, 2)
-        self.assertEqual(rules.REGION_ARM_LIMIT_M, 0.21)
-
-    def test_front_placement_constants_are_named(self):
-        self.assertEqual(rules.PLACE_FRONT_GAP_M, 0.05)
-        self.assertEqual(rules.PLACE_FRONT_RISE_FRAC, 0.02)
-
-    def test_gap_register_covers_every_pending_rule(self):
-        self.assertEqual(
-            set(rules.RULE_GAPS),
-            {
-                "garment.offset",
-                "garment.place",
-                "garment.region",
-                "garment.project",
-                "garment.weights",
-            },
-        )
+    def test_command_values_name_the_pipeline_function(self):
+        for description in rules.RULE_COMMANDS.values():
+            self.assertTrue(description.endswith(")"), description)
 
     @unittest.skipUnless(SCULPTO.is_file(), "target/debug/sculpto is not built")
-    def test_gap_ids_are_still_absent_from_the_registry(self):
+    def test_rule_ids_are_registered_in_the_core(self):
         out = subprocess.run(
             [str(SCULPTO), "commands", "--json"],
             capture_output=True,
@@ -118,9 +92,11 @@ class RuleGapTest(unittest.TestCase):
             check=True,
         )
         registered = {row["id"] for row in json.loads(out.stdout)["commands"]}
+        missing = set(rules.RULE_COMMANDS) - registered
         self.assertFalse(
-            set(rules.RULE_GAPS) & registered,
-            "a gap id is now registered: delete the add-on copy behind it",
+            missing,
+            f"a rule id is no longer registered: {sorted(missing)}; the add-on "
+            "would have to carry the numbers again",
         )
 
 

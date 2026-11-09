@@ -14,27 +14,27 @@ import bpy
 import tempfile
 from math import radians
 from pathlib import Path
-from mathutils import Vector, bvhtree
+from mathutils import Vector
 
 from . import cli_bridge
-from . import rules
 
-# F03 gap register (DECL0002): every measure/normalise/decide rule this file
-# still applies is a declared gap — the command id that will own it does not
-# exist in the closed registry (crates/sculpto-engine/src/lib.rs COMMANDS)
-# yet, so the values live once, named, in `rules.py` and the functions below
-# consume that table. The ids are proposed, not registered:
-#   garment.offset  -> GARMENT_OFFSET / BOUNDARY_RELIEF surface offsets,
-#   garment.place   -> place_raw class fractions (collar 0.87, waist 0.62,
-#                      sole 0.01, scale targets 1.15 / 1.1 / 2.4 / 0.42),
-#   garment.region  -> select_region band cut (majority-in-band, |x| <= 0.21
-#                      arm exclusion),
-#   garment.project -> project_texture ray-cast barycentric fill and miss
-#                      snap (0.5, 0.5),
-#   garment.weights -> wire_animation nearest-vertex weight transfer and
-#                      _unpose_garment skin-matrix inversion.
-# tools/tests/test_sculpto_rules.py asserts none of these ids is registered;
-# when one lands, delete the add-on copy behind it.
+# Every measure/normalise/decide rule of the dress flow is a command now
+# (DECL0002): `outfit.place` (this file's place_raw), `outfit.band`
+# (select_region), `outfit.offsets` (build_garment), `outfit.projection`
+# (project_texture) and `outfit.weights` (wire_animation). The numbers live in
+# `crates/sculpto-mesh/src/garment.rs`; what stays here is Blender data
+# construction — object transforms, bmesh edits, modifier wiring.
+
+
+def mesh_data(obj, world):
+    """Vertex positions and polygons of a mesh, in world or object space."""
+    matrix = obj.matrix_world if world else None
+    positions = [
+        list(matrix @ vertex.co) if matrix is not None else list(vertex.co)
+        for vertex in obj.data.vertices
+    ]
+    polygons = [list(polygon.vertices) for polygon in obj.data.polygons]
+    return positions, polygons
 
 
 def posed_body(body, armature, clip):
@@ -159,57 +159,42 @@ def import_raw(path, operator):
     return raw, material
 
 
-def place_raw(raw, body, kind, width_reference=None):
+def place_raw(raw, body, kind, width_reference=None, cli=None):
     """Scale and move the raw asset in front of the body it will dress.
 
-    Returns world-space coverage: (hem_z, collar_z, width). The class table
-    (`rules.GARMENT_KINDS`, gap `garment.place`) owns every fraction: the
-    upper-body class hangs the collar at the neck base, footwear rests the
-    sole on the ground, trousers anchor at the waist. `width_reference` (the
-    rest-pose body) supplies the width the garment class is scaled against: a
-    posed body with arms tucked measures narrower and shrinks the garment
-    into a crop top.
+    Returns world-space coverage: (hem_z, collar_z, width). The class fractions
+    and the front clearance are `outfit.place`'s; the add-on measures the body
+    and the raw, then applies the returned object transform. `width_reference`
+    (the rest-pose body) supplies the width the garment class is scaled against:
+    a posed body with arms tucked measures narrower and shrinks the garment into
+    a crop top.
     """
-    rule = rules.kind(kind)
-    if rule is None:
-        raise RuntimeError(f"no placement rule for kind `{kind}`")
     zs = [(body.matrix_world @ v.co).z for v in body.data.vertices]
-    zmin, zmax = min(zs), max(zs)
-    height = zmax - zmin
     width_source = width_reference or body
     xs = [(width_source.matrix_world @ v.co).x for v in width_source.data.vertices]
-    body_cx = (min(xs) + max(xs)) / 2
     ys = [(body.matrix_world @ v.co).y for v in body.data.vertices]
-    front_y = min(ys)
-
-    world = [
-        raw.matrix_world @ v.co for v in raw.data.vertices
-    ]
-    rw = max(p.x for p in world) - min(p.x for p in world)
-    rh = max(p.z for p in world) - min(p.z for p in world)
-    if rw <= 1e-6 or rh <= 1e-6:
-        raise RuntimeError("raw asset is degenerate")
-
-    width_base = (max(xs) - min(xs)) if rule["width_basis"] == "body-width" else height
-    scale = (rule["width_factor"] * width_base) / rw
-    if rule["hem_from_sole"]:
-        # Sole on the floor, shaft rises by the item's own proportions:
-        # anchoring the collar at ankle height buries a knee-high shaft
-        # below the ground.
-        hem_z = zmin + rule["sole_offset_m"]
-        collar_z = hem_z + rh * scale
-    else:
-        collar_z = zmin + rule["collar_frac"] * height
-        hem_z = collar_z - rh * scale
-        if rule["floor_clamp_m"] is not None:
-            # A waist-anchored hem cannot go through the floor.
-            hem_z = max(hem_z, zmin + rule["floor_clamp_m"])
-    raw.scale = (scale, scale, scale)
-    raw.location = (
-        body_cx - (min(p.x for p in world) + rw / 2) * scale,
-        front_y - rules.PLACE_FRONT_GAP_M - height * rules.PLACE_FRONT_RISE_FRAC,
-        hem_z - min(p.z for p in world) * scale,
+    world = [raw.matrix_world @ v.co for v in raw.data.vertices]
+    placement = (cli or cli_bridge.SculptoCli()).run(
+        "outfit.place",
+        {
+            "kind": kind,
+            "body": {
+                "min_z": min(zs),
+                "max_z": max(zs),
+                "front_y": min(ys),
+                "width_min_x": min(xs),
+                "width_max_x": max(xs),
+            },
+            "raw": {
+                "min_x": min(p.x for p in world),
+                "max_x": max(p.x for p in world),
+                "min_z": min(p.z for p in world),
+                "max_z": max(p.z for p in world),
+            },
+        },
     )
+    raw.scale = (placement["scale"],) * 3
+    raw.location = tuple(placement["location"])
     bpy.context.view_layer.update()
     # Bake the placement into the mesh: every later query (ray casting,
     # bounds) then works in world coordinates with an identity transform.
@@ -218,77 +203,69 @@ def place_raw(raw, body, kind, width_reference=None):
         obj.select_set(False)
     raw.select_set(True)
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    return hem_z, collar_z, rw * scale
+    return placement["hem_z"], placement["collar_z"], placement["width"]
 
 
-def select_region(body, hem_z, collar_z, kind="upper-body"):
+def select_region(body, hem_z, collar_z, kind="upper-body", cli=None):
     """Body faces whose vertices all sit between the hem and collar lines.
 
-    Arm-excluding classes (`rules.GARMENT_KINDS`, gap `garment.region`) drop
-    faces beyond the sagittal limit: the band of a trousers or footwear
-    garment overlaps hanging arms, which would sew arm tubes onto legs.
-    Returns face indices; BMFace references die with their bmesh.
+    The majority rule and the arm limit are `outfit.band`'s (DECL0002); the
+    add-on passes the body's world-space polygons and keeps the returned face
+    indices. BMFace references die with their bmesh, so indices are the contract.
     """
-    rule = rules.kind(kind)
-    if rule is None:
-        raise RuntimeError(f"no region rule for kind `{kind}`")
-    bm = bmesh.new()
-    bm.from_mesh(body.data)
-    bm.faces.ensure_lookup_table()
-    world = body.matrix_world
-    # Faces with a majority of vertices inside the band: a strict
-    # all-vertices rule zigzags the hem and collar into torn-looking edges.
-    faces = [
-        face.index
-        for face in bm.faces
-        if sum(1 for v in face.verts if hem_z <= (world @ v.co).z <= collar_z)
-        >= rules.REGION_MAJORITY
-        and (
-            not rule["arm_exclusion"]
-            or abs(sum((world @ v.co).x for v in face.verts) / len(face.verts))
-            <= rules.REGION_ARM_LIMIT_M
-        )
-    ]
-    bm.free()
-    return faces
+    positions, polygons = mesh_data(body, world=True)
+    band = (cli or cli_bridge.SculptoCli()).run(
+        "outfit.band",
+        {
+            "kind": kind,
+            "positions": positions,
+            "polygons": polygons,
+            "hem_z": hem_z,
+            "collar_z": collar_z,
+        },
+    )
+    return band["faces"]
 
 
-def build_garment(body, face_indices):
-    """Offset surface over the selected body faces, as a new object."""
-    bm = bmesh.new()
-    bm.from_mesh(body.data)
-    bm.faces.ensure_lookup_table()
-    bm.verts.ensure_lookup_table()
-    keep = set(face_indices)
-    for face in list(bm.faces):
-        if face.index not in keep:
-            bm.faces.remove(face)
-    for vert in list(bm.verts):
-        if not vert.link_faces:
-            bm.verts.remove(vert)
-    boundary = {v.index for v in bm.verts if v.is_boundary}
-    for vert in bm.verts:
-        offset = rules.GARMENT_OFFSET + (
-            rules.BOUNDARY_RELIEF if vert.index in boundary else 0.0
-        )
-        vert.co += vert.normal * offset
+def build_garment(body, face_indices, cli=None):
+    """Offset surface over the selected body faces, as a new object.
+
+    `outfit.offsets` trims the body to the selected faces and answers the
+    per-vertex offset, including the boundary relief; Blender owns the vertex
+    normals, so the displacement is applied here along them.
+    """
+    positions, polygons = mesh_data(body, world=False)
+    surface = (cli or cli_bridge.SculptoCli()).run(
+        "outfit.offsets",
+        {"positions": positions, "polygons": polygons, "keep": list(face_indices)},
+    )
     mesh = bpy.data.meshes.new("SculptoGarment")
-    bm.to_mesh(mesh)
-    bm.free()
+    mesh.from_pydata(surface["positions"], [], surface["polygons"])
+    mesh.update()
+    if len(mesh.vertices) != len(surface["offsets"]):
+        raise RuntimeError(
+            f"the offset command answered {len(surface['offsets'])} offsets for "
+            f"{len(mesh.vertices)} vertices"
+        )
+    # Snapshot the normals first: they are derived from the mesh, so displacing
+    # as we read would fold each move into the next vertex's normal.
+    normals = [vertex.normal.copy() for vertex in mesh.vertices]
+    for vertex, normal, offset in zip(mesh.vertices, normals, surface["offsets"]):
+        vertex.co += normal * offset
     garment = bpy.data.objects.new("SculptoGarment", mesh)
     bpy.context.collection.objects.link(garment)
     garment.matrix_world = body.matrix_world.copy()
-    # The bmesh round-trip carries the body's vertex groups through its
-    # deform layer; they are stale on the trimmed surface and would mix into
-    # the transferred weights, so drop them here.
-    while garment.vertex_groups:
-        garment.vertex_groups.remove(garment.vertex_groups[0])
-    print(f"build_garment: groups after clear: {len(garment.vertex_groups)}")
     return garment
 
 
-def project_texture(garment, raw, material):
-    """Garment UVs by ray-casting the placed raw mesh along the body axis."""
+def project_texture(garment, raw, material, cli=None):
+    """Garment UVs by ray-casting the placed raw mesh.
+
+    `outfit.projection` casts one ray per garment loop and answers the atlas
+    coordinate: barycentric interpolation over the hit triangle's corner UVs, or
+    the miss snap. The raw copy is triangulated so the cast surface and the
+    corner UVs the command interpolates describe the same triangles.
+    """
     if material is None or not material.use_nodes:
         return False
     image = next(
@@ -299,57 +276,51 @@ def project_texture(garment, raw, material):
         return False
     raw_bm = bmesh.new()
     raw_bm.from_mesh(raw.data)
+    bmesh.ops.triangulate(raw_bm, faces=raw_bm.faces[:])
     raw_bm.faces.ensure_lookup_table()
     raw_bm.verts.ensure_lookup_table()
     raw_uv = raw_bm.loops.layers.uv.active
     if raw_uv is None:
         raw_bm.free()
         return False
-    raw_mesh = bpy.data.meshes.new("SculptoRawBVH")
-    raw_bm.to_mesh(raw_mesh)
-    tree = bvhtree.BVHTree.FromBMesh(raw_bm)
+    # Both sides stay in the raw asset's own frame: `place_raw` bakes the
+    # placement into the mesh, and the garment shares the body's frame.
+    raw_triangles = [
+        {
+            "positions": [list(corner.vert.co) for corner in face.loops],
+            "uvs": [list(corner[raw_uv].uv) for corner in face.loops],
+        }
+        for face in raw_bm.faces
+    ]
+    raw_bm.free()
     bm = bmesh.new()
     bm.from_mesh(garment.data)
     uv_layer = bm.loops.layers.uv.get("SculptoProjected")
     if uv_layer is None:
         uv_layer = bm.loops.layers.uv.new("SculptoProjected")
-    axis = Vector(rules.PROJECT_AXIS)
-    hits = 0
+    bm.faces.ensure_lookup_table()
+    origins = [
+        list(garment.matrix_world @ loop.vert.co)
+        for face in bm.faces
+        for loop in face.loops
+    ]
+    projection = (cli or cli_bridge.SculptoCli()).run(
+        "outfit.projection",
+        {"origins": origins, "raw": raw_triangles},
+    )
+    uvs = projection["uvs"]
+    if len(uvs) != len(origins):
+        bm.free()
+        raise RuntimeError(
+            f"the projection command answered {len(uvs)} UVs for {len(origins)} loops"
+        )
+    index = 0
     for face in bm.faces:
         for loop in face.loops:
-            origin = garment.matrix_world @ loop.vert.co
-            location, _normal, index, hit = tree.ray_cast(origin, axis)
-            if hit:
-                # Barycentric interpolation of the hit face's corner UVs:
-                # nearest-corner snapping fragments a shared catalog atlas
-                # into mottle instead of coherent cloth.
-                raw_face = raw_bm.faces[index]
-                corners = raw_face.loops[:3]
-                a, b, c = (l.vert.co for l in corners)
-                ab, ac = b - a, c - a
-                denom = ab.dot(ab) * ac.dot(ac) - ab.dot(ac) ** 2
-                if abs(denom) < 1e-12:
-                    loop[uv_layer].uv = corners[0][raw_uv].uv
-                else:
-                    ap = location - a
-                    d20, d21 = ap.dot(ab), ap.dot(ac)
-                    v = (ac.dot(ac) * d20 - ab.dot(ac) * d21) / denom
-                    w = (ab.dot(ab) * d21 - ab.dot(ac) * d20) / denom
-                    u = 1.0 - v - w
-                    v = max(0.0, min(1.0, v))
-                    w = max(0.0, min(1.0, w))
-                    u = max(0.0, min(1.0 - w - v + 1e-6, u))
-                    uvs = [l[raw_uv].uv.copy() for l in corners]
-                    loop[uv_layer].uv = (
-                        uvs[0] * u + uvs[1] * v + uvs[2] * w
-                    )
-                hits += 1
-            else:
-                loop[uv_layer].uv = rules.PROJECT_MISS_UV
+            loop[uv_layer].uv = uvs[index]
+            index += 1
     bm.to_mesh(garment.data)
     bm.free()
-    raw_bm.free()
-    bpy.data.meshes.remove(raw_mesh)
     # The body's own UV layers ride along on the copied faces; drop them at
     # the mesh level (bmesh cannot delete UV layers) and make the projected
     # layer the active one the material samples.
@@ -362,108 +333,84 @@ def project_texture(garment, raw, material):
     mat = material.copy()
     mat.name = "SculptoGarmentMaterial"
     garment.data.materials.append(mat)
-    return hits > 0
+    return projection["hits"] > 0
 
 
-def _unpose_garment(garment, armature):
+def _unpose_garment(garment, armature, weights, cli=None):
     """Undo the clip's first-frame deformation on the garment's own vertices.
 
     The garment is constructed on the posed body, but the Armature modifier
     deforms from the rest pose — without this compensation it would apply the
-    frame-1 pose twice and overshoot (measured: sleeve verts pushed 0.15 m
-    past the arm). For weights {(bone, w)} and frame-1 skinning matrices M,
-    built v1 = (sum w*M) @ v0, so v0 = (sum w*M)^-1 @ v1 restores the rest
-    geometry the modifier expects.
+    frame-1 pose twice and overshoot (measured: sleeve verts pushed 0.15 m past
+    the arm). `outfit.weights` inverts the blended skin matrix; the matrices
+    are Blender's, the inversion and the blend are the command's.
     """
-    from mathutils import Matrix, Vector
-
     world = armature.matrix_world
     skinning = {}
     for bone in armature.pose.bones:
         bind = world @ bone.bone.matrix_local
         skinning[bone.name] = (world @ bone.matrix) @ bind.inverted()
-
-    import bmesh
-
-    bm = bmesh.new()
-    bm.from_mesh(garment.data)
-    layer = bm.verts.layers.deform.verify()
-    index_to_name = {g.index: g.name for g in garment.vertex_groups}
-    for vert in bm.verts:
-        blend = Matrix.Identity(4) * 0.0
-        total = 0.0
-        for group_index, weight in vert[layer].items():
-            name = index_to_name.get(group_index)
-            matrix = skinning.get(name)
-            if matrix is None or weight <= 0.0:
-                continue
-            blend += matrix * weight
-            total += weight
-        if total <= 0.0:
-            continue
-        try:
-            rest = blend.inverted() @ vert.co
-        except ValueError:
-            continue
-        vert.co = rest.copy() if isinstance(rest, Vector) else Vector(rest)
-    bm.to_mesh(garment.data)
-    bm.free()
+    unposed = (cli or cli_bridge.SculptoCli()).run(
+        "outfit.weights",
+        {
+            "stage": "unpose",
+            "positions": [list(vertex.co) for vertex in garment.data.vertices],
+            "weights": [weights[vertex.index] for vertex in garment.data.vertices],
+            "skinning": {
+                name: [value for row in matrix for value in row]
+                for name, matrix in skinning.items()
+            },
+        },
+    )
+    for vertex, position in zip(garment.data.vertices, unposed["positions"]):
+        vertex.co = position
 
 
-def wire_animation(garment, armature, body, clip):
+def wire_animation(garment, armature, body, clip, cli=None):
     """Bind the garment to the armature by transferring the body's weights.
 
-    The body already carries the reviewed rigging, so each garment vertex
-    takes the normalized weights of the nearest body vertex — no bone-space
-    reconstruction, and sleeves track arms exactly as the body does. Weights
-    are collected first and written once (`ADD` accumulation during
-    collection produced cross-side phantom weights on shared indices), and
-    the garment rides an Armature modifier because `parent_set` silently
-    no-ops in background mode.
+    The body already carries the reviewed rigging, so each garment vertex takes
+    the normalized weights of the nearest body vertex (`outfit.weights`) — no
+    bone-space reconstruction, and sleeves track arms exactly as the body does.
+    Weights are written once through the deform layer: `VertexGroup.add` and
+    `ADD` accumulation were both observed to duplicate memberships across sides.
+    The garment rides an Armature modifier because `parent_set` silently no-ops
+    in background mode.
     """
-    from mathutils import kdtree
-
     body_groups = {g.index: g.name for g in body.vertex_groups}
     if not body_groups:
         raise RuntimeError(f"body {body.name} has no vertex groups to transfer")
-    size = len(body.data.vertices)
-    tree = kdtree.KDTree(size)
     body_world = body.matrix_world
-    for index, vert in enumerate(body.data.vertices):
-        tree.insert(body_world @ vert.co, index)
-    tree.balance()
     garment_world = garment.matrix_world
-
-    plan = {}
-    for vert in garment.data.vertices:
-        _position, nearest_index, _distance = tree.find(garment_world @ vert.co)
-        weights = {
-            body_groups[entry.group]: entry.weight
-            for entry in body.data.vertices[nearest_index].groups
-        }
-        total = sum(weights.values()) or 1.0
-        plan[vert.index] = {name: weight / total for name, weight in weights.items()}
+    client = cli or cli_bridge.SculptoCli()
+    transferred = client.run(
+        "outfit.weights",
+        {
+            "stage": "transfer",
+            "garment_positions": [
+                list(garment_world @ vertex.co) for vertex in garment.data.vertices
+            ],
+            "body_positions": [list(body_world @ vertex.co) for vertex in body.data.vertices],
+            "body_weights": [
+                {body_groups[entry.group]: entry.weight for entry in vertex.groups}
+                for vertex in body.data.vertices
+            ],
+        },
+    )["weights"]
 
     while garment.vertex_groups:
         garment.vertex_groups.remove(garment.vertex_groups[0])
     # One group per bone name: calling new() per (vertex, group) pair spawned
     # thousands of suffixed duplicates that split the weights.
-    names = sorted({name for weights in plan.values() for name in weights})
+    names = sorted({name for weights in transferred for name in weights})
     group_index = {name: garment.vertex_groups.new(name=name).index for name in names}
-    # Write through the bmesh deform layer: `VertexGroup.add` was observed to
-    # alias group objects (one call landing in two groups with identical
-    # weights), which duplicated memberships across sides. The deform layer
-    # replaces each vertex's weights exactly.
-    import bmesh
-
     bm = bmesh.new()
     bm.from_mesh(garment.data)
     layer = bm.verts.layers.deform.verify()
     for vert in bm.verts:
-        weights = plan[vert.index]
         dvert = vert[layer]
         dvert.clear()
-        for name, weight in weights.items():
+        for name, weight in transferred[vert.index].items():
             dvert[group_index[name]] = weight
     bm.to_mesh(garment.data)
     bm.free()
@@ -472,7 +419,7 @@ def wire_animation(garment, armature, body, clip):
     if clip and clip in bpy.data.actions:
         armature.animation_data_create()
         armature.animation_data.action = bpy.data.actions[clip]
-    _unpose_garment(garment, armature)
+    _unpose_garment(garment, armature, transferred, cli=client)
 
 # Native outfit families a dressed class replaces, so the audit frames show
 # one tunic/trouser/boot, not the actor's own pieces layered under ours.

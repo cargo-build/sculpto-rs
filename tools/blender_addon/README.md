@@ -2,17 +2,16 @@
 
 The Blender surface of the sculpto engine: dress a character from a raw
 garment asset, render audit screenshots, and convert NIFs. Per DECL0002 the
-add-on is thin — every format read/write goes through the `sculpto` command
-surface and every garment decision is one named entry in `rules.py`; this
-add-on only builds Blender data.
+add-on is thin — every format read/write and every garment decision is a
+`sculpto` command; this add-on only builds Blender data.
 
 ## Layout
 
 | File | Role |
 |---|---|
 | `sculpto_garment/__init__.py` | Operators, panel, registration (`bl_info` floor: Blender 4.2) |
-| `sculpto_garment/rules.py` | The one decision table: garment classes, offsets, region and projection constants, each entry labelled with the proposed command id that will own it (F03 gap register, `RULE_GAPS`) |
-| `sculpto_garment/pipeline.py` | Blender data construction: bmesh offset surface, placement baking, texture projection, weight wiring — consumes `rules.py` |
+| `sculpto_garment/rules.py` | The garment class table (id, label, tooltip) and `RULE_COMMANDS`, the five rule commands the pipeline dispatches; no numbers |
+| `sculpto_garment/pipeline.py` | Blender data construction: object transforms, bmesh edits, modifier wiring — every rule value comes from `outfit.offsets`, `outfit.place`, `outfit.band`, `outfit.projection` or `outfit.weights` |
 | `sculpto_garment/cli_bridge.py` | The one command driver: argv building, payload builders, envelope parsing, binary discovery, `run_cli` operator error surfacing, `CommandError`/`EnvelopeError` |
 | `headless_run.py` | Headless operator run: import → bake → fit → export with count and byte assertions |
 
@@ -35,11 +34,10 @@ own classification, F06) and cancel.
    stdout, exit codes 0 success / 2 invalid request / 1 refusal or
    environment failure, 300 s default timeout per command.
 4. Command ids in use: `export.obj` (dress imports a raw NIF through the
-   model), `export.nif` (operator conversion), and `bake` + `outfit.fit` in
-   the headless script's preset and fit steps. The garment rules still
-   computed in `rules.py` await proposed ids `garment.place`,
-   `garment.region`, `garment.project`, `garment.weights` and
-   `garment.offset` — none registered yet.
+   model), `export.nif` (operator conversion), `bake` + `outfit.fit` in the
+   headless script's preset and fit steps, and the five garment rules the
+   dress flow dispatches: `outfit.offsets`, `outfit.place`, `outfit.band`,
+   `outfit.projection`, `outfit.weights`.
 
 ## Install
 
@@ -59,7 +57,7 @@ the `sculpto_garment` directory works through *Install from disk* too.
 
 | Operator | id | Command ids | What it does |
 |---|---|---|---|
-| Dress character from raw asset | `sculpto_garment.dress` | `export.obj`; pending `garment.place` / `garment.region` / `garment.project` / `garment.weights` / `garment.offset` (proposed ids, `rules.py`) | poses the body at the clip's first frame, imports the raw asset (NIF through the command, glb/fbx/obj through Blender importers), scales and places it by class, rebuilds the covered body region as an offset surface, projects the raw's texture by ray-cast, transfers body weights |
+| Dress character from raw asset | `sculpto_garment.dress` | `export.obj`, `outfit.place`, `outfit.band`, `outfit.offsets`, `outfit.projection`, `outfit.weights` | poses the body at the clip's first frame, imports the raw asset (NIF through the command, glb/fbx/obj through Blender importers), scales and places it by class, rebuilds the covered body region as an offset surface, projects the raw's texture by ray-cast, transfers body weights |
 | Render audit screenshots | `sculpto_garment.audit` | none — Blender render staging only | renders clip frames × views, plus garment-only frames with the actor's own outfit hidden |
 | Export NIF through sculpto | `sculpto_garment.export_nif` | `export.nif` | converts a NIF to the `se`/`le` target, reports vertices/triangles/bytes |
 
@@ -91,13 +89,13 @@ python3 tools/tests/test_sculpto_rules.py
 
 The first covers the bridge (argv shape, payload builders, envelope
 parsing, `run_cli` error surfacing, fake-binary dispatch); the second covers
-the rules table and asserts the F03 gap ids are still unregistered — the day
-one appears, the test fails and the add-on copy behind it must be deleted.
+the class table and asserts the five rule ids are registered in the engine, so
+the add-on never regains a numeric copy of a rule.
 
 Headless through Blender (F07; skips with a message under plain `python3`):
 
 ```sh
-/run/current-system/sw/bin/blender --background --python \
+/run/current-system/bin/blender --background --python \
   tools/blender_addon/tests/test_addon_headless.py
 ```
 

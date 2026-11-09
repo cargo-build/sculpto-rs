@@ -12,6 +12,7 @@ use sculpto_bake::BakeError;
 use sculpto_core::mesh::MeshError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
 use sculpto_mesh::conform::ConformError;
+use sculpto_mesh::garment::GarmentRuleError;
 use sculpto_nif::NifError;
 use sculpto_nif::write::header::NifWriteError;
 
@@ -168,6 +169,20 @@ pub fn not_found(what: &str, name: &str) -> CommandError {
         "not_found",
         format!("{what} `{name}` not found"),
     )
+}
+
+/// A garment rule could not answer.
+pub fn garment_rule(error: GarmentRuleError) -> CommandError {
+    let (kind, code) = match &error {
+        GarmentRuleError::EmptyMesh => (ErrorKind::InvalidParams, "garment_empty_mesh"),
+        GarmentRuleError::FaceOutOfRange { .. } => {
+            (ErrorKind::InvalidParams, "garment_face_out_of_range")
+        }
+        GarmentRuleError::DegenerateRaw => (ErrorKind::Refused, "garment_degenerate_raw"),
+        GarmentRuleError::MissingParameter(_) => (ErrorKind::Refused, "garment_missing_parameter"),
+        GarmentRuleError::NoNearestVertex => (ErrorKind::Refused, "garment_no_nearest"),
+    };
+    CommandError::new(kind, code, error.to_string())
 }
 
 #[cfg(test)]

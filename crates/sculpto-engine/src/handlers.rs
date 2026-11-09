@@ -54,7 +54,7 @@ pub fn version(_input: &Value) -> Result<Value, CommandError> {
     Ok(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-fn missing(field: &str) -> CommandError {
+pub(crate) fn missing(field: &str) -> CommandError {
     CommandError::new(
         ErrorKind::InvalidParams,
         "missing_field",
@@ -80,7 +80,7 @@ fn string_list(input: &Value, field: &str) -> Result<Option<Vec<String>>, Comman
     }
 }
 
-fn string(input: &Value, field: &str) -> Result<String, CommandError> {
+pub(crate) fn string(input: &Value, field: &str) -> Result<String, CommandError> {
     input
         .get(field)
         .and_then(Value::as_str)

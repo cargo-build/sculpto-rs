@@ -622,6 +622,156 @@ pub fn nearest_distances(
         .collect()
 }
 
+/// The first triangle a ray meets, with the hit point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RayHit {
+    /// Triangle index in the queried triangle list.
+    pub triangle: usize,
+    /// World-space hit point.
+    pub location: [f32; 3],
+}
+
+/// Nearest hit of one ray per origin. A direction of zero length hits nothing.
+/// @req DECL0002
+pub fn first_hits(
+    origins: &[[f32; 3]],
+    direction: [f32; 3],
+    positions: &[[f32; 3]],
+    faces: &[[u32; 3]],
+) -> Vec<Option<RayHit>> {
+    let length = direction
+        .iter()
+        .map(|c| f64::from(*c).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if length == 0.0 || faces.is_empty() {
+        return vec![None; origins.len()];
+    }
+    let ray = direction.map(|c| f64::from(c) / length);
+    let bvh = Bvh::build(triangles(positions, faces));
+    origins
+        .iter()
+        .map(|&origin| bvh.first_hit(origin, ray))
+        .collect()
+}
+
+impl Bvh {
+    /// Nearest triangle along `ray` (unit length, already f64).
+    fn first_hit(&self, origin: [f32; 3], ray: [f64; 3]) -> Option<RayHit> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let origin = origin.map(f64::from);
+        let mut best = f64::INFINITY;
+        let mut hit = None;
+        let mut stack = vec![0usize];
+        while let Some(node) = stack.pop() {
+            let entry = &self.nodes[node];
+            if !ray_box(origin, ray, entry.min, entry.max, best) {
+                continue;
+            }
+            if entry.count > 0 {
+                for &triangle in
+                    &self.order[entry.start as usize..(entry.start + entry.count) as usize]
+                {
+                    if let Some((distance, location)) =
+                        ray_triangle(origin, ray, &self.tries[triangle].corners)
+                        && distance < best
+                    {
+                        best = distance;
+                        hit = Some(RayHit {
+                            triangle,
+                            location: location.map(|value| value as f32),
+                        });
+                    }
+                }
+            } else {
+                stack.push(entry.left as usize);
+                stack.push(entry.right as usize);
+            }
+        }
+        hit
+    }
+}
+
+/// Whether the ray reaches the box before `limit`.
+fn ray_box(origin: [f64; 3], ray: [f64; 3], min: [f32; 3], max: [f32; 3], limit: f64) -> bool {
+    let mut near = 0.0f64;
+    let mut far = limit;
+    for axis in 0..3 {
+        let low = f64::from(min[axis]);
+        let high = f64::from(max[axis]);
+        let direction = ray[axis];
+        let origin = origin[axis];
+        if direction.abs() < f64::EPSILON {
+            if origin < low || origin > high {
+                return false;
+            }
+            continue;
+        }
+        let mut first = (low - origin) / direction;
+        let mut second = (high - origin) / direction;
+        if first > second {
+            std::mem::swap(&mut first, &mut second);
+        }
+        near = near.max(first);
+        far = far.min(second);
+        if near > far {
+            return false;
+        }
+    }
+    far >= 0.0
+}
+
+/// Möller–Trumbore: the ray parameter and point where it crosses the triangle.
+fn ray_triangle(
+    origin: [f64; 3],
+    ray: [f64; 3],
+    corners: &[[f32; 3]; 3],
+) -> Option<(f64, [f64; 3])> {
+    let corner = |index: usize| corners[index].map(f64::from);
+    let [a, b, c] = [corner(0), corner(1), corner(2)];
+    let edge_1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let edge_2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ray[1] * edge_2[2] - ray[2] * edge_2[1],
+        ray[2] * edge_2[0] - ray[0] * edge_2[2],
+        ray[0] * edge_2[1] - ray[1] * edge_2[0],
+    ];
+    let determinant = edge_1[0] * cross[0] + edge_1[1] * cross[1] + edge_1[2] * cross[2];
+    if determinant.abs() < 1e-12 {
+        return None;
+    }
+    let inverse = 1.0 / determinant;
+    let offset = [origin[0] - a[0], origin[1] - a[1], origin[2] - a[2]];
+    let u = (offset[0] * cross[0] + offset[1] * cross[1] + offset[2] * cross[2]) * inverse;
+    if !(-1e-9..=1.0 + 1e-9).contains(&u) {
+        return None;
+    }
+    let second = [
+        offset[1] * edge_1[2] - offset[2] * edge_1[1],
+        offset[2] * edge_1[0] - offset[0] * edge_1[2],
+        offset[0] * edge_1[1] - offset[1] * edge_1[0],
+    ];
+    let v = (ray[0] * second[0] + ray[1] * second[1] + ray[2] * second[2]) * inverse;
+    if v < -1e-9 || u + v > 1.0 + 1e-9 {
+        return None;
+    }
+    let distance =
+        (edge_2[0] * second[0] + edge_2[1] * second[1] + edge_2[2] * second[2]) * inverse;
+    if distance < 0.0 {
+        return None;
+    }
+    Some((
+        distance,
+        [
+            origin[0] + ray[0] * distance,
+            origin[1] + ray[1] * distance,
+            origin[2] + ray[2] * distance,
+        ],
+    ))
+}
+
 /// Shared acceleration for validated control-surface binding. @req DECL0013
 pub(crate) fn nearest_triangle_indices(
     points: &[[f32; 3]],
