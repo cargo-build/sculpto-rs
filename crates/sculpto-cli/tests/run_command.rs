@@ -119,3 +119,48 @@ fn domain_failures_and_request_failures_have_distinct_kinds() {
     assert_eq!(value["error"]["kind"], "io");
     assert_eq!(value["error"]["code"], "io_error");
 }
+
+#[test]
+fn every_catalogue_row_carries_a_schema() {
+    let output = sculpto()
+        .args(["commands", "--json"])
+        .output()
+        .expect("run");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    for row in value["commands"].as_array().expect("array") {
+        assert!(
+            row["input_schema"].is_object(),
+            "{} has no input schema",
+            row["id"]
+        );
+    }
+}
+
+#[test]
+fn dispatch_and_run_share_one_handler() {
+    for id in ["bake", "outfit.fit", "export.obj"] {
+        let output = sculpto()
+            .args(["run", "--cmd", id, "--input", "{}"])
+            .output()
+            .expect("run");
+        let from_run: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+        let from_dispatch =
+            sculpto_engine::envelope(sculpto_engine::dispatch(id, &serde_json::json!({})));
+        assert_eq!(
+            from_run, from_dispatch,
+            "{id} diverges between run and dispatch"
+        );
+    }
+}
+
+#[test]
+fn catalogue_and_dispatch_list_agree() {
+    let output = sculpto()
+        .args(["commands", "--json"])
+        .output()
+        .expect("run");
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let dispatched =
+        sculpto_engine::dispatch("commands.list", &serde_json::Value::Null).expect("commands.list");
+    assert_eq!(listed["commands"], dispatched["commands"]);
+}
