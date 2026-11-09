@@ -48,6 +48,9 @@ fps = int(cfg.get("fps", report.get("fps", 24)))
 # frame (Blender authoring starts at 1, glTF import at 0); the bake frame is
 # shifted by the action's start before it is used as a scene time.
 frame_offset = int(cfg.get("frame_offset", -int(round(report.get("action_start", 1)))))
+# Bevy 0.17 rejects a mesh with more than 64 morph targets; stride thins a
+# dense bake without changing the clip's time range.
+stride = int(cfg.get("stride", "1"))
 material_blend = cfg.get("material_blend")
 material_object = cfg.get("material_object")
 
@@ -250,7 +253,10 @@ for shell in shell_names:
     rest_world = [vertex.co.copy() for vertex in obj.data.vertices]
     obj.shape_key_add(name="Basis", from_mix=False)
     baked_frames = {}
-    for frame in sorted(frames):
+    selected = sorted(frames)[::stride]
+    if sorted(frames) and selected[-1] != sorted(frames)[-1]:
+        selected.append(sorted(frames)[-1])
+    for frame in selected:
         bpy.ops.wm.obj_import(
             filepath=os.path.abspath(frames[frame]), forward_axis="Y", up_axis="Z"
         )
@@ -272,7 +278,7 @@ for shell in shell_names:
         key.data.foreach_set("co", target.ravel())
         key.value = 0.0
         baked_frames[frame] = baked
-    weights_curve[shell] = sorted(frames)
+    weights_curve[shell] = selected
     if skin:
         skinned[shell] = (skinned[shell][0], skinned[shell][1], baked_frames)
 

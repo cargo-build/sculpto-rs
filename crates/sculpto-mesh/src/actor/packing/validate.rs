@@ -30,12 +30,12 @@ pub(super) fn images(base: &Source) -> Result<(), ActorError> {
 }
 
 pub(super) fn schedule(times: &[f64]) -> Result<Vec<f32>, ActorError> {
-    match (2..=256).contains(&times.len()) {
+    match (2..=64).contains(&times.len()) {
         true => {}
         false => {
             return Err(unsupported(
                 "cloth schedule",
-                "target count outside current Bevy consumer bound 2–256",
+                "target count outside current Bevy consumer bound 2–64",
             ));
         }
     }
