@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
+use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakeError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
-use sculpto_engine::{CommandError, ErrorKind};
 use sculpto_mesh::conform::ConformError;
 use sculpto_nif::NifError;
 

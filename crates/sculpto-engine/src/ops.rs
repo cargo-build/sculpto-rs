@@ -11,16 +11,18 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
+
+use crate::CommandError;
 use sculpto_bake::BakePlan;
 use sculpto_core::{SliderSize, document::Document};
-use sculpto_engine::CommandError;
 use sculpto_mesh::conform::Conform;
 
 use crate::errors;
-use crate::{pick_shape, read_obj_positions, write_obj, write_obj_uv};
+use crate::obj::{pick_shape, read_obj_positions, write_obj, write_obj_uv};
 
 /// Everything `bake` needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, JsonSchema)]
 pub struct BakeParams {
     /// `.osp` project.
     pub project: PathBuf,
@@ -138,7 +140,7 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
 }
 
 /// Everything `export.obj` needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, JsonSchema)]
 pub struct ExportObjParams {
     /// Input NIF.
     pub nif: PathBuf,
@@ -215,7 +217,7 @@ pub fn export_obj(params: &ExportObjParams) -> Result<ExportObjOutcome, CommandE
 }
 
 /// Everything `outfit.fit` needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, JsonSchema)]
 pub struct FitParams {
     /// Garment NIF.
     pub nif: PathBuf,

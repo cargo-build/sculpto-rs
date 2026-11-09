@@ -1,0 +1,174 @@
+//! Typed command handlers. Every surface reaches these through the registry in
+//! [`crate::dispatch`]; the JSON body is parsed here and the parameter struct is
+//! the same one the argv surface builds.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use schemars::JsonSchema;
+use serde_json::{Value, json};
+
+use crate::ops;
+use crate::{CommandError, ErrorKind};
+
+/// Parameters of commands that take no input.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct EmptyParams {}
+
+/// Schema of a command with no input.
+pub fn empty_schema() -> Value {
+    schema_for::<EmptyParams>()
+}
+
+/// Schema for a command whose parameters are not fixed yet.
+pub fn any_schema() -> Value {
+    json!({ "type": "object" })
+}
+
+/// Schema derived from the typed `bake` parameters.
+pub fn bake_schema() -> Value {
+    schema_for::<ops::BakeParams>()
+}
+
+/// Schema derived from the typed `fit` parameters.
+pub fn fit_schema() -> Value {
+    schema_for::<ops::FitParams>()
+}
+
+/// Schema derived from the typed `export.obj` parameters.
+pub fn export_obj_schema() -> Value {
+    schema_for::<ops::ExportObjParams>()
+}
+
+fn schema_for<T: JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect("schema serialises")
+}
+
+pub fn version(_input: &Value) -> Result<Value, CommandError> {
+    Ok(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+fn missing(field: &str) -> CommandError {
+    CommandError::new(
+        ErrorKind::InvalidParams,
+        "missing_field",
+        format!("`{field}` is required"),
+    )
+}
+
+fn string(input: &Value, field: &str) -> Result<String, CommandError> {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| missing(field))
+}
+
+fn optional_string(input: &Value, field: &str) -> Option<String> {
+    input.get(field).and_then(Value::as_str).map(str::to_string)
+}
+
+fn path(input: &Value, field: &str) -> Result<PathBuf, CommandError> {
+    string(input, field).map(PathBuf::from)
+}
+
+fn optional_path(input: &Value, field: &str) -> Option<PathBuf> {
+    optional_string(input, field).map(PathBuf::from)
+}
+
+pub fn bake(input: &Value) -> Result<Value, CommandError> {
+    let mut sliders = BTreeMap::new();
+    if let Some(map) = input.get("sliders").and_then(Value::as_object) {
+        for (name, value) in map {
+            let percent = value.as_f64().ok_or_else(|| {
+                CommandError::new(
+                    ErrorKind::InvalidParams,
+                    "slider_not_a_number",
+                    format!("slider `{name}` is not a number"),
+                )
+            })?;
+            sliders.insert(name.clone(), percent as f32);
+        }
+    }
+    let params = ops::BakeParams {
+        project: path(input, "project")?,
+        presets: path(input, "presets")?,
+        set: string(input, "set")?,
+        preset: string(input, "preset")?,
+        endpoint: string(input, "endpoint")?,
+        out: path(input, "out")?,
+        source: optional_path(input, "source"),
+        shape: optional_string(input, "shape"),
+        home: optional_path(input, "home"),
+        sliders,
+    };
+    let outcome = ops::bake(&params)?;
+    Ok(json!({
+        "out": outcome.out.display().to_string(),
+        "vertices": outcome.vertices,
+        "triangles": outcome.triangles,
+        "sliders": outcome.sliders,
+        "unresolved": outcome.unresolved,
+        "deferred": outcome.deferred,
+    }))
+}
+
+pub fn fit(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::FitParams {
+        nif: path(input, "nif")?,
+        shape: string(input, "shape")?,
+        body_shape: string(input, "body_shape")?,
+        body: path(input, "body")?,
+        out: path(input, "out")?,
+        body_after: optional_path(input, "body_after"),
+        out_after: optional_path(input, "out_after"),
+    };
+    let outcome = ops::garment_fit(&params)?;
+    let follow = outcome.follow.map(|(body, garment, difference)| {
+        json!({ "body": body, "garment": garment, "difference": difference })
+    });
+    Ok(json!({
+        "out": outcome.out.display().to_string(),
+        "vertices": outcome.vertices,
+        "garment": outcome.garment,
+        "reference": outcome.reference,
+        "offset_mean": outcome.offset_mean,
+        "offset_max": outcome.offset_max,
+        "follow": follow,
+    }))
+}
+
+pub fn export_obj(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::ExportObjParams {
+        nif: path(input, "nif")?,
+        shape: optional_string(input, "shape"),
+        list: input.get("list").and_then(Value::as_bool).unwrap_or(false),
+        out: optional_path(input, "out"),
+    };
+    match ops::export_obj(&params)? {
+        ops::ExportObjOutcome::Listed(rows) => {
+            let shapes: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "name": row.name,
+                        "vertices": row.vertices,
+                        "triangles": row.triangles,
+                    })
+                })
+                .collect();
+            Ok(json!({ "shapes": shapes }))
+        }
+        ops::ExportObjOutcome::Written {
+            out,
+            shape,
+            vertices,
+            triangles,
+        } => Ok(json!({
+            "out": out.display().to_string(),
+            "shape": shape,
+            "vertices": vertices,
+            "triangles": triangles,
+        })),
+    }
+}

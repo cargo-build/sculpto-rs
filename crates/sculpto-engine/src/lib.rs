@@ -13,6 +13,11 @@
 
 use serde_json::{Value, json};
 
+pub mod errors;
+mod handlers;
+pub mod obj;
+pub mod ops;
+
 /// A stable command identifier.
 ///
 /// Wire names use `noun.verb`; they are part of the external contract and must
@@ -140,11 +145,18 @@ impl std::fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-/// A command implementation supplied by a binary.
+/// A command implementation.
 pub type Handler = fn(&Value) -> Result<Value, CommandError>;
 
-/// One catalogue row.
-#[derive(Debug, Clone, Copy)]
+/// Produces the JSON schema derived from a command's typed parameter struct.
+pub type Schema = fn() -> Value;
+
+/// One registry row.
+///
+/// `stub` is the single source of the `implemented` flag: a row either points at
+/// a real handler or at the typed `not_implemented` fallback. Nothing outside
+/// this table may decide whether an id is implemented.
+#[derive(Clone, Copy)]
 pub struct Spec {
     /// The id this row describes.
     pub id: CommandId,
@@ -152,18 +164,29 @@ pub struct Spec {
     pub summary: &'static str,
     /// Does the command write files?
     pub mutates: bool,
-    /// Is the handler implemented, or does it return `not_implemented`?
-    pub implemented: bool,
+    stub: bool,
+    schema: Schema,
     handler: Handler,
 }
 
 impl Spec {
+    /// The command has a real handler (the inverse of the `stub` flag).
+    pub fn implemented(&self) -> bool {
+        !self.stub
+    }
+
+    /// The input schema derived from the typed parameter struct.
+    pub fn input_schema(&self) -> Value {
+        (self.schema)()
+    }
+
     fn json(&self) -> Value {
         json!({
             "id": self.id.as_str(),
             "summary": self.summary,
             "mutates": self.mutates,
-            "implemented": self.implemented,
+            "implemented": self.implemented(),
+            "input_schema": self.input_schema(),
         })
     }
 }
@@ -173,71 +196,62 @@ const COMMANDS: &[Spec] = &[
         id: CommandId::Version,
         summary: "Report the engine build version.",
         mutates: false,
-        implemented: true,
-        handler: version,
+        stub: false,
+        schema: handlers::empty_schema,
+        handler: handlers::version,
     },
     Spec {
         id: CommandId::CommandsList,
-        summary: "List every command with its mutation class.",
+        summary: "List every command with its schema and mutation class.",
         mutates: false,
-        implemented: true,
+        stub: false,
+        schema: handlers::empty_schema,
         handler: commands_list,
     },
     Spec {
         id: CommandId::Bake,
         summary: "Apply a slider preset to a source shape and write an OBJ.",
         mutates: true,
-        implemented: false,
-        handler: not_implemented,
+        stub: false,
+        schema: handlers::bake_schema,
+        handler: handlers::bake,
     },
     Spec {
         id: CommandId::OutfitFit,
         summary: "Bind a garment to its authored body and fit it to a bake.",
         mutates: true,
-        implemented: false,
-        handler: not_implemented,
+        stub: false,
+        schema: handlers::fit_schema,
+        handler: handlers::fit,
     },
     Spec {
         id: CommandId::ExportObj,
         summary: "Read one shape from a NIF and write it as an OBJ.",
         mutates: true,
-        implemented: false,
-        handler: not_implemented,
+        stub: false,
+        schema: handlers::export_obj_schema,
+        handler: handlers::export_obj,
     },
     Spec {
         id: CommandId::ExportNif,
         summary: "Export an asset as a Skyrim NIF.",
         mutates: true,
-        implemented: false,
+        stub: true,
+        schema: handlers::any_schema,
         handler: not_implemented,
     },
 ];
 
-/// Every catalogue row, in declaration order.
+/// Every registry row, in declaration order.
 pub fn catalogue() -> &'static [Spec] {
     COMMANDS
 }
 
-/// Dispatch one command using only the handlers built into this crate.
+/// Dispatch one command through the registry.
 ///
 /// The returned value is the `result` member of a successful envelope; failures
 /// are [`CommandError`] and are rendered by [`envelope`].
 pub fn dispatch(name: &str, input: &Value) -> Result<Value, CommandError> {
-    dispatch_with(name, input, &[])
-}
-
-/// Dispatch with caller-supplied handlers for the ids this crate catalogues but
-/// does not implement.
-///
-/// The engine owns the catalogue, the unknown-id refusal and the
-/// `not_implemented` fallback; the binaries own the code that touches the
-/// document and the file system. That keeps `sculpto-engine` free of format
-/// crates while still being the single dispatch point.
-pub fn dispatch_with(
-    name: &str,
-    input: &Value,
-    handlers: &[(&str, Handler)],
-) -> Result<Value, CommandError> {
     let spec = COMMANDS
         .iter()
         .find(|spec| spec.id.as_str() == name)
@@ -248,9 +262,6 @@ pub fn dispatch_with(
                 format!("no command named {name}"),
             )
         })?;
-    if let Some((_, handler)) = handlers.iter().find(|(id, _)| *id == name) {
-        return handler(input);
-    }
     (spec.handler)(input)
 }
 
@@ -262,12 +273,8 @@ pub fn envelope(result: Result<Value, CommandError>) -> Value {
     }
 }
 
-fn version(_input: &Value) -> Result<Value, CommandError> {
-    Ok(json!({ "version": env!("CARGO_PKG_VERSION") }))
-}
-
 fn commands_list(_input: &Value) -> Result<Value, CommandError> {
-    let rows: Vec<Value> = COMMANDS.iter().map(|spec| spec.json()).collect();
+    let rows: Vec<Value> = COMMANDS.iter().map(Spec::json).collect();
     Ok(json!({ "commands": rows }))
 }
 
@@ -302,10 +309,37 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_lists_every_row() {
-        let value = dispatch(CommandId::CommandsList.as_str(), &Value::Null).expect("list");
-        let rows = value["commands"].as_array().expect("array");
-        assert_eq!(rows.len(), COMMANDS.len());
+    fn every_row_has_a_schema_and_consistent_flag() {
+        for spec in COMMANDS {
+            assert!(
+                spec.input_schema().is_object(),
+                "{} has no schema",
+                spec.id.as_str()
+            );
+            let value = dispatch(CommandId::CommandsList.as_str(), &Value::Null).expect("list");
+            let row = value["commands"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .find(|row| row["id"] == spec.id.as_str())
+                .expect("row");
+            assert_eq!(row["implemented"], spec.implemented());
+        }
+    }
+
+    #[test]
+    fn dispatch_wires_the_documented_commands() {
+        assert!(dispatch("version", &Value::Null).is_ok());
+        for id in ["bake", "outfit.fit", "export.obj"] {
+            let error = dispatch(id, &Value::Null).expect_err("missing params are an error");
+            assert_ne!(error.kind(), ErrorKind::NotImplemented, "{id} is not wired");
+        }
+        assert_eq!(
+            dispatch("export.nif", &Value::Null)
+                .expect_err("stub")
+                .kind(),
+            ErrorKind::NotImplemented
+        );
     }
 
     #[test]
@@ -313,12 +347,6 @@ mod tests {
         let error = dispatch("no.such", &Value::Null).expect_err("must fail");
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(error.code(), "unknown_command");
-    }
-
-    #[test]
-    fn unimplemented_command_is_typed() {
-        let error = dispatch("export.nif", &Value::Null).expect_err("must fail");
-        assert_eq!(error.kind(), ErrorKind::NotImplemented);
     }
 
     #[test]
