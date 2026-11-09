@@ -15,22 +15,34 @@
 //!   `extras.targetNames`. Any morph whose vertex index exceeds the primitive's
 //!   vertex count is refused as [`MeshError::MorphVertexOutOfRange`].
 //!   Normal deltas are omitted as `MorphDelta` carries only position deltas.
-//! - The physics sidecar is a later slice (E06) and is not emitted.
+//! - Physics: a [`PhysicsRef::Path`](sculpto_core::mesh::PhysicsRef) sidecar
+//!   travels as the documented `extras.sculpto.physics` string on the root
+//!   node — glTF has no native slot for Skyrim-style physics data. An inline
+//!   document has no representation in the file and is refused as
+//!   [`GltfError::PhysicsInlineUnsupported`].
+//! - Clips: [`write_glb_with`] emits one glTF `animation` per [`Clip`] with
+//!   LINEAR samplers whose channels target the joint node of the named bone.
+//!   Zero-length or single-sample clips are refused as
+//!   [`GltfError::ConstantClip`]; the E09 animation gate exists precisely
+//!   because a constant clip is a defect.
 //!
-//! Layout contract of [`write_glb`]:
+//! Layout contract of [`write_glb_with`]:
 //! - One mesh with one primitive per triangle partition, primitives in
 //!   ascending partition-id order. The model is one flat vertex arena, so all
 //!   primitives share the same vertex accessors and each keeps only its own
 //!   index accessor; the material slice maps slots per primitive.
 //! - POSITION (with `min`/`max`), plus NORMAL, TEXCOORD_0 and TANGENT when the
-//!   model carries them. Indices are `u32`. Node and mesh names come from
+//!   model carries them. Indices are `u32`. Mesh names come from
 //!   `MeshAsset::name` and joint nodes from the bone names.
-//! - One skin on the mesh node: joints in model bone order (one identity node
-//!   per bone; the skin's `skeleton` root is the first joint), inverse bind
-//!   matrices from [`sculpto_core::mesh::Skin::bind_inverse`]. The model
-//!   stores bind matrices column-major, which is already the glTF `MAT4`
-//!   layout, so they are flattened without transposing; an empty array means
-//!   the identity per bone.
+//! - The scene is one root node named from `MeshAsset::name`; it carries the
+//!   mesh and skin, and the joint nodes hang under it as children (one
+//!   identity node per bone; the skin's `skeleton` root is the first joint),
+//!   inverse bind matrices from [`sculpto_core::mesh::Skin::bind_inverse`].
+//!   The model stores bind matrices column-major, which is already the glTF
+//!   `MAT4` layout, so they are flattened without transposing; an empty array
+//!   means the identity per bone. A clip channel drives bone `b` through its
+//!   joint node `b + 1`: node 0 is the root/mesh node and the joints follow in
+//!   model bone order.
 //! - `JOINTS_0` is `u16` and `WEIGHTS_0` is `f32`: `f32` keeps the model's
 //!   weights bit-exact instead of quantizing them into normalized `u16`.
 
@@ -38,7 +50,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, TextureSlot};
+use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, PhysicsRef, TextureSlot};
 use serde_json::{Map, Value, json};
 
 /// `f32` accessor component type.
@@ -81,6 +93,44 @@ pub enum GltfError {
         /// The number of material slots declared.
         count: usize,
     },
+    /// A clip has fewer than two samples, so a player could only render it
+    /// constant; constant clips are defects (the E09 animation gate refuses
+    /// them on written bytes too).
+    ConstantClip {
+        /// The clip's position in the clip slice.
+        clip: usize,
+        /// The clip name.
+        name: String,
+        /// The sample count that is too few.
+        samples: usize,
+    },
+    /// A channel's value count differs from its clip's sample count, which no
+    /// sampler can pair.
+    ClipChannelSampleMismatch {
+        /// The clip's position in the clip slice.
+        clip: usize,
+        /// The channel's position in the clip.
+        channel: usize,
+        /// The clip's sample count.
+        samples: usize,
+        /// The channel's value count.
+        values: usize,
+    },
+    /// A channel targets a bone the skin has no joint node for (a model
+    /// without a skin has no joints at all).
+    ClipBoneOutOfRange {
+        /// The clip's position in the clip slice.
+        clip: usize,
+        /// The channel's position in the clip.
+        channel: usize,
+        /// The targeted bone index.
+        bone: usize,
+        /// The number of joint nodes the model offers.
+        joints: usize,
+    },
+    /// The model carries an inline physics document; glTF has no slot for it,
+    /// so the sidecar must ship as a file referenced by path.
+    PhysicsInlineUnsupported,
     /// The JSON chunk failed to serialize.
     Serialize(String),
     /// The GLB container failed to frame the chunks.
@@ -107,6 +157,40 @@ impl fmt::Display for GltfError {
                     "model has {count} material slots; glTF export supports at most one"
                 )
             }
+            Self::ConstantClip {
+                clip,
+                name,
+                samples,
+            } => write!(
+                f,
+                "clip {clip} ('{name}') has {samples} samples; a constant clip is a \
+                 defect and at least two samples are required"
+            ),
+            Self::ClipChannelSampleMismatch {
+                clip,
+                channel,
+                samples,
+                values,
+            } => write!(
+                f,
+                "clip {clip} channel {channel} has {values} values for {samples} samples"
+            ),
+            Self::ClipBoneOutOfRange {
+                clip,
+                channel,
+                bone,
+                joints,
+            } => write!(
+                f,
+                "clip {clip} channel {channel} targets bone {bone} but the model has \
+                 {joints} joint nodes"
+            ),
+            Self::PhysicsInlineUnsupported => write!(
+                f,
+                "inline physics document has no glTF slot; ship the sidecar as a file \
+                 and reference it with PhysicsRef::Path (written as \
+                 extras.sculpto.physics)"
+            ),
             Self::Serialize(detail) => write!(f, "GLB JSON failed: {detail}"),
             Self::Encode(detail) => write!(f, "GLB framing failed: {detail}"),
         }
@@ -115,14 +199,111 @@ impl fmt::Display for GltfError {
 
 impl std::error::Error for GltfError {}
 
-/// Write one model as a GLB with an embedded single buffer.
+/// One named animation clip: shared sample times and per-channel values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clip {
+    /// Clip name; an empty name is written without an animation name.
+    pub name: String,
+    /// Keyframe times, one per sample, shared by every channel.
+    pub times: Vec<f32>,
+    /// Channels; each carries one value per time.
+    pub channels: Vec<ClipChannel>,
+}
+
+/// One clip channel: the bone it drives and the property, with one value per
+/// clip sample.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipChannel {
+    /// Local-space translation per sample.
+    Translation {
+        /// The bone, indexed into [`sculpto_core::mesh::Skin::bones`].
+        bone: usize,
+        /// One vector per sample.
+        values: Vec<[f32; 3]>,
+    },
+    /// Local-space rotation quaternion (`x, y, z, w`) per sample.
+    Rotation {
+        /// The bone, indexed into [`sculpto_core::mesh::Skin::bones`].
+        bone: usize,
+        /// One quaternion per sample.
+        values: Vec<[f32; 4]>,
+    },
+    /// Local-space scale per sample.
+    Scale {
+        /// The bone, indexed into [`sculpto_core::mesh::Skin::bones`].
+        bone: usize,
+        /// One vector per sample.
+        values: Vec<[f32; 3]>,
+    },
+}
+
+/// The bone a channel drives.
+fn channel_bone(channel: &ClipChannel) -> usize {
+    match channel {
+        ClipChannel::Translation { bone, .. }
+        | ClipChannel::Rotation { bone, .. }
+        | ClipChannel::Scale { bone, .. } => *bone,
+    }
+}
+
+/// How many samples a channel carries.
+fn channel_samples(channel: &ClipChannel) -> usize {
+    match channel {
+        ClipChannel::Translation { values, .. } | ClipChannel::Scale { values, .. } => values.len(),
+        ClipChannel::Rotation { values, .. } => values.len(),
+    }
+}
+
+/// Write one model as a GLB with an embedded single buffer and no clips.
 ///
 /// The model is validated first, so a refused asset returns a typed
 /// [`GltfError`] and never bytes.
 pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
+    write_glb_with(asset, &[])
+}
+
+/// [`write_glb`] with one glTF animation per [`Clip`].
+///
+/// Every refusal check runs before any byte is produced.
+pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, GltfError> {
     asset.validate().map_err(GltfError::InvalidMesh)?;
     if asset.triangles.is_empty() {
         return Err(GltfError::NoTriangles);
+    }
+    if matches!(asset.physics, Some(PhysicsRef::Inline(_))) {
+        return Err(GltfError::PhysicsInlineUnsupported);
+    }
+    // A clip channel drives bone `b` through joint node `b + 1`: node 0 is
+    // the root/mesh node and the joints follow in model bone order.
+    let joints = asset.skin.as_ref().map_or(0, |skin| skin.bones.len());
+    for (clip_idx, clip) in clips.iter().enumerate() {
+        if clip.times.len() < 2 {
+            return Err(GltfError::ConstantClip {
+                clip: clip_idx,
+                name: clip.name.clone(),
+                samples: clip.times.len(),
+            });
+        }
+        for (channel_idx, channel) in clip.channels.iter().enumerate() {
+            let bone = channel_bone(channel);
+            if bone >= joints {
+                return Err(GltfError::ClipBoneOutOfRange {
+                    clip: clip_idx,
+                    channel: channel_idx,
+                    bone,
+                    joints,
+                });
+            }
+            let values = channel_samples(channel);
+            if values != clip.times.len() {
+                return Err(GltfError::ClipChannelSampleMismatch {
+                    clip: clip_idx,
+                    channel: channel_idx,
+                    samples: clip.times.len(),
+                    values,
+                });
+            }
+        }
     }
     // Accessor counts are glTF u32 fields; the writer refuses what they cannot hold.
     u32::try_from(asset.positions.len()).map_err(|_| GltfError::TooLarge {
@@ -300,6 +481,68 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
         }));
     }
 
+    let mut animations = Vec::with_capacity(clips.len());
+    for clip in clips {
+        let times_min = clip.times.iter().copied().fold(f32::INFINITY, f32::min);
+        let times_max = clip.times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let times_view = writer.view(&bytes_f32(clip.times.iter().copied()))?;
+        writer.accessors.push(json!({
+            "bufferView": times_view,
+            "componentType": FLOAT,
+            "type": "SCALAR",
+            "count": clip.times.len(),
+            "min": [times_min],
+            "max": [times_max],
+        }));
+        let input = writer.accessors.len() - 1;
+
+        let mut samplers = Vec::with_capacity(clip.channels.len());
+        let mut channels = Vec::with_capacity(clip.channels.len());
+        for channel in &clip.channels {
+            let (path, component, payload, count) = match channel {
+                ClipChannel::Translation { values, .. } => (
+                    "translation",
+                    "VEC3",
+                    bytes_f32(values.iter().flat_map(|row| row.iter().copied())),
+                    values.len(),
+                ),
+                ClipChannel::Rotation { values, .. } => (
+                    "rotation",
+                    "VEC4",
+                    bytes_f32(values.iter().flat_map(|row| row.iter().copied())),
+                    values.len(),
+                ),
+                ClipChannel::Scale { values, .. } => (
+                    "scale",
+                    "VEC3",
+                    bytes_f32(values.iter().flat_map(|row| row.iter().copied())),
+                    values.len(),
+                ),
+            };
+            let output_view = writer.view(&payload)?;
+            let output = writer.accessor(output_view, FLOAT, component, count);
+            samplers.push(json!({
+                "input": input,
+                "interpolation": "LINEAR",
+                "output": output,
+            }));
+            let bone = channel_bone(channel);
+            // Validated above: `bone + 1` is that bone's joint node.
+            channels.push(json!({
+                "sampler": samplers.len() - 1,
+                "target": { "node": bone + 1, "path": path },
+            }));
+        }
+
+        let mut animation = Map::new();
+        if !clip.name.is_empty() {
+            animation.insert("name".into(), json!(clip.name));
+        }
+        animation.insert("channels".into(), json!(channels));
+        animation.insert("samplers".into(), json!(samplers));
+        animations.push(Value::Object(animation));
+    }
+
     let mut by_partition: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
     for (index, partition) in asset.triangle_partitions.iter().enumerate() {
         by_partition.entry(*partition).or_default().push(index);
@@ -352,18 +595,25 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
     if skin_json.is_some() {
         mesh_node.insert("skin".into(), json!(0));
     }
+    if let Some(PhysicsRef::Path(path)) = &asset.physics {
+        // glTF has no native physics slot; the sidecar travels as a
+        // documented extras string on the root node.
+        mesh_node.insert("extras".into(), json!({ "sculpto": { "physics": path } }));
+    }
     let mut nodes = vec![Value::Object(mesh_node)];
-    let mut scene_nodes = vec![0_usize];
     if let Some(skin) = &asset.skin {
+        let mut children = Vec::with_capacity(skin.bones.len());
         for bone in &skin.bones {
             let mut node = Map::new();
             if !bone.is_empty() {
                 node.insert("name".into(), json!(bone));
             }
-            scene_nodes.push(nodes.len());
+            children.push(nodes.len());
             nodes.push(Value::Object(node));
         }
+        nodes[0]["children"] = json!(children);
     }
+    let scene_nodes = [0_usize];
 
     let mut root = Map::new();
     root.insert(
@@ -371,11 +621,14 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
         json!({"version": "2.0", "generator": "sculpto-gltf"}),
     );
     root.insert("scene".into(), json!(0));
-    root.insert("scenes".into(), json!([{"nodes": scene_nodes}]));
+    root.insert("scenes".into(), json!([{ "nodes": scene_nodes }]));
     root.insert("nodes".into(), json!(nodes));
     root.insert("meshes".into(), json!([Value::Object(mesh)]));
     if let Some(skin) = skin_json {
         root.insert("skins".into(), json!([skin]));
+    }
+    if !animations.is_empty() {
+        root.insert("animations".into(), json!(animations));
     }
     if !materials.is_empty() {
         root.insert("materials".into(), json!(materials));
