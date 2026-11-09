@@ -25,6 +25,9 @@
 //!   Zero-length or single-sample clips are refused as
 //!   [`GltfError::ConstantClip`]; the E09 animation gate exists precisely
 //!   because a constant clip is a defect.
+//! - Packing: [`pack::PackWriter`] is the only writer of the append path that
+//!   adds baked cloth geometry to an existing GLB; the actor admission stays
+//!   in `sculpto-mesh`.
 //!
 //! Layout contract of [`write_glb_with`]:
 //! - One mesh with one primitive per triangle partition, primitives in
@@ -45,6 +48,8 @@
 //!   model bone order.
 //! - `JOINTS_0` is `u16` and `WEIGHTS_0` is `f32`: `f32` keeps the model's
 //!   weights bit-exact instead of quantizing them into normalized `u16`.
+
+pub mod pack;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
