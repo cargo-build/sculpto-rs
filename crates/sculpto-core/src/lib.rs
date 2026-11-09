@@ -18,6 +18,7 @@
 
 pub mod document;
 pub mod error;
+pub mod mesh;
 pub mod preset;
 pub mod project;
 pub mod report;
