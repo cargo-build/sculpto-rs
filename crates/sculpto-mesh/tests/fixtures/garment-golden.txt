@@ -1,0 +1,4 @@
+vertices=154629
+triangles=51543
+morphs=37
+positions_fnv1a64=915b260064d9fac6
