@@ -42,7 +42,7 @@ pub struct PresetValue {
     pub slider: String,
     /// Endpoint this value drives.
     pub size: SliderSize,
-    /// Authored percentage in `0.0..=100.0`.
+    /// Authored percentage in `-100.0..=100.0`; negative values invert the slider.
     pub percent: f32,
 }
 
@@ -148,11 +148,11 @@ impl Preset {
             .with_path(origin)
         })?;
         let percent = f32_attr(node, "value", 0.0).map_err(|e| e.with_path(origin))?;
-        if !(0.0..=100.0).contains(&percent) {
+        if !(-100.0..=100.0).contains(&percent) {
             return Err(Error::new(
                 ErrorKind::InvalidValue,
                 element_path(node),
-                format!("value `{percent}` is outside 0..=100"),
+                format!("value `{percent}` is outside -100..=100"),
             )
             .with_path(origin));
         }

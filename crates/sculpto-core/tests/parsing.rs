@@ -198,3 +198,17 @@ fn unknown_preset_child_is_reported_not_fatal() {
         "SliderPresets/Preset[name=P]/LockedBy"
     );
 }
+
+#[test]
+fn negative_percentage_is_accepted() {
+    let document = Document::parse_str(
+        r#"<SliderPresets><Preset name="P"><SetSlider name="A" size="big" value="-25"/></Preset></SliderPresets>"#,
+        "inline.xml",
+    )
+    .expect("a negative preset value is valid");
+    let Document::Presets(presets) = document else {
+        panic!("expected presets");
+    };
+    assert_eq!(presets[0].values[0].percent, -25.0);
+    assert_eq!(presets[0].values[0].fraction(), -0.25);
+}
