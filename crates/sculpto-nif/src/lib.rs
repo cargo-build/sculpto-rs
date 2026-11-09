@@ -75,6 +75,10 @@ impl NifShape {
 pub struct NifDocument {
     /// Header version facts.
     pub header: NifHeader,
+    /// Bethesda BS stream version (`user_version_2`): 100 for Skyrim SE, 83
+    /// for LE. Both games share user version 12, so this is the only header
+    /// fact that separates them.
+    pub bsver: u32,
     /// Shapes in scene order.
     pub shapes: Vec<NifShape>,
     /// The parser dropped blocks; geometry may be incomplete.
@@ -126,7 +130,7 @@ fn yup_matrix_to_zup(matrix: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     right.map(|column| [column[0], -column[2], column[1], column[3]])
 }
 
-fn parse_header(bytes: &[u8]) -> Result<NifHeader, NifError> {
+fn parse_header(bytes: &[u8]) -> Result<(NifHeader, u32), NifError> {
     let newline = bytes
         .iter()
         .position(|byte| *byte == b'\n')
@@ -137,13 +141,17 @@ fn parse_header(bytes: &[u8]) -> Result<NifHeader, NifError> {
         ));
     }
     let rest = &bytes[newline + 1..];
-    if rest.len() < 9 {
+    // version (4) + endian (1) + user version (4) + block count (4) + BS
+    // stream version (4).
+    if rest.len() < 17 {
         return Err(NifError::TooShort);
     }
-    Ok(NifHeader {
+    let header = NifHeader {
         version: u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]),
         user_version: u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]),
-    })
+    };
+    let bsver = u32::from_le_bytes([rest[13], rest[14], rest[15], rest[16]]);
+    Ok((header, bsver))
 }
 
 /// Read a NIF into Sculpto shapes.
@@ -151,7 +159,7 @@ fn parse_header(bytes: &[u8]) -> Result<NifHeader, NifError> {
 /// A NIF starts with an ASCII line (`Gamebryo File Format, Version 20.2.0.7`),
 /// then the numeric header: `u32` version, `u8` endian, `u32` user version.
 pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
-    let header = parse_header(bytes)?;
+    let (header, bsver) = parse_header(bytes)?;
     let scene = parse_nif(bytes).map_err(|error| NifError::Malformed(error.to_string()))?;
     if scene.truncated {
         return Err(NifError::Truncated {
@@ -232,6 +240,7 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
         .collect::<Result<Vec<_>, _>>()?;
     Ok(NifDocument {
         header,
+        bsver,
         shapes,
         truncated: false,
     })

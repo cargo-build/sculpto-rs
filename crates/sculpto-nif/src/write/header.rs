@@ -1,8 +1,12 @@
 //! NIF header bytes and the game-version gate.
 //!
-//! Skyrim SE and LE share the `20.2.0.7` header and differ only in the Bethesda
-//! user version (12 and 11). Fallout 4 and Starfield are refused with a typed
-//! error instead of being written as a Skyrim file.
+//! Skyrim SE and LE share the `20.2.0.7` header and both use Bethesda user
+//! version 12; they differ in the BS stream version (100 and 83). User version
+//! 11 belongs to Fallout 3 / New Vegas, whose `NiSkinPartition` omits the two
+//! Skyrim trailing bytes, so writing it for an LE file desynchronises nifly's
+//! reader (`Skin.cpp`, `User() >= 12` gates `lodLevel` + `globalVB`). Fallout 4
+//! and Starfield are refused with a typed error instead of being written as a
+//! Skyrim file.
 
 use std::fmt;
 
@@ -19,9 +23,9 @@ pub const HEADER_LINE: &[u8] = b"Gamebryo File Format, Version 20.2.0.7\n";
 /// A supported game target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NifTarget {
-    /// Skyrim Special Edition, user version 12.
+    /// Skyrim Special Edition, user version 12, BS stream version 100.
     Se,
-    /// Skyrim Legendary Edition, user version 11.
+    /// Skyrim Legendary Edition, user version 12, BS stream version 83.
     Le,
 }
 
@@ -30,7 +34,7 @@ impl NifTarget {
     pub fn user_version(self) -> u32 {
         match self {
             NifTarget::Se => 12,
-            NifTarget::Le => 11,
+            NifTarget::Le => 12,
         }
     }
 }
@@ -79,6 +83,15 @@ pub enum NifWriteError {
     MultipleMaterialSlots { count: usize },
     /// An inline physics sidecar has no file the HDT link could name.
     InlinePhysicsUnsupported,
+    /// The SSE global vertex buffer does not match the mesh or its descriptor.
+    GlobalVertexMismatch {
+        /// Mesh vertex count.
+        vertices: usize,
+        /// Declared packed stride.
+        vertex_size: u32,
+        /// Actual packed bytes.
+        bytes: usize,
+    },
 }
 
 impl fmt::Display for NifWriteError {
@@ -150,6 +163,14 @@ impl fmt::Display for NifWriteError {
                     "inline physics has no file the HDT link can name"
                 )
             }
+            Self::GlobalVertexMismatch {
+                vertices,
+                vertex_size,
+                bytes,
+            } => write!(
+                formatter,
+                "{bytes} global vertex bytes do not pack {vertices} vertices at {vertex_size} bytes"
+            ),
         }
     }
 }
@@ -166,9 +187,12 @@ pub fn write_header(target: NifTarget) -> Vec<u8> {
 }
 
 /// Write a header, refusing a game or version the writer does not own.
+///
+/// Only Skyrim's user version 12 is writable: 11 produces a file nifly parses
+/// two bytes short at `NiSkinPartition` (see the module note).
 pub fn write_header_for(header: NifHeader) -> Result<Vec<u8>, NifWriteError> {
     match header.user_version {
-        12 | 11 => {}
+        12 => {}
         user_version => return Err(NifWriteError::UnsupportedGame { user_version }),
     }
     if header.version != VERSION {
@@ -183,7 +207,13 @@ pub fn write_header_for(header: NifHeader) -> Result<Vec<u8>, NifWriteError> {
     Ok(bytes)
 }
 
-/// Read the header and apply the same game gate as the writer.
+/// Read the header and gate the user versions this crate can parse.
+///
+/// The writer only emits 12; 11 is still accepted here because files written
+/// before the LE fix exist on disk and this crate's parser keys every
+/// `NiSkinPartition` conditional on the BS stream version, not on the user
+/// version, so those bytes read exactly as they did. They stay readable; they
+/// are just not a file native nifly can parse.
 pub fn read_header(bytes: &[u8]) -> Result<NifHeader, NifWriteError> {
     let newline = bytes
         .iter()
@@ -247,9 +277,34 @@ mod tests {
             le,
             [
                 b"Gamebryo File Format, Version 20.2.0.7\n".as_slice(),
-                &[0x07, 0x00, 0x02, 0x14, 0x01, 0x0b, 0x00, 0x00, 0x00],
+                &[0x07, 0x00, 0x02, 0x14, 0x01, 0x0c, 0x00, 0x00, 0x00],
             ]
             .concat()
+        );
+    }
+
+    #[test]
+    fn the_writer_refuses_the_fallout_user_version() {
+        assert_eq!(
+            write_header_for(NifHeader {
+                version: VERSION,
+                user_version: 11
+            }),
+            Err(NifWriteError::UnsupportedGame { user_version: 11 })
+        );
+    }
+
+    #[test]
+    fn a_legacy_user_version_11_header_still_reads() {
+        let mut bytes = write_header(NifTarget::Le);
+        let len = HEADER_LINE.len();
+        bytes[len + 5] = 11;
+        assert_eq!(
+            read_header(&bytes),
+            Ok(NifHeader {
+                version: VERSION,
+                user_version: 11
+            })
         );
     }
 

@@ -293,16 +293,25 @@ fn pair_stem(out: &Path) -> PathBuf {
     }
 }
 
-/// The written target follows the input's Bethesda user version, so a pair
-/// always matches its source game.
-fn nif_target(user_version: u32) -> Result<NifTarget, CommandError> {
-    match user_version {
-        12 => Ok(NifTarget::Se),
-        11 => Ok(NifTarget::Le),
-        other => Err(CommandError::new(
+/// The written target follows the input's BS stream version, so a pair always
+/// matches its source game.
+///
+/// Skyrim LE and SE both carry user version 12; only `user_version_2` (BSVER
+/// 83 vs 100) separates them. User version still disambiguates files whose
+/// stream version is absent, and 11 marks a legacy Fallout-era or pre-fix LE
+/// header.
+fn nif_target(bsver: u32, user_version: u32) -> Result<NifTarget, CommandError> {
+    match (bsver, user_version) {
+        (83, _) => Ok(NifTarget::Le),
+        (100..=129, _) => Ok(NifTarget::Se),
+        (_, 12) => Ok(NifTarget::Se),
+        (_, 11) => Ok(NifTarget::Le),
+        (bsver, user_version) => Err(CommandError::new(
             ErrorKind::Unsupported,
             "nif_target_unsupported",
-            format!("input user version {other} is neither SE (12) nor LE (11)"),
+            format!(
+                "input BS version {bsver} with user version {user_version} is neither SE nor LE"
+            ),
         )),
     }
 }
@@ -364,7 +373,7 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
     ];
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
-    let target = nif_target(document.header.user_version)?;
+    let target = nif_target(document.bsver, document.header.user_version)?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
     let mut asset = MeshAsset::from(shape);
     let mut bodies = Vec::with_capacity(2);
@@ -744,10 +753,12 @@ mod tests {
     }
 
     #[test]
-    fn the_target_follows_the_input_user_version() {
-        assert_eq!(nif_target(12), Ok(NifTarget::Se));
-        assert_eq!(nif_target(11), Ok(NifTarget::Le));
-        let error = nif_target(1).expect_err("refused");
+    fn the_target_follows_the_input_stream_version() {
+        assert_eq!(nif_target(100, 12), Ok(NifTarget::Se));
+        assert_eq!(nif_target(83, 12), Ok(NifTarget::Le));
+        assert_eq!(nif_target(0, 12), Ok(NifTarget::Se));
+        assert_eq!(nif_target(0, 11), Ok(NifTarget::Le));
+        let error = nif_target(0, 1).expect_err("refused");
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(error.code(), "nif_target_unsupported");
     }

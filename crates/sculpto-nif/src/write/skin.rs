@@ -2,9 +2,11 @@
 //!
 //! The model carries bone names, per-bone bind matrices and four influences per
 //! vertex. Both targets write `NiSkinInstance` + `NiSkinData`; SE additionally
-//! packs the influences into the `BSTriShape` vertex stream (`VF_SKINNED`) while
-//! LE reads them from the sparse `NiSkinData` arrays. Bones are `NiNode` blocks
-//! so the reader can resolve each palette entry to its name.
+//! packs every vertex once into `NiSkinPartition.global_vertex_data`
+//! (`VF_SKINNED` included) and leaves the shape without inline geometry, while
+//! LE keeps geometry on `NiTriShapeData` and reads weights from the sparse
+//! `NiSkinData` arrays. Bones are `NiNode` blocks so the reader can resolve
+//! each palette entry to its name.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -185,19 +187,35 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// The `NiSkinPartition` SSE global packed-vertex buffer.
+///
+/// Skyrim SE stores a skinned shape's geometry once, in the linked partition
+/// block: `data_size`, `vertex_size`, `vertex_desc`, then `vertex_size` bytes
+/// per mesh vertex. Every entry's `triangles` (and the trailing SSE copy) index
+/// that buffer globally, not through the partition's `vertex_map`.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalVertices<'a> {
+    /// `BSVertexDesc` shared by the shape and every partition entry.
+    pub vertex_desc: u64,
+    /// Packed stride per vertex, in bytes.
+    pub vertex_size: u32,
+    /// Packed vertices in mesh order, `vertex_size * mesh vertices` bytes.
+    pub bytes: &'a [u8],
+}
+
 /// A `NiSkinPartition` body: one entry per triangle partition.
 ///
 /// Each entry's palette is exactly the bones its vertices reference
 /// ([`MeshAsset::partition_palettes`]); the call is refused if that projection
-/// cannot cover the mesh. SE appends the per-partition vertex descriptor and a
-/// triangle copy, with an empty global vertex buffer because the geometry stays
-/// inline on `BSTriShape`.
+/// cannot cover the mesh. A `global` buffer selects the SSE layout: the packed
+/// vertices are written once before the entries, and both triangle copies use
+/// mesh-global indices (nifly forces `bMappedIndices = false` on stream 100).
+/// Without one the LE layout stores palette-local indices and no global buffer.
 pub fn partitions(
     mesh: &MeshAsset,
-    is_sse: bool,
-    vertex_desc: u64,
+    global: Option<&GlobalVertices<'_>>,
 ) -> Result<Vec<u8>, NifWriteError> {
-    partitions_from_palettes(mesh, &mesh.partition_palettes(), is_sse, vertex_desc)
+    partitions_from_palettes(mesh, &mesh.partition_palettes(), global)
 }
 
 /// Same as [`partitions`], but with a caller-supplied palette set.
@@ -207,8 +225,7 @@ pub fn partitions(
 pub fn partitions_from_palettes(
     mesh: &MeshAsset,
     palettes: &[sculpto_core::mesh::PartitionPalette],
-    is_sse: bool,
-    vertex_desc: u64,
+    global: Option<&GlobalVertices<'_>>,
 ) -> Result<Vec<u8>, NifWriteError> {
     mesh.validate_partition_palettes(palettes)
         .map_err(NifWriteError::InvalidModel)?;
@@ -216,6 +233,19 @@ pub fn partitions_from_palettes(
         .skin
         .as_ref()
         .ok_or(NifWriteError::UnnamedBone { index: 0 })?;
+    if let Some(global) = global {
+        let expected = mesh.positions.len() * global.vertex_size as usize;
+        if global.vertex_size == 0
+            || global.bytes.len() != expected
+            || ((global.vertex_desc & 0xF) as u32) * 4 != global.vertex_size
+        {
+            return Err(NifWriteError::GlobalVertexMismatch {
+                vertices: mesh.positions.len(),
+                vertex_size: global.vertex_size,
+                bytes: global.bytes.len(),
+            });
+        }
+    }
 
     let mut entries = Vec::with_capacity(palettes.len());
     for palette in palettes {
@@ -254,6 +284,27 @@ pub fn partitions_from_palettes(
                 ]
             })
             .collect();
+        // SSE triangles address the partition's global buffer (nifly sets
+        // `bMappedIndices = false` on stream 100), so the same indices land in
+        // both copies. LE keeps the `vertex_map`-local form.
+        let written_triangles: Vec<[u16; 3]> = match global.is_some() {
+            true => triangles
+                .iter()
+                .map(|triangle| {
+                    let index = |vertex: u32| {
+                        u16::try_from(vertex).map_err(|_| NifWriteError::TooManyVertices {
+                            vertices: vertex as usize,
+                        })
+                    };
+                    Ok([
+                        index(triangle[0])?,
+                        index(triangle[1])?,
+                        index(triangle[2])?,
+                    ])
+                })
+                .collect::<Result<_, NifWriteError>>()?,
+            false => local_triangles.clone(),
+        };
 
         let mut entry = Vec::new();
         push_u16(&mut entry, map.len() as u16);
@@ -276,7 +327,7 @@ pub fn partitions_from_palettes(
             }
         }
         push_u8(&mut entry, 1); // has faces
-        for triangle in &local_triangles {
+        for triangle in &written_triangles {
             push_u16(&mut entry, triangle[0]);
             push_u16(&mut entry, triangle[1]);
             push_u16(&mut entry, triangle[2]);
@@ -300,9 +351,9 @@ pub fn partitions_from_palettes(
         }
         push_u8(&mut entry, 0); // lod level
         push_u8(&mut entry, 0); // global vertex buffer
-        if is_sse {
-            push_u64(&mut entry, vertex_desc);
-            for triangle in &local_triangles {
+        if let Some(global) = global {
+            push_u64(&mut entry, global.vertex_desc);
+            for triangle in &written_triangles {
                 push_u16(&mut entry, triangle[0]);
                 push_u16(&mut entry, triangle[1]);
                 push_u16(&mut entry, triangle[2]);
@@ -313,10 +364,11 @@ pub fn partitions_from_palettes(
 
     let mut bytes = Vec::new();
     push_u32(&mut bytes, entries.len() as u32);
-    if is_sse {
-        push_u32(&mut bytes, 0); // global buffer data size
-        push_u32(&mut bytes, 0); // global vertex size
-        push_u64(&mut bytes, 0); // global vertex descriptor
+    if let Some(global) = global {
+        push_u32(&mut bytes, global.bytes.len() as u32);
+        push_u32(&mut bytes, global.vertex_size);
+        push_u64(&mut bytes, global.vertex_desc);
+        bytes.extend_from_slice(global.bytes);
     }
     for entry in entries {
         bytes.extend_from_slice(&entry);
@@ -363,7 +415,7 @@ mod tests {
         let mesh = two_partitions();
         mesh.validate().expect("valid");
         let palettes = mesh.partition_palettes();
-        let bytes = partitions(&mesh, false, 0).expect("partitions write");
+        let bytes = partitions(&mesh, None).expect("partitions write");
         assert!(!bytes.is_empty());
         // Two entries: each palette is the derived one, in partition order.
         assert_eq!(palettes.len(), 2);
@@ -376,7 +428,7 @@ mod tests {
         let mesh = two_partitions();
         let mut palettes = mesh.partition_palettes();
         palettes[0].bones = vec![0];
-        let error = partitions_from_palettes(&mesh, &palettes, false, 0)
+        let error = partitions_from_palettes(&mesh, &palettes, None)
             .expect_err("a missing bone must be refused");
         assert_eq!(
             error,
@@ -393,10 +445,36 @@ mod tests {
         let mut palettes: Vec<PartitionPalette> = mesh.partition_palettes();
         palettes.pop();
         assert!(matches!(
-            partitions_from_palettes(&mesh, &palettes, false, 0),
+            partitions_from_palettes(&mesh, &palettes, None),
             Err(NifWriteError::InvalidModel(
                 sculpto_core::mesh::MeshError::MissingPartitionPalette { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn a_global_buffer_that_does_not_pack_the_mesh_is_refused() {
+        let mesh = two_partitions();
+        let short = vec![0u8; 63];
+        let global = GlobalVertices {
+            vertex_desc: (0x001u64 << 44) | 4,
+            vertex_size: 16,
+            bytes: &short,
+        };
+        assert!(matches!(
+            partitions(&mesh, Some(&global)),
+            Err(NifWriteError::GlobalVertexMismatch {
+                vertices: 4,
+                vertex_size: 16,
+                bytes: 63
+            })
+        ));
+        let stride = vec![0u8; 64];
+        let mismatched = GlobalVertices {
+            vertex_desc: (0x001u64 << 44) | 8,
+            vertex_size: 16,
+            bytes: &stride,
+        };
+        assert!(partitions(&mesh, Some(&mismatched)).is_err());
     }
 }
