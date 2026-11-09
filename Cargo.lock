@@ -430,6 +430,7 @@ dependencies = [
  "gltf",
  "sculpto-bake",
  "sculpto-core",
+ "sculpto-engine",
  "sculpto-mesh",
  "sculpto-nif",
  "serde_json",
@@ -440,6 +441,13 @@ name = "sculpto-core"
 version = "0.1.0"
 dependencies = [
  "roxmltree",
+]
+
+[[package]]
+name = "sculpto-engine"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
