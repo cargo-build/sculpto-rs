@@ -159,3 +159,24 @@ class SculptoCli:
                 f"{command}: envelope reported ok but the exit code is {completed.returncode}"
             )
         return result
+
+
+def run_cli(operator, command, payload, cli=None):
+    """Run one command for an operator; every failure is a reported error.
+
+    A refused command surfaces the engine's own classification as
+    `kind: message` (F06) through `operator.report` and returns None, so the
+    caller returns {'CANCELLED'} — the engine's kind, not a traceback. Bridge
+    breaches (envelope shape, ok envelope with a failure exit), a missing
+    binary and a timeout report the same way. Returns the result member on
+    success.
+    """
+    try:
+        return (cli or SculptoCli()).run(command, payload)
+    except CommandError as error:
+        operator.report({"ERROR"}, f"{error.kind}: {error.message}")
+    except EnvelopeError as error:
+        operator.report({"ERROR"}, f"protocol: {error}")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        operator.report({"ERROR"}, f"launch: {error}")
+    return None

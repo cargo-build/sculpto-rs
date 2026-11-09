@@ -66,7 +66,7 @@ def posed_body(body, armature, clip):
     return posed
 
 
-def import_nif(path, cli=None):
+def import_nif(path, operator, cli=None):
     """Import a NIF through the sculpto command and return its mesh.
 
     The command reads the NIF, writes the OBJ artifact and reports the shape's
@@ -74,11 +74,17 @@ def import_nif(path, cli=None):
     the vertex count is asserted against the envelope (the model is the
     contract, not the importer's goodwill). The artifact lands in a temporary
     directory and dies with it: Blender data is the only thing that survives.
+    A refused command is reported through `operator` (`kind: message`, F06)
+    and None is returned; the caller cancels.
     """
     cli = cli or cli_bridge.SculptoCli()
     with tempfile.TemporaryDirectory(prefix="sculpto-import-") as work:
         artifact = Path(work) / (Path(path).stem + ".obj")
-        result = cli.run("export.obj", cli_bridge.export_obj_payload(path, artifact))
+        result = cli_bridge.run_cli(
+            operator, "export.obj", cli_bridge.export_obj_payload(path, artifact), cli=cli
+        )
+        if result is None:
+            return None
         before = set(bpy.data.objects)
         bpy.ops.wm.obj_import(filepath=str(artifact))
         imported = [o for o in bpy.data.objects if o not in before and o.type == "MESH"]
@@ -111,7 +117,7 @@ def join_imported(imported):
     return bpy.context.view_layer.objects.active
 
 
-def import_raw(path):
+def import_raw(path, operator):
     """Import a raw garment asset, bake import transforms, orient Y-up->Z-up.
 
     `.nif` files never reach a Blender importer: they go through the sculpto
@@ -119,10 +125,11 @@ def import_raw(path):
     artifact already in scene orientation. Every other format is Blender's
     own importer; after this call the raw mesh sits in scene orientation at
     its own scale: x = width, y = depth, z = height, i.e. a front relief
-    faces +y.
+    faces +y. Returns (raw, material), or None after `operator` reported a
+    refused NIF command.
     """
     if path.lower().endswith(".nif"):
-        return import_nif(path)
+        return import_nif(path, operator)
     before = set(bpy.data.objects)
     if path.lower().endswith((".glb", ".gltf")):
         bpy.ops.import_scene.gltf(filepath=path)

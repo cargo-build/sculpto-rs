@@ -41,6 +41,16 @@ OK_ENVELOPE = '{"ok": true, "result": {"vertices": 4, "triangles": 2}}\n'
 ERROR_ENVELOPE = '{"ok": false, "error": {"kind": "not_found", "code": "shape", "message": "no shape"}}\n'
 
 
+class _Recorder:
+    """Operator stand-in: captures every report call for exact assertions."""
+
+    def __init__(self):
+        self.reports = []
+
+    def report(self, level, message):
+        self.reports.append((set(level), message))
+
+
 class BridgeTest(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.TemporaryDirectory(prefix="sculpto-bridge-test-")
@@ -134,6 +144,51 @@ class BridgeTest(unittest.TestCase):
         os.environ["FAKE_EXIT"] = "1"
         with self.assertRaises(cli_bridge.EnvelopeError):
             cli_bridge.SculptoCli(binary=self.stub).run("version", None)
+
+    def test_run_cli_reports_the_engine_kind_and_message(self):
+        os.environ["FAKE_ENVELOPE"] = ERROR_ENVELOPE
+        os.environ["FAKE_EXIT"] = "2"
+        recorder = _Recorder()
+        result = cli_bridge.run_cli(
+            recorder, "export.obj", {}, cli=cli_bridge.SculptoCli(binary=self.stub)
+        )
+        self.assertIsNone(result)
+        self.assertEqual(recorder.reports, [({"ERROR"}, "not_found: no shape")])
+
+    def test_run_cli_reports_a_broken_envelope_without_raising(self):
+        os.environ["FAKE_ENVELOPE"] = "not json at all"
+        recorder = _Recorder()
+        result = cli_bridge.run_cli(
+            recorder, "version", None, cli=cli_bridge.SculptoCli(binary=self.stub)
+        )
+        self.assertIsNone(result)
+        self.assertEqual(len(recorder.reports), 1)
+        level, message = recorder.reports[0]
+        self.assertEqual(level, {"ERROR"})
+        self.assertTrue(message.startswith("protocol: "), message)
+
+    def test_run_cli_reports_a_missing_binary_without_raising(self):
+        recorder = _Recorder()
+        result = cli_bridge.run_cli(
+            recorder,
+            "version",
+            None,
+            cli=cli_bridge.SculptoCli(binary=str(Path(self.work.name) / "absent-sculpto")),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(len(recorder.reports), 1)
+        level, message = recorder.reports[0]
+        self.assertEqual(level, {"ERROR"})
+        self.assertTrue(message.startswith("launch: "), message)
+
+    def test_run_cli_returns_the_result_and_reports_nothing_on_success(self):
+        os.environ["FAKE_ENVELOPE"] = OK_ENVELOPE
+        recorder = _Recorder()
+        result = cli_bridge.run_cli(
+            recorder, "export.obj", {"nif": "x"}, cli=cli_bridge.SculptoCli(binary=self.stub)
+        )
+        self.assertEqual(result["vertices"], 4)
+        self.assertEqual(recorder.reports, [])
 
     def test_find_binary_prefers_the_environment(self):
         os.environ["SCULPTO_BIN"] = "/somewhere/sculpto"
