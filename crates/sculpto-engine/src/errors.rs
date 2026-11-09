@@ -12,6 +12,7 @@ use sculpto_bake::BakeError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
 use sculpto_mesh::conform::ConformError;
 use sculpto_nif::NifError;
+use sculpto_nif::write::header::NifWriteError;
 
 /// A file-system failure, with the path in the message.
 pub fn io(path: &Path, error: std::io::Error) -> CommandError {
@@ -41,6 +42,48 @@ pub fn nif(error: NifError) -> CommandError {
         NifError::TooShort => (ErrorKind::InvalidRequest, "nif_too_short"),
         NifError::Malformed(_) => (ErrorKind::InvalidRequest, "nif_malformed"),
         NifError::Truncated { .. } => (ErrorKind::Refused, "nif_truncated"),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A NIF could not be written: the target or the model refused it.
+pub fn nif_write(error: NifWriteError) -> CommandError {
+    let (kind, code) = match &error {
+        NifWriteError::UnsupportedGame { .. } => (ErrorKind::Unsupported, "nif_game_unsupported"),
+        NifWriteError::UnsupportedVersion { .. } => {
+            (ErrorKind::Unsupported, "nif_version_unsupported")
+        }
+        NifWriteError::TooShort => (ErrorKind::InvalidRequest, "nif_too_short"),
+        NifWriteError::NotGamebryo => (ErrorKind::InvalidRequest, "nif_not_gamebryo"),
+        NifWriteError::UnsupportedEndian { .. } => {
+            (ErrorKind::Unsupported, "nif_endian_unsupported")
+        }
+        NifWriteError::InvalidModel(_) => (ErrorKind::InvalidParams, "nif_model_invalid"),
+        NifWriteError::TooManyVertices { .. } => {
+            (ErrorKind::InvalidParams, "nif_too_many_vertices")
+        }
+        NifWriteError::TooManyTriangles { .. } => {
+            (ErrorKind::InvalidParams, "nif_too_many_triangles")
+        }
+        NifWriteError::TangentsWithoutNormals => {
+            (ErrorKind::InvalidParams, "nif_tangents_without_normals")
+        }
+        NifWriteError::TangentsUnsupported { .. } => {
+            (ErrorKind::Unsupported, "nif_tangents_unsupported")
+        }
+        NifWriteError::ZeroVector { .. } => (ErrorKind::InvalidParams, "nif_zero_vector"),
+        NifWriteError::UnnamedBone { .. } => (ErrorKind::InvalidParams, "nif_unnamed_bone"),
+        NifWriteError::DuplicateBone { .. } => (ErrorKind::InvalidParams, "nif_duplicate_bone"),
+        NifWriteError::NameTooLong { .. } => (ErrorKind::InvalidParams, "nif_name_too_long"),
+        NifWriteError::TooManyBones { .. } => (ErrorKind::InvalidParams, "nif_too_many_bones"),
+        NifWriteError::SingularBind { .. } => (ErrorKind::InvalidParams, "nif_singular_bind"),
+        NifWriteError::TextureSlotUnsupported { .. } => {
+            (ErrorKind::Unsupported, "nif_texture_slot")
+        }
+        NifWriteError::MultipleMaterialSlots { .. } => {
+            (ErrorKind::Unsupported, "nif_material_slots")
+        }
+        NifWriteError::InlinePhysicsUnsupported => (ErrorKind::Unsupported, "nif_inline_physics"),
     };
     CommandError::new(kind, code, error.to_string())
 }
@@ -86,6 +129,8 @@ pub fn not_found(what: &str, name: &str) -> CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sculpto_core::mesh::MeshError;
+    use sculpto_nif::write::header::NifTarget;
 
     #[test]
     fn every_bake_variant_has_its_own_code() {
@@ -110,6 +155,53 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), 3, "bake variants must map to distinct codes");
+    }
+
+    #[test]
+    fn every_nif_write_variant_has_its_own_code() {
+        let cases = [
+            NifWriteError::UnsupportedGame { user_version: 1 },
+            NifWriteError::UnsupportedVersion { version: 1 },
+            NifWriteError::TooShort,
+            NifWriteError::NotGamebryo,
+            NifWriteError::UnsupportedEndian { endian: 0 },
+            NifWriteError::InvalidModel(MeshError::NoVertices),
+            NifWriteError::TooManyVertices { vertices: 1 },
+            NifWriteError::TooManyTriangles { triangles: 1 },
+            NifWriteError::TangentsWithoutNormals,
+            NifWriteError::TangentsUnsupported {
+                target: NifTarget::Le,
+            },
+            NifWriteError::ZeroVector {
+                attribute: "normal",
+                vertex: 0,
+            },
+            NifWriteError::UnnamedBone { index: 0 },
+            NifWriteError::DuplicateBone {
+                name: "b".to_string(),
+            },
+            NifWriteError::NameTooLong {
+                name: "b".to_string(),
+            },
+            NifWriteError::TooManyBones { bones: 1 },
+            NifWriteError::SingularBind { bone: 0 },
+            NifWriteError::TextureSlotUnsupported { slot: "specular" },
+            NifWriteError::MultipleMaterialSlots { count: 2 },
+            NifWriteError::InlinePhysicsUnsupported,
+        ];
+        let mut codes = Vec::new();
+        for error in cases {
+            let mapped = nif_write(error);
+            assert!(!mapped.code().is_empty());
+            codes.push(mapped.code());
+        }
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            19,
+            "NifWriteError variants must map to distinct codes"
+        );
     }
 
     #[test]

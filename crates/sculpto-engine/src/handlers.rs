@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde_json::{Value, json};
 
+use crate::errors;
 use crate::ops;
 use crate::{CommandError, ErrorKind};
 
@@ -40,6 +41,11 @@ pub fn export_obj_schema() -> Value {
     schema_for::<ops::ExportObjParams>()
 }
 
+/// Schema derived from the typed `export.pair` parameters.
+pub fn export_pair_schema() -> Value {
+    schema_for::<ops::ExportPairParams>()
+}
+
 fn schema_for<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).expect("schema serialises")
 }
@@ -54,6 +60,24 @@ fn missing(field: &str) -> CommandError {
         "missing_field",
         format!("`{field}` is required"),
     )
+}
+
+fn string_list(input: &Value, field: &str) -> Result<Option<Vec<String>>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(values) => values
+            .as_array()
+            .ok_or_else(|| errors::invalid(field, "must be an array of strings"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| errors::invalid(field, "must be an array of strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+    }
 }
 
 fn string(input: &Value, field: &str) -> Result<String, CommandError> {
@@ -171,4 +195,33 @@ pub fn export_obj(input: &Value) -> Result<Value, CommandError> {
             "triangles": triangles,
         })),
     }
+}
+
+pub fn export_pair(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::ExportPairParams {
+        nif: path(input, "nif")?,
+        project: path(input, "project")?,
+        presets: path(input, "presets")?,
+        preset: string(input, "preset")?,
+        set: string(input, "set")?,
+        out: path(input, "out")?,
+        size: string_list(input, "size")?,
+        shape: optional_string(input, "shape"),
+        home: optional_path(input, "home"),
+    };
+    let outcome = ops::export_pair(&params)?;
+    let endpoint = |size: sculpto_core::SliderSize| match size {
+        sculpto_core::SliderSize::Small => "small",
+        sculpto_core::SliderSize::Big => "big",
+    };
+    Ok(json!({
+        "out_0": outcome.out_0.display().to_string(),
+        "out_1": outcome.out_1.display().to_string(),
+        "endpoint_0": endpoint(outcome.size_0),
+        "endpoint_1": endpoint(outcome.size_1),
+        "target": outcome.target,
+        "shape": outcome.shape,
+        "vertices": outcome.vertices,
+        "triangles": outcome.triangles,
+    }))
 }

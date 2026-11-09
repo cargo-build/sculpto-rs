@@ -14,9 +14,12 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 
 use crate::CommandError;
+use crate::ErrorKind;
 use sculpto_bake::BakePlan;
+use sculpto_core::mesh::MeshAsset;
 use sculpto_core::{SliderSize, document::Document};
 use sculpto_mesh::conform::Conform;
+use sculpto_nif::write::header::NifTarget;
 
 use crate::errors;
 use crate::obj::{pick_shape, read_obj_positions, write_obj, write_obj_uv};
@@ -65,16 +68,7 @@ pub struct BakeOutcome {
 
 /// Resolve a preset and write the morphed shape as an OBJ.
 pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
-    let size = match params.endpoint.as_str() {
-        "big" => SliderSize::Big,
-        "small" => SliderSize::Small,
-        other => {
-            return Err(errors::invalid(
-                "endpoint",
-                format!("must be big or small, got `{other}`"),
-            ));
-        }
-    };
+    let size = endpoint("endpoint", &params.endpoint)?;
     let project = match Document::parse_file(&params.project).map_err(errors::document)? {
         Document::Project(project) => project,
         Document::Presets(_) => {
@@ -216,6 +210,190 @@ pub fn export_obj(params: &ExportObjParams) -> Result<ExportObjOutcome, CommandE
     })
 }
 
+/// Everything `export.pair` needs.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ExportPairParams {
+    /// Input NIF; its Bethesda user version selects the written target
+    /// (SE is 12, LE is 11).
+    pub nif: PathBuf,
+    /// `.osp` project.
+    pub project: PathBuf,
+    /// `SliderPresets` collection naming the preset.
+    pub presets: PathBuf,
+    /// Preset name; both endpoint plans resolve through it.
+    pub preset: String,
+    /// Slider set name.
+    pub set: String,
+    /// Output stem: the pair lands at `<out>_0.nif` and `<out>_1.nif`. A
+    /// trailing `.nif` and a trailing `_0`/`_1` are stripped first, so any
+    /// output path of a previous run is accepted back unchanged.
+    pub out: PathBuf,
+    /// Two endpoints, `["small"|"big", "small"|"big"]`: the first resolves the
+    /// `_0` file, the second the `_1` file. Defaults to small, big.
+    pub size: Option<Vec<String>>,
+    /// Shape name; the largest shape when absent.
+    pub shape: Option<String>,
+    /// BodySlide home; the project's grandparent when absent.
+    pub home: Option<PathBuf>,
+}
+
+/// What `export.pair` produced.
+#[derive(Debug, Clone)]
+pub struct ExportPairOutcome {
+    /// Output of the first endpoint (the `_0` file).
+    pub out_0: PathBuf,
+    /// Output of the second endpoint (the `_1` file).
+    pub out_1: PathBuf,
+    /// Endpoint the `_0` file carries.
+    pub size_0: SliderSize,
+    /// Endpoint the `_1` file carries.
+    pub size_1: SliderSize,
+    /// Written target: `se` or `le`.
+    pub target: &'static str,
+    /// Shape name.
+    pub shape: String,
+    /// Vertices per file.
+    pub vertices: usize,
+    /// Triangles per file.
+    pub triangles: usize,
+}
+
+/// The `big`/`small` wire token, shared by `bake` and `export.pair`.
+fn endpoint(field: &str, value: &str) -> Result<SliderSize, CommandError> {
+    match value {
+        "big" => Ok(SliderSize::Big),
+        "small" => Ok(SliderSize::Small),
+        other => Err(errors::invalid(
+            field,
+            format!("must be big or small, got `{other}`"),
+        )),
+    }
+}
+
+/// Strip a trailing `.nif` and a trailing `_0`/`_1` from the caller's `out`.
+///
+/// The rule is total: every input yields exactly one pair (`<stem>_0.nif`,
+/// `<stem>_1.nif`), and re-running with either output of a previous run
+/// reproduces the same pair, so no input is ambiguous enough to refuse.
+fn pair_stem(out: &Path) -> PathBuf {
+    let Some(name) = out.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return out.to_path_buf();
+    };
+    let without_extension = name.strip_suffix(".nif").unwrap_or(name);
+    let stem = without_extension
+        .strip_suffix("_0")
+        .or_else(|| without_extension.strip_suffix("_1"))
+        .unwrap_or(without_extension);
+    match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(stem),
+        _ => PathBuf::from(stem),
+    }
+}
+
+/// The written target follows the input's Bethesda user version, so a pair
+/// always matches its source game.
+fn nif_target(user_version: u32) -> Result<NifTarget, CommandError> {
+    match user_version {
+        12 => Ok(NifTarget::Se),
+        11 => Ok(NifTarget::Le),
+        other => Err(CommandError::new(
+            ErrorKind::Unsupported,
+            "nif_target_unsupported",
+            format!("input user version {other} is neither SE (12) nor LE (11)"),
+        )),
+    }
+}
+
+/// Bake one shape at both weight endpoints and write them as NIFs.
+///
+/// BodySlide's build names the low-weight output `<file>_0.nif` and the
+/// high-weight output `<file>_1.nif`; both plans resolve through the same
+/// preset, so the pair differs only in the endpoint that produced it. Both
+/// byte buffers are assembled before either file is written: a refused model
+/// or a failed second plan leaves the output directory untouched.
+pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, CommandError> {
+    let sizes = match &params.size {
+        None => [SliderSize::Small, SliderSize::Big],
+        Some(values) if values.len() == 2 => {
+            [endpoint("size", &values[0])?, endpoint("size", &values[1])?]
+        }
+        Some(values) => {
+            return Err(errors::invalid(
+                "size",
+                format!("must be two endpoints, got {}", values.len()),
+            ));
+        }
+    };
+    let project = match Document::parse_file(&params.project).map_err(errors::document)? {
+        Document::Project(project) => project,
+        Document::Presets(_) => {
+            return Err(errors::invalid(
+                "project",
+                format!("{} is not a project", params.project.display()),
+            ));
+        }
+    };
+    let presets = match Document::parse_file(&params.presets).map_err(errors::document)? {
+        Document::Presets(presets) => presets,
+        Document::Project(_) => {
+            return Err(errors::invalid(
+                "presets",
+                format!("{} is not a presets file", params.presets.display()),
+            ));
+        }
+    };
+    let preset = presets
+        .iter()
+        .find(|preset| preset.name == params.preset)
+        .ok_or_else(|| errors::not_found("preset", &params.preset))?;
+    let home = match &params.home {
+        Some(home) => home.clone(),
+        None => params
+            .project
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| errors::invalid("home", "cannot derive the BodySlide home; pass it"))?
+            .to_path_buf(),
+    };
+    let plans = [
+        BakePlan::resolve(&project, preset, &params.set, sizes[0], &home).map_err(errors::bake)?,
+        BakePlan::resolve(&project, preset, &params.set, sizes[1], &home).map_err(errors::bake)?,
+    ];
+    let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let target = nif_target(document.header.user_version)?;
+    let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
+    let mut asset = MeshAsset::from(shape);
+    let mut bodies = Vec::with_capacity(2);
+    for plan in &plans {
+        asset.positions = plan
+            .apply(&shape.name, &shape.positions)
+            .map_err(errors::bake)?;
+        bodies.push(sculpto_nif::write::write_shape(&asset, target).map_err(errors::nif_write)?);
+    }
+    let stem = pair_stem(&params.out);
+    let outs = [
+        PathBuf::from(format!("{}_0.nif", stem.display())),
+        PathBuf::from(format!("{}_1.nif", stem.display())),
+    ];
+    for (out, body) in outs.iter().zip(&bodies) {
+        std::fs::write(out, body).map_err(|error| errors::io(out, error))?;
+    }
+    Ok(ExportPairOutcome {
+        out_0: outs[0].clone(),
+        out_1: outs[1].clone(),
+        size_0: sizes[0],
+        size_1: sizes[1],
+        target: match target {
+            NifTarget::Se => "se",
+            NifTarget::Le => "le",
+        },
+        shape: shape.name.clone(),
+        vertices: shape.positions.len(),
+        triangles: shape.triangles.len(),
+    })
+}
+
 /// Everything `outfit.fit` needs.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct FitParams {
@@ -288,4 +466,66 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         offset_max: conform.offset_max(),
         follow,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pair_stem_rule_strips_weight_suffixes() {
+        let cases = [
+            ("out/body", "out/body"),
+            ("out/body.nif", "out/body"),
+            ("out/body_0", "out/body"),
+            ("out/body_1", "out/body"),
+            ("out/body_0.nif", "out/body"),
+            ("body", "body"),
+            ("body_1.nif", "body"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pair_stem(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pair_stem_rule_is_total() {
+        // Every accepted input yields the same pair, so nothing is ambiguous
+        // enough to refuse: feeding either output back reproduces the pair.
+        for input in ["body", "body_0", "body_1", "body.nif"] {
+            let stem = pair_stem(Path::new(input));
+            assert_eq!(
+                PathBuf::from(format!("{}_0.nif", stem.display())),
+                Path::new("body_0.nif"),
+                "{input}"
+            );
+            assert_eq!(
+                PathBuf::from(format!("{}_1.nif", stem.display())),
+                Path::new("body_1.nif"),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoints_parse_and_refuse() {
+        assert_eq!(endpoint("size", "big"), Ok(SliderSize::Big));
+        assert_eq!(endpoint("size", "small"), Ok(SliderSize::Small));
+        let error = endpoint("size", "huge").expect_err("refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidParams);
+        assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn the_target_follows_the_input_user_version() {
+        assert_eq!(nif_target(12), Ok(NifTarget::Se));
+        assert_eq!(nif_target(11), Ok(NifTarget::Le));
+        let error = nif_target(1).expect_err("refused");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.code(), "nif_target_unsupported");
+    }
 }

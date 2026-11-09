@@ -138,7 +138,7 @@ fn every_catalogue_row_carries_a_schema() {
 
 #[test]
 fn dispatch_and_run_share_one_handler() {
-    for id in ["bake", "outfit.fit", "export.obj"] {
+    for id in ["bake", "outfit.fit", "export.obj", "export.pair"] {
         let output = sculpto()
             .args(["run", "--cmd", id, "--input", "{}"])
             .output()
