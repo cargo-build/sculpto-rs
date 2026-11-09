@@ -82,7 +82,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     let bone_count = bone_names.len();
     // Block 0 is the shape; a skin adds the instance (1), the data (2) and one
     // node per bone (3..).
-    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 4 + offset as i32).collect();
+    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 5 + offset as i32).collect();
     let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
     let skin_ref = skin_plan.as_ref().map_or(-1, |_| 1);
 
@@ -175,10 +175,11 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     }
     push_u32(&mut body, 0); // SSE particle_data_size
 
-    let (instance, data, root, nodes) = match &skin_plan {
+    let (instance, data, partition, root, nodes) = match &skin_plan {
         Some(plan) => (
-            skin::instance(2, skeleton_root, &bone_refs),
+            skin::instance(2, 3, skeleton_root, &bone_refs),
             skin::data(plan)?,
+            skin::partitions(asset, true, vertex_desc)?,
             skin::node(-1, &[0]),
             plan.names
                 .iter()
@@ -186,15 +187,15 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
                 .map(|(_name, index)| skin::node(*index, &[]))
                 .collect::<Vec<_>>(),
         ),
-        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
 
     let mut type_names: Vec<&str> = vec![BLOCK_TYPE];
     let mut type_indices: Vec<u16> = vec![0];
     if skin_plan.is_some() {
-        type_names.extend(["NiSkinInstance", "NiSkinData", "NiNode"]);
-        type_indices.extend([1, 2]);
-        type_indices.extend(std::iter::repeat_n(3, bone_count + 1));
+        type_names.extend(["NiSkinInstance", "NiSkinData", "NiSkinPartition", "NiNode"]);
+        type_indices.extend([1, 2, 3]);
+        type_indices.extend(std::iter::repeat_n(4, bone_count + 1));
     }
 
     let mut file = write_header(NifTarget::Se);
@@ -218,6 +219,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     if skin_plan.is_some() {
         push_u32(&mut file, instance.len() as u32);
         push_u32(&mut file, data.len() as u32);
+        push_u32(&mut file, partition.len() as u32);
         push_u32(&mut file, root.len() as u32);
         for node in &nodes {
             push_u32(&mut file, node.len() as u32);
@@ -236,6 +238,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     if skin_plan.is_some() {
         file.extend_from_slice(&instance);
         file.extend_from_slice(&data);
+        file.extend_from_slice(&partition);
         file.extend_from_slice(&root);
         for node in &nodes {
             file.extend_from_slice(node);
@@ -457,6 +460,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn se_skin_partition_block_matches_the_model_palette() {
+        let asset = skinned();
+        let bytes = write_se_shape(&asset).expect("writes");
+        let scene = byroredux_nif::parse_nif(&bytes).expect("parses");
+        let partition = scene
+            .get_as::<byroredux_nif::blocks::skin::NiSkinPartition>(3)
+            .expect("partition block");
+        assert_eq!(partition.partitions.len(), 1);
+        assert_eq!(partition.partitions[0].bones, vec![0, 1]);
+        assert_eq!(partition.partitions[0].num_weights_per_vertex, 4);
+        assert_eq!(partition.partitions[0].vertex_map.len(), 3);
+        // Palette-local bone indices: 0.75 -> palette slot 0, 0.25 -> slot 1.
+        assert_eq!(&partition.partitions[0].bone_indices[..4], &[0, 1, 0, 0]);
+        assert!(partition.global_vertex_data.is_none());
     }
 
     #[test]

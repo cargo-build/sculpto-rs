@@ -73,6 +73,8 @@ fn se_and_le_writer_bytes_are_pinned() {
     // Structural markers the readers depend on.
     assert!(se.windows(10).any(|window| window == b"BSTriShape"));
     assert!(le.windows(10).any(|window| window == b"NiTriShape"));
+    assert!(se.windows(15).any(|window| window == b"NiSkinPartition"));
+    assert!(le.windows(15).any(|window| window == b"NiSkinPartition"));
     assert!(se.len() > 200 && le.len() > 200);
     // Negative control: any attribute change must move the hash.
     let mut changed = asset.clone();
