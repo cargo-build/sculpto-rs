@@ -43,6 +43,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     push_i32(&mut shape, -1); // shader
     push_i32(&mut shape, -1); // alpha
 
+    let has_uvs = !asset.uvs.is_empty();
     let mut data = Vec::new();
     push_i32(&mut data, 0); // group id
     push_u16(&mut data, vertices);
@@ -54,14 +55,19 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         push_f32(&mut data, position[1]);
         push_f32(&mut data, position[2]);
     }
-    push_u16(&mut data, 0); // data flags: no normals, no UVs
+    push_u16(&mut data, u16::from(has_uvs)); // data flags: bit 0 = has UV
     push_u32(&mut data, 0); // material CRC
     data.push(0); // has normals
     for value in [0.0f32, 0.0, 0.0, 0.0] {
         push_f32(&mut data, value); // center + radius
     }
     data.push(0); // has vertex colors
-    // data_flags bit 0 clear -> no UV sets, has UV false
+    if has_uvs {
+        for uv in &asset.uvs {
+            push_f32(&mut data, uv[0]);
+            push_f32(&mut data, uv[1]);
+        }
+    }
     push_u16(&mut data, 0); // consistency flags
     push_i32(&mut data, -1); // additional data
     push_u16(&mut data, triangles);
@@ -139,6 +145,21 @@ mod tests {
         for (actual, expected) in shape.positions.iter().zip(&asset.positions) {
             for (left, right) in actual.iter().zip(expected) {
                 assert!((left - right).abs() <= 1e-6, "position drift");
+            }
+        }
+    }
+
+    #[test]
+    fn le_uv_seam_roundtrips() {
+        let mut asset = triangle();
+        asset.uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
+        let bytes = write_le_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("parses");
+        let shape = &document.shapes[0];
+        assert_eq!(shape.uvs.len(), asset.uvs.len());
+        for (actual, expected) in shape.uvs.iter().zip(&asset.uvs) {
+            for (left, right) in actual.iter().zip(expected) {
+                assert!((left - right).abs() <= 1e-6, "UV drift at the seam");
             }
         }
     }

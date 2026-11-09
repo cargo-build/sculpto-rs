@@ -8,5 +8,6 @@ description = "NIF adapter: read Skyrim bodies into Sculpto shapes through the v
 
 [dependencies]
 sculpto-core.workspace = true
+half = "2"
 byroredux-core = { path = "../../vendor/byroredux/core" }
 byroredux-nif = { path = "../../vendor/byroredux/nif" }
