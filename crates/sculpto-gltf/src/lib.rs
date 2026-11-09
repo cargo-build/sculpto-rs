@@ -51,6 +51,8 @@
 
 pub mod pack;
 
+pub mod profile;
+
 pub mod sanitize;
 
 use std::borrow::Cow;
@@ -59,6 +61,8 @@ use std::fmt;
 
 use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, PhysicsRef, TextureSlot};
 use serde_json::{Map, Value, json};
+
+use profile::ConsumerProfile;
 
 /// `f32` accessor component type.
 const FLOAT: u32 = 5126;
@@ -98,6 +102,21 @@ pub enum GltfError {
     /// The model declared more than one material slot.
     MultipleMaterialSlots {
         /// The number of material slots declared.
+        count: usize,
+    },
+    /// The model carries more morph targets than the caller-selected
+    /// [`profile::ConsumerProfile`] measured on its consumer build; nothing
+    /// was written.
+    ConsumerCapExceeded {
+        /// The profile name.
+        profile: String,
+        /// The consumer version requirement the profile targets.
+        requirement: String,
+        /// The exact consumer version that was measured.
+        resolved: String,
+        /// The measured morph-target cap.
+        cap: usize,
+        /// The model's morph-target count that exceeds it.
         count: usize,
     },
     /// A clip has fewer than two samples, so a player could only render it
@@ -164,6 +183,17 @@ impl fmt::Display for GltfError {
                     "model has {count} material slots; glTF export supports at most one"
                 )
             }
+            Self::ConsumerCapExceeded {
+                profile,
+                requirement,
+                resolved,
+                cap,
+                count,
+            } => write!(
+                f,
+                "profile '{profile}' (requirement {requirement}, resolved {resolved}) \
+                 caps morph targets at {cap}; the model carries {count}"
+            ),
             Self::ConstantClip {
                 clip,
                 name,
@@ -266,6 +296,31 @@ fn channel_samples(channel: &ClipChannel) -> usize {
 /// The model is validated first, so a refused asset returns a typed
 /// [`GltfError`] and never bytes.
 pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
+    write_glb_with(asset, &[])
+}
+
+/// [`write_glb`] for a caller-selected [`ConsumerProfile`]: the model's
+/// morph-target count is compared against the profile's measured cap
+/// (`profile.max_morph_targets.value`) before any byte is produced, and a
+/// count above it is refused as [`GltfError::ConsumerCapExceeded`], naming
+/// the profile.
+///
+/// Format limits stay adapter-enforced `FormatLimits`, not profile data;
+/// see [`profile`].
+pub fn write_glb_with_profile(
+    asset: &MeshAsset,
+    profile: &ConsumerProfile,
+) -> Result<Vec<u8>, GltfError> {
+    asset.validate().map_err(GltfError::InvalidMesh)?;
+    if asset.morphs.len() > profile.max_morph_targets.value {
+        return Err(GltfError::ConsumerCapExceeded {
+            profile: profile.name.clone(),
+            requirement: profile.requirement.clone(),
+            resolved: profile.resolved.clone(),
+            cap: profile.max_morph_targets.value,
+            count: asset.morphs.len(),
+        });
+    }
     write_glb_with(asset, &[])
 }
 
