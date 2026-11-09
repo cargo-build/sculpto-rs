@@ -327,3 +327,40 @@ fn bytes_u16(values: impl Iterator<Item = u16>) -> Vec<u8> {
 fn bytes_u32(values: impl Iterator<Item = u32>) -> Vec<u8> {
     values.flat_map(u32::to_le_bytes).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{UNSIGNED_INT, Writer, bytes_u32};
+
+    #[test]
+    fn views_pad_to_four_byte_boundaries() {
+        let mut writer = Writer::default();
+        assert_eq!(writer.view(&[1, 2, 3]).expect("first view"), 0);
+        assert_eq!(writer.view(&[4]).expect("second view"), 1);
+        assert_eq!(writer.views[0]["byteOffset"].as_u64(), Some(0));
+        assert_eq!(
+            writer.views[1]["byteOffset"].as_u64(),
+            Some(4),
+            "the second view is padded"
+        );
+        assert_eq!(writer.bin, [1, 2, 3, 0, 4]);
+    }
+
+    #[test]
+    fn an_accessor_records_its_view_component_type_and_count() {
+        let mut writer = Writer::default();
+        let view = writer.view(&bytes_u32([7, 9].into_iter())).expect("view");
+        let accessor = writer.accessor(view, UNSIGNED_INT, "SCALAR", 2);
+        assert_eq!(accessor, 0);
+        assert_eq!(
+            writer.accessors[0]["bufferView"].as_u64(),
+            Some(view as u64)
+        );
+        assert_eq!(
+            writer.accessors[0]["componentType"].as_u64(),
+            Some(u64::from(UNSIGNED_INT))
+        );
+        assert_eq!(writer.accessors[0]["type"].as_str(), Some("SCALAR"));
+        assert_eq!(writer.accessors[0]["count"].as_u64(), Some(2));
+    }
+}
