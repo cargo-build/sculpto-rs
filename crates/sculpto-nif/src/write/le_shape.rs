@@ -180,7 +180,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         Some(plan) => (
             skin::instance(3, 4, skeleton_root, &bone_refs),
             skin::data(plan)?,
-            skin::partitions(asset, false, 0)?,
+            skin::partitions(asset, None)?,
             skin::node(-1, &[0], &root_extra),
             bone_names
                 .iter()

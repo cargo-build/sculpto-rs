@@ -275,12 +275,18 @@ fn compare(document: &NifDocument, model: &MeshAsset, target: NifTarget) -> Resu
         ));
     }
 
-    // UV absence round-trips: neither writer emits a UV stream for a
-    // model that authors none. Normal absence does not — the shared
-    // importer synthesizes geometry normals when the file carries none
-    // (`byroredux-nif` import/mesh/normal.rs), so normals are compared
-    // only when the model authors them.
-    if shape.uvs.is_empty() != model.uvs.is_empty() {
+    // UV absence round-trips through the inline layouts (LE and unskinned SE).
+    // A skinned SE shape is reconstructed from
+    // `NiSkinPartition.global_vertex_data`, where the vendored decoder
+    // fabricates a `[0, 0]` fill so its parallel arrays stay length-aligned;
+    // the importer exposes no UV-authorship flag (normals have one), so
+    // absence is not observable on that path. Values are still compared
+    // whenever the model authors UVs. Normal absence does not round-trip on
+    // any layout either — the shared importer synthesizes geometry normals
+    // when the file carries none (`byroredux-nif` import/mesh/normal.rs), so
+    // normals are compared only when the model authors them.
+    let reconstructed_sse_skin = target == NifTarget::Se && model.skin.is_some();
+    if !reconstructed_sse_skin && shape.uvs.is_empty() != model.uvs.is_empty() {
         return Err(format!(
             "uv presence changed: model authors {}, {} read back",
             model.uvs.len(),

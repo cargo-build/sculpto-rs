@@ -95,6 +95,9 @@ pub fn nif_write(error: NifWriteError) -> CommandError {
         NifWriteError::InlinePhysicsUnsupported => {
             (ErrorKind::Refused, "nif_write_inline_physics_unsupported")
         }
+        NifWriteError::GlobalVertexMismatch { .. } => {
+            (ErrorKind::Refused, "nif_write_global_vertex_mismatch")
+        }
     };
     CommandError::new(kind, code, error.to_string())
 }
