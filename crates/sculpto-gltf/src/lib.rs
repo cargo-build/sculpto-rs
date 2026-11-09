@@ -1,9 +1,21 @@
 //! glTF adapter: write a Sculpto [`MeshAsset`](sculpto_core::mesh::MeshAsset)
 //! as a single-buffer GLB.
 //!
-//! Geometry and skin only for now: materials, morph targets and the physics
-//! sidecar are later slices (E03, E04, E06) and are not emitted, so an asset
-//! carrying them exports without them.
+//! Geometry, skin, materials and morph targets:
+//! - Materials: neutral [`MaterialSlot`](sculpto_core::mesh::MaterialSlot)
+//!   maps diffuse to `pbrMetallicRoughness.baseColorTexture` and normal to
+//!   `normalTexture` using relative URIs. Specular textures have no core glTF
+//!   slot and are refused as [`GltfError::TextureSlotUnsupported`].
+//!   Today, `MeshAsset` represents a single authored shape with at most one
+//!   material slot (`asset.materials.len() <= 1`); multiple slots are refused
+//!   as [`GltfError::MultipleMaterialSlots`].
+//! - Morphs: sparse [`MorphTarget`](sculpto_core::mesh::MorphTarget) deltas
+//!   are expanded to full-primitive POSITION accessors with min/max bounds and
+//!   zero default weights (`mesh.weights`). Target names are recorded under
+//!   `extras.targetNames`. Any morph whose vertex index exceeds the primitive's
+//!   vertex count is refused as [`MeshError::MorphVertexOutOfRange`].
+//!   Normal deltas are omitted as `MorphDelta` carries only position deltas.
+//! - The physics sidecar is a later slice (E06) and is not emitted.
 //!
 //! Layout contract of [`write_glb`]:
 //! - One mesh with one primitive per triangle partition, primitives in
@@ -26,7 +38,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId};
+use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, TextureSlot};
 use serde_json::{Map, Value, json};
 
 /// `f32` accessor component type.
@@ -59,6 +71,16 @@ pub enum GltfError {
         /// The size that does not fit.
         size: usize,
     },
+    /// A material channel has no standard glTF slot and was refused.
+    TextureSlotUnsupported {
+        /// The unsupported texture channel name.
+        slot: &'static str,
+    },
+    /// The model declared more than one material slot.
+    MultipleMaterialSlots {
+        /// The number of material slots declared.
+        count: usize,
+    },
     /// The JSON chunk failed to serialize.
     Serialize(String),
     /// The GLB container failed to frame the chunks.
@@ -72,6 +94,18 @@ impl fmt::Display for GltfError {
             Self::NoTriangles => write!(f, "mesh has no triangles to export"),
             Self::TooLarge { field, size } => {
                 write!(f, "{field} ({size}) exceeds the glTF u32 limit")
+            }
+            Self::TextureSlotUnsupported { slot } => {
+                write!(
+                    f,
+                    "texture slot '{slot}' is not supported in glTF 2.0 core PBR"
+                )
+            }
+            Self::MultipleMaterialSlots { count } => {
+                write!(
+                    f,
+                    "model has {count} material slots; glTF export supports at most one"
+                )
             }
             Self::Serialize(detail) => write!(f, "GLB JSON failed: {detail}"),
             Self::Encode(detail) => write!(f, "GLB framing failed: {detail}"),
@@ -95,6 +129,19 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
         field: "vertex count",
         size: asset.positions.len(),
     })?;
+
+    // The single-shape model allows at most one material slot today.
+    let material_slot = match asset.materials.len() {
+        0 => None,
+        1 => {
+            let slot = &asset.materials[0];
+            if slot.texture(TextureSlot::Specular).is_some() {
+                return Err(GltfError::TextureSlotUnsupported { slot: "specular" });
+            }
+            Some(slot)
+        }
+        count => return Err(GltfError::MultipleMaterialSlots { count }),
+    };
 
     let mut writer = Writer::default();
     let mut attributes = Map::new();
@@ -180,6 +227,79 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
         }));
     }
 
+    let mut images = Vec::new();
+    let mut textures = Vec::new();
+    let mut materials = Vec::new();
+
+    if let Some(slot) = material_slot {
+        let mut pbr = Map::new();
+        if let Some(diffuse) = slot.texture(TextureSlot::Diffuse) {
+            let image_idx = images.len();
+            images.push(json!({ "uri": diffuse }));
+            let texture_idx = textures.len();
+            textures.push(json!({ "source": image_idx }));
+            pbr.insert("baseColorTexture".into(), json!({ "index": texture_idx }));
+        }
+
+        let mut material = Map::new();
+        if !slot.name.is_empty() {
+            material.insert("name".into(), json!(slot.name));
+        }
+        if !pbr.is_empty() {
+            material.insert("pbrMetallicRoughness".into(), Value::Object(pbr));
+        }
+        if let Some(normal) = slot.texture(TextureSlot::Normal) {
+            let image_idx = images.len();
+            images.push(json!({ "uri": normal }));
+            let texture_idx = textures.len();
+            textures.push(json!({ "source": image_idx }));
+            material.insert("normalTexture".into(), json!({ "index": texture_idx }));
+        }
+        if slot.double_sided {
+            material.insert("doubleSided".into(), json!(true));
+        }
+        materials.push(Value::Object(material));
+    }
+
+    let mut target_names = Vec::with_capacity(asset.morphs.len());
+    let mut primitive_targets = Vec::with_capacity(asset.morphs.len());
+    for (target_idx, morph) in asset.morphs.iter().enumerate() {
+        target_names.push(morph.name.clone());
+        let mut dense = vec![[0.0_f32; 3]; asset.positions.len()];
+        for delta in &morph.deltas {
+            if delta.vertex as usize >= asset.positions.len() {
+                return Err(GltfError::InvalidMesh(MeshError::MorphVertexOutOfRange {
+                    target: target_idx,
+                    vertex: delta.vertex,
+                }));
+            }
+            dense[delta.vertex as usize] = delta.position;
+        }
+
+        let mut min = [0.0_f32; 3];
+        let mut max = [0.0_f32; 3];
+        for row in &dense {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(row[axis]);
+                max[axis] = max[axis].max(row[axis]);
+            }
+        }
+
+        let view = writer.view(&bytes_f32(dense.iter().flat_map(|row| row.iter().copied())))?;
+        let accessor_idx = writer.accessors.len();
+        writer.accessors.push(json!({
+            "bufferView": view,
+            "componentType": FLOAT,
+            "type": "VEC3",
+            "count": dense.len(),
+            "min": min,
+            "max": max,
+        }));
+        primitive_targets.push(json!({
+            "POSITION": accessor_idx,
+        }));
+    }
+
     let mut by_partition: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
     for (index, partition) in asset.triangle_partitions.iter().enumerate() {
         by_partition.entry(*partition).or_default().push(index);
@@ -192,11 +312,18 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
                 .flat_map(|&triangle| asset.triangles[triangle])
                 .collect();
             let view = writer.view(&bytes_u32(indices.iter().copied()))?;
-            Ok(json!({
+            let mut prim = json!({
                 "attributes": attributes.clone(),
                 "indices": writer.accessor(view, UNSIGNED_INT, "SCALAR", indices.len()),
                 "mode": TRIANGLES,
-            }))
+            });
+            if material_slot.is_some() {
+                prim["material"] = json!(0);
+            }
+            if !primitive_targets.is_empty() {
+                prim["targets"] = json!(primitive_targets);
+            }
+            Ok(prim)
         })
         .collect::<Result<Vec<_>, GltfError>>()?;
 
@@ -205,6 +332,17 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
         mesh.insert("name".into(), json!(asset.name));
     }
     mesh.insert("primitives".into(), json!(primitives));
+    if !asset.morphs.is_empty() {
+        let weights = vec![0.0_f32; asset.morphs.len()];
+        mesh.insert("weights".into(), json!(weights));
+        mesh.insert(
+            "extras".into(),
+            json!({
+                "targetNames": target_names,
+            }),
+        );
+        mesh.insert("targetNames".into(), json!(target_names));
+    }
 
     let mut mesh_node = Map::new();
     if !asset.name.is_empty() {
@@ -238,6 +376,15 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
     root.insert("meshes".into(), json!([Value::Object(mesh)]));
     if let Some(skin) = skin_json {
         root.insert("skins".into(), json!([skin]));
+    }
+    if !materials.is_empty() {
+        root.insert("materials".into(), json!(materials));
+    }
+    if !textures.is_empty() {
+        root.insert("textures".into(), json!(textures));
+    }
+    if !images.is_empty() {
+        root.insert("images".into(), json!(images));
     }
     root.insert("accessors".into(), json!(writer.accessors));
     root.insert("bufferViews".into(), json!(writer.views));
