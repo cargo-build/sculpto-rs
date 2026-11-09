@@ -15,6 +15,11 @@
 //! factor. Detection is a declared heuristic, not a proof: a genuine
 //! sub-decimetre miniature is misread as shrunk content, which the reported
 //! factor makes visible instead of silent.
+//!
+//! [`RawGarment::into_fit_input`] is the G05 hand-off: it narrows the read into
+//! the mesh the conform path consumes, in intake vertex order. Its refusals are
+//! the fit path's own (see [`HandoffError`]); intake defects such as an open
+//! boundary are reported by the audit, never invented here as a fit rule.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -710,5 +715,110 @@ fn scale_rule(extent: f32) -> ScaleRule {
         value if value < METRE_LIMIT => ScaleRule::Metres,
         value if value < CENTIMETRE_LIMIT => ScaleRule::Centimetres,
         _ => ScaleRule::Millimetres,
+    }
+}
+
+/// The garment the conform fit path consumes
+/// ([`sculpto_mesh::conform`](crate::conform)).
+///
+/// This is [`RawGarment`] minus the fields the fit has no use for. The render
+/// vertex arena, its normals and the triangles stay in intake order, so
+/// `Conform::bind(&fit.positions, &body.positions)` pins vertex *i* exactly as
+/// the intake read it: no welding, no reordering, no normal recomputation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FitInput {
+    /// Mesh name, as authored; empty when the file names none.
+    pub name: String,
+    /// Vertex positions in metres, in intake order.
+    pub positions: Vec<[f32; 3]>,
+    /// Vertex normals in the same order; empty when the file carries none.
+    pub normals: Vec<[f32; 3]>,
+    /// Triangle indices into [`Self::positions`].
+    pub triangles: Vec<[u32; 3]>,
+}
+
+/// Why an intake cannot be handed to the fit path.
+///
+/// The rules are the fit path's own, not a new garment policy:
+/// [`Conform::bind`](crate::conform::Conform::bind) refuses an empty garment,
+/// and the fitted mesh keeps the intake triangles, so an index outside the
+/// vertex arena could not be applied. Open boundaries and non-manifold edges
+/// are **not** refusals: conform pins every vertex to its nearest reference
+/// vertex and never reads a triangle, so those defects stay with the intake
+/// audit instead of blocking a fit that the vertex binding can perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffError {
+    /// The garment has no vertices, which `Conform::bind` refuses as
+    /// `ConformError::EmptyGarment` for the same positions.
+    EmptyGarment,
+    /// The normals cover a different vertex count than the positions, so they
+    /// cannot be carried in intake order.
+    NormalCount {
+        /// Vertex count of the positions.
+        positions: usize,
+        /// Vertex count of the normals.
+        normals: usize,
+    },
+    /// A triangle references a vertex outside the arena; the fitted mesh would
+    /// read past the last position.
+    TriangleVertexOutOfRange {
+        /// The 0-based triangle index.
+        triangle: usize,
+        /// The offending vertex index, as read.
+        vertex: u32,
+    },
+}
+
+impl fmt::Display for HandoffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyGarment => write!(f, "the garment has no vertices"),
+            Self::NormalCount { positions, normals } => write!(
+                f,
+                "{normals} normals cover {positions} garment vertices; the fit needs one per vertex or none"
+            ),
+            Self::TriangleVertexOutOfRange { triangle, vertex } => write!(
+                f,
+                "triangle {triangle} references vertex {vertex} outside the garment"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HandoffError {}
+
+impl RawGarment {
+    /// Narrow the read into the fit input, preserving vertex order and normals.
+    pub fn into_fit_input(self) -> Result<FitInput, HandoffError> {
+        if self.positions.is_empty() {
+            return Err(HandoffError::EmptyGarment);
+        }
+        if !self.normals.is_empty() && self.normals.len() != self.positions.len() {
+            return Err(HandoffError::NormalCount {
+                positions: self.positions.len(),
+                normals: self.normals.len(),
+            });
+        }
+        let arena = self.positions.len();
+        if let Some((triangle, vertex)) =
+            self.triangles
+                .iter()
+                .enumerate()
+                .find_map(|(index, corners)| {
+                    let vertex = corners
+                        .iter()
+                        .copied()
+                        .find(|vertex| *vertex as usize >= arena)?;
+                    Some((index, vertex))
+                })
+        {
+            return Err(HandoffError::TriangleVertexOutOfRange { triangle, vertex });
+        }
+        Ok(FitInput {
+            name: self.name,
+            positions: self.positions,
+            normals: self.normals,
+            triangles: self.triangles,
+        })
     }
 }
