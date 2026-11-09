@@ -51,6 +51,7 @@ pub struct CountReport {
     pub vertices: usize,
     pub triangles: usize,
     pub materials: usize,
+    pub joints: usize,
     pub parts: Vec<PartReport>,
 }
 
@@ -329,6 +330,7 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_counts(
     config: Res<ViewerConfig>,
     gltf_root: Option<Res<GltfRoot>>,
@@ -336,6 +338,7 @@ fn report_counts(
     gltf_assets: Res<Assets<bevy::gltf::Gltf>>,
     gltf_mesh_assets: Res<Assets<bevy::gltf::GltfMesh>>,
     mesh_assets: Res<Assets<Mesh>>,
+    gltf_skin_assets: Res<Assets<bevy::gltf::GltfSkin>>,
     mut frames: Local<u32>,
 ) {
     if !config.report_mode {
@@ -369,6 +372,12 @@ fn report_counts(
     let mut total_vertices = 0;
     let mut total_triangles = 0;
     let mut parts = Vec::new();
+    let total_joints: usize = gltf
+        .skins
+        .iter()
+        .filter_map(|handle| gltf_skin_assets.get(handle))
+        .map(|skin| skin.joints.len())
+        .sum();
 
     for (mesh_idx, mesh_handle) in gltf.meshes.iter().enumerate() {
         let Some(gltf_mesh) = gltf_mesh_assets.get(mesh_handle) else {
@@ -394,7 +403,7 @@ fn report_counts(
                 vertices: verts,
                 triangles: tris,
                 morph_targets: morphs,
-                joints: 0,
+                joints: total_joints,
                 material: prim.material.is_some(),
             });
         }
@@ -413,6 +422,7 @@ fn report_counts(
         vertices: total_vertices,
         triangles: total_triangles,
         materials: gltf.materials.len(),
+        joints: total_joints,
         parts,
     };
 
