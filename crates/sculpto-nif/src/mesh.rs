@@ -18,6 +18,8 @@ impl From<&NifShape> for MeshAsset {
             name: shape.name.clone(),
             positions: shape.positions.clone(),
             uvs: shape.uvs.clone(),
+            normals: shape.normals.clone(),
+            tangents: shape.tangents.clone(),
             triangles: shape.triangles.clone(),
             // NifShape carries no partition metadata; one partition is the
             // honest default until the reader exposes it.
@@ -32,8 +34,8 @@ impl From<&NifShape> for MeshAsset {
 ///
 /// This is the compatibility path for the existing slice-based consumers:
 /// `NifShape -> MeshAsset -> NifShape` preserves every field `NifShape` owns.
-/// Normals, tangents, materials and morphs have no `NifShape` slot and are
-/// dropped by this projection.
+/// Materials and morphs have no `NifShape` slot and are dropped by this
+/// projection.
 impl From<&MeshAsset> for NifShape {
     fn from(mesh: &MeshAsset) -> Self {
         let (bones, bone_indices, weights) = match &mesh.skin {
@@ -48,6 +50,8 @@ impl From<&MeshAsset> for NifShape {
             name: mesh.name.clone(),
             positions: mesh.positions.clone(),
             uvs: mesh.uvs.clone(),
+            normals: mesh.normals.clone(),
+            tangents: mesh.tangents.clone(),
             triangles: mesh.triangles.clone(),
             bones,
             bone_indices,
@@ -65,6 +69,8 @@ mod tests {
             name: "body".into(),
             positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            tangents: vec![[1.0, 0.0, 0.0, 1.0]; 3],
             triangles: vec![[0, 1, 2]],
             bones: vec!["root".into(), "spine".into()],
             bone_indices: vec![[0, 1, 0, 0]; 3],
@@ -77,6 +83,8 @@ mod tests {
         let mesh = MeshAsset::from(&shape());
         assert_eq!(mesh.positions.len(), 3);
         assert_eq!(mesh.uvs.len(), 3);
+        assert_eq!(mesh.normals.len(), 3);
+        assert_eq!(mesh.tangents.len(), 3);
         assert_eq!(mesh.triangles, vec![[0, 1, 2]]);
         assert_eq!(mesh.triangle_partitions, vec![PartitionId(0)]);
         let skin = mesh.skin.as_ref().expect("skin");

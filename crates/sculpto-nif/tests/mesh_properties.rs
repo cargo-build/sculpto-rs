@@ -22,6 +22,22 @@ fn shape(seed: u64) -> NifShape {
         name: format!("shape{seed}"),
         positions,
         uvs,
+        normals: (0..vertices)
+            .map(|index| {
+                let value = (index % 3) as f32 + 0.5;
+                [value, -value, value]
+            })
+            .collect(),
+        tangents: (0..vertices)
+            .map(|index| {
+                [
+                    1.0,
+                    0.0,
+                    0.0,
+                    if index.is_multiple_of(2) { 1.0 } else { -1.0 },
+                ]
+            })
+            .collect(),
         triangles: (0..1 + seed as usize % 30)
             .map(|index| {
                 [

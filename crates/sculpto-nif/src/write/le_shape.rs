@@ -1,8 +1,9 @@
-//! Skyrim LE `NiTriShape` + `NiTriShapeData` writer for one position-only shape.
+//! Skyrim LE `NiTriShape` + `NiTriShapeData` writer for one shape.
 //!
-//! The LE wire format keeps geometry in a separate data block. C04 writes the
-//! two blocks with positions and triangles only; UVs, normals and skin follow in
-//! C05–C07.
+//! The LE wire format keeps geometry in a separate data block. C04 wrote
+//! positions and triangles, C05 added UVs and C06 adds `f32` normals. Tangents
+//! need the NBT layout, which this writer does not emit yet, so they are
+//! refused instead of dropped; skin follows in C07.
 
 use sculpto_core::mesh::MeshAsset;
 
@@ -44,6 +45,12 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     push_i32(&mut shape, -1); // alpha
 
     let has_uvs = !asset.uvs.is_empty();
+    let has_normals = !asset.normals.is_empty();
+    if !asset.tangents.is_empty() {
+        return Err(NifWriteError::TangentsUnsupported {
+            target: NifTarget::Le,
+        });
+    }
     let mut data = Vec::new();
     push_i32(&mut data, 0); // group id
     push_u16(&mut data, vertices);
@@ -57,7 +64,14 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     }
     push_u16(&mut data, u16::from(has_uvs)); // data flags: bit 0 = has UV
     push_u32(&mut data, 0); // material CRC
-    data.push(0); // has normals
+    data.push(u8::from(has_normals));
+    if has_normals {
+        for normal in &asset.normals {
+            push_f32(&mut data, normal[0]);
+            push_f32(&mut data, normal[1]);
+            push_f32(&mut data, normal[2]);
+        }
+    }
     for value in [0.0f32, 0.0, 0.0, 0.0] {
         push_f32(&mut data, value); // center + radius
     }
@@ -147,6 +161,34 @@ mod tests {
                 assert!((left - right).abs() <= 1e-6, "position drift");
             }
         }
+    }
+
+    #[test]
+    fn le_normals_roundtrip() {
+        let mut asset = triangle();
+        asset.normals = vec![[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
+        let bytes = write_le_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("parses");
+        let shape = &document.shapes[0];
+        assert_eq!(shape.normals.len(), asset.normals.len());
+        for (actual, expected) in shape.normals.iter().zip(&asset.normals) {
+            for (left, right) in actual.iter().zip(expected) {
+                assert!((left - right).abs() <= 1e-6, "normal drift");
+            }
+        }
+    }
+
+    #[test]
+    fn le_tangents_are_refused() {
+        let mut asset = triangle();
+        asset.normals = vec![[0.0, 0.0, 1.0]; 3];
+        asset.tangents = vec![[1.0, 0.0, 0.0, 1.0]; 3];
+        assert!(matches!(
+            write_le_shape(&asset),
+            Err(NifWriteError::TangentsUnsupported {
+                target: NifTarget::Le
+            })
+        ));
     }
 
     #[test]
