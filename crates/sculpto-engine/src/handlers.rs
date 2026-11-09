@@ -21,11 +21,6 @@ pub fn empty_schema() -> Value {
     schema_for::<EmptyParams>()
 }
 
-/// Schema for a command whose parameters are not fixed yet.
-pub fn any_schema() -> Value {
-    json!({ "type": "object" })
-}
-
 /// Schema derived from the typed `bake` parameters.
 pub fn bake_schema() -> Value {
     schema_for::<ops::BakeParams>()
@@ -44,6 +39,11 @@ pub fn export_obj_schema() -> Value {
 /// Schema derived from the typed `export.pair` parameters.
 pub fn export_pair_schema() -> Value {
     schema_for::<ops::ExportPairParams>()
+}
+
+/// Schema derived from the typed `export.nif` parameters.
+pub fn export_nif_schema() -> Value {
+    schema_for::<ops::ExportNifParams>()
 }
 
 fn schema_for<T: JsonSchema>() -> Value {
@@ -223,5 +223,22 @@ pub fn export_pair(input: &Value) -> Result<Value, CommandError> {
         "shape": outcome.shape,
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
+    }))
+}
+
+pub fn export_nif(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::ExportNifParams {
+        nif: path(input, "nif")?,
+        out: path(input, "out")?,
+        target: ops::ExportTarget::parse(&string(input, "target")?)?,
+        shape: optional_string(input, "shape"),
+    };
+    let outcome = ops::export_nif(&params)?;
+    Ok(json!({
+        "out": outcome.out.display().to_string(),
+        "target": outcome.target.as_str(),
+        "vertices": outcome.vertices,
+        "triangles": outcome.triangles,
+        "bytes": outcome.bytes,
     }))
 }

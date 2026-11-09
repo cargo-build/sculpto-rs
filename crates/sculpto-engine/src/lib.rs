@@ -157,8 +157,8 @@ pub type Schema = fn() -> Value;
 /// One registry row.
 ///
 /// `stub` is the single source of the `implemented` flag: a row either points at
-/// a real handler or at the typed `not_implemented` fallback. Nothing outside
-/// this table may decide whether an id is implemented.
+/// a real handler or is a stub the surfaces report as unimplemented. Nothing
+/// outside this table may decide whether an id is implemented.
 #[derive(Clone, Copy)]
 pub struct Spec {
     /// The id this row describes.
@@ -247,9 +247,9 @@ const COMMANDS: &[Spec] = &[
         id: CommandId::ExportNif,
         summary: "Export an asset as a Skyrim NIF.",
         mutates: true,
-        stub: true,
-        schema: handlers::any_schema,
-        handler: not_implemented,
+        stub: false,
+        schema: handlers::export_nif_schema,
+        handler: handlers::export_nif,
     },
 ];
 
@@ -287,14 +287,6 @@ pub fn envelope(result: Result<Value, CommandError>) -> Value {
 fn commands_list(_input: &Value) -> Result<Value, CommandError> {
     let rows: Vec<Value> = COMMANDS.iter().map(Spec::json).collect();
     Ok(json!({ "commands": rows }))
-}
-
-fn not_implemented(_input: &Value) -> Result<Value, CommandError> {
-    Err(CommandError::new(
-        ErrorKind::NotImplemented,
-        "not_implemented",
-        "the command is catalogued but its handler is not wired yet",
-    ))
 }
 
 #[cfg(test)]
@@ -341,16 +333,16 @@ mod tests {
     #[test]
     fn dispatch_wires_the_documented_commands() {
         assert!(dispatch("version", &Value::Null).is_ok());
-        for id in ["bake", "outfit.fit", "export.obj", "export.pair"] {
+        for id in [
+            "bake",
+            "outfit.fit",
+            "export.obj",
+            "export.pair",
+            "export.nif",
+        ] {
             let error = dispatch(id, &Value::Null).expect_err("missing params are an error");
             assert_ne!(error.kind(), ErrorKind::NotImplemented, "{id} is not wired");
         }
-        assert_eq!(
-            dispatch("export.nif", &Value::Null)
-                .expect_err("stub")
-                .kind(),
-            ErrorKind::NotImplemented
-        );
     }
 
     #[test]

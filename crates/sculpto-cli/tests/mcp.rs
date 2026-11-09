@@ -145,13 +145,13 @@ fn tools_list_ids_equal_the_command_catalogue() {
     }
     assert!(
         listed.contains(&"export.nif".to_string()),
-        "the stub stays catalogued"
+        "the tool stays catalogued"
     );
     session.finish();
 }
 
 #[test]
-fn stub_tool_is_marked_unimplemented_in_its_description() {
+fn export_nif_tool_is_implemented() {
     let mut session = Session::start();
     initialize(&mut session);
     let response = session.call(&json!({
@@ -160,15 +160,24 @@ fn stub_tool_is_marked_unimplemented_in_its_description() {
         "method": "tools/list",
     }));
     let tools = response["result"]["tools"].as_array().expect("tools array");
-    let stub = tools
+    let tool = tools
         .iter()
         .find(|tool| tool["name"] == "export.nif")
         .expect("export.nif row");
-    let description = stub["description"].as_str().expect("description");
+    let description = tool["description"].as_str().expect("description");
     assert!(
-        description.contains("Not implemented"),
-        "the stub description must say so: {description}"
+        !description.contains("Not implemented"),
+        "the wired tool must not claim a stub: {description}"
     );
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["required"].as_array().map(Vec::len), Some(3));
+    let targets: Vec<&str> = schema["$defs"]["ExportTarget"]["oneOf"]
+        .as_array()
+        .expect("target variants")
+        .iter()
+        .map(|variant| variant["const"].as_str().expect("const target"))
+        .collect();
+    assert_eq!(targets, ["se", "le"], "the target must be a closed enum");
     session.finish();
 }
 
@@ -217,7 +226,7 @@ fn tools_call_bake_with_empty_arguments_is_a_typed_error() {
 }
 
 #[test]
-fn stub_tool_call_reports_not_implemented() {
+fn export_nif_call_with_missing_params_is_a_typed_error() {
     let mut session = Session::start();
     initialize(&mut session);
     let response = session.call(&json!({
@@ -226,10 +235,14 @@ fn stub_tool_call_reports_not_implemented() {
         "method": "tools/call",
         "params": { "name": "export.nif", "arguments": {} },
     }));
+    assert!(
+        response.get("error").is_none(),
+        "no protocol error: {response}"
+    );
     let result = &response["result"];
     assert_eq!(result["isError"], true);
-    assert_eq!(result["_meta"]["sculpto"]["kind"], "not_implemented");
-    assert_eq!(result["_meta"]["sculpto"]["code"], "not_implemented");
+    assert_eq!(result["_meta"]["sculpto"]["kind"], "invalid_params");
+    assert_eq!(result["_meta"]["sculpto"]["code"], "missing_field");
     session.finish();
 }
 
