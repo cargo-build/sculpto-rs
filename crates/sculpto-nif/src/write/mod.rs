@@ -2,3 +2,4 @@
 //! block gates cannot drift apart.
 
 pub mod header;
+pub mod strings;
