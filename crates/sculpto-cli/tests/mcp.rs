@@ -107,14 +107,15 @@ fn tier1_bake(out: &Path) -> Value {
     })
 }
 
-/// How far the most displaced baked vertex moved from the unbaked source.
-fn max_displacement(baked: &Path, source: &[[f32; 3]]) -> f32 {
-    let positions = sculpto_engine::obj::read_obj_positions(baked).expect("baked OBJ positions");
+/// How far the most displaced vertex of `moved` is from the same vertex in
+/// `source`.
+fn max_displacement(moved: &Path, source: &[[f32; 3]]) -> f32 {
+    let positions = sculpto_engine::obj::read_obj_positions(moved).expect("moved OBJ positions");
     assert_eq!(
         positions.len(),
         source.len(),
         "{}: vertex count",
-        baked.display()
+        moved.display()
     );
     positions
         .iter()
@@ -515,5 +516,286 @@ fn bake_tool_error_codes_match_the_command_surface() {
                 .is_some_and(|text| text.starts_with(&code)),
             "the message must keep the code: {response}"
         );
+    }
+}
+
+/// The Tier-1 `outfit.fit` request; only `out` differs between the surfaces.
+///
+/// `shape` and `body_shape` name the fixture's one shape: `garment_fit` picks
+/// both from the same document (`ops.rs:565-566`), and the NIF writer emits one
+/// `BSTriShape` per file (`write/se_shape.rs:34`), so a distinct authored
+/// reference cannot be committed. See the coverage limit on
+/// [`fit_tool_matches_the_command_surface`].
+fn tier1_fit(body: &Path, out: &Path) -> Value {
+    json!({
+        "nif": fixture_home().join("ShapeData/Tier1/Body.nif"),
+        "shape": "Tier1 Body",
+        "body_shape": "Tier1 Body",
+        "body": body,
+        "out": out,
+    })
+}
+
+/// One surface's answer to the same request.
+struct FitRun {
+    surface: &'static str,
+    result: Value,
+    out: PathBuf,
+}
+
+/// Run one `outfit.fit` request over the three transports: in-process
+/// `dispatch`, `sculpto run` and one stdio tool call.
+fn fit_everywhere(id: u64, body: &Path, dir: &Path, tag: &str) -> Vec<FitRun> {
+    let direct_out = dir.join(format!("{tag}-direct.obj"));
+    let direct = sculpto_engine::dispatch("outfit.fit", &tier1_fit(body, &direct_out))
+        .expect("fit dispatches");
+
+    let cli_out = dir.join(format!("{tag}-run.obj"));
+    let cli = Command::new(env!("CARGO_BIN_EXE_sculpto"))
+        .args([
+            "run",
+            "--cmd",
+            "outfit.fit",
+            "--input",
+            &tier1_fit(body, &cli_out).to_string(),
+        ])
+        .output()
+        .expect("run outfit.fit");
+    assert!(
+        cli.status.success(),
+        "the command failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&cli.stdout).expect("one JSON envelope");
+    assert_eq!(envelope["ok"], true, "the command failed: {envelope}");
+
+    let mcp_out = dir.join(format!("{tag}-tool.obj"));
+    let mut session = Session::start();
+    initialize(&mut session);
+    let response = session.call(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": "outfit.fit", "arguments": tier1_fit(body, &mcp_out) },
+    }));
+    session.finish();
+    let tool = &response["result"];
+    assert_eq!(tool["isError"], false, "the tool failed: {response}");
+    let from_tool: Value =
+        serde_json::from_str(tool["content"][0]["text"].as_str().expect("text content"))
+            .expect("the text content is the result JSON");
+
+    vec![
+        FitRun {
+            surface: "dispatch",
+            result: direct,
+            out: direct_out,
+        },
+        FitRun {
+            surface: "run",
+            result: envelope["result"].clone(),
+            out: cli_out,
+        },
+        FitRun {
+            surface: "tool",
+            result: from_tool,
+            out: mcp_out,
+        },
+    ]
+}
+
+/// A07: the `outfit.fit` tool, `sculpto run` and an in-process `dispatch` are
+/// one command and write one OBJ.
+///
+/// Coverage limit, asserted instead of assumed: the garment and the authored
+/// reference body must come from one NIF (`ops.rs:565-566`), and the writer
+/// emits one `BSTriShape` per file (`write/se_shape.rs:34`), so no committed
+/// two-shape fixture exists and the Tier-1 shape is bound to itself. The
+/// authored offsets are therefore zero and this fit is a transport
+/// pass-through; the authored-reference case stays host-gated
+/// (`run_matches_argv.rs:267`) until a multi-shape writer exists. The
+/// zero-offset assertions below fail the moment this test is pointed at a
+/// two-shape fixture, so it cannot widen into a claim it does not make.
+#[test]
+fn fit_tool_matches_the_command_surface() {
+    let home = fixture_home();
+    let dir = work_dir("fit-parity");
+    // The body the Tier-1 shape was authored on, exported by the product.
+    let authored = dir.join("authored.obj");
+    sculpto_engine::dispatch(
+        "export.obj",
+        &json!({
+            "nif": home.join("ShapeData/Tier1/Body.nif"),
+            "shape": "Tier1 Body",
+            "out": &authored,
+        }),
+    )
+    .expect("export the authored body");
+    // A body it was not authored on: the fixture preset moves vertex 1 by +0.25
+    // and vertex 2 by +0.5 on x at Widen=50%, so the fit has to carry a movement
+    // it did not invent.
+    let morphed = dir.join("morphed.obj");
+    sculpto_engine::dispatch("bake", &tier1_bake(&morphed)).expect("bake the morphed body");
+
+    let authored_runs = fit_everywhere(9, &authored, &dir, "authored");
+    let morphed_runs = fit_everywhere(10, &morphed, &dir, "morphed");
+
+    // One result object on every surface; only the output path differs.
+    for run in &authored_runs[1..] {
+        for field in [
+            "garment",
+            "reference",
+            "vertices",
+            "offset_mean",
+            "offset_max",
+            "follow",
+        ] {
+            assert_eq!(
+                run.result[field], authored_runs[0].result[field],
+                "`outfit.fit` `{field}` differs between `dispatch` and {}",
+                run.surface
+            );
+        }
+    }
+    // Same output bytes on every surface: the OBJ checksum is one value.
+    for run in &authored_runs[1..] {
+        assert_eq!(
+            read(&run.out),
+            read(&authored_runs[0].out),
+            "`outfit.fit` wrote different artifacts over {}",
+            run.surface
+        );
+    }
+    // The fixture's own degeneracy, pinned: the garment and the reference are
+    // the same shape, so the authored offset is exactly zero and no follow
+    // measurement was requested.
+    assert_eq!(authored_runs[0].result["garment"], "Tier1 Body");
+    assert_eq!(authored_runs[0].result["reference"], "Tier1 Body");
+    assert_eq!(authored_runs[0].result["vertices"], 4);
+    assert_eq!(authored_runs[0].result["offset_mean"], 0.0);
+    assert_eq!(authored_runs[0].result["offset_max"], 0.0);
+    assert_eq!(authored_runs[0].result["follow"], Value::Null);
+
+    // A zero-offset fit places the garment exactly on the body it is given, so
+    // the positions are the body's and the triangles are the shape's.
+    let body = sculpto_engine::obj::read_obj_positions(&authored).expect("body positions");
+    let fitted =
+        sculpto_engine::obj::read_obj_positions(&authored_runs[0].out).expect("fitted positions");
+    assert_eq!(
+        fitted, body,
+        "a zero-offset fit must place every garment vertex on its bound body vertex"
+    );
+
+    // Negative control: the checksum is a function of the body, so a differently
+    // morphed body cannot produce the same OBJ on any surface. (The command has
+    // no mask or mode parameter — `ops.rs:523-540` — so the body is its fit
+    // input.)
+    let authored_bytes = read(&authored_runs[0].out);
+    for run in &morphed_runs {
+        assert_eq!(
+            read(&run.out),
+            read(&morphed_runs[0].out),
+            "`outfit.fit` wrote different artifacts over {} for a morphed body",
+            run.surface
+        );
+        assert_ne!(
+            read(&run.out),
+            authored_bytes,
+            "a differently morphed body produced the same OBJ over {}",
+            run.surface
+        );
+    }
+    let movement = max_displacement(&morphed_runs[0].out, &body);
+    assert!(
+        (movement - 0.5).abs() < 1e-6,
+        "the fit must carry the fixture's Widen=50% movement, got {movement}"
+    );
+}
+
+/// A07: one typed envelope for a refused `outfit.fit`, on every transport.
+///
+/// The command accepts no mask or mode (`ops.rs:523-540`), so the refusals a
+/// call can reach are a name the NIF does not carry and a body whose vertex
+/// count differs from the reference shape's.
+#[test]
+fn fit_tool_error_codes_match_the_command_surface() {
+    let home = fixture_home();
+    let dir = work_dir("fit-errors");
+    let nif = home.join("ShapeData/Tier1/Body.nif");
+    let body = dir.join("body.obj");
+    sculpto_engine::dispatch(
+        "export.obj",
+        &json!({ "nif": &nif, "shape": "Tier1 Body", "out": &body }),
+    )
+    .expect("export the authored body");
+    // Three vertices against the four-vertex reference.
+    let triangle_body = dir.join("triangle.obj");
+    std::fs::write(&triangle_body, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("write body");
+    let never = dir.join("never.obj");
+
+    let unknown_shape = json!({
+        "nif": &nif, "shape": "Tier1 Skirt", "body_shape": "Tier1 Body",
+        "body": &body, "out": &never,
+    });
+    let wrong_topology = json!({
+        "nif": &nif, "shape": "Tier1 Body", "body_shape": "Tier1 Body",
+        "body": &triangle_body, "out": &never,
+    });
+    // Request, expected code, expected kind, the `sculpto run` exit code.
+    for (arguments, code, kind, exit) in [
+        (unknown_shape, "not_found", "not_found", 2),
+        (wrong_topology, "topology_mismatch", "refused", 1),
+    ] {
+        let cli = Command::new(env!("CARGO_BIN_EXE_sculpto"))
+            .args([
+                "run",
+                "--cmd",
+                "outfit.fit",
+                "--input",
+                &arguments.to_string(),
+            ])
+            .output()
+            .expect("run outfit.fit");
+        assert_eq!(cli.status.code(), Some(exit), "exit code for {arguments}");
+        let envelope: Value = serde_json::from_slice(&cli.stdout).expect("one JSON envelope");
+        assert_eq!(envelope["ok"], false, "{envelope}");
+        assert_eq!(envelope["error"]["code"], code, "{envelope}");
+        assert_eq!(envelope["error"]["kind"], kind, "{envelope}");
+
+        let direct = sculpto_engine::dispatch("outfit.fit", &arguments)
+            .expect_err("the same request is refused in process");
+        assert_eq!(direct.code(), code, "`dispatch` code for {arguments}");
+        assert_eq!(
+            direct.kind().as_str(),
+            kind,
+            "`dispatch` kind for {arguments}"
+        );
+
+        let mut session = Session::start();
+        initialize(&mut session);
+        let response = session.call(&json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": { "name": "outfit.fit", "arguments": &arguments },
+        }));
+        session.finish();
+        let result = &response["result"];
+        assert_eq!(result["isError"], true, "the tool accepted {arguments}");
+        assert_eq!(
+            result["_meta"]["sculpto"]["code"], code,
+            "the tool and `run` disagree on the code for {arguments}"
+        );
+        assert_eq!(
+            result["_meta"]["sculpto"]["kind"], kind,
+            "the tool and `run` disagree on the kind for {arguments}"
+        );
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(code)),
+            "the message must keep the code: {response}"
+        );
+        assert!(!never.exists(), "a refused fit left a file behind");
     }
 }
