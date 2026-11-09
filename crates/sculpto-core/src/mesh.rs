@@ -290,6 +290,8 @@ pub enum MeshError {
     },
     /// A vertex's skin weights do not sum to one within `1e-4`.
     WeightSumOutOfRange { vertex: usize, sum: f32 },
+    /// A vertex's skin weights sum to zero, so they cannot be normalized.
+    ZeroWeightSum { vertex: usize },
     /// A triangle carries the reader's unmatched-partition sentinel.
     UnmatchedPartition { triangle: usize },
     /// A material slot violates a named rule.
@@ -482,6 +484,26 @@ impl MeshAsset {
                 });
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Normalize every vertex's skin weights to sum to one.
+    ///
+    /// Idempotent: a second call divides by a sum already within float noise of
+    /// one. A zero (or non-finite) sum is refused instead of hidden.
+    pub fn normalize_weights(&mut self) -> Result<(), MeshError> {
+        let Some(skin) = &mut self.skin else {
+            return Ok(());
+        };
+        for (vertex, weights) in skin.weights.iter_mut().enumerate() {
+            let sum: f32 = weights.iter().sum();
+            if sum == 0.0 || !sum.is_finite() {
+                return Err(MeshError::ZeroWeightSum { vertex });
+            }
+            for weight in weights.iter_mut() {
+                *weight /= sum;
+            }
         }
         Ok(())
     }
