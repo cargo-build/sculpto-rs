@@ -42,6 +42,13 @@ every combined GLB renumbers its clips (the cloth weight track is animation
 (default `/tmp/sculpto-classify/cloth/bevy_combined_240.png`). Print the
 index list from the GLB's JSON chunk before a capture.
 
+`SCULPTO_VIEWER_DEBUG_SCENE=1` replaces the capture with a consumer-limit
+audit on the pinned Bevy version: it probes the morph-target gate (256 accepted,
+257 rejected), prints one line per loaded mesh with vertex count, morph targets,
+material presence and skin joints, and takes two playback snapshots (active
+clips, elapsed time, summed morph weights) before exiting. This is the command
+behind the A00B numbers.
+
 Series mode replaces the single shot:
 `SCULPTO_VIEWER_SERIES=<start>:<count>:<stride>` captures one pose every
 `stride` ticks from `start` (≥ 240 — earlier frames are black while assets
