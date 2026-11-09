@@ -9,6 +9,7 @@
 use sculpto_core::mesh::MeshAsset;
 
 use super::header::{NifTarget, NifWriteError, write_header};
+use super::shader;
 use super::skin;
 use super::strings::StringTable;
 
@@ -53,6 +54,32 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 6 + offset as i32).collect();
     let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
     let skin_ref = skin_plan.as_ref().map_or(-1, |_| 2);
+    let material = match asset.materials.len() {
+        0 => None,
+        1 => Some(&asset.materials[0]),
+        count => return Err(NifWriteError::MultipleMaterialSlots { count }),
+    };
+    let texture_body = match material {
+        Some(slot) => shader::texture_set(slot)?,
+        None => Vec::new(),
+    };
+    let mut next_block = if skin_plan.is_some() {
+        6 + bone_count as i32
+    } else {
+        2
+    };
+    let shader_index = material.map_or(-1, |_| {
+        let index = next_block;
+        next_block += 1;
+        index
+    });
+    let texture_index = match material.is_some() && !texture_body.is_empty() {
+        true => next_block,
+        false => -1,
+    };
+    let shader_body = material.map_or_else(Vec::new, |slot| {
+        shader::shader(slot, texture_index, name_index)
+    });
 
     let mut shape = Vec::new();
     push_i32(&mut shape, name_index);
@@ -74,7 +101,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     push_u32(&mut shape, 0); // num_materials
     push_u32(&mut shape, 0); // active_material_index
     shape.push(0); // dirty flag
-    push_i32(&mut shape, -1); // shader
+    push_i32(&mut shape, shader_index);
     push_i32(&mut shape, -1); // alpha
 
     let mut data = Vec::new();
@@ -141,6 +168,14 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         type_indices.extend([2, 3, 4]);
         type_indices.extend(std::iter::repeat_n(5, bone_count + 1));
     }
+    if material.is_some() {
+        type_names.push("BSLightingShaderProperty");
+        type_indices.push(type_names.len() as u16 - 1);
+        if texture_index >= 0 {
+            type_names.push("BSShaderTextureSet");
+            type_indices.push(type_names.len() as u16 - 1);
+        }
+    }
 
     let mut file = write_header(NifTarget::Le);
     push_u32(&mut file, type_indices.len() as u32);
@@ -167,6 +202,12 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             push_u32(&mut file, node.len() as u32);
         }
     }
+    if material.is_some() {
+        push_u32(&mut file, shader_body.len() as u32);
+        if texture_index >= 0 {
+            push_u32(&mut file, texture_body.len() as u32);
+        }
+    }
     let max_length = strings.iter().map(str::len).max().unwrap_or(0);
     push_u32(&mut file, strings.len() as u32);
     push_u32(&mut file, max_length as u32);
@@ -184,6 +225,12 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         file.extend_from_slice(&root);
         for node in &nodes {
             file.extend_from_slice(node);
+        }
+    }
+    if material.is_some() {
+        file.extend_from_slice(&shader_body);
+        if texture_index >= 0 {
+            file.extend_from_slice(&texture_body);
         }
     }
     Ok(file)
@@ -208,7 +255,7 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sculpto_core::mesh::{PartitionId, Skin};
+    use sculpto_core::mesh::{MaterialSlot, PartitionId, ShaderKind, Skin};
 
     fn triangle() -> MeshAsset {
         MeshAsset {
@@ -275,6 +322,30 @@ mod tests {
             weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
         });
         asset
+    }
+
+    #[test]
+    fn le_texture_set_roundtrips_through_the_reader_blocks() {
+        let mut asset = triangle();
+        asset.name = "Robe".into();
+        asset.materials = vec![MaterialSlot {
+            name: "robe".into(),
+            shader: ShaderKind::Cloth,
+            diffuse: Some("textures/robe_d.dds".into()),
+            normal: None,
+            specular: None,
+            double_sided: false,
+        }];
+        let bytes = write_le_shape(&asset).expect("writes");
+        let scene = byroredux_nif::parse_nif(&bytes).expect("parses");
+        let shader = scene
+            .get_as::<byroredux_nif::blocks::shader::BSLightingShaderProperty>(2)
+            .expect("shader block");
+        let texture_index = shader.texture_set_ref.index().expect("texture set ref");
+        let textures = scene
+            .get_as::<byroredux_nif::blocks::shader::BSShaderTextureSet>(texture_index)
+            .expect("texture set block");
+        assert_eq!(textures.textures, vec!["textures/robe_d.dds"]);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 use sculpto_core::mesh::MeshAsset;
 
 use super::header::{NifTarget, NifWriteError, write_header};
+use super::shader;
 use super::skin;
 use super::strings::StringTable;
 
@@ -85,6 +86,33 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 5 + offset as i32).collect();
     let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
     let skin_ref = skin_plan.as_ref().map_or(-1, |_| 1);
+    let material = match asset.materials.len() {
+        0 => None,
+        1 => Some(&asset.materials[0]),
+        count => return Err(NifWriteError::MultipleMaterialSlots { count }),
+    };
+    let texture_body = match material {
+        Some(slot) => shader::texture_set(slot)?,
+        None => Vec::new(),
+    };
+    // Blocks after the geometry/skin group.
+    let mut next_block = if skin_plan.is_some() {
+        5 + bone_count as i32
+    } else {
+        1
+    };
+    let shader_index = material.map_or(-1, |_| {
+        let index = next_block;
+        next_block += 1;
+        index
+    });
+    let texture_index = match material.is_some() && !texture_body.is_empty() {
+        true => next_block,
+        false => -1,
+    };
+    let shader_body = material.map_or_else(Vec::new, |slot| {
+        shader::shader(slot, texture_index, name_index)
+    });
 
     let mut body = Vec::new();
     // NiObjectNET: name, no extra data, no controller.
@@ -108,7 +136,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         push_f32(&mut body, value);
     }
     push_i32(&mut body, skin_ref);
-    push_i32(&mut body, -1); // shader
+    push_i32(&mut body, shader_index);
     push_i32(&mut body, -1); // alpha
     push_u64(&mut body, vertex_desc);
     push_u16(&mut body, triangles);
@@ -197,6 +225,14 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         type_indices.extend([1, 2, 3]);
         type_indices.extend(std::iter::repeat_n(4, bone_count + 1));
     }
+    if material.is_some() {
+        type_names.push("BSLightingShaderProperty");
+        type_indices.push(type_names.len() as u16 - 1);
+        if texture_index >= 0 {
+            type_names.push("BSShaderTextureSet");
+            type_indices.push(type_names.len() as u16 - 1);
+        }
+    }
 
     let mut file = write_header(NifTarget::Se);
     // Block count precedes BSStreamHeader in the parsed layout.
@@ -225,6 +261,12 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             push_u32(&mut file, node.len() as u32);
         }
     }
+    if material.is_some() {
+        push_u32(&mut file, shader_body.len() as u32);
+        if texture_index >= 0 {
+            push_u32(&mut file, texture_body.len() as u32);
+        }
+    }
     // String table: index 0 is empty, then the shape and bone names.
     let max_length = strings.iter().map(str::len).max().unwrap_or(0);
     push_u32(&mut file, strings.len() as u32);
@@ -242,6 +284,12 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         file.extend_from_slice(&root);
         for node in &nodes {
             file.extend_from_slice(node);
+        }
+    }
+    if material.is_some() {
+        file.extend_from_slice(&shader_body);
+        if texture_index >= 0 {
+            file.extend_from_slice(&texture_body);
         }
     }
     Ok(file)
@@ -308,7 +356,7 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sculpto_core::mesh::{PartitionId, Skin};
+    use sculpto_core::mesh::{MaterialSlot, PartitionId, ShaderKind, Skin};
 
     fn triangle() -> MeshAsset {
         MeshAsset {
@@ -477,6 +525,61 @@ mod tests {
         // Palette-local bone indices: 0.75 -> palette slot 0, 0.25 -> slot 1.
         assert_eq!(&partition.partitions[0].bone_indices[..4], &[0, 1, 0, 0]);
         assert!(partition.global_vertex_data.is_none());
+    }
+
+    fn textured() -> MeshAsset {
+        let mut asset = triangle();
+        asset.name = "Robe".into();
+        asset.materials = vec![MaterialSlot {
+            name: "robe".into(),
+            shader: ShaderKind::Cloth,
+            diffuse: Some("textures/robe_d.dds".into()),
+            normal: Some("textures/robe_n.dds".into()),
+            specular: None,
+            double_sided: true,
+        }];
+        asset
+    }
+
+    #[test]
+    fn se_texture_set_roundtrips_through_the_reader_blocks() {
+        let asset = textured();
+        let bytes = write_se_shape(&asset).expect("writes");
+        let scene = byroredux_nif::parse_nif(&bytes).expect("parses");
+        let shader = scene
+            .get_as::<byroredux_nif::blocks::shader::BSLightingShaderProperty>(1)
+            .expect("shader block");
+        assert_eq!(shader.shader_flags_2 & 0x10, 0x10, "double-sided bit");
+        let texture_index = shader.texture_set_ref.index().expect("texture set ref");
+        let textures = scene
+            .get_as::<byroredux_nif::blocks::shader::BSShaderTextureSet>(texture_index)
+            .expect("texture set block");
+        assert_eq!(
+            textures.textures,
+            vec!["textures/robe_d.dds", "textures/robe_n.dds"]
+        );
+    }
+
+    #[test]
+    fn specular_textures_are_refused_until_the_slot_is_measured() {
+        let mut asset = textured();
+        asset.materials[0].specular = Some("textures/robe_s.dds".into());
+        assert!(matches!(
+            write_se_shape(&asset),
+            Err(NifWriteError::TextureSlotUnsupported { slot: "specular" })
+        ));
+    }
+
+    #[test]
+    fn multiple_material_slots_are_refused() {
+        let mut asset = textured();
+        let mut second = asset.materials[0].clone();
+        second.name = "robe2".into();
+        asset.materials.push(second);
+        assert!(matches!(
+            write_se_shape(&asset),
+            Err(NifWriteError::MultipleMaterialSlots { count: 2 })
+        ));
     }
 
     #[test]
