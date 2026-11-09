@@ -1536,6 +1536,9 @@ name = "cloth-viewer"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
