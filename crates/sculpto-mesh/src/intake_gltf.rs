@@ -20,11 +20,16 @@
 //! the mesh the conform path consumes, in intake vertex order. Its refusals are
 //! the fit path's own (see [`HandoffError`]); intake defects such as an open
 //! boundary are reported by the audit, never invented here as a fit rule.
+//! [`RawGarment::classify`] is the G06 kind gate: one
+//! [`classify`](crate::classify) call with the fitted path's rules, and an
+//! undecided kind is a typed refusal carrying the measurements, never a guess.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use sculpto_core::mesh::MaterialSlot;
+
+use crate::classify::{ClassifyError, Features, GarmentKind};
 
 /// Largest dimension still read as metres; above it the file is
 /// unit-labelled instead.
@@ -787,6 +792,61 @@ impl fmt::Display for HandoffError {
 
 impl std::error::Error for HandoffError {}
 
+/// Why the intake cannot name a garment kind.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KindError {
+    /// The classifier's evidence left the kind undecided
+    /// ([`GarmentKind::Unknown`]); the measurements name what was measured so
+    /// the caller can split the parts or pass an explicit kind upstream.
+    Undecided {
+        /// The measured shape facts the verdict rests on.
+        features: Features,
+        /// One line per decision branch taken.
+        evidence: Vec<String>,
+    },
+    /// Classification could not run: the fitted path's own
+    /// [`ClassifyError`] (empty or flat body, empty garment, garment
+    /// without triangles, triangle index outside the garment).
+    Classified(ClassifyError),
+}
+
+impl fmt::Display for KindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Undecided { features, .. } => write!(
+                f,
+                "garment kind is undecided: bottom={bottom:.2} top={top:.2} \
+                 coverage={coverage:.2} columns={columns} leg_columns={leg_columns} \
+                 body_columns={body_columns} merged={merged} \
+                 radial_ratio={radial_ratio:.2} top_ratio={top_ratio:.2} \
+                 angular={angular:.2} components={components} vertices={vertices}",
+                bottom = features.bottom,
+                top = features.top,
+                coverage = features.coverage,
+                columns = features.columns,
+                leg_columns = features.leg_columns,
+                body_columns = features.body_columns,
+                merged = features.merged,
+                radial_ratio = features.radial_ratio,
+                top_ratio = features.top_ratio,
+                angular = features.angular,
+                components = features.components,
+                vertices = features.vertices,
+            ),
+            Self::Classified(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for KindError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Classified(error) => Some(error),
+            Self::Undecided { .. } => None,
+        }
+    }
+}
+
 impl RawGarment {
     /// Narrow the read into the fit input, preserving vertex order and normals.
     pub fn into_fit_input(self) -> Result<FitInput, HandoffError> {
@@ -820,5 +880,33 @@ impl RawGarment {
             normals: self.normals,
             triangles: self.triangles,
         })
+    }
+
+    // TODO(G04-intake-check): wire this classification into the engine's
+    // future `intake.check` command (G04 topology defect report, epic
+    // 2026-11-09_01h40m00s); the command id does not exist yet, so the kind
+    // has no command surface.
+    /// Classify the raw garment against the body it must fit with the same
+    /// rules the fitted path uses: one
+    /// [`classify`](crate::classify::classify) call, the classifier's own
+    /// taxonomy — no intake-specific kinds. The kind selects the corset-aura
+    /// profile the fit consumes; an undecided kind
+    /// ([`GarmentKind::Unknown`]) is a [`KindError::Undecided`] refusal
+    /// carrying the measurements, never a guess.
+    pub fn classify(
+        &self,
+        body: &[[f32; 3]],
+        body_triangles: &[[u32; 3]],
+    ) -> Result<GarmentKind, KindError> {
+        let verdict =
+            crate::classify::classify(body, body_triangles, &self.positions, &self.triangles)
+                .map_err(KindError::Classified)?;
+        if verdict.kind == GarmentKind::Unknown {
+            return Err(KindError::Undecided {
+                features: verdict.features,
+                evidence: verdict.evidence,
+            });
+        }
+        Ok(verdict.kind)
     }
 }
