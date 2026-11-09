@@ -1,10 +1,12 @@
 //! Headless Bevy proof: load the accepted actor GLB and the baked cloth GLB
 //! (morph animation), render an offscreen frame, save it as PNG, exit.
+//! Also provides `--headless --report --glb <path>` count reporting for consumer acceptance.
 use bevy::asset::RenderAssetUsages;
-use bevy::mesh::morph::{MAX_MORPH_WEIGHTS, MorphWeights};
+use bevy::mesh::morph::{MorphWeights, MAX_MORPH_WEIGHTS};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use serde::{Deserialize, Serialize};
 
 fn env_f32(key: &str, default: f32) -> f32 {
     std::env::var(key)
@@ -26,19 +28,139 @@ struct Units(usize);
 #[derive(Resource)]
 struct Bench(bool);
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PartReport {
+    pub name: String,
+    pub mesh_index: usize,
+    pub primitive_index: usize,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub morph_targets: usize,
+    pub joints: usize,
+    pub material: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CountReport {
+    pub profile: String,
+    pub bevy_version: String,
+    pub morph_limit: usize,
+    pub morph_limit_verified: bool,
+    pub nodes: usize,
+    pub meshes: usize,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub materials: usize,
+    pub parts: Vec<PartReport>,
+}
+
+#[derive(Resource, Clone, Debug)]
+struct ViewerConfig {
+    report_mode: bool,
+    debug_scene: bool,
+    asset_file: String,
+}
+
+struct CliOptions {
+    report: bool,
+    headless: bool,
+    debug_scene: bool,
+    glb_path: Option<String>,
+    units: usize,
+    bench: bool,
+    uncapped: bool,
+}
+
+fn parse_args() -> CliOptions {
+    let mut args = std::env::args().skip(1);
+    let mut options = CliOptions {
+        report: std::env::var("SCULPTO_VIEWER_REPORT").is_ok(),
+        headless: std::env::var("SCULPTO_VIEWER_HEADLESS").is_ok(),
+        debug_scene: std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_ok(),
+        glb_path: std::env::var("SCULPTO_VIEWER_GLB")
+            .ok()
+            .or_else(|| std::env::var("SCULPTO_VIEWER_ASSET").ok()),
+        units: env_usize("SCULPTO_VIEWER_UNITS", 1),
+        bench: std::env::var("SCULPTO_VIEWER_BENCH").is_ok(),
+        uncapped: std::env::var("SCULPTO_VIEWER_UNCAPPED").is_ok(),
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--report" => options.report = true,
+            "--headless" => options.headless = true,
+            "--debug-scene" => options.debug_scene = true,
+            "--bench" => options.bench = true,
+            "--uncapped" => options.uncapped = true,
+            "--glb" => {
+                if let Some(val) = args.next() {
+                    options.glb_path = Some(val);
+                }
+            }
+            "--asset" => {
+                if let Some(val) = args.next() {
+                    options.glb_path = Some(val);
+                }
+            }
+            "--units" => {
+                if let Some(val) = args.next().and_then(|v| v.parse().ok()) {
+                    options.units = val;
+                }
+            }
+            _ => {}
+        }
+    }
+    options
+}
+
 fn main() {
+    let options = parse_args();
+    let (asset_dir, asset_file) = if let Some(ref glb) = options.glb_path {
+        let p = std::path::Path::new(glb);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(p))
+                .unwrap_or_else(|_| p.to_path_buf())
+        };
+        let parent = abs.parent().unwrap_or(std::path::Path::new("."));
+        let filename = abs
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("model.glb")
+            .to_string();
+        (parent.to_string_lossy().to_string(), filename)
+    } else {
+        (
+            "assets".to_string(),
+            env_or("SCULPTO_VIEWER_ASSET", "combined.glb"),
+        )
+    };
+
     // The ordinary proof runs at 60 Hz so captures land on stable ticks. The
-    // units benchmark must not be capped: a 16.7 ms sleep would hide the real
-    // playback cost.
-    let interval = if std::env::var("SCULPTO_VIEWER_UNCAPPED").is_ok() {
+    // units benchmark and report modes must not be capped: a 16.7 ms sleep would
+    // hide the real playback cost or slow down tests.
+    let interval = if options.uncapped || options.report {
         std::time::Duration::ZERO
     } else {
         std::time::Duration::from_secs_f64(1.0 / 60.0)
     };
+
+    let config = ViewerConfig {
+        report_mode: options.report,
+        debug_scene: options.debug_scene,
+        asset_file,
+    };
+    let asset_plugin = AssetPlugin {
+        file_path: asset_dir,
+        ..Default::default()
+    };
+
     App::new()
         .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(interval))
-        .insert_resource(Units(env_usize("SCULPTO_VIEWER_UNITS", 1)))
-        .insert_resource(Bench(std::env::var("SCULPTO_VIEWER_BENCH").is_ok()))
+        .insert_resource(Units(options.units))
+        .insert_resource(Bench(options.bench))
+        .insert_resource(config)
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -47,7 +169,8 @@ fn main() {
                     exit_condition: bevy::window::ExitCondition::DontExit,
                     close_when_requested: false,
                 })
-                .set(ImagePlugin::default()),
+                .set(ImagePlugin::default())
+                .set(asset_plugin),
         )
         .register_type::<Transform>()
         .register_type::<GlobalTransform>()
@@ -86,6 +209,7 @@ fn main() {
         .add_systems(
             Update,
             (
+                report_counts,
                 advance_animation,
                 capture_once,
                 benchmark,
@@ -98,6 +222,9 @@ fn main() {
 
 #[derive(Resource)]
 struct Target(Handle<Image>);
+
+#[derive(Resource)]
+struct GltfRoot(Handle<bevy::gltf::Gltf>);
 
 /// Graph (actor bones + cloth morph clips) to attach to the scene's players.
 #[derive(Resource)]
@@ -112,6 +239,7 @@ fn setup(
     asset_server: Res<AssetServer>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     units: Res<Units>,
+    config: Res<ViewerConfig>,
 ) {
     let mut image = Image::new(
         Extent3d {
@@ -130,7 +258,7 @@ fn setup(
         | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
     let handle = images.add(image);
     commands.insert_resource(Target(handle.clone()));
-    if std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_ok() {
+    if config.debug_scene {
         let at_cap = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS], None).is_ok();
         let over_cap = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS + 1], None)
             .err()
@@ -165,32 +293,35 @@ fn setup(
         },
         Transform::from_xyz(3.0, 5.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    // The glTF loader spawns AnimationPlayer on each animation root inside
-    // the scene, and every AnimationTarget references that internal player
-    // entity. A player on the SceneRoot wrapper would drive nothing. So: load
-    // one scene instance, build a graph blending the actor clip (bones) and
-    // the cloth clip (morph weights), and hand it to the scene's own players
-    // once they appear. Clip indices are per-asset (the combined export
-    // prepends the cloth weight track), so the capture names them instead of
-    // hard-coding one asset's numbering.
-    let asset = env_or("SCULPTO_VIEWER_ASSET", "combined.glb");
-    let actor_animation = env_or("SCULPTO_VIEWER_ACTOR_ANIMATION", "4");
-    let cloth_animation = env_or("SCULPTO_VIEWER_CLOTH_ANIMATION", "0");
-    let actor_clip = asset_server.load(format!("{asset}#Animation{actor_animation}"));
-    let cloth_clip = asset_server.load(format!("{asset}#Animation{cloth_animation}"));
-    let (mut graph, actor_node) = AnimationGraph::from_clip(actor_clip);
-    let cloth_node = graph.add_clip(cloth_clip, 1.0, graph.root);
-    commands.insert_resource(PlayerGraph {
-        handle: graphs.add(graph),
-        nodes: vec![actor_node, cloth_node],
-    });
-    let scene = asset_server.load(format!("{asset}#Scene0"));
+
+    let gltf_handle: Handle<bevy::gltf::Gltf> = asset_server.load(config.asset_file.clone());
+    commands.insert_resource(GltfRoot(gltf_handle));
+
+    if !config.report_mode {
+        let actor_animation = env_or("SCULPTO_VIEWER_ACTOR_ANIMATION", "4");
+        let cloth_animation = env_or("SCULPTO_VIEWER_CLOTH_ANIMATION", "0");
+        let actor_clip =
+            asset_server.load(format!("{}#Animation{actor_animation}", config.asset_file));
+        let cloth_clip =
+            asset_server.load(format!("{}#Animation{cloth_animation}", config.asset_file));
+        let (mut graph, actor_node) = AnimationGraph::from_clip(actor_clip);
+        let cloth_node = graph.add_clip(cloth_clip, 1.0, graph.root);
+        commands.insert_resource(PlayerGraph {
+            handle: graphs.add(graph),
+            nodes: vec![actor_node, cloth_node],
+        });
+    }
+
+    let scene = asset_server.load(format!("{}#Scene0", config.asset_file));
     for index in 0..count {
         let column = index % columns;
         let row = index / columns;
         let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
         let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
-        commands.spawn((bevy::world_serialization::WorldAssetRoot(scene.clone()), Transform::from_xyz(x, 0.0, z)));
+        commands.spawn((
+            bevy::world_serialization::WorldAssetRoot(scene.clone()),
+            Transform::from_xyz(x, 0.0, z),
+        ));
     }
 }
 
@@ -198,11 +329,112 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+fn report_counts(
+    config: Res<ViewerConfig>,
+    gltf_root: Option<Res<GltfRoot>>,
+    asset_server: Res<AssetServer>,
+    gltf_assets: Res<Assets<bevy::gltf::Gltf>>,
+    gltf_mesh_assets: Res<Assets<bevy::gltf::GltfMesh>>,
+    mesh_assets: Res<Assets<Mesh>>,
+    mut frames: Local<u32>,
+) {
+    if !config.report_mode {
+        return;
+    }
+    *frames += 1;
+    let Some(root) = gltf_root else { return };
+    let state = asset_server.load_state(&root.0);
+    if state.is_failed() {
+        eprintln!(
+            "REPORT_ERROR: failed to load glTF asset {}: {state:?}",
+            config.asset_file
+        );
+        unsafe {
+            libc::_exit(1);
+        }
+    }
+    let Some(gltf) = gltf_assets.get(&root.0) else {
+        if *frames > 300 {
+            eprintln!(
+                "REPORT_ERROR: timed out waiting for glTF asset {} to load (state={state:?})",
+                config.asset_file
+            );
+            unsafe {
+                libc::_exit(2);
+            }
+        }
+        return;
+    };
+
+    let mut total_vertices = 0;
+    let mut total_triangles = 0;
+    let mut parts = Vec::new();
+
+    for (mesh_idx, mesh_handle) in gltf.meshes.iter().enumerate() {
+        let Some(gltf_mesh) = gltf_mesh_assets.get(mesh_handle) else {
+            return;
+        };
+        for (prim_idx, prim) in gltf_mesh.primitives.iter().enumerate() {
+            let Some(mesh) = mesh_assets.get(&prim.mesh) else {
+                return;
+            };
+            let verts = mesh.count_vertices();
+            let tris = mesh.indices().map_or(verts / 3, |ind| ind.len() / 3);
+            let morphs = mesh.morph_target_names().map_or(0, <[String]>::len);
+            total_vertices += verts;
+            total_triangles += tris;
+            parts.push(PartReport {
+                name: if !prim.name.is_empty() {
+                    prim.name.clone()
+                } else {
+                    gltf_mesh.name.clone()
+                },
+                mesh_index: mesh_idx,
+                primitive_index: prim_idx,
+                vertices: verts,
+                triangles: tris,
+                morph_targets: morphs,
+                joints: 0,
+                material: prim.material.is_some(),
+            });
+        }
+    }
+
+    let at_cap_ok = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS], None).is_ok();
+    let over_cap_err = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS + 1], None).is_err();
+
+    let report = CountReport {
+        profile: "bevy".to_string(),
+        bevy_version: "0.20.1".to_string(),
+        morph_limit: MAX_MORPH_WEIGHTS,
+        morph_limit_verified: at_cap_ok && over_cap_err,
+        nodes: gltf.nodes.len(),
+        meshes: gltf.meshes.len(),
+        vertices: total_vertices,
+        triangles: total_triangles,
+        materials: gltf.materials.len(),
+        parts,
+    };
+
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(&report).unwrap();
+    println!("{json}");
+    let _ = std::io::stdout().flush();
+    unsafe {
+        // Skip glibc atexit handlers that crash inside NVIDIA driver cleanup.
+        libc::_exit(0);
+    }
+}
+
 fn advance_animation(
     mut commands: Commands,
+    config: Res<ViewerConfig>,
     graph: Option<Res<PlayerGraph>>,
     mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
 ) {
+    if config.report_mode {
+        return;
+    }
     // The glTF scene spawns its players asynchronously; attach our graph and
     // start both clips the moment each player appears.
     let Some(graph) = graph else { return };
@@ -236,7 +468,9 @@ fn parse_series(spec: &str) -> Option<(u32, u32, u32)> {
     (count > 0 && stride > 0).then_some((start, count, stride))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_once(
+    config: Res<ViewerConfig>,
     target: Res<Target>,
     bench: Res<Bench>,
     mut frames: Local<u32>,
@@ -245,7 +479,7 @@ fn capture_once(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if bench.0 || std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_ok() {
+    if bench.0 || config.report_mode || config.debug_scene {
         return;
     }
     *frames += 1;
@@ -311,7 +545,9 @@ fn capture_once(
 /// `SCULPTO_VIEWER_DEBUG_SCENE` is set it also reports the loader facts the
 /// glTF writer must satisfy: vertex count, morph targets, material and skin
 /// joints.
+#[allow(clippy::type_complexity)]
 fn debug_scene(
+    config: Res<ViewerConfig>,
     mut done: Local<bool>,
     meshes: Query<
         (
@@ -329,7 +565,7 @@ fn debug_scene(
     >,
     assets: Res<Assets<Mesh>>,
 ) {
-    if *done || std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_err() {
+    if *done || config.report_mode || !config.debug_scene {
         return;
     }
     if meshes.is_empty() {
@@ -365,12 +601,13 @@ fn debug_scene(
 /// elapsed time prove animation is advancing, the summed morph weights prove
 /// the cloth clip reaches the targets rather than only the skeleton.
 fn debug_playback(
+    config: Res<ViewerConfig>,
     mut tick: Local<u32>,
     players: Query<&AnimationPlayer>,
     weights: Query<&MorphWeights>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_err() {
+    if config.report_mode || !config.debug_scene {
         return;
     }
     *tick += 1;
@@ -389,10 +626,7 @@ fn debug_playback(
         .iter()
         .flat_map(|player| player.playing_animations().map(|(_, a)| a.elapsed()))
         .collect();
-    let sums: Vec<f32> = weights
-        .iter()
-        .map(|w| w.weights().iter().sum())
-        .collect();
+    let sums: Vec<f32> = weights.iter().map(|w| w.weights().iter().sum()).collect();
     info!(
         "viewer: playback tick={} players={} active_clips={} elapsed={:?} morph_weight_sums={:?}",
         *tick,
