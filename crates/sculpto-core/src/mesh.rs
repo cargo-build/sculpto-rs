@@ -9,7 +9,7 @@
 //! is the pure projection that splits such a part into deterministic sub-shapes
 //! while preserving partition ids and morph deltas.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Partition id inside one NIF shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -263,6 +263,15 @@ impl MeshAsset {
     }
 }
 
+/// One partition's bone palette: the bones its vertices reference, sorted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionPalette {
+    /// Partition this palette serves.
+    pub partition: PartitionId,
+    /// Bone indices referenced by the partition's vertices, ascending.
+    pub bones: Vec<u16>,
+}
+
 /// A validation defect over the aligned model arrays.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MeshError {
@@ -300,6 +309,12 @@ pub enum MeshError {
     BindLengthMismatch { bind: usize, bones: usize },
     /// A bind matrix cell is not finite.
     NonFiniteBind { bone: usize },
+    /// A triangle partition has no supplied palette.
+    MissingPartitionPalette { partition: PartitionId },
+    /// A supplied palette omits a bone its vertices reference.
+    PaletteMissingBone { partition: PartitionId, bone: u16 },
+    /// The same partition id appears in two palettes.
+    DuplicatePartitionPalette { partition: PartitionId },
     /// A triangle carries the reader's unmatched-partition sentinel.
     UnmatchedPartition { triangle: usize },
     /// A material slot violates a named rule.
@@ -524,6 +539,78 @@ impl MeshAsset {
             }
             for weight in weights.iter_mut() {
                 *weight /= sum;
+            }
+        }
+        Ok(())
+    }
+
+    /// Derive one exact palette per triangle partition.
+    ///
+    /// A bone is in a palette only when some vertex of that partition carries a
+    /// non-zero weight for it, so the result is the smallest legal palette. The
+    /// writers project it; a caller may also compare it against an authored set.
+    pub fn partition_palettes(&self) -> Vec<PartitionPalette> {
+        let Some(skin) = &self.skin else {
+            return Vec::new();
+        };
+        let mut by_partition: BTreeMap<PartitionId, BTreeSet<u16>> = BTreeMap::new();
+        for (index, triangle) in self.triangles.iter().enumerate() {
+            let entry = by_partition
+                .entry(self.triangle_partitions[index])
+                .or_default();
+            for vertex in triangle {
+                let vertex = *vertex as usize;
+                for (slot, bone) in skin.indices[vertex].iter().enumerate() {
+                    if skin.weights[vertex][slot] > 0.0 {
+                        entry.insert(*bone);
+                    }
+                }
+            }
+        }
+        by_partition
+            .into_iter()
+            .map(|(partition, bones)| PartitionPalette {
+                partition,
+                bones: bones.into_iter().collect(),
+            })
+            .collect()
+    }
+
+    /// Refuse a palette set that misses a partition or a referenced bone.
+    ///
+    /// This is the gate a writer or an authoring surface uses before emitting
+    /// `NiSkinPartition`: a partition whose palette omits one of its bones
+    /// produces a mesh that deforms wrongly at runtime, so it is a typed error.
+    pub fn validate_partition_palettes(
+        &self,
+        palettes: &[PartitionPalette],
+    ) -> Result<(), MeshError> {
+        let mut supplied: BTreeMap<PartitionId, &PartitionPalette> = BTreeMap::new();
+        for palette in palettes {
+            if supplied.insert(palette.partition, palette).is_some() {
+                return Err(MeshError::DuplicatePartitionPalette {
+                    partition: palette.partition,
+                });
+            }
+        }
+        let Some(skin) = &self.skin else {
+            return Ok(());
+        };
+        for (index, triangle) in self.triangles.iter().enumerate() {
+            let partition = self.triangle_partitions[index];
+            let Some(palette) = supplied.get(&partition) else {
+                return Err(MeshError::MissingPartitionPalette { partition });
+            };
+            for vertex in triangle {
+                let vertex = *vertex as usize;
+                for (slot, bone) in skin.indices[vertex].iter().enumerate() {
+                    if skin.weights[vertex][slot] > 0.0 && !palette.bones.contains(bone) {
+                        return Err(MeshError::PaletteMissingBone {
+                            partition,
+                            bone: *bone,
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -1086,6 +1173,92 @@ mod tests {
             mesh.validate(),
             Err(MeshError::Physics {
                 defect: PhysicsDefect::EmptyInline
+            })
+        );
+    }
+
+    fn two_partitions() -> MeshAsset {
+        MeshAsset {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            triangles: vec![[0, 1, 2], [1, 2, 3]],
+            triangle_partitions: vec![PartitionId(0), PartitionId(1)],
+            skin: Some(Skin {
+                bones: vec!["a".into(), "b".into(), "c".into()],
+                bind_inverse: Vec::new(),
+                indices: vec![[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]],
+                weights: vec![
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.5, 0.5, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                ],
+            }),
+            ..MeshAsset::default()
+        }
+    }
+
+    #[test]
+    fn partition_palettes_are_exact_and_sorted() {
+        let mesh = two_partitions();
+        mesh.validate().expect("valid");
+        assert_eq!(
+            mesh.partition_palettes(),
+            vec![
+                PartitionPalette {
+                    partition: PartitionId(0),
+                    bones: vec![0, 1],
+                },
+                PartitionPalette {
+                    partition: PartitionId(1),
+                    bones: vec![0, 1, 2],
+                },
+            ]
+        );
+        mesh.validate_partition_palettes(&mesh.partition_palettes())
+            .expect("derived palettes cover every reference");
+
+        let mut skinless = mesh.clone();
+        skinless.skin = None;
+        assert!(skinless.partition_palettes().is_empty());
+        skinless
+            .validate_partition_palettes(&[])
+            .expect("a skinless mesh needs no palette");
+    }
+
+    #[test]
+    fn partition_palette_defects_are_named() {
+        let mesh = two_partitions();
+        let mut palettes = mesh.partition_palettes();
+
+        palettes[0].bones.retain(|bone| *bone != 1);
+        assert_eq!(
+            mesh.validate_partition_palettes(&palettes),
+            Err(MeshError::PaletteMissingBone {
+                partition: PartitionId(0),
+                bone: 1
+            })
+        );
+
+        let mut missing = mesh.partition_palettes();
+        missing.pop();
+        assert_eq!(
+            mesh.validate_partition_palettes(&missing),
+            Err(MeshError::MissingPartitionPalette {
+                partition: PartitionId(1)
+            })
+        );
+
+        let mut duplicate = mesh.partition_palettes();
+        duplicate.push(duplicate[0].clone());
+        assert_eq!(
+            mesh.validate_partition_palettes(&duplicate),
+            Err(MeshError::DuplicatePartitionPalette {
+                partition: PartitionId(0)
             })
         );
     }
