@@ -61,7 +61,11 @@ class SCULPTO_OT_dress(bpy.types.Operator):
             return {"CANCELLED"}
         armature = next((o for o in context.scene.objects if o.type == "ARMATURE"), None)
         posed = pipeline.posed_body(body, armature, self.clip)
-        raw, material = pipeline.import_raw(self.filepath)
+        imported = pipeline.import_raw(self.filepath, self)
+        if imported is None:
+            # The import already reported the engine's kind: message.
+            return {"CANCELLED"}
+        raw, material = imported
         hem_z, collar_z, width = pipeline.place_raw(raw, posed, self.kind, width_reference=body)
         faces = pipeline.select_region(posed, hem_z, collar_z, kind=self.kind)
         if not faces:
@@ -144,10 +148,9 @@ class SCULPTO_OT_export_nif(bpy.types.Operator):
         payload = cli_bridge.export_nif_payload(self.filepath, out, self.target)
         if self.shape:
             payload["shape"] = self.shape
-        try:
-            result = cli_bridge.SculptoCli().run("export.nif", payload)
-        except (cli_bridge.CommandError, cli_bridge.EnvelopeError) as error:
-            self.report({"ERROR"}, f"export.nif: {error}")
+        result = cli_bridge.run_cli(self, "export.nif", payload)
+        if result is None:
+            # The bridge already reported the engine's kind: message.
             return {"CANCELLED"}
         self.report(
             {"INFO"},

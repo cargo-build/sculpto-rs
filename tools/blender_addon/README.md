@@ -13,13 +13,14 @@ add-on only builds Blender data.
 | `sculpto_garment/__init__.py` | Operators, panel, registration (`bl_info` floor: Blender 4.2) |
 | `sculpto_garment/rules.py` | The one decision table: garment classes, offsets, region and projection constants, each entry labelled with the proposed command id that will own it (F03 gap register, `RULE_GAPS`) |
 | `sculpto_garment/pipeline.py` | Blender data construction: bmesh offset surface, placement baking, texture projection, weight wiring — consumes `rules.py` |
-| `sculpto_garment/cli_bridge.py` | The one command driver: argv building, payload builders, envelope parsing, binary discovery, `CommandError`/`EnvelopeError` |
+| `sculpto_garment/cli_bridge.py` | The one command driver: argv building, payload builders, envelope parsing, binary discovery, `run_cli` operator error surfacing, `CommandError`/`EnvelopeError` |
 | `headless_run.py` | Headless operator run: import → bake → fit → export with count and byte assertions |
 
 ## CLI dependency
 
 The add-on drives the `sculpto` binary built from this repository; without
-it, dress and export fail with the engine's kind/code message.
+it, dress and export report a `kind: message` operator error (the engine's
+own classification, F06) and cancel.
 
 1. Build (two jobs on the shared host):
 
@@ -79,7 +80,9 @@ command envelope, byte-compares the command-surface bake against the plain
 argv surface, and prints exactly one JSON summary line — exit 0 on success,
 exit 1 with the failure summary otherwise.
 
-## Tests (argv only, no Blender)
+## Tests
+
+argv-level, no Blender, plain `python3 -m unittest`:
 
 ```sh
 python3 tools/tests/test_sculpto_cli_bridge.py
@@ -87,6 +90,17 @@ python3 tools/tests/test_sculpto_rules.py
 ```
 
 The first covers the bridge (argv shape, payload builders, envelope
-parsing, fake-binary dispatch); the second covers the rules table and
-asserts the F03 gap ids are still unregistered — the day one appears, the
-test fails and the add-on copy behind it must be deleted.
+parsing, `run_cli` error surfacing, fake-binary dispatch); the second covers
+the rules table and asserts the F03 gap ids are still unregistered — the day
+one appears, the test fails and the add-on copy behind it must be deleted.
+
+Headless through Blender (F07; skips with a message under plain `python3`):
+
+```sh
+/run/current-system/sw/bin/blender --background --python \
+  tools/blender_addon/tests/test_addon_headless.py
+```
+
+It imports the Tier-1 NIF through the add-on, converts it through the
+export operator, and runs a corrupt NIF through the real `execute`,
+asserting the CLI exit code and the reported `kind: message`.
