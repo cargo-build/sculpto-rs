@@ -3,14 +3,20 @@
 //! Both surfaces construct the same parameter struct and call the same function,
 //! so a command cannot drift between them; the only difference is how the values
 //! arrive (flags or JSON) and how the outcome is rendered (text or envelope).
+//!
+//! Failures are [`CommandError`] from the first line, not strings converted at
+//! the boundary: [`crate::errors`] owns the exhaustive variant → `kind` + `code`
+//! mapping, so a new domain variant breaks the build here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sculpto_bake::BakePlan;
-use sculpto_core::{document::Document, SliderSize};
+use sculpto_core::{SliderSize, document::Document};
+use sculpto_engine::CommandError;
 use sculpto_mesh::conform::Conform;
 
+use crate::errors;
 use crate::{pick_shape, read_obj_positions, write_obj, write_obj_uv};
 
 /// Everything `bake` needs.
@@ -56,51 +62,56 @@ pub struct BakeOutcome {
 }
 
 /// Resolve a preset and write the morphed shape as an OBJ.
-pub fn bake(params: &BakeParams) -> Result<BakeOutcome, String> {
+pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
     let size = match params.endpoint.as_str() {
         "big" => SliderSize::Big,
         "small" => SliderSize::Small,
-        other => return Err(format!("`--endpoint` must be big or small, got `{other}`")),
-    };
-    let project = match Document::parse_file(&params.project).map_err(|e| e.to_string())? {
-        Document::Project(project) => project,
-        Document::Presets(_) => {
-            return Err(format!("{} is not a project", params.project.display()));
+        other => {
+            return Err(errors::invalid(
+                "endpoint",
+                format!("must be big or small, got `{other}`"),
+            ));
         }
     };
-    let presets = match Document::parse_file(&params.presets).map_err(|e| e.to_string())? {
+    let project = match Document::parse_file(&params.project).map_err(errors::document)? {
+        Document::Project(project) => project,
+        Document::Presets(_) => {
+            return Err(errors::invalid(
+                "project",
+                format!("{} is not a project", params.project.display()),
+            ));
+        }
+    };
+    let presets = match Document::parse_file(&params.presets).map_err(errors::document)? {
         Document::Presets(presets) => presets,
         Document::Project(_) => {
-            return Err(format!("{} is not a presets file", params.presets.display()));
+            return Err(errors::invalid(
+                "presets",
+                format!("{} is not a presets file", params.presets.display()),
+            ));
         }
     };
     let preset = presets
         .iter()
         .find(|preset| preset.name == params.preset)
-        .ok_or_else(|| format!("preset `{}` not found", params.preset))?;
+        .ok_or_else(|| errors::not_found("preset", &params.preset))?;
     let home = match &params.home {
         Some(home) => home.clone(),
         None => params
             .project
             .parent()
             .and_then(Path::parent)
-            .ok_or_else(|| "cannot derive the BodySlide home; pass `--home`".to_string())?
+            .ok_or_else(|| errors::invalid("home", "cannot derive the BodySlide home; pass it"))?
             .to_path_buf(),
     };
-    let plan = BakePlan::resolve_overrides(
-        &project,
-        preset,
-        &params.set,
-        size,
-        &home,
-        &params.sliders,
-    )
-    .map_err(|e| e.to_string())?;
+    let plan =
+        BakePlan::resolve_overrides(&project, preset, &params.set, size, &home, &params.sliders)
+            .map_err(errors::bake)?;
     let set = project
         .sets
         .iter()
         .find(|set| set.name == params.set)
-        .ok_or_else(|| format!("set `{}` not found", params.set))?;
+        .ok_or_else(|| errors::not_found("set", &params.set))?;
     let source = match &params.source {
         Some(source) => source.clone(),
         None => home
@@ -108,14 +119,14 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, String> {
             .join(set.data_folder.replace('\\', "/"))
             .join(&set.source_file),
     };
-    let bytes = std::fs::read(&source).map_err(|e| format!("{}: {e}", source.display()))?;
-    let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&source).map_err(|error| errors::io(&source, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
     let baked = plan
         .apply(&shape.name, &shape.positions)
-        .map_err(|e| e.to_string())?;
+        .map_err(errors::bake)?;
     write_obj(&params.out, &baked, &shape.triangles)
-        .map_err(|e| format!("{}: {e}", params.out.display()))?;
+        .map_err(|error| errors::io(&params.out, error))?;
     Ok(BakeOutcome {
         out: params.out.clone(),
         vertices: baked.len(),
@@ -169,10 +180,9 @@ pub enum ExportObjOutcome {
 }
 
 /// Read one NIF shape and write it as an OBJ.
-pub fn export_obj(params: &ExportObjParams) -> Result<ExportObjOutcome, String> {
-    let bytes =
-        std::fs::read(&params.nif).map_err(|e| format!("{}: {e}", params.nif.display()))?;
-    let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
+pub fn export_obj(params: &ExportObjParams) -> Result<ExportObjOutcome, CommandError> {
+    let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     if params.list {
         // A BodySlide NIF carries the body and the garment together; the largest
         // shape is often the body, so the caller must see the names before
@@ -192,10 +202,10 @@ pub fn export_obj(params: &ExportObjParams) -> Result<ExportObjOutcome, String> 
     let out = params
         .out
         .clone()
-        .ok_or_else(|| "`--out` is required unless `--list`".to_string())?;
+        .ok_or_else(|| errors::invalid("out", "required unless `list` is true"))?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
     write_obj_uv(&out, &shape.positions, &shape.triangles, &shape.uvs)
-        .map_err(|e| format!("{}: {e}", out.display()))?;
+        .map_err(|error| errors::io(&out, error))?;
     Ok(ExportObjOutcome::Written {
         out,
         shape: shape.name.clone(),
@@ -243,29 +253,28 @@ pub struct FitOutcome {
 }
 
 /// Bind a garment to its authored body and apply the bind to a morphed body.
-pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, String> {
-    let bytes =
-        std::fs::read(&params.nif).map_err(|e| format!("{}: {e}", params.nif.display()))?;
-    let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
+pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
+    let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let garment = pick_shape(&document.shapes, Some(&params.shape))?;
     let reference = pick_shape(&document.shapes, Some(&params.body_shape))?;
     let body = read_obj_positions(&params.body)?;
     let conform =
-        Conform::bind(&garment.positions, &reference.positions).map_err(|e| e.to_string())?;
-    let fitted = conform.apply(&body).map_err(|e| e.to_string())?;
+        Conform::bind(&garment.positions, &reference.positions).map_err(errors::conform)?;
+    let fitted = conform.apply(&body).map_err(errors::conform)?;
     write_obj(&params.out, &fitted, &garment.triangles)
-        .map_err(|e| format!("{}: {e}", params.out.display()))?;
+        .map_err(|error| errors::io(&params.out, error))?;
     let mut follow = None;
     if let Some(after_body) = &params.body_after {
         let out_after = params
             .out_after
             .clone()
-            .ok_or_else(|| "`--out-after` is required with `--body-after`".to_string())?;
+            .ok_or_else(|| errors::invalid("out_after", "required when `body_after` is given"))?;
         let after = read_obj_positions(after_body)?;
-        let fitted_after = conform.apply(&after).map_err(|e| e.to_string())?;
+        let fitted_after = conform.apply(&after).map_err(errors::conform)?;
         write_obj(&out_after, &fitted_after, &garment.triangles)
-            .map_err(|e| format!("{}: {e}", out_after.display()))?;
-        let measured = conform.follow(&body, &after).map_err(|e| e.to_string())?;
+            .map_err(|error| errors::io(&out_after, error))?;
+        let measured = conform.follow(&body, &after).map_err(errors::conform)?;
         follow = Some((measured.body, measured.garment, measured.difference));
     }
     Ok(FitOutcome {

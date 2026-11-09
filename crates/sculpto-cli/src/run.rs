@@ -14,10 +14,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use sculpto_engine::{CommandError, ErrorKind, Handler, catalogue, dispatch_with, envelope};
 use serde_json::{Value, json};
-use sculpto_engine::{
-    CommandError, ErrorKind, Handler, catalogue, dispatch_with, envelope,
-};
 
 use crate::ops;
 
@@ -34,7 +32,14 @@ commands options:
 ";
 
 /// Handlers this binary supplies for catalogued ids.
+fn reject(code: &'static str, message: impl Into<String>) -> ExitCode {
+    let error = CommandError::new(ErrorKind::InvalidRequest, code, message);
+    println!("{}", envelope(Err(error)));
+    ExitCode::from(2)
+}
+
 const HANDLERS: &[(&str, Handler)] = &[
+    ("commands.list", commands_list_handler),
     ("bake", bake_handler),
     ("outfit.fit", fit_handler),
     ("export.obj", export_obj_handler),
@@ -50,10 +55,7 @@ pub fn commands(args: &[String]) -> ExitCode {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            other => {
-                eprintln!("unknown option {other}\n{USAGE}");
-                return ExitCode::from(2);
-            }
+            other => return reject("unknown_option", format!("unknown option {other}")),
         }
     }
     if json {
@@ -72,10 +74,15 @@ pub fn commands(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     for spec in catalogue() {
-        let implemented = spec.implemented || HANDLERS.iter().any(|(id, _)| *id == spec.id.as_str());
+        let implemented =
+            spec.implemented || HANDLERS.iter().any(|(id, _)| *id == spec.id.as_str());
         let marker = if implemented { " " } else { "*" };
         let class = if spec.mutates { "write" } else { "read " };
-        println!("{marker} {:<16} {class}  {}", spec.id.as_str(), spec.summary);
+        println!(
+            "{marker} {:<16} {class}  {}",
+            spec.id.as_str(),
+            spec.summary
+        );
     }
     println!("\n* catalogued, handler not wired yet");
     ExitCode::SUCCESS
@@ -92,37 +99,27 @@ pub fn run(args: &[String]) -> ExitCode {
                 index += 1;
                 match args.get(index) {
                     Some(value) => command = Some(value.clone()),
-                    None => {
-                        eprintln!("--cmd needs a value\n{USAGE}");
-                        return ExitCode::from(2);
-                    }
+                    None => return reject("missing_option_value", "--cmd needs a value"),
                 }
             }
             "--input" => {
                 index += 1;
                 match args.get(index) {
                     Some(value) => input = Some(value.clone()),
-                    None => {
-                        eprintln!("--input needs a value or -\n{USAGE}");
-                        return ExitCode::from(2);
-                    }
+                    None => return reject("missing_option_value", "--input needs a value or -"),
                 }
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            other => {
-                eprintln!("unknown option {other}\n{USAGE}");
-                return ExitCode::from(2);
-            }
+            other => return reject("unknown_option", format!("unknown option {other}")),
         }
         index += 1;
     }
 
     let Some(command) = command else {
-        eprintln!("--cmd is required\n{USAGE}");
-        return ExitCode::from(2);
+        return reject("missing_field", "--cmd is required");
     };
 
     let payload = match input.as_deref() {
@@ -130,22 +127,19 @@ pub fn run(args: &[String]) -> ExitCode {
         Some("-") => {
             let mut buffer = String::new();
             if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer) {
-                eprintln!("cannot read stdin: {error}");
-                return ExitCode::from(2);
+                return reject("stdin", format!("cannot read stdin: {error}"));
             }
             match serde_json::from_str(&buffer) {
                 Ok(value) => value,
                 Err(error) => {
-                    eprintln!("--input is not JSON: {error}");
-                    return ExitCode::from(2);
+                    return reject("invalid_json", format!("--input is not JSON: {error}"));
                 }
             }
         }
         Some(text) => match serde_json::from_str(text) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("--input is not JSON: {error}");
-                return ExitCode::from(2);
+                return reject("invalid_json", format!("--input is not JSON: {error}"));
             }
         },
     };
@@ -192,8 +186,21 @@ fn optional_path(input: &Value, field: &str) -> Option<PathBuf> {
     optional_string(input, field).map(PathBuf::from)
 }
 
-fn io_error(error: String) -> CommandError {
-    CommandError::new(ErrorKind::Io, "operation_failed", error)
+fn commands_list_handler(_input: &Value) -> Result<Value, CommandError> {
+    let rows: Vec<Value> = catalogue()
+        .iter()
+        .map(|spec| {
+            let implemented =
+                spec.implemented || HANDLERS.iter().any(|(id, _)| *id == spec.id.as_str());
+            json!({
+                "id": spec.id.as_str(),
+                "summary": spec.summary,
+                "mutates": spec.mutates,
+                "implemented": implemented,
+            })
+        })
+        .collect();
+    Ok(json!({ "commands": rows }))
 }
 
 fn bake_handler(input: &Value) -> Result<Value, CommandError> {
@@ -222,7 +229,7 @@ fn bake_handler(input: &Value) -> Result<Value, CommandError> {
         home: optional_path(input, "home"),
         sliders,
     };
-    let outcome = ops::bake(&params).map_err(io_error)?;
+    let outcome = ops::bake(&params)?;
     Ok(json!({
         "out": outcome.out.display().to_string(),
         "vertices": outcome.vertices,
@@ -243,7 +250,7 @@ fn fit_handler(input: &Value) -> Result<Value, CommandError> {
         body_after: optional_path(input, "body_after"),
         out_after: optional_path(input, "out_after"),
     };
-    let outcome = ops::garment_fit(&params).map_err(io_error)?;
+    let outcome = ops::garment_fit(&params)?;
     let follow = outcome.follow.map(|(body, garment, difference)| {
         json!({ "body": body, "garment": garment, "difference": difference })
     });
@@ -265,7 +272,7 @@ fn export_obj_handler(input: &Value) -> Result<Value, CommandError> {
         list: input.get("list").and_then(Value::as_bool).unwrap_or(false),
         out: optional_path(input, "out"),
     };
-    match ops::export_obj(&params).map_err(io_error)? {
+    match ops::export_obj(&params)? {
         ops::ExportObjOutcome::Listed(rows) => {
             let shapes: Vec<Value> = rows
                 .iter()
@@ -279,7 +286,12 @@ fn export_obj_handler(input: &Value) -> Result<Value, CommandError> {
                 .collect();
             Ok(json!({ "shapes": shapes }))
         }
-        ops::ExportObjOutcome::Written { out, shape, vertices, triangles } => Ok(json!({
+        ops::ExportObjOutcome::Written {
+            out,
+            shape,
+            vertices,
+            triangles,
+        } => Ok(json!({
             "out": out.display().to_string(),
             "shape": shape,
             "vertices": vertices,

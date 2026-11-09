@@ -59,7 +59,7 @@ fn main() {
         .register_type::<MeshMaterial3d<StandardMaterial>>()
         .register_type::<bevy::camera::visibility::Visibility>()
         .register_type::<bevy::animation::AnimationPlayer>()
-        .register_type::<bevy::animation::AnimationTarget>()
+        .register_type::<bevy::animation::AnimationTargetId>()
         .register_type::<bevy::camera::primitives::Aabb>()
         .register_type::<bevy::gltf::GltfMaterialExtras>()
         .register_type::<bevy::gltf::GltfMeshName>()
@@ -73,7 +73,7 @@ fn main() {
         .register_type::<InheritedVisibility>()
         .register_type::<ViewVisibility>()
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
-        .insert_resource(AmbientLight {
+        .insert_resource(GlobalAmbientLight {
             brightness: env_f32("SCULPTO_VIEWER_AMBIENT", 0.0),
             ..default()
         })
@@ -135,10 +135,7 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         bevy::core_pipeline::tonemapping::Tonemapping::None,
-        Camera {
-            target: handle.into(),
-            ..default()
-        },
+        bevy::camera::RenderTarget::Image(handle.into()),
         Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
     commands.spawn((
@@ -173,7 +170,7 @@ fn setup(
         let row = index / columns;
         let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
         let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
-        commands.spawn((SceneRoot(scene.clone()), Transform::from_xyz(x, 0.0, z)));
+        commands.spawn((bevy::world_serialization::WorldAssetRoot(scene.clone()), Transform::from_xyz(x, 0.0, z)));
     }
 }
 
@@ -226,7 +223,7 @@ fn capture_once(
     mut captured: Local<bool>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
     mut commands: Commands,
-    mut exit: EventWriter<AppExit>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     if bench.0 {
         return;
@@ -337,7 +334,7 @@ fn benchmark(
     bench: Res<Bench>,
     mut frames: Local<u32>,
     mut samples: Local<Vec<f32>>,
-    mut exit: EventWriter<AppExit>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     if !bench.0 {
         return;

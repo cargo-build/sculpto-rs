@@ -20,8 +20,10 @@ use sculpto_mesh::aura::{Aura, AuraMode, AuraParams};
 use sculpto_mesh::check;
 use sculpto_mesh::classify;
 
+use sculpto_engine::CommandError;
 use sculpto_nif::NifShape;
 
+mod errors;
 mod ops;
 mod run;
 
@@ -384,7 +386,7 @@ fn bake_inner(args: &[String]) -> Result<(), String> {
         home: flags.get("home").map(PathBuf::from),
         sliders,
     };
-    let outcome = ops::bake(&params)?;
+    let outcome = ops::bake(&params).map_err(|error| error.to_string())?;
     println!(
         "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred",
         outcome.out.display(),
@@ -415,13 +417,21 @@ fn export_obj_inner(args: &[String]) -> Result<(), String> {
         list: flags.contains_key("list"),
         out: flags.get("out").map(PathBuf::from),
     };
-    match ops::export_obj(&params)? {
+    match ops::export_obj(&params).map_err(|error| error.to_string())? {
         ops::ExportObjOutcome::Listed(rows) => {
             for row in rows {
-                println!("{}: {} vertices, {} triangles", row.name, row.vertices, row.triangles);
+                println!(
+                    "{}: {} vertices, {} triangles",
+                    row.name, row.vertices, row.triangles
+                );
             }
         }
-        ops::ExportObjOutcome::Written { out, shape, vertices, triangles } => {
+        ops::ExportObjOutcome::Written {
+            out,
+            shape,
+            vertices,
+            triangles,
+        } => {
             println!(
                 "{}: {} vertices, {} triangles (shape `{}`)",
                 out.display(),
@@ -518,7 +528,7 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         body_after: flags.get("body-after").map(PathBuf::from),
         out_after: flags.get("out-after").map(PathBuf::from),
     };
-    let outcome = ops::garment_fit(&params)?;
+    let outcome = ops::garment_fit(&params).map_err(|error| error.to_string())?;
     println!(
         "{}: {} vertices from `{}` on `{}`, offset mean {:.6} max {:.6}",
         outcome.out.display(),
@@ -1168,46 +1178,57 @@ fn read_obj(path: &Path) -> Result<Mesh, String> {
 
 /// Source NIF positions are Z-up; every OBJ here uses the `(x, z, -y)` display
 /// frame, so garment, reference shape and baked body stay comparable.
-pub(crate) fn read_obj_positions(path: &Path) -> Result<Vec<[f32; 3]>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+pub(crate) fn read_obj_positions(path: &Path) -> Result<Vec<[f32; 3]>, CommandError> {
+    let text = std::fs::read_to_string(path).map_err(|error| errors::io(path, error))?;
     let mut positions = Vec::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("v ") else {
             continue;
         };
         let mut parts = rest.split_whitespace();
-        let mut coordinate = || -> Result<f32, String> {
-            parts
-                .next()
-                .ok_or_else(|| format!("{}: incomplete vertex line `{line}`", path.display()))?
-                .parse::<f32>()
-                .map_err(|e| format!("{}: {e}", path.display()))
+        let mut coordinate = || -> Result<f32, CommandError> {
+            let value = parts.next().ok_or_else(|| {
+                errors::invalid("obj", format!("{}: incomplete vertex line", path.display()))
+            })?;
+            value.parse::<f32>().map_err(|error| {
+                errors::invalid("obj", format!("{}: `{value}`: {error}", path.display()))
+            })
         };
         let [x, y, z] = [coordinate()?, coordinate()?, coordinate()?];
         positions.push([x, -z, y]);
     }
     if positions.is_empty() {
-        return Err(format!("{}: no vertex lines", path.display()));
+        return Err(errors::invalid(
+            "obj",
+            format!("{}: no vertex lines", path.display()),
+        ));
     }
     Ok(positions)
 }
 
-pub(crate) fn pick_shape<'a>(shapes: &'a [NifShape], name: Option<&str>) -> Result<&'a NifShape, String> {
+pub(crate) fn pick_shape<'a>(
+    shapes: &'a [NifShape],
+    name: Option<&str>,
+) -> Result<&'a NifShape, CommandError> {
     match name {
         Some(name) => shapes
             .iter()
             .find(|shape| shape.name == name)
-            .ok_or_else(|| format!("shape `{name}` not found")),
+            .ok_or_else(|| errors::not_found("shape", name)),
         None => shapes
             .iter()
             .max_by_key(|shape| shape.positions.len())
-            .ok_or_else(|| "the NIF has no shapes".to_string()),
+            .ok_or_else(|| errors::invalid("nif", "the file has no shapes")),
     }
 }
 
 /// Wavefront OBJ in a Y-up display frame: source positions are Z-up, so they are
 /// converted as `(x, z, -y)` here. Both comparison exports use the same frame.
-pub(crate) fn write_obj(path: &Path, positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> std::io::Result<()> {
+pub(crate) fn write_obj(
+    path: &Path,
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+) -> std::io::Result<()> {
     write_obj_uv(path, positions, triangles, &[])
 }
 

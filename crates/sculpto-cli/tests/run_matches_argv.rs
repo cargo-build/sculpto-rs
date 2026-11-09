@@ -90,7 +90,13 @@ fn argv_and_run_produce_identical_artifacts() {
     let exported = serde_json::json!({
         "nif": source, "shape": "HIMBO - Body", "out": run_export,
     });
-    run_ok(sculpto().args(["run", "--cmd", "export.obj", "--input", &exported.to_string()]));
+    run_ok(sculpto().args([
+        "run",
+        "--cmd",
+        "export.obj",
+        "--input",
+        &exported.to_string(),
+    ]));
     assert_eq!(
         read(&argv_export),
         read(&run_export),

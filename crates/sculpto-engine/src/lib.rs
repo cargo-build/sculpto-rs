@@ -101,7 +101,11 @@ pub struct CommandError {
 impl CommandError {
     /// Build an error. `code` must be a stable identifier, not a sentence.
     pub fn new(kind: ErrorKind, code: &'static str, message: impl Into<String>) -> Self {
-        Self { kind, code, message: message.into() }
+        Self {
+            kind,
+            code,
+            message: message.into(),
+        }
     }
 
     /// The caller's decision input.
@@ -119,7 +123,7 @@ impl CommandError {
         &self.message
     }
 
-    fn to_json(&self) -> Value {
+    fn json(&self) -> Value {
         json!({
             "kind": self.kind.as_str(),
             "code": self.code,
@@ -127,6 +131,14 @@ impl CommandError {
         })
     }
 }
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for CommandError {}
 
 /// A command implementation supplied by a binary.
 pub type Handler = fn(&Value) -> Result<Value, CommandError>;
@@ -146,7 +158,7 @@ pub struct Spec {
 }
 
 impl Spec {
-    fn to_json(&self) -> Value {
+    fn json(&self) -> Value {
         json!({
             "id": self.id.as_str(),
             "summary": self.summary,
@@ -246,7 +258,7 @@ pub fn dispatch_with(
 pub fn envelope(result: Result<Value, CommandError>) -> Value {
     match result {
         Ok(value) => json!({ "ok": true, "result": value }),
-        Err(error) => json!({ "ok": false, "error": error.to_json() }),
+        Err(error) => json!({ "ok": false, "error": error.json() }),
     }
 }
 
@@ -255,7 +267,7 @@ fn version(_input: &Value) -> Result<Value, CommandError> {
 }
 
 fn commands_list(_input: &Value) -> Result<Value, CommandError> {
-    let rows: Vec<Value> = COMMANDS.iter().map(Spec::to_json).collect();
+    let rows: Vec<Value> = COMMANDS.iter().map(|spec| spec.json()).collect();
     Ok(json!({ "commands": rows }))
 }
 
