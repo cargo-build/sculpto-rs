@@ -3,8 +3,9 @@
 //! BodySlide links a model to its physics XML with one `NiStringExtraData` that
 //! the plugin scans for by name; the marker below is the reference's spelling,
 //! not a guess: `OutfitProject.cpp:250-252` documents the link, and
-//! `physics/Controller.cpp:145-152` compares against
-//! `HDT Skinned Mesh Physics Object` case-insensitively. BodySlide only ever
+//! `physics/Controller.cpp:154` compares against the canonical constant
+//! `HDT Skinned Mesh Physics Object` (`physics/Controller.cpp:52`)
+//! case-insensitively (`hdtRefUtils.h:120-128`). BodySlide only ever
 //! keeps one, attached to the model root node (`OutfitProject.cpp:7023-7062`
 //! deletes the inherited links before assigning the chosen one).
 //!
