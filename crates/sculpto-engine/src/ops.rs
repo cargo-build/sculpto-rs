@@ -19,6 +19,7 @@ use sculpto_bake::BakePlan;
 use sculpto_core::mesh::MeshAsset;
 use sculpto_core::{SliderSize, document::Document};
 use sculpto_mesh::conform::Conform;
+use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_nif::NifShape;
 use sculpto_nif::write::header::NifTarget;
 
@@ -591,6 +592,48 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         offset_mean: conform.offset_mean(),
         offset_max: conform.offset_max(),
         follow,
+    })
+}
+
+/// Everything `intake.check` needs.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct IntakeCheckParams {
+    /// Raw garment export to audit: `.glb`, `.gltf` or `.obj`, as generated.
+    pub file: PathBuf,
+}
+
+/// What `intake.check` measured.
+#[derive(Debug, Clone)]
+pub struct IntakeCheckOutcome {
+    /// Garment name, as authored; empty when the file names none.
+    pub name: String,
+    /// Vertex count.
+    pub vertices: usize,
+    /// Triangle count.
+    pub triangles: usize,
+    /// The measured defect counts, never repaired.
+    pub counts: TopologyDefects,
+    /// The limits the verdict was measured against.
+    pub limits: DefectLimits,
+    /// `accept` while every count is within its limit; over a limit the
+    /// command refuses and no outcome exists.
+    pub verdict: &'static str,
+}
+
+/// Audit a raw garment export: measured defect counts against the declared
+/// limits. Read-only: nothing is written, nothing is repaired.
+pub fn intake_check(params: &IntakeCheckParams) -> Result<IntakeCheckOutcome, CommandError> {
+    let garment = read_raw(&params.file).map_err(errors::intake)?;
+    let counts = garment.defects();
+    let limits = DefectLimits::default();
+    limits.check(counts).map_err(errors::intake_defects)?;
+    Ok(IntakeCheckOutcome {
+        name: garment.name,
+        vertices: garment.positions.len(),
+        triangles: garment.triangles.len(),
+        counts,
+        limits,
+        verdict: "accept",
     })
 }
 

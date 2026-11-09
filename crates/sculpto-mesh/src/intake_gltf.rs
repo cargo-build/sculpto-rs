@@ -23,7 +23,11 @@
 //! [`RawGarment::classify`] is the G06 kind gate: one
 //! [`classify`](crate::classify) call with the fitted path's rules, and an
 //! undecided kind is a typed refusal carrying the measurements, never a guess.
+//!
+//! [`RawGarment::defects`] is the G04 defect report: the measured topology
+//! counts, never repaired, and [`DefectLimits`] is the G07 gate over them.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -501,16 +505,19 @@ fn read_obj_file(path: &Path) -> Result<RawGarment, IntakeError> {
             path: path.to_owned(),
         });
     }
-    // Per-vertex slots only carry UVs/normals when the file authors them; a
-    // geometry-only face list keeps the arrays empty.
-    if !seen_uvs {
+    // Per-vertex slots carry UVs/normals only when the file authors them: an
+    // unauthored layer stays empty as [`RawGarment`] documents, a partially
+    // authored one is padded to the arena with defaults.
+    if seen_uvs {
+        align(&mut source.uvs, source.positions.len());
+    } else {
         source.uvs.clear();
     }
-    if !seen_normals {
+    if seen_normals {
+        align(&mut source.normals, source.positions.len());
+    } else {
         source.normals.clear();
     }
-    align(&mut source.uvs, source.positions.len());
-    align(&mut source.normals, source.positions.len());
 
     let mut material = match source.material_name.as_deref() {
         Some(name) => MaterialSlot {
@@ -723,6 +730,127 @@ fn scale_rule(extent: f32) -> ScaleRule {
     }
 }
 
+/// The measured topology defects of one raw garment, as read. Intake never
+/// repairs; these counts are the caller's decision input. @req DECL0013
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopologyDefects {
+    /// Edges carried by more than two triangles.
+    pub non_manifold_edges: usize,
+    /// Triangles with zero area: repeated, coincident or collinear corners.
+    pub degenerate_triangles: usize,
+    /// Position entries beyond the first at one exactly coincident location
+    /// (the bit-exact rule the topology stage welds by).
+    pub duplicate_positions: usize,
+    /// Vertices without a UV: the whole arena when the file carries no UV
+    /// layer, the uncovered remainder of a partial one.
+    pub missing_uvs: usize,
+    /// Edges carried by exactly one triangle. Openings at collar, cuffs and
+    /// hem are normal cloth; the count only feeds the declared limits.
+    pub open_boundary_edges: usize,
+}
+
+/// Acceptable defect maxima for one raw garment. A count above its limit is
+/// a refusal; there is no bypass flag — the caller decides with the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefectLimits {
+    /// Largest accepted [`TopologyDefects::non_manifold_edges`] count.
+    pub non_manifold_edges: usize,
+    /// Largest accepted [`TopologyDefects::degenerate_triangles`] count.
+    pub degenerate_triangles: usize,
+    /// Largest accepted [`TopologyDefects::duplicate_positions`] count.
+    pub duplicate_positions: usize,
+    /// Largest accepted [`TopologyDefects::missing_uvs`] count.
+    pub missing_uvs: usize,
+    /// Largest accepted [`TopologyDefects::open_boundary_edges`] count.
+    pub open_boundary_edges: usize,
+}
+
+impl Default for DefectLimits {
+    /// Generated exports must arrive manifold, non-degenerate, weld-free and
+    /// fully UV-covered, so those limits are zero. Open boundary edges are
+    /// normal cloth (hem, collar, cuffs): a garment-resolution torso keeps
+    /// those openings far below this budget, while a shredded or fractured
+    /// mesh crosses it.
+    fn default() -> Self {
+        Self {
+            non_manifold_edges: 0,
+            degenerate_triangles: 0,
+            duplicate_positions: 0,
+            missing_uvs: 0,
+            open_boundary_edges: 512,
+        }
+    }
+}
+
+impl DefectLimits {
+    /// The typed refusal when any measured count exceeds its limit.
+    pub fn check(&self, counts: TopologyDefects) -> Result<(), DefectOverLimit> {
+        let over = counts.non_manifold_edges > self.non_manifold_edges
+            || counts.degenerate_triangles > self.degenerate_triangles
+            || counts.duplicate_positions > self.duplicate_positions
+            || counts.missing_uvs > self.missing_uvs
+            || counts.open_boundary_edges > self.open_boundary_edges;
+        match over {
+            true => Err(DefectOverLimit {
+                counts,
+                limits: *self,
+            }),
+            false => Ok(()),
+        }
+    }
+}
+
+/// Why a raw garment was refused: the measured counts against the limits
+/// that were applied. The display names every exceeded count and its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefectOverLimit {
+    /// The measured counts.
+    pub counts: TopologyDefects,
+    /// The limits the garment was measured against.
+    pub limits: DefectLimits,
+}
+
+impl fmt::Display for DefectOverLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let exceeded = [
+            (
+                "non_manifold_edges",
+                self.counts.non_manifold_edges,
+                self.limits.non_manifold_edges,
+            ),
+            (
+                "degenerate_triangles",
+                self.counts.degenerate_triangles,
+                self.limits.degenerate_triangles,
+            ),
+            (
+                "duplicate_positions",
+                self.counts.duplicate_positions,
+                self.limits.duplicate_positions,
+            ),
+            (
+                "missing_uvs",
+                self.counts.missing_uvs,
+                self.limits.missing_uvs,
+            ),
+            (
+                "open_boundary_edges",
+                self.counts.open_boundary_edges,
+                self.limits.open_boundary_edges,
+            ),
+        ]
+        .into_iter()
+        .filter(|&(_, measured, limit)| measured > limit);
+        write!(formatter, "garment defects exceed the declared limits")?;
+        for (name, measured, limit) in exceeded {
+            write!(formatter, "; {name} {measured} > {limit}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DefectOverLimit {}
+
 /// The garment the conform fit path consumes
 /// ([`sculpto_mesh::conform`](crate::conform)).
 ///
@@ -848,6 +976,59 @@ impl std::error::Error for KindError {
 }
 
 impl RawGarment {
+    /// Count the topology defects the read carries — measurement only, no
+    /// repair, no tolerance.
+    ///
+    /// Triangles referencing a missing vertex enter no count; the hand-off
+    /// refuses them as [`HandoffError::TriangleVertexOutOfRange`]. Degenerate
+    /// triangles are excluded from the edge census so one defect does not
+    /// masquerade as another (the same rule [`crate::control`] applies when
+    /// it builds its edge map).
+    pub fn defects(&self) -> TopologyDefects {
+        let arena = self.positions.len() as u32;
+        let mut counts = TopologyDefects::default();
+        let mut distinct = HashSet::new();
+        counts.duplicate_positions = self
+            .positions
+            .iter()
+            .filter(|position| !distinct.insert(crate::topology::key(**position)))
+            .count();
+        counts.missing_uvs = match self.uvs.is_empty() {
+            true => self.positions.len(),
+            false => self.positions.len().saturating_sub(self.uvs.len()),
+        };
+        let mut edge_faces: HashMap<[u32; 2], usize> = HashMap::new();
+        for &[a, b, c] in &self.triangles {
+            if a >= arena || b >= arena || c >= arena {
+                continue;
+            }
+            let corners = [
+                self.positions[a as usize],
+                self.positions[b as usize],
+                self.positions[c as usize],
+            ];
+            if crate::check::zero_area(corners[0], corners[1], corners[2]) {
+                counts.degenerate_triangles += 1;
+                continue;
+            }
+            for (left, right) in [(a, b), (b, c), (c, a)] {
+                let edge = match left <= right {
+                    true => [left, right],
+                    false => [right, left],
+                };
+                *edge_faces.entry(edge).or_default() += 1;
+            }
+        }
+        for faces in edge_faces.values() {
+            match *faces {
+                1 => counts.open_boundary_edges += 1,
+                3.. => counts.non_manifold_edges += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
     /// Narrow the read into the fit input, preserving vertex order and normals.
     pub fn into_fit_input(self) -> Result<FitInput, HandoffError> {
         if self.positions.is_empty() {

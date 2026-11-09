@@ -41,6 +41,11 @@ pub fn export_pair_schema() -> Value {
     schema_for::<ops::ExportPairParams>()
 }
 
+/// Schema derived from the typed `intake.check` parameters.
+pub fn intake_check_schema() -> Value {
+    schema_for::<ops::IntakeCheckParams>()
+}
+
 /// Schema derived from the typed `export.nif` parameters.
 pub fn export_nif_schema() -> Value {
     schema_for::<ops::ExportNifParams>()
@@ -240,5 +245,34 @@ pub fn export_nif(input: &Value) -> Result<Value, CommandError> {
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
         "bytes": outcome.bytes,
+    }))
+}
+
+pub fn intake_check(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::IntakeCheckParams {
+        file: path(input, "file")?,
+    };
+    let outcome = ops::intake_check(&params)?;
+    let counts = &outcome.counts;
+    let limits = &outcome.limits;
+    Ok(json!({
+        "name": outcome.name,
+        "vertices": outcome.vertices,
+        "triangles": outcome.triangles,
+        "counts": {
+            "non_manifold_edges": counts.non_manifold_edges,
+            "degenerate_triangles": counts.degenerate_triangles,
+            "duplicate_positions": counts.duplicate_positions,
+            "missing_uvs": counts.missing_uvs,
+            "open_boundary_edges": counts.open_boundary_edges,
+        },
+        "limits": {
+            "non_manifold_edges": limits.non_manifold_edges,
+            "degenerate_triangles": limits.degenerate_triangles,
+            "duplicate_positions": limits.duplicate_positions,
+            "missing_uvs": limits.missing_uvs,
+            "open_boundary_edges": limits.open_boundary_edges,
+        },
+        "verdict": outcome.verdict,
     }))
 }

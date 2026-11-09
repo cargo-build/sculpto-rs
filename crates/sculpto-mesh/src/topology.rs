@@ -12,7 +12,9 @@ pub(crate) struct Identical {
 }
 
 /// The bit-exact key of a position; `-0.0` and `0.0` are the same place.
-fn key(point: [f32; 3]) -> [u32; 3] {
+/// One owner of the identity rule: the intake defect report counts
+/// duplicates with it instead of restating it. @req DECL0013
+pub(crate) fn key(point: [f32; 3]) -> [u32; 3] {
     point.map(|value| match value == 0.0 {
         true => 0,
         false => value.to_bits(),

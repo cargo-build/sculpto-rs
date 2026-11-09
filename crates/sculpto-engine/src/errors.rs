@@ -13,6 +13,7 @@ use sculpto_core::mesh::MeshError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
 use sculpto_mesh::conform::ConformError;
 use sculpto_mesh::garment::GarmentRuleError;
+use sculpto_mesh::intake_gltf::{DefectOverLimit, IntakeError};
 use sculpto_nif::NifError;
 use sculpto_nif::write::header::NifWriteError;
 
@@ -153,6 +154,35 @@ pub fn conform(error: ConformError) -> CommandError {
     CommandError::new(kind, code, error.to_string())
 }
 
+/// A raw garment export could not be read.
+pub fn intake(error: IntakeError) -> CommandError {
+    let (kind, code) = match &error {
+        IntakeError::Io { .. } => (ErrorKind::Io, "intake_io"),
+        IntakeError::UnsupportedExtension { .. } => (ErrorKind::InvalidParams, "intake_extension"),
+        IntakeError::Empty { .. } => (ErrorKind::InvalidRequest, "intake_empty"),
+        IntakeError::Decode { .. } => (ErrorKind::InvalidRequest, "intake_decode"),
+        IntakeError::MissingVertices { .. } => (ErrorKind::InvalidRequest, "intake_no_vertices"),
+        IntakeError::MissingIndices { .. } => (ErrorKind::InvalidRequest, "intake_no_indices"),
+        // The one-garment contract is a domain rule, not a parse failure.
+        IntakeError::MultipleMeshes { .. } => (ErrorKind::Refused, "intake_multiple_meshes"),
+        IntakeError::Rigged { .. } => (ErrorKind::Refused, "intake_rigged"),
+        IntakeError::TooManyMaterials { .. } => (ErrorKind::Refused, "intake_too_many_materials"),
+        IntakeError::UnsupportedBufferUri { .. } => (ErrorKind::Unsupported, "intake_buffer_uri"),
+        IntakeError::FaceIndexOutOfRange { .. } => (ErrorKind::InvalidRequest, "intake_face_range"),
+        IntakeError::Malformed { .. } => (ErrorKind::InvalidRequest, "intake_malformed"),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A garment's measured defects exceed the declared limits.
+pub fn intake_defects(error: DefectOverLimit) -> CommandError {
+    CommandError::new(
+        ErrorKind::Refused,
+        "intake_defects_over_limit",
+        error.to_string(),
+    )
+}
+
 /// A value the caller supplied is outside the accepted set.
 pub fn invalid(field: &str, detail: impl Into<String>) -> CommandError {
     CommandError::new(
@@ -284,6 +314,71 @@ mod tests {
             codes.len(),
             3,
             "conform variants must map to distinct codes"
+        );
+    }
+
+    #[test]
+    fn every_intake_variant_has_its_own_code() {
+        use sculpto_mesh::intake_gltf::IntakeError;
+        let cases = [
+            IntakeError::Io {
+                path: "p".into(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "x"),
+            },
+            IntakeError::UnsupportedExtension {
+                extension: "fbx".into(),
+            },
+            IntakeError::Empty { path: "p".into() },
+            IntakeError::Decode {
+                format: "glTF",
+                detail: "d".into(),
+            },
+            IntakeError::MissingVertices { path: "p".into() },
+            IntakeError::MissingIndices { mesh: 0 },
+            IntakeError::MultipleMeshes { count: 2 },
+            IntakeError::Rigged { skins: 1 },
+            IntakeError::TooManyMaterials { count: 2 },
+            IntakeError::UnsupportedBufferUri {
+                uri: "data:".into(),
+            },
+            IntakeError::FaceIndexOutOfRange { face: 1, vertex: 9 },
+            IntakeError::Malformed {
+                format: "OBJ",
+                line: 1,
+                detail: "d".into(),
+            },
+        ];
+        let mut codes = Vec::new();
+        for error in cases {
+            let mapped = intake(error);
+            assert!(!mapped.code().is_empty());
+            codes.push(mapped.code());
+        }
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            count,
+            codes.len(),
+            "IntakeError variants must stay distinct"
+        );
+    }
+
+    #[test]
+    fn an_over_limit_garment_is_a_refusal() {
+        let refused = intake_defects(DefectOverLimit {
+            counts: sculpto_mesh::intake_gltf::TopologyDefects {
+                degenerate_triangles: 1,
+                ..Default::default()
+            },
+            limits: sculpto_mesh::intake_gltf::DefectLimits::default(),
+        });
+        assert_eq!(refused.kind(), ErrorKind::Refused);
+        assert_eq!(refused.code(), "intake_defects_over_limit");
+        assert!(
+            refused.message().contains("degenerate_triangles 1 > 0"),
+            "the refusal lists the measured count and the limit: {}",
+            refused.message()
         );
     }
 
