@@ -8,7 +8,7 @@
 use gltf::Gltf;
 use gltf::animation::Property;
 use gltf::mesh::Semantic;
-use sculpto_core::mesh::{MeshAsset, MorphDelta, MorphTarget, PartitionId};
+use sculpto_core::mesh::{MeshAsset, MorphDelta, MorphScope, MorphTarget, PartitionId};
 use sculpto_gltf::Clip;
 use sculpto_gltf::pack::{AccessorCopy, PackWriter};
 use sculpto_gltf::write_glb_with;
@@ -73,6 +73,7 @@ fn a_packed_glb_parses_and_its_accessor_counts_match() {
             vertex: 2,
             position: [0.0, 0.0, 0.25],
         }],
+        scope: MorphScope::Whole,
     }];
     let targets = write_glb_with(&displaced, &[]).expect("targets GLB");
 

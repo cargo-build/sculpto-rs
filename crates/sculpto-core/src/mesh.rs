@@ -24,6 +24,22 @@ pub struct MorphDelta {
     pub position: [f32; 3],
 }
 
+/// Which part of the mesh a morph target moves.
+///
+/// The `.tri` writer projects one shape per partition, so a [`MorphScope::Part`]
+/// target travels only with the shape owning its partition, while a
+/// [`MorphScope::Whole`] target travels with every projected shape. glTF morph
+/// targets stay whole-mesh: [`MorphScope`] narrows the `.tri` shape projection,
+/// not the glTF target list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MorphScope {
+    /// The target moves the whole mesh and projects into every shape.
+    #[default]
+    Whole,
+    /// The target moves only the named partition's shape.
+    Part(PartitionId),
+}
+
 /// One named morph target with sparse, vertex-sorted deltas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MorphTarget {
@@ -31,6 +47,8 @@ pub struct MorphTarget {
     pub name: String,
     /// Sparse deltas, strictly increasing by vertex.
     pub deltas: Vec<MorphDelta>,
+    /// Which part of the mesh the target moves.
+    pub scope: MorphScope,
 }
 
 /// One ordered skin: bone names and four influences per vertex.
@@ -223,16 +241,35 @@ impl MeshAsset {
     /// Project the model into the sparse `.tri` model.
     ///
     /// The `.tri` layout stores one `u16` index per offset and has no target
-    /// cap, so every model target survives. A shape above 65 535 vertices must
-    /// be split first ([`Self::split_for_limit`]); this projection refuses an
-    /// index it cannot narrow.
+    /// cap, so every model target survives — including [`MorphScope::Part`]
+    /// targets scoped to other partitions; use [`Self::tri_shape_for_part`]
+    /// to drop them. A shape above 65 535 vertices must be split first
+    /// ([`Self::split_for_limit`]); this projection refuses an index it
+    /// cannot narrow.
     pub fn tri_shape(&self) -> Result<TriShape, TriError> {
+        self.tri_shape_filtered(|_| true)
+    }
+
+    /// [`Self::tri_shape`] narrowed to one partition's shape: it carries the
+    /// [`MorphScope::Whole`] targets and the [`MorphScope::Part`] targets owned
+    /// by `part`, and drops targets scoped to other partitions. The vertex
+    /// arena is unchanged; only the morph list narrows.
+    pub fn tri_shape_for_part(&self, part: PartitionId) -> Result<TriShape, TriError> {
+        self.tri_shape_filtered(|scope| match scope {
+            MorphScope::Whole => true,
+            MorphScope::Part(target) => *target == part,
+        })
+    }
+
+    /// The shared `.tri` projection; `keep` selects the targets that survive.
+    fn tri_shape_filtered(&self, keep: impl Fn(&MorphScope) -> bool) -> Result<TriShape, TriError> {
         let vertex_count =
             u32::try_from(self.positions.len()).map_err(|_| TriError::TooManyVertices)?;
         let morphs = self
             .morphs
             .iter()
             .enumerate()
+            .filter(|(_, morph)| keep(&morph.scope))
             .map(|(target, morph)| {
                 let offsets = morph
                     .deltas
@@ -287,6 +324,13 @@ pub enum MeshError {
     MorphVertexOutOfRange { target: usize, vertex: u32 },
     /// A morph target is not strictly sorted by vertex.
     MorphDeltasNotSorted { target: usize },
+    /// A morph target scoped to a partition the model has no triangles for.
+    MorphUnknownPart {
+        /// The morph target's position in the morph slice.
+        target: usize,
+        /// The partition id the target names.
+        part: PartitionId,
+    },
     /// A position, normal, UV, tangent, morph delta or weight is not finite.
     NonFinite {
         attribute: &'static str,
@@ -430,6 +474,11 @@ impl MeshAsset {
         }
 
         for (target, morph) in self.morphs.iter().enumerate() {
+            if let MorphScope::Part(part) = morph.scope
+                && !self.triangle_partitions.contains(&part)
+            {
+                return Err(MeshError::MorphUnknownPart { target, part });
+            }
             let mut previous = None;
             for delta in &morph.deltas {
                 if delta.vertex as usize >= self.positions.len() {
@@ -736,6 +785,7 @@ impl MeshAsset {
                 MorphTarget {
                     name: target.name.clone(),
                     deltas,
+                    scope: target.scope,
                 }
             })
             .collect();
@@ -787,6 +837,7 @@ mod tests {
                 vertex,
                 position: [0.1, 0.2, 0.3],
             }],
+            scope: MorphScope::Whole,
         }
     }
 
@@ -810,6 +861,7 @@ mod tests {
                             position: [1.0, 0.0, 0.0],
                         })
                         .collect(),
+                    scope: MorphScope::Whole,
                 },
                 MorphTarget {
                     name: "even".into(),
@@ -820,6 +872,7 @@ mod tests {
                             position: [0.0, 1.0, 0.0],
                         })
                         .collect(),
+                    scope: MorphScope::Whole,
                 },
             ],
             ..MeshAsset::default()
@@ -1028,6 +1081,7 @@ mod tests {
                 vertex: 3,
                 position: [0.0; 3],
             }],
+            scope: MorphScope::Whole,
         }];
         assert_eq!(
             mesh.validate(),
@@ -1050,6 +1104,7 @@ mod tests {
                     position: [1.0; 3],
                 },
             ],
+            scope: MorphScope::Whole,
         }];
         assert_eq!(
             mesh.validate(),
@@ -1090,6 +1145,7 @@ mod tests {
                 vertex: 0,
                 position: [f32::NAN, 0.0, 0.0],
             }],
+            scope: MorphScope::Whole,
         }];
         assert_eq!(
             mesh.validate(),
@@ -1356,6 +1412,7 @@ mod tests {
                     vertex: target % 3,
                     position: [target as f32, 0.0, 0.0],
                 }],
+                scope: MorphScope::Whole,
             })
             .collect();
         mesh.validate().expect("65 targets are valid");
@@ -1387,6 +1444,7 @@ mod tests {
                 vertex: 69_999,
                 position: [1.0, 0.0, 0.0],
             }],
+            scope: MorphScope::Whole,
         }];
         mesh.validate().expect("the model itself is valid");
         assert_eq!(
@@ -1410,6 +1468,7 @@ mod tests {
                     vertex: 3,
                     position: [1.0, 0.0, 0.0],
                 }],
+                scope: MorphScope::Whole,
             }],
             ..MeshAsset::default()
         };
@@ -1497,6 +1556,7 @@ mod tests {
                     position: [1.0; 3],
                 },
             ],
+            scope: MorphScope::Whole,
         }];
         assert_eq!(
             unsorted.split_for_limit(4),

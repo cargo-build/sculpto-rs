@@ -5,7 +5,8 @@
 
 use gltf::Gltf;
 use sculpto_core::mesh::{
-    MaterialSlot, MeshAsset, MeshError, MorphDelta, MorphTarget, PartitionId, ShaderKind,
+    MaterialSlot, MeshAsset, MeshError, MorphDelta, MorphScope, MorphTarget, PartitionId,
+    ShaderKind,
 };
 use sculpto_gltf::{GltfError, write_glb};
 
@@ -111,6 +112,7 @@ fn morph_targets_weights_names_and_deltas_round_trip() {
                 vertex: 1,
                 position: [0.25, -0.5, 1.5],
             }],
+            scope: MorphScope::Whole,
         },
         MorphTarget {
             name: "Widen".into(),
@@ -124,6 +126,7 @@ fn morph_targets_weights_names_and_deltas_round_trip() {
                     position: [-0.75, 0.5, 0.25],
                 },
             ],
+            scope: MorphScope::Whole,
         },
     ];
 
@@ -228,6 +231,7 @@ fn multi_partition_mesh_shares_material_and_morph_targets() {
             [0.0, 1.0, 0.0],
             [1.0, 1.0, 0.0],
         ],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
         triangles: vec![[0, 1, 2], [1, 3, 2]],
         triangle_partitions: vec![PartitionId(0), PartitionId(1)],
         materials: vec![MaterialSlot {
@@ -241,6 +245,7 @@ fn multi_partition_mesh_shares_material_and_morph_targets() {
                 vertex: 3,
                 position: [0.0, 0.0, 1.0],
             }],
+            scope: MorphScope::Whole,
         }],
         ..MeshAsset::default()
     };
@@ -322,6 +327,7 @@ fn morph_with_vertex_out_of_range_is_refused() {
             vertex: 3, // Valid indices are 0..=2
             position: [1.0, 2.0, 3.0],
         }],
+        scope: MorphScope::Whole,
     }];
 
     assert_eq!(

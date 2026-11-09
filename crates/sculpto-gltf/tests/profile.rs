@@ -5,19 +5,26 @@
 //! no-profile writer produces.
 
 use gltf::Gltf;
-use sculpto_core::mesh::{MeshAsset, MorphDelta, MorphTarget, PartitionId};
+use sculpto_core::mesh::{
+    MaterialSlot, MeshAsset, MorphDelta, MorphScope, MorphTarget, PartitionId,
+};
 use sculpto_gltf::profile::{ConsumerProfile, Measured};
 use sculpto_gltf::{GltfError, write_glb, write_glb_with_profile};
 
-/// A three-vertex triangle carrying three named morph targets.
-fn morphed() -> MeshAsset {
-    let mut asset = MeshAsset {
+/// A plain three-vertex triangle base for testing.
+fn triangle() -> MeshAsset {
+    MeshAsset {
         name: "morphed".into(),
         positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         triangles: vec![[0, 1, 2]],
         triangle_partitions: vec![PartitionId(0)],
         ..MeshAsset::default()
-    };
+    }
+}
+
+/// [`triangle`] carrying three named morph targets.
+fn morphed() -> MeshAsset {
+    let mut asset = triangle();
     asset.morphs = ["Bend", "Fold", "Sag"]
         .into_iter()
         .enumerate()
@@ -27,6 +34,7 @@ fn morphed() -> MeshAsset {
                 vertex: index as u32,
                 position: [0.0, 0.0, 1.0],
             }],
+            scope: MorphScope::Whole,
         })
         .collect();
     asset
@@ -130,4 +138,54 @@ fn the_documented_bevy_example_is_the_a00b_measurement() {
     assert_eq!(bevy.requirement, "0.20");
     assert_eq!(bevy.resolved, "0.20.1");
     assert_eq!(bevy.max_morph_targets.value, 256, "the A00B measurement");
+}
+
+#[test]
+fn a_texture_without_uvs_is_refused_naming_the_slot() {
+    let mut textured = triangle();
+    textured.materials = vec![MaterialSlot {
+        name: "textured".into(),
+        diffuse: Some("textures/cloth_d.png".into()),
+        normal: Some("textures/cloth_n.png".into()),
+        ..MaterialSlot::default()
+    }];
+    assert_eq!(
+        write_glb(&textured),
+        Err(GltfError::TextureWithoutUv { slot: "diffuse" }),
+        "the diffuse texture is refused first and names its slot"
+    );
+
+    let mut normal_only = triangle();
+    normal_only.materials = vec![MaterialSlot {
+        name: "normal_only".into(),
+        normal: Some("textures/cloth_n.png".into()),
+        ..MaterialSlot::default()
+    }];
+    assert_eq!(
+        write_glb(&normal_only),
+        Err(GltfError::TextureWithoutUv { slot: "normal" }),
+        "a normal texture without UVs is refused and names its slot"
+    );
+}
+
+#[test]
+fn an_untextured_model_without_uvs_writes() {
+    let asset = triangle();
+    let bytes = write_glb(&asset).expect("untextured model without UVs writes");
+    let parsed = Gltf::from_slice(&bytes).expect("writer output parses");
+    assert_eq!(parsed.document.materials().count(), 0);
+}
+
+#[test]
+fn a_textured_model_with_uvs_writes() {
+    let mut asset = triangle();
+    asset.uvs = vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+    asset.materials = vec![MaterialSlot {
+        name: "textured".into(),
+        diffuse: Some("textures/cloth_d.png".into()),
+        ..MaterialSlot::default()
+    }];
+    let bytes = write_glb(&asset).expect("textured model with UVs writes");
+    let parsed = Gltf::from_slice(&bytes).expect("writer output parses");
+    assert_eq!(parsed.document.materials().count(), 1);
 }

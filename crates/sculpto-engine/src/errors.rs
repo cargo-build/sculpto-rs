@@ -115,6 +115,7 @@ pub fn mesh(error: MeshError) -> CommandError {
         }
         MeshError::MorphVertexOutOfRange { .. } => (ErrorKind::InvalidRequest, "mesh_morph_range"),
         MeshError::MorphDeltasNotSorted { .. } => (ErrorKind::InvalidRequest, "mesh_morph_order"),
+        MeshError::MorphUnknownPart { .. } => (ErrorKind::InvalidRequest, "mesh_morph_part"),
         MeshError::NonFinite { .. } => (ErrorKind::InvalidRequest, "mesh_non_finite"),
         MeshError::SkinLengthMismatch => (ErrorKind::InvalidRequest, "mesh_skin_length"),
         MeshError::BoneIndexOutOfRange { .. } => (ErrorKind::InvalidRequest, "mesh_bone_range"),
