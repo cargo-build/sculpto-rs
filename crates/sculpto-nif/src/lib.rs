@@ -12,6 +12,8 @@ use byroredux_core::string::StringPool;
 use byroredux_nif::import::import_nif_scene;
 use byroredux_nif::parse_nif;
 
+mod mesh;
+
 /// Header facts a caller needs to gate a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NifHeader {
