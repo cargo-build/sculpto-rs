@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SliderPresets>
+    <Preset name="Tier1 Default" set="Tier1">
+        <SetSlider name="Widen" size="big" value="50"/>
+    </Preset>
+</SliderPresets>

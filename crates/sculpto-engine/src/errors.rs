@@ -30,7 +30,10 @@ pub fn document(error: DocumentError) -> CommandError {
         DocumentKind::UnsupportedRoot => (ErrorKind::Unsupported, "unsupported_root"),
         DocumentKind::UnsupportedVersion => (ErrorKind::Unsupported, "unsupported_version"),
         DocumentKind::MissingRequired => (ErrorKind::InvalidRequest, "missing_required"),
-        DocumentKind::InvalidValue => (ErrorKind::InvalidParams, "invalid_value"),
+        // A rejected value inside a parsed document, not a bad parameter of the
+        // request: the `document_` prefix keeps the code distinct from
+        // `errors::invalid`. @req DECL0007
+        DocumentKind::InvalidValue => (ErrorKind::InvalidParams, "document_invalid_value"),
     };
     CommandError::new(kind, code, error.to_string())
 }
@@ -156,5 +159,32 @@ mod tests {
         assert_eq!(malformed.kind(), ErrorKind::InvalidRequest);
         assert_eq!(unsupported.kind(), ErrorKind::Unsupported);
         assert_ne!(malformed.code(), unsupported.code());
+    }
+
+    #[test]
+    fn every_document_kind_has_its_own_code() {
+        // `InvalidValue` shared the `invalid_value` code with `errors::invalid`
+        // until the CMD_GATE registry test caught it; this pins the split at
+        // runtime, next to the mapping that had it. @req DECL0007
+        let cases = [
+            DocumentKind::Io,
+            DocumentKind::Malformed,
+            DocumentKind::UnsupportedRoot,
+            DocumentKind::UnsupportedVersion,
+            DocumentKind::MissingRequired,
+            DocumentKind::InvalidValue,
+        ];
+        let mut codes = Vec::new();
+        for kind in cases {
+            codes.push(document(DocumentError::new(kind, "e", "d")).code());
+        }
+        assert_eq!(
+            document(DocumentError::new(DocumentKind::InvalidValue, "e", "d")).code(),
+            "document_invalid_value"
+        );
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(count, codes.len(), "document kinds must stay distinct");
     }
 }
