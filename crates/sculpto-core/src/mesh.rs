@@ -458,7 +458,10 @@ impl MeshAsset {
                 TextureSlot::Normal,
                 TextureSlot::Specular,
             ] {
-                if material.texture(texture).is_some_and(str::is_empty) {
+                if material
+                    .texture(texture)
+                    .is_some_and(|value| value.trim().is_empty())
+                {
                     return Err(MeshError::Material {
                         slot,
                         defect: MaterialDefect::EmptyTexturePath(texture),
@@ -531,8 +534,8 @@ impl MeshAsset {
             for triangle_index in triangle_indices {
                 let triangle = self.triangles[triangle_index];
                 let mut new_vertices = 0;
-                for vertex in triangle {
-                    if !chunk.map.contains_key(&vertex) {
+                for (slot, vertex) in triangle.iter().enumerate() {
+                    if !chunk.map.contains_key(vertex) && !triangle[..slot].contains(vertex) {
                         new_vertices += 1;
                     }
                 }
@@ -1112,6 +1115,15 @@ mod tests {
                 defect: MaterialDefect::EmptyTexturePath(TextureSlot::Diffuse)
             })
         );
+
+        empty_path.materials[0].diffuse = Some("   ".into());
+        assert_eq!(
+            empty_path.validate(),
+            Err(MeshError::Material {
+                slot: 0,
+                defect: MaterialDefect::EmptyTexturePath(TextureSlot::Diffuse)
+            })
+        );
     }
 
     #[test]
@@ -1189,6 +1201,20 @@ mod tests {
                 vertex: 3
             })
         );
+    }
+
+    #[test]
+    fn degenerate_triangles_do_not_oversplit() {
+        let mesh = MeshAsset {
+            positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            triangles: vec![[0, 0, 1], [2, 2, 2]],
+            triangle_partitions: vec![PartitionId(0), PartitionId(0)],
+            ..MeshAsset::default()
+        };
+        mesh.validate().expect("in-range indices");
+        let shapes = mesh.split_for_limit(3).expect("splits");
+        assert_eq!(shapes.len(), 1, "repeated indices must count once");
+        assert_eq!(shapes[0].positions.len(), 3);
     }
 
     #[test]
