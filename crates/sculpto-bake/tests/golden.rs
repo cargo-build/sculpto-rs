@@ -1,9 +1,9 @@
-//! Golden fixture for the accepted bake.
+//! Golden fixtures for the default bodies and the accepted bake.
 //!
-//! The descriptor is committed; the body NIF stays a private host fixture.
-//! Without `SCULPTO_BODYSLIDE_HOME` the test skips, so `just gate` is portable.
-//! `GOLDEN_UPDATE=1` rewrites the descriptor when the accepted fixture changes
-//! on purpose.
+//! The descriptors are committed; the NIFs stay private host fixtures. Without
+//! `SCULPTO_BODYSLIDE_HOME` the tests skip, so `just gate` is portable.
+//! `GOLDEN_UPDATE=1` rewrites a descriptor when the accepted fixture changes on
+//! purpose.
 
 use std::path::PathBuf;
 
@@ -24,12 +24,7 @@ fn fnv1a64(positions: &[[f32; 3]]) -> String {
     format!("{hash:016x}")
 }
 
-fn descriptor_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/himbo-chonky-golden.txt")
-}
-
-#[test]
-fn himbo_chonky_golden() {
+fn bake_golden(preset_name: &str, set: &str, source: &str, descriptor: &str) {
     let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME") else {
         return;
     };
@@ -44,14 +39,13 @@ fn himbo_chonky_golden() {
     };
     let preset = presets
         .iter()
-        .find(|preset| preset.name == "HIMBO Chonky")
-        .expect("preset exists");
-    let plan = BakePlan::resolve(&project, preset, "HIMBO Body 1st", SliderSize::Big, &home)
-        .expect("plan resolves");
+        .find(|preset| preset.name == preset_name)
+        .unwrap_or_else(|| panic!("preset `{preset_name}` exists"));
+    let plan =
+        BakePlan::resolve(&project, preset, set, SliderSize::Big, &home).expect("plan resolves");
     assert!(plan.unresolved.is_empty(), "{:?}", plan.unresolved);
 
-    let bytes = std::fs::read(home.join("ShapeData/HIMBO/HIMBO Body 1st.nif"))
-        .expect("body NIF is readable");
+    let bytes = std::fs::read(home.join(source)).expect("body NIF is readable");
     let document = sculpto_nif::read(&bytes).expect("body NIF parses");
     let mut baked = document
         .shapes
@@ -65,7 +59,7 @@ fn himbo_chonky_golden() {
     let mesh = MeshAsset::from(&baked);
     mesh.validate().expect("golden bake validates");
     let actual = format!(
-        "preset=HIMBO Chonky\nset=HIMBO Body 1st\nshape={}\nvertices={}\ntriangles={}\nbones={}\nmorphs={}\npositions_fnv1a64={}\n",
+        "preset={preset_name}\nset={set}\nshape={}\nvertices={}\ntriangles={}\nbones={}\nmorphs={}\npositions_fnv1a64={}\n",
         mesh.name,
         mesh.positions.len(),
         mesh.triangles.len(),
@@ -74,16 +68,34 @@ fn himbo_chonky_golden() {
         fnv1a64(&mesh.positions),
     );
 
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(descriptor);
     if std::env::var_os("GOLDEN_UPDATE").is_some() {
-        let path = descriptor_path();
         std::fs::create_dir_all(path.parent().expect("parent")).expect("fixture directory");
         std::fs::write(path, &actual).expect("write descriptor");
         return;
     }
-    let expected =
-        std::fs::read_to_string(descriptor_path()).expect("golden descriptor is committed");
-    assert_eq!(
-        actual, expected,
-        "accepted bake drifted from the golden fixture"
+    let expected = std::fs::read_to_string(path).expect("golden descriptor is committed");
+    assert_eq!(actual, expected, "golden bake drifted");
+}
+
+#[test]
+fn himbo_chonky_golden() {
+    bake_golden(
+        "HIMBO Chonky",
+        "HIMBO Body 1st",
+        "ShapeData/HIMBO/HIMBO Body 1st.nif",
+        "himbo-chonky-golden.txt",
+    );
+}
+
+#[test]
+fn himbo_mike_golden() {
+    bake_golden(
+        "HIMBO Mike",
+        "HIMBO Body - Vanilla Nevernude",
+        "ShapeData/HIMBO Body/Vanilla/Vanilla NeverNude.nif",
+        "himbo-mike-golden.txt",
     );
 }
