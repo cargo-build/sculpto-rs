@@ -34,6 +34,8 @@ pub enum CommandId {
     OutfitFit,
     /// Read one shape from a NIF and write it as an OBJ.
     ExportObj,
+    /// Bake one shape at both weight endpoints and write them as NIFs.
+    ExportPair,
     /// Export an asset as a NIF.
     ExportNif,
 }
@@ -47,6 +49,7 @@ impl CommandId {
             CommandId::Bake => "bake",
             CommandId::OutfitFit => "outfit.fit",
             CommandId::ExportObj => "export.obj",
+            CommandId::ExportPair => "export.pair",
             CommandId::ExportNif => "export.nif",
         }
     }
@@ -233,6 +236,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::export_obj,
     },
     Spec {
+        id: CommandId::ExportPair,
+        summary: "Bake one shape at both weight endpoints and write the `_0`/`_1` NIF pair.",
+        mutates: true,
+        stub: false,
+        schema: handlers::export_pair_schema,
+        handler: handlers::export_pair,
+    },
+    Spec {
         id: CommandId::ExportNif,
         summary: "Export an asset as a Skyrim NIF.",
         mutates: true,
@@ -330,7 +341,7 @@ mod tests {
     #[test]
     fn dispatch_wires_the_documented_commands() {
         assert!(dispatch("version", &Value::Null).is_ok());
-        for id in ["bake", "outfit.fit", "export.obj"] {
+        for id in ["bake", "outfit.fit", "export.obj", "export.pair"] {
             let error = dispatch(id, &Value::Null).expect_err("missing params are an error");
             assert_ne!(error.kind(), ErrorKind::NotImplemented, "{id} is not wired");
         }
