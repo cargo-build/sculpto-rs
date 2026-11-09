@@ -61,3 +61,51 @@ fn himbo_chonky_moves_the_real_body() {
     assert!(moved > 0, "the preset must move something");
     assert!(max.is_finite());
 }
+
+#[test]
+fn accepted_bake_roundtrips_through_the_mesh_asset() {
+    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    let project = match Document::parse_file(home.join("SliderSets/HIMBO.osp")) {
+        Ok(Document::Project(project)) => project,
+        other => panic!("expected a project: {other:?}"),
+    };
+    let presets = match Document::parse_file(home.join("SliderPresets/HIMBO.xml")) {
+        Ok(Document::Presets(presets)) => presets,
+        other => panic!("expected presets: {other:?}"),
+    };
+    let preset = presets
+        .iter()
+        .find(|preset| preset.name == "HIMBO Chonky")
+        .expect("preset exists");
+    let plan = BakePlan::resolve(&project, preset, "HIMBO Body 1st", SliderSize::Big, &home)
+        .expect("plan resolves");
+    assert!(plan.unresolved.is_empty(), "{:?}", plan.unresolved);
+
+    let bytes = std::fs::read(home.join("ShapeData/HIMBO/HIMBO Body 1st.nif"))
+        .expect("body NIF is readable");
+    let document = sculpto_nif::read(&bytes).expect("body NIF parses");
+    let mut baked = document
+        .shapes
+        .into_iter()
+        .max_by_key(|shape| shape.positions.len())
+        .expect("a shape");
+    baked.positions = plan
+        .apply(&baked.name, &baked.positions)
+        .expect("offsets apply");
+
+    let mesh = sculpto_core::mesh::MeshAsset::from(&baked);
+    mesh.validate().expect("the baked shape is a valid model");
+    assert_eq!(mesh.positions, baked.positions);
+    assert_eq!(mesh.triangles, baked.triangles);
+    assert_eq!(mesh.uvs, baked.uvs);
+    assert_eq!(mesh.name, baked.name);
+
+    let back = sculpto_nif::NifShape::from(&mesh);
+    assert_eq!(
+        back, baked,
+        "NifShape -> MeshAsset -> NifShape loses a field"
+    );
+}

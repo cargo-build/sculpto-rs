@@ -54,6 +54,8 @@ pub struct MaterialSlot {
 /// One export mesh: flat arena, per-triangle partitions, sparse morphs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeshAsset {
+    /// Shape name, as authored.
+    pub name: String,
     /// Vertex positions.
     pub positions: Vec<[f32; 3]>,
     /// Vertex normals; empty or one per position.
@@ -197,7 +199,8 @@ impl MeshAsset {
                     }
                 }
                 if chunk.vertices.len() + new_vertices > max_vertices {
-                    shapes.push(self.flush(&mut chunk, partition));
+                    let name = self.chunk_name(shapes.len());
+                    shapes.push(self.flush(&mut chunk, partition, name));
                 }
                 let mut local = [0_u32; 3];
                 for (slot, vertex) in triangle.iter().enumerate() {
@@ -215,13 +218,21 @@ impl MeshAsset {
                 chunk.triangles.push(local);
             }
             if !chunk.triangles.is_empty() {
-                shapes.push(self.flush(&mut chunk, partition));
+                let name = self.chunk_name(shapes.len());
+                shapes.push(self.flush(&mut chunk, partition, name));
             }
         }
         Ok(shapes)
     }
 
-    fn flush(&self, chunk: &mut Chunk, partition: PartitionId) -> Self {
+    fn chunk_name(&self, index: usize) -> String {
+        match index {
+            0 => self.name.clone(),
+            _ => format!("{}.{index}", self.name),
+        }
+    }
+
+    fn flush(&self, chunk: &mut Chunk, partition: PartitionId, name: String) -> Self {
         let positions = chunk
             .vertices
             .iter()
@@ -261,6 +272,7 @@ impl MeshAsset {
         chunk.map.clear();
         chunk.vertices.clear();
         Self {
+            name,
             positions,
             normals,
             uvs,
@@ -446,6 +458,7 @@ mod tests {
             materials: vec![MaterialSlot {
                 name: "robe".into(),
             }],
+            ..MeshAsset::default()
         };
         let shapes = mesh.split_for_limit(3).expect("splits");
         assert_eq!(shapes.len(), 2);
