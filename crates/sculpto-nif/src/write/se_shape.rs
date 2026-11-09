@@ -10,7 +10,7 @@ use sculpto_core::mesh::MeshAsset;
 use super::header::{NifTarget, NifWriteError, write_header};
 
 const VF_VERTEX: u64 = 0x001;
-const VERTEX_SIZE_QUADS: u64 = 4;
+const VF_UVS: u64 = 0x002;
 const BLOCK_TYPE: &str = "BSTriShape";
 
 /// Write a complete SE NIF containing one position-only `BSTriShape`.
@@ -27,6 +27,10 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         u16::try_from(asset.triangles.len()).map_err(|_| NifWriteError::TooManyTriangles {
             triangles: asset.triangles.len(),
         })?;
+
+    let has_uvs = !asset.uvs.is_empty();
+    let vertex_size = if has_uvs { 20 } else { 16 };
+    let vertex_desc = ((VF_VERTEX | if has_uvs { VF_UVS } else { 0 }) << 44) | (vertex_size / 4);
 
     let mut body = Vec::new();
     // NiObjectNET: name=-1, no extra data, no controller.
@@ -52,17 +56,21 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     push_i32(&mut body, -1); // skin
     push_i32(&mut body, -1); // shader
     push_i32(&mut body, -1); // alpha
-    let vertex_desc = (VF_VERTEX << 44) | VERTEX_SIZE_QUADS;
     push_u64(&mut body, vertex_desc);
     push_u16(&mut body, triangles);
     push_u16(&mut body, vertices);
-    let data_size = asset.positions.len() as u64 * 16 + asset.triangles.len() as u64 * 6;
+    let data_size = asset.positions.len() as u64 * vertex_size + asset.triangles.len() as u64 * 6;
     push_u32(&mut body, data_size as u32);
-    for position in &asset.positions {
+    for (index, position) in asset.positions.iter().enumerate() {
         push_f32(&mut body, position[0]);
         push_f32(&mut body, position[1]);
         push_f32(&mut body, position[2]);
         push_f32(&mut body, 0.0); // unused W / bitangent X
+        if has_uvs {
+            let uv = asset.uvs[index];
+            push_u16(&mut body, half::f16::from_f32(uv[0]).to_bits());
+            push_u16(&mut body, half::f16::from_f32(uv[1]).to_bits());
+        }
     }
     for triangle in &asset.triangles {
         push_u16(&mut body, triangle[0] as u16);
@@ -139,6 +147,21 @@ mod tests {
         for (actual, expected) in shape.positions.iter().zip(&asset.positions) {
             for (left, right) in actual.iter().zip(expected) {
                 assert!((left - right).abs() <= 1e-6, "position drift");
+            }
+        }
+    }
+
+    #[test]
+    fn se_uv_seam_roundtrips() {
+        let mut asset = triangle();
+        asset.uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
+        let bytes = write_se_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("parses");
+        let shape = &document.shapes[0];
+        assert_eq!(shape.uvs.len(), asset.uvs.len());
+        for (actual, expected) in shape.uvs.iter().zip(&asset.uvs) {
+            for (left, right) in actual.iter().zip(expected) {
+                assert!((left - right).abs() <= 1e-3, "UV drift at the seam");
             }
         }
     }
