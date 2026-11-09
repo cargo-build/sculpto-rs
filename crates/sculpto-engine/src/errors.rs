@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakeError;
+use sculpto_core::mesh::MeshError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
 use sculpto_mesh::conform::ConformError;
 use sculpto_nif::NifError;
@@ -49,48 +50,86 @@ pub fn nif(error: NifError) -> CommandError {
     CommandError::new(kind, code, error.to_string())
 }
 
-/// A NIF could not be written: the target or the model refused it.
+/// A NIF writer refused the model.
 pub fn nif_write(error: NifWriteError) -> CommandError {
     let (kind, code) = match &error {
-        NifWriteError::UnsupportedGame { .. } => (ErrorKind::Unsupported, "nif_game_unsupported"),
+        NifWriteError::UnsupportedGame { .. } => {
+            (ErrorKind::Unsupported, "nif_write_unsupported_game")
+        }
         NifWriteError::UnsupportedVersion { .. } => {
-            (ErrorKind::Unsupported, "nif_version_unsupported")
+            (ErrorKind::Unsupported, "nif_write_unsupported_version")
         }
-        // The write path keeps its own code: the read path owns
-        // `nif_too_short`, and one code must not answer two failures.
         NifWriteError::TooShort => (ErrorKind::InvalidRequest, "nif_write_too_short"),
-        NifWriteError::NotGamebryo => (ErrorKind::InvalidRequest, "nif_not_gamebryo"),
+        NifWriteError::NotGamebryo => (ErrorKind::InvalidRequest, "nif_write_not_gamebryo"),
         NifWriteError::UnsupportedEndian { .. } => {
-            (ErrorKind::Unsupported, "nif_endian_unsupported")
+            (ErrorKind::Unsupported, "nif_write_unsupported_endian")
         }
-        NifWriteError::InvalidModel(_) => (ErrorKind::InvalidParams, "nif_model_invalid"),
+        NifWriteError::InvalidModel(_) => (ErrorKind::Refused, "nif_write_invalid_model"),
         NifWriteError::TooManyVertices { .. } => {
-            (ErrorKind::InvalidParams, "nif_too_many_vertices")
+            (ErrorKind::Unsupported, "nif_write_too_many_vertices")
         }
         NifWriteError::TooManyTriangles { .. } => {
-            (ErrorKind::InvalidParams, "nif_too_many_triangles")
+            (ErrorKind::Unsupported, "nif_write_too_many_triangles")
         }
         NifWriteError::TangentsWithoutNormals => {
-            (ErrorKind::InvalidParams, "nif_tangents_without_normals")
+            (ErrorKind::Refused, "nif_write_tangents_without_normals")
         }
         NifWriteError::TangentsUnsupported { .. } => {
-            (ErrorKind::Unsupported, "nif_tangents_unsupported")
+            (ErrorKind::Refused, "nif_write_tangents_unsupported")
         }
-        NifWriteError::ZeroVector { .. } => (ErrorKind::InvalidParams, "nif_zero_vector"),
-        NifWriteError::UnnamedBone { .. } => (ErrorKind::InvalidParams, "nif_unnamed_bone"),
-        NifWriteError::DuplicateBone { .. } => (ErrorKind::InvalidParams, "nif_duplicate_bone"),
-        NifWriteError::NameTooLong { .. } => (ErrorKind::InvalidParams, "nif_name_too_long"),
-        NifWriteError::TooManyBones { .. } => (ErrorKind::InvalidParams, "nif_too_many_bones"),
-        NifWriteError::SingularBind { .. } => (ErrorKind::InvalidParams, "nif_singular_bind"),
+        NifWriteError::ZeroVector { .. } => (ErrorKind::Refused, "nif_write_zero_vector"),
+        NifWriteError::UnnamedBone { .. } => (ErrorKind::Refused, "nif_write_unnamed_bone"),
+        NifWriteError::DuplicateBone { .. } => (ErrorKind::Refused, "nif_write_duplicate_bone"),
+        NifWriteError::NameTooLong { .. } => (ErrorKind::Refused, "nif_write_name_too_long"),
+        NifWriteError::TooManyBones { .. } => (ErrorKind::Refused, "nif_write_too_many_bones"),
+        NifWriteError::SingularBind { .. } => (ErrorKind::Refused, "nif_write_singular_bind"),
         NifWriteError::TextureSlotUnsupported { .. } => {
-            (ErrorKind::Unsupported, "nif_texture_slot")
+            (ErrorKind::Refused, "nif_write_texture_slot_unsupported")
         }
         NifWriteError::MultipleMaterialSlots { .. } => {
-            (ErrorKind::Unsupported, "nif_material_slots")
+            (ErrorKind::Refused, "nif_write_multiple_material_slots")
         }
-        NifWriteError::InlinePhysicsUnsupported => (ErrorKind::Unsupported, "nif_inline_physics"),
+        NifWriteError::InlinePhysicsUnsupported => {
+            (ErrorKind::Refused, "nif_write_inline_physics_unsupported")
+        }
     };
     CommandError::new(kind, code, error.to_string())
+}
+
+/// A model failed validation before a writer could produce bytes.
+pub fn mesh(error: MeshError) -> CommandError {
+    let (kind, code) = match &error {
+        MeshError::NoVertices => (ErrorKind::InvalidRequest, "mesh_no_vertices"),
+        MeshError::AttributeLengthMismatch { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_attribute_length")
+        }
+        MeshError::PartitionLengthMismatch => (ErrorKind::InvalidRequest, "mesh_partition_length"),
+        MeshError::TriangleVertexOutOfRange { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_triangle_range")
+        }
+        MeshError::MorphVertexOutOfRange { .. } => (ErrorKind::InvalidRequest, "mesh_morph_range"),
+        MeshError::MorphDeltasNotSorted { .. } => (ErrorKind::InvalidRequest, "mesh_morph_order"),
+        MeshError::NonFinite { .. } => (ErrorKind::InvalidRequest, "mesh_non_finite"),
+        MeshError::SkinLengthMismatch => (ErrorKind::InvalidRequest, "mesh_skin_length"),
+        MeshError::BoneIndexOutOfRange { .. } => (ErrorKind::InvalidRequest, "mesh_bone_range"),
+        MeshError::WeightSumOutOfRange { .. } => (ErrorKind::InvalidRequest, "mesh_weight_sum"),
+        MeshError::ZeroWeightSum { .. } => (ErrorKind::InvalidRequest, "mesh_zero_weight_sum"),
+        MeshError::BindLengthMismatch { .. } => (ErrorKind::InvalidRequest, "mesh_bind_length"),
+        MeshError::NonFiniteBind { .. } => (ErrorKind::InvalidRequest, "mesh_non_finite_bind"),
+        MeshError::MissingPartitionPalette { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_missing_palette")
+        }
+        MeshError::PaletteMissingBone { .. } => (ErrorKind::InvalidRequest, "mesh_palette_bone"),
+        MeshError::DuplicatePartitionPalette { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_duplicate_palette")
+        }
+        MeshError::UnmatchedPartition { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_unmatched_partition")
+        }
+        MeshError::Material { .. } => (ErrorKind::InvalidRequest, "mesh_material"),
+        MeshError::Physics { .. } => (ErrorKind::InvalidRequest, "mesh_physics"),
+    };
+    CommandError::new(kind, code, format!("{error:?}"))
 }
 
 /// A bake plan could not be resolved or applied.
@@ -280,5 +319,17 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(count, codes.len(), "document kinds must stay distinct");
+    }
+
+    #[test]
+    fn write_refusals_carry_their_own_codes() {
+        let invalid = nif_write(NifWriteError::InvalidModel(MeshError::NoVertices));
+        let tangents = nif_write(NifWriteError::TangentsUnsupported {
+            target: NifTarget::Le,
+        });
+        assert_eq!(invalid.kind(), ErrorKind::Refused);
+        assert_ne!(invalid.code(), tangents.code());
+        assert_ne!(invalid.code(), nif(NifError::TooShort).code());
+        assert_eq!(invalid.code(), "nif_write_invalid_model");
     }
 }

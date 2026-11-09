@@ -8,17 +8,18 @@
 //! the boundary: [`crate::errors`] owns the exhaustive variant → `kind` + `code`
 //! mapping, so a new domain variant breaks the build here.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 
-use crate::CommandError;
-use crate::ErrorKind;
+use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakePlan;
 use sculpto_core::mesh::MeshAsset;
 use sculpto_core::{SliderSize, document::Document};
 use sculpto_mesh::conform::Conform;
+use sculpto_nif::NifShape;
 use sculpto_nif::write::header::NifTarget;
 
 use crate::errors;
@@ -392,6 +393,131 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
         vertices: shape.positions.len(),
         triangles: shape.triangles.len(),
     })
+}
+
+/// Target game version of a written NIF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+pub enum ExportTarget {
+    /// Skyrim Special Edition, one `BSTriShape`.
+    #[schemars(rename = "se")]
+    Se,
+    /// Skyrim Legendary Edition, one `NiTriShape`.
+    #[schemars(rename = "le")]
+    Le,
+}
+
+impl ExportTarget {
+    /// Parse the wire name used by the JSON surfaces.
+    pub fn parse(name: &str) -> Result<Self, CommandError> {
+        match name {
+            "se" => Ok(Self::Se),
+            "le" => Ok(Self::Le),
+            other => Err(errors::invalid(
+                "target",
+                format!("must be se or le, got `{other}`"),
+            )),
+        }
+    }
+
+    /// Stable wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Se => "se",
+            Self::Le => "le",
+        }
+    }
+}
+
+/// Everything `export.nif` needs.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ExportNifParams {
+    /// Input NIF.
+    pub nif: PathBuf,
+    /// Output NIF.
+    pub out: PathBuf,
+    /// Target game version.
+    pub target: ExportTarget,
+    /// Shape name; the largest shape when absent.
+    pub shape: Option<String>,
+}
+
+/// What `export.nif` produced.
+#[derive(Debug, Clone)]
+pub struct ExportNifOutcome {
+    /// Output path.
+    pub out: PathBuf,
+    /// Target written.
+    pub target: ExportTarget,
+    /// Vertices written.
+    pub vertices: usize,
+    /// Triangles written.
+    pub triangles: usize,
+    /// Bytes written.
+    pub bytes: usize,
+}
+
+/// Re-encode one shape of a source NIF for the requested Skyrim target.
+pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandError> {
+    let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let shape = match &params.shape {
+        // The caller chose from a list, so the miss names what the file holds.
+        Some(name) => document
+            .shapes
+            .iter()
+            .find(|shape| shape.name == *name)
+            .ok_or_else(|| unknown_shape(&document.shapes, name))?,
+        None => pick_shape(&document.shapes, None)?,
+    };
+    let asset = MeshAsset::from(shape);
+    let written = write_nif(&asset, params.target)?;
+    std::fs::write(&params.out, &written).map_err(|error| errors::io(&params.out, error))?;
+    Ok(ExportNifOutcome {
+        out: params.out.clone(),
+        target: params.target,
+        vertices: asset.positions.len(),
+        triangles: asset.triangles.len(),
+        bytes: written.len(),
+    })
+}
+
+/// Validate one model and encode it for the target.
+///
+/// `export_nif` is the only product caller; the function is public so the
+/// validation gate and the target projection are testable without a NIF round
+/// trip. A refused model returns before any byte exists.
+pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<Vec<u8>, CommandError> {
+    asset.validate().map_err(errors::mesh)?;
+    // This LE writer has no NBT layout and refuses authored tangents. A
+    // texture-ready model always carries them (the reader synthesizes them from
+    // UVs and normals), so the target projection omits them instead of refusing
+    // every real shape. SE writes them.
+    let projected = match target {
+        ExportTarget::Se => Cow::Borrowed(asset),
+        ExportTarget::Le => {
+            let mut projection = asset.clone();
+            projection.tangents.clear();
+            Cow::Owned(projection)
+        }
+    };
+    match target {
+        ExportTarget::Se => sculpto_nif::write::se_shape::write_se_shape(&projected),
+        ExportTarget::Le => sculpto_nif::write::le_shape::write_le_shape(&projected),
+    }
+    .map_err(errors::nif_write)
+}
+
+fn unknown_shape(shapes: &[NifShape], name: &str) -> CommandError {
+    let available: Vec<&str> = shapes.iter().map(|shape| shape.name.as_str()).collect();
+    let listed = match available.is_empty() {
+        true => "none".to_string(),
+        false => available.join(", "),
+    };
+    CommandError::new(
+        ErrorKind::NotFound,
+        "shape_not_found",
+        format!("shape `{name}` not found; available shapes: {listed}"),
+    )
 }
 
 /// Everything `outfit.fit` needs.

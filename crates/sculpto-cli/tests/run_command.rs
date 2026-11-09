@@ -53,14 +53,16 @@ fn unknown_command_is_a_request_error() {
 }
 
 #[test]
-fn unimplemented_command_is_a_domain_error() {
+fn export_nif_missing_params_is_a_request_error() {
     let output = sculpto()
         .args(["run", "--cmd", "export.nif"])
         .output()
         .expect("run");
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(value["error"]["kind"], "not_implemented");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["kind"], "invalid_params");
+    assert_eq!(value["error"]["code"], "missing_field");
 }
 
 #[test]
