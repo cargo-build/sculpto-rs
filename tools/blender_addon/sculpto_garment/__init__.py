@@ -15,13 +15,17 @@ bl_info = {
     "category": "Object",
 }
 
+import os
+
 import bpy
 
+from . import cli_bridge
 from . import pipeline
 
 if "bpy" in locals():
     import importlib
 
+    importlib.reload(cli_bridge)
     importlib.reload(pipeline)
 
 
@@ -120,6 +124,45 @@ class SCULPTO_OT_audit(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+class SCULPTO_OT_export_nif(bpy.types.Operator):
+    """Convert a NIF to a Skyrim target through the sculpto command"""
+
+    bl_idname = "sculpto_garment.export_nif"
+    bl_label = "Export NIF through sculpto"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")  # noqa: F821
+    target: bpy.props.EnumProperty(  # noqa: F821
+        items=[
+            ("se", "Skyrim SE/AE", "Skyrim Special Edition NIF"),
+            ("le", "Skyrim LE", "Skyrim Legendary Edition NIF"),
+        ],
+        default="le",
+    )
+    shape: bpy.props.StringProperty(name="Shape", default="", description="Empty picks the largest shape")  # noqa: F821
+
+    def execute(self, context):
+        stem, _ext = os.path.splitext(self.filepath)
+        out = f"{stem}_{self.target}.nif"
+        payload = cli_bridge.export_nif_payload(self.filepath, out, self.target)
+        if self.shape:
+            payload["shape"] = self.shape
+        try:
+            result = cli_bridge.SculptoCli().run("export.nif", payload)
+        except (cli_bridge.CommandError, cli_bridge.EnvelopeError) as error:
+            self.report({"ERROR"}, f"export.nif: {error}")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"{result['out']}: {result['vertices']} vertices, {result['triangles']} triangles, target {result['target']}, {result['bytes']} bytes",
+        )
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
 class SCULPTO_PT_panel(bpy.types.Panel):
     bl_label = "Sculpto Garment"
     bl_space_type = "VIEW_3D"
@@ -133,9 +176,10 @@ class SCULPTO_PT_panel(bpy.types.Panel):
         props.clip = "Combat_Idle"
         audit = layout.operator(SCULPTO_OT_audit.bl_idname, icon="RENDER_ANIMATION")
         audit.clip = "Combat_Idle"
+        layout.operator(SCULPTO_OT_export_nif.bl_idname, icon="EXPORT")
 
 
-CLASSES = (SCULPTO_OT_dress, SCULPTO_OT_audit, SCULPTO_PT_panel)
+CLASSES = (SCULPTO_OT_dress, SCULPTO_OT_audit, SCULPTO_OT_export_nif, SCULPTO_PT_panel)
 
 
 def register():

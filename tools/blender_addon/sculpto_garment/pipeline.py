@@ -11,8 +11,22 @@ weights.
 
 import bmesh
 import bpy
+import tempfile
 from math import radians
+from pathlib import Path
 from mathutils import Vector, bvhtree
+
+from . import cli_bridge
+
+# TODO(F03): these rules still live in the add-on and must move behind command
+# ids (DECL0002 — Blender keeps only bmesh/modifier operations):
+#   - GARMENT_OFFSET / BOUNDARY_RELIEF surface offsets,
+#   - place_raw class fractions (collar 0.87, waist 0.62, sole 0.01, scale
+#     targets 1.15 / 1.1 / 2.4 / 0.42),
+#   - select_region band cut (majority-in-band, |x| <= 0.21 arm exclusion),
+#   - project_texture ray-cast barycentric fill and miss snap (0.5, 0.5),
+#   - wire_animation nearest-vertex weight transfer and _unpose_garment
+#     skin-matrix inversion.
 
 # Garment offset from the body surface, meters.
 GARMENT_OFFSET = 0.008
@@ -50,13 +64,63 @@ def posed_body(body, armature, clip):
     return posed
 
 
+def import_nif(path, cli=None):
+    """Import a NIF through the sculpto command and return its mesh.
+
+    The command reads the NIF, writes the OBJ artifact and reports the shape's
+    counts in the envelope; Blender then builds data from that artifact and
+    the vertex count is asserted against the envelope (the model is the
+    contract, not the importer's goodwill). The artifact lands in a temporary
+    directory and dies with it: Blender data is the only thing that survives.
+    """
+    cli = cli or cli_bridge.SculptoCli()
+    with tempfile.TemporaryDirectory(prefix="sculpto-import-") as work:
+        artifact = Path(work) / (Path(path).stem + ".obj")
+        result = cli.run("export.obj", cli_bridge.export_obj_payload(path, artifact))
+        before = set(bpy.data.objects)
+        bpy.ops.wm.obj_import(filepath=str(artifact))
+        imported = [o for o in bpy.data.objects if o not in before and o.type == "MESH"]
+        if not imported:
+            raise RuntimeError(f"the artifact has no mesh: {result}")
+        for obj in imported:
+            obj.hide_set(False)
+            obj.hide_viewport = False
+        raw = imported[0] if len(imported) == 1 else join_imported(imported)
+        raw.name = "SculptoRaw"
+        # The artifact is already in the Y-up display frame the CLI writes
+        # (crates/sculpto-engine/src/obj.rs), and the OBJ importer's default
+        # Y-up preset maps it into scene Z-up — no glTF rotation to bake.
+        vertices, triangles = len(raw.data.vertices), len(raw.data.polygons)
+        if vertices != result["vertices"] or triangles != result["triangles"]:
+            raise RuntimeError(
+                f"imported {vertices} vertices / {triangles} faces but the envelope "
+                f"reported {result['vertices']} / {result['triangles']}"
+            )
+    material = raw.data.materials[0] if raw.data.materials else None
+    return raw, material
+
+
+def join_imported(imported):
+    """Join multiple imported mesh objects into the last-selected one."""
+    bpy.context.view_layer.objects.active = imported[0]
+    for obj in imported:
+        obj.select_set(True)
+    bpy.ops.object.join()
+    return bpy.context.view_layer.objects.active
+
+
 def import_raw(path):
     """Import a raw garment asset, bake import transforms, orient Y-up->Z-up.
 
-    Returns the joined raw mesh object and its material. After this call the
-    raw mesh sits in scene orientation at its own scale: x = width, y =
-    depth, z = height, i.e. a front relief faces +y.
+    `.nif` files never reach a Blender importer: they go through the sculpto
+    command, which owns NIF reading (DECL0002), and come back as an OBJ
+    artifact already in scene orientation. Every other format is Blender's
+    own importer; after this call the raw mesh sits in scene orientation at
+    its own scale: x = width, y = depth, z = height, i.e. a front relief
+    faces +y.
     """
+    if path.lower().endswith(".nif"):
+        return import_nif(path)
     before = set(bpy.data.objects)
     if path.lower().endswith((".glb", ".gltf")):
         bpy.ops.import_scene.gltf(filepath=path)
@@ -71,11 +135,9 @@ def import_raw(path):
         obj.hide_set(False)
         obj.hide_viewport = False
     if len(imported) > 1:
-        bpy.context.view_layer.objects.active = imported[0]
-        for obj in imported:
-            obj.select_set(True)
-        bpy.ops.object.join()
-    raw = bpy.context.view_layer.objects.active
+        raw = join_imported(imported)
+    else:
+        raw = imported[0]
     raw.name = "SculptoRaw"
     # Bake the importer's rotation/scale into the mesh, then orient the
     # glTF frame (Y-up) into the scene frame (Z-up) on the object.
