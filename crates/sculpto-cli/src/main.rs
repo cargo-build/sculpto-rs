@@ -7,6 +7,7 @@
 mod actor;
 mod garment_control;
 mod garment_uv;
+mod mcp;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,7 @@ commands:
   garment uv-check [options] qualify triangle-corner UV area and atlas bounds
   run --cmd <id>        dispatch one command id and print its JSON envelope
   commands [--json]     list every command id with its mutation class
+  mcp                   serve the MCP surface (JSON-RPC 2.0 over stdio)
   version               print the Sculpto implementation version
   help                  print this help
 
@@ -177,6 +179,7 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "garment" => garment(rest),
         [command, rest @ ..] if command == "run" => run::run(rest),
         [command, rest @ ..] if command == "commands" => run::commands(rest),
+        [command] if command == "mcp" => mcp::serve(),
         [command] if command == "help" || command == "-h" || command == "--help" => {
             print!("{USAGE}");
             ExitCode::SUCCESS
