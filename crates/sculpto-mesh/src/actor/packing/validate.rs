@@ -30,12 +30,15 @@ pub(super) fn images(base: &Source) -> Result<(), ActorError> {
 }
 
 pub(super) fn schedule(times: &[f64]) -> Result<Vec<f32>, ActorError> {
-    match (2..=64).contains(&times.len()) {
+    // The consumer cap belongs to a ConsumerProfile, not to the model: Bevy
+    // 0.20.x measured 256 (A00B); 110 of 136 real .osd sets exceed 64. This
+    // bound only rejects schedules no current consumer can play.
+    match (2..=256).contains(&times.len()) {
         true => {}
         false => {
             return Err(unsupported(
                 "cloth schedule",
-                "target count outside current Bevy consumer bound 2–64",
+                "target count outside current Bevy consumer bound 2–256",
             ));
         }
     }

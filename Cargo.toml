@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "tools/span-manifest"]
+members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "crates/sculpto-engine", "tools/span-manifest"]
 exclude = ["vendor/byroredux", "tools/bevy-viewer"]
 resolver = "3"
 
@@ -15,4 +15,5 @@ sculpto-core = { path = "crates/sculpto-core" }
 sculpto-bake = { path = "crates/sculpto-bake" }
 sculpto-mesh = { path = "crates/sculpto-mesh" }
 sculpto-nif = { path = "crates/sculpto-nif" }
-roxmltree = "0.20"
+sculpto-engine = { path = "crates/sculpto-engine" }
+roxmltree = "0.21"

@@ -19,9 +19,13 @@ use sculpto_core::{Document, MorphContainer, SliderSize};
 use sculpto_mesh::aura::{Aura, AuraMode, AuraParams};
 use sculpto_mesh::check;
 use sculpto_mesh::classify;
-use sculpto_mesh::conform::Conform;
 
+use sculpto_engine::CommandError;
 use sculpto_nif::NifShape;
+
+mod errors;
+mod ops;
+mod run;
 
 const USAGE: &str = "\
 usage: sculpto <command> [options]
@@ -50,6 +54,8 @@ commands:
   garment control-separate [options] apply the declared bounded local contact repair
   garment control-cuts [options] validate declared source-opening cuts and print the plan
   garment uv-check [options] qualify triangle-corner UV area and atlas bounds
+  run --cmd <id>        dispatch one command id and print its JSON envelope
+  commands [--json]     list every command id with its mutation class
   version               print the Sculpto implementation version
   help                  print this help
 
@@ -172,6 +178,8 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "presets" => presets(rest),
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
         [command, rest @ ..] if command == "garment" => garment(rest),
+        [command, rest @ ..] if command == "run" => run::run(rest),
+        [command, rest @ ..] if command == "commands" => run::commands(rest),
         [command] if command == "help" || command == "-h" || command == "--help" => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -352,43 +360,7 @@ fn bake(args: &[String]) -> ExitCode {
 
 fn bake_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
-    let project_path = PathBuf::from(required(&flags, "project")?);
-    let presets_path = PathBuf::from(required(&flags, "presets")?);
-    let set_name = required(&flags, "set")?;
-    let preset_name = required(&flags, "preset")?;
-    let endpoint = required(&flags, "endpoint")?;
-    let out = PathBuf::from(required(&flags, "out")?);
-    let size = match endpoint {
-        "big" => SliderSize::Big,
-        "small" => SliderSize::Small,
-        other => return Err(format!("`--endpoint` must be big or small, got `{other}`")),
-    };
-
-    let project = match Document::parse_file(&project_path).map_err(|e| e.to_string())? {
-        Document::Project(project) => project,
-        Document::Presets(_) => return Err(format!("{} is not a project", project_path.display())),
-    };
-    let presets = match Document::parse_file(&presets_path).map_err(|e| e.to_string())? {
-        Document::Presets(presets) => presets,
-        Document::Project(_) => {
-            return Err(format!("{} is not a presets file", presets_path.display()));
-        }
-    };
-    let preset = presets
-        .iter()
-        .find(|preset| preset.name == preset_name)
-        .ok_or_else(|| format!("preset `{preset_name}` not found"))?;
-
-    let home = match flags.get("home") {
-        Some(home) => PathBuf::from(home),
-        None => project_path
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| "cannot derive the BodySlide home; pass `--home`".to_string())?
-            .to_path_buf(),
-    };
-
-    let mut overrides = BTreeMap::new();
+    let mut sliders = BTreeMap::new();
     let mut index = 0;
     while index + 1 < args.len() {
         if args[index] == "--slider" {
@@ -398,40 +370,31 @@ fn bake_inner(args: &[String]) -> Result<(), String> {
             let percent: f32 = value
                 .parse()
                 .map_err(|_| format!("`--slider {name}` value `{value}` is not a number"))?;
-            overrides.insert(name.to_string(), percent);
+            sliders.insert(name.to_string(), percent);
         }
         index += 2;
     }
-    let plan = BakePlan::resolve_overrides(&project, preset, set_name, size, &home, &overrides)
-        .map_err(|e| e.to_string())?;
-    let set = project
-        .sets
-        .iter()
-        .find(|set| set.name == set_name)
-        .ok_or_else(|| format!("set `{set_name}` not found"))?;
-    let source = match flags.get("source") {
-        Some(source) => PathBuf::from(source),
-        None => home
-            .join("ShapeData")
-            .join(set.data_folder.replace('\\', "/"))
-            .join(&set.source_file),
+    let params = ops::BakeParams {
+        project: PathBuf::from(required(&flags, "project")?),
+        presets: PathBuf::from(required(&flags, "presets")?),
+        set: required(&flags, "set")?.to_string(),
+        preset: required(&flags, "preset")?.to_string(),
+        endpoint: required(&flags, "endpoint")?.to_string(),
+        out: PathBuf::from(required(&flags, "out")?),
+        source: flags.get("source").map(PathBuf::from),
+        shape: flags.get("shape").cloned(),
+        home: flags.get("home").map(PathBuf::from),
+        sliders,
     };
-
-    let bytes = std::fs::read(&source).map_err(|e| format!("{}: {e}", source.display()))?;
-    let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
-    let shape = pick_shape(&document.shapes, flags.get("shape").map(String::as_str))?;
-    let baked = plan
-        .apply(&shape.name, &shape.positions)
-        .map_err(|e| e.to_string())?;
-    write_obj(&out, &baked, &shape.triangles).map_err(|e| format!("{}: {e}", out.display()))?;
+    let outcome = ops::bake(&params).map_err(|error| error.to_string())?;
     println!(
         "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred",
-        out.display(),
-        baked.len(),
-        shape.triangles.len(),
-        plan.sliders.len(),
-        plan.unresolved.len(),
-        plan.deferred.len()
+        outcome.out.display(),
+        outcome.vertices,
+        outcome.triangles,
+        outcome.sliders,
+        outcome.unresolved,
+        outcome.deferred
     );
     Ok(())
 }
@@ -448,34 +411,36 @@ fn export_obj(args: &[String]) -> ExitCode {
 
 fn export_obj_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
-    let nif = PathBuf::from(required(&flags, "nif")?);
-    let bytes = std::fs::read(&nif).map_err(|e| format!("{}: {e}", nif.display()))?;
-    let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
-    if flags.contains_key("list") {
-        // A BodySlide NIF carries the body and the garment together; the largest
-        // shape is often the body, so the caller must see the names before
-        // choosing. @req DECL0013
-        for shape in &document.shapes {
+    let params = ops::ExportObjParams {
+        nif: PathBuf::from(required(&flags, "nif")?),
+        shape: flags.get("shape").cloned(),
+        list: flags.contains_key("list"),
+        out: flags.get("out").map(PathBuf::from),
+    };
+    match ops::export_obj(&params).map_err(|error| error.to_string())? {
+        ops::ExportObjOutcome::Listed(rows) => {
+            for row in rows {
+                println!(
+                    "{}: {} vertices, {} triangles",
+                    row.name, row.vertices, row.triangles
+                );
+            }
+        }
+        ops::ExportObjOutcome::Written {
+            out,
+            shape,
+            vertices,
+            triangles,
+        } => {
             println!(
-                "{}: {} vertices, {} triangles",
-                shape.name,
-                shape.positions.len(),
-                shape.triangles.len()
+                "{}: {} vertices, {} triangles (shape `{}`)",
+                out.display(),
+                vertices,
+                triangles,
+                shape
             );
         }
-        return Ok(());
     }
-    let out = PathBuf::from(required(&flags, "out")?);
-    let shape = pick_shape(&document.shapes, flags.get("shape").map(String::as_str))?;
-    write_obj_uv(&out, &shape.positions, &shape.triangles, &shape.uvs)
-        .map_err(|e| format!("{}: {e}", out.display()))?;
-    println!(
-        "{}: {} vertices, {} triangles (shape `{}`)",
-        out.display(),
-        shape.positions.len(),
-        shape.triangles.len(),
-        shape.name
-    );
     Ok(())
 }
 
@@ -554,43 +519,31 @@ fn garment_follow_inner(args: &[String]) -> Result<(), String> {
 
 fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
-    let nif = PathBuf::from(required(&flags, "nif")?);
-    let shape_name = required(&flags, "shape")?;
-    let body_shape_name = required(&flags, "body-shape")?;
-    let body_path = PathBuf::from(required(&flags, "body")?);
-    let out = PathBuf::from(required(&flags, "out")?);
-    let bytes = std::fs::read(&nif).map_err(|e| format!("{}: {e}", nif.display()))?;
-    let document = sculpto_nif::read(&bytes).map_err(|e| e.to_string())?;
-    let garment = pick_shape(&document.shapes, Some(shape_name))?;
-    let reference = pick_shape(&document.shapes, Some(body_shape_name))?;
-    let body = read_obj_positions(&body_path)?;
-    let conform =
-        Conform::bind(&garment.positions, &reference.positions).map_err(|e| e.to_string())?;
-    let fitted = conform.apply(&body).map_err(|e| e.to_string())?;
-    write_obj(&out, &fitted, &garment.triangles).map_err(|e| format!("{}: {e}", out.display()))?;
+    let params = ops::FitParams {
+        nif: PathBuf::from(required(&flags, "nif")?),
+        shape: required(&flags, "shape")?.to_string(),
+        body_shape: required(&flags, "body-shape")?.to_string(),
+        body: PathBuf::from(required(&flags, "body")?),
+        out: PathBuf::from(required(&flags, "out")?),
+        body_after: flags.get("body-after").map(PathBuf::from),
+        out_after: flags.get("out-after").map(PathBuf::from),
+    };
+    let outcome = ops::garment_fit(&params).map_err(|error| error.to_string())?;
     println!(
         "{}: {} vertices from `{}` on `{}`, offset mean {:.6} max {:.6}",
-        out.display(),
-        fitted.len(),
-        garment.name,
-        reference.name,
-        conform.offset_mean(),
-        conform.offset_max()
+        outcome.out.display(),
+        outcome.vertices,
+        outcome.garment,
+        outcome.reference,
+        outcome.offset_mean,
+        outcome.offset_max
     );
-
-    let Some(after_body) = flags.get("body-after") else {
-        return Ok(());
-    };
-    let out_after = PathBuf::from(required(&flags, "out-after")?);
-    let after = read_obj_positions(Path::new(after_body))?;
-    let fitted_after = conform.apply(&after).map_err(|e| e.to_string())?;
-    write_obj(&out_after, &fitted_after, &garment.triangles)
-        .map_err(|e| format!("{}: {e}", out_after.display()))?;
-    let follow = conform.follow(&body, &after).map_err(|e| e.to_string())?;
-    println!(
-        "follow (bound vertices): body moved {:.6}, garment moved {:.6}, max difference {:.9}",
-        follow.body, follow.garment, follow.difference
-    );
+    if let Some((body, garment, difference)) = outcome.follow {
+        println!(
+            "follow (bound vertices): body moved {:.6}, garment moved {:.6}, max difference {:.9}",
+            body, garment, difference
+        );
+    }
     Ok(())
 }
 
@@ -1225,53 +1178,64 @@ fn read_obj(path: &Path) -> Result<Mesh, String> {
 
 /// Source NIF positions are Z-up; every OBJ here uses the `(x, z, -y)` display
 /// frame, so garment, reference shape and baked body stay comparable.
-fn read_obj_positions(path: &Path) -> Result<Vec<[f32; 3]>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+pub(crate) fn read_obj_positions(path: &Path) -> Result<Vec<[f32; 3]>, CommandError> {
+    let text = std::fs::read_to_string(path).map_err(|error| errors::io(path, error))?;
     let mut positions = Vec::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("v ") else {
             continue;
         };
         let mut parts = rest.split_whitespace();
-        let mut coordinate = || -> Result<f32, String> {
-            parts
-                .next()
-                .ok_or_else(|| format!("{}: incomplete vertex line `{line}`", path.display()))?
-                .parse::<f32>()
-                .map_err(|e| format!("{}: {e}", path.display()))
+        let mut coordinate = || -> Result<f32, CommandError> {
+            let value = parts.next().ok_or_else(|| {
+                errors::invalid("obj", format!("{}: incomplete vertex line", path.display()))
+            })?;
+            value.parse::<f32>().map_err(|error| {
+                errors::invalid("obj", format!("{}: `{value}`: {error}", path.display()))
+            })
         };
         let [x, y, z] = [coordinate()?, coordinate()?, coordinate()?];
         positions.push([x, -z, y]);
     }
     if positions.is_empty() {
-        return Err(format!("{}: no vertex lines", path.display()));
+        return Err(errors::invalid(
+            "obj",
+            format!("{}: no vertex lines", path.display()),
+        ));
     }
     Ok(positions)
 }
 
-fn pick_shape<'a>(shapes: &'a [NifShape], name: Option<&str>) -> Result<&'a NifShape, String> {
+pub(crate) fn pick_shape<'a>(
+    shapes: &'a [NifShape],
+    name: Option<&str>,
+) -> Result<&'a NifShape, CommandError> {
     match name {
         Some(name) => shapes
             .iter()
             .find(|shape| shape.name == name)
-            .ok_or_else(|| format!("shape `{name}` not found")),
+            .ok_or_else(|| errors::not_found("shape", name)),
         None => shapes
             .iter()
             .max_by_key(|shape| shape.positions.len())
-            .ok_or_else(|| "the NIF has no shapes".to_string()),
+            .ok_or_else(|| errors::invalid("nif", "the file has no shapes")),
     }
 }
 
 /// Wavefront OBJ in a Y-up display frame: source positions are Z-up, so they are
 /// converted as `(x, z, -y)` here. Both comparison exports use the same frame.
-fn write_obj(path: &Path, positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> std::io::Result<()> {
+pub(crate) fn write_obj(
+    path: &Path,
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+) -> std::io::Result<()> {
     write_obj_uv(path, positions, triangles, &[])
 }
 
 /// Like [`write_obj`], plus per-vertex UVs as `vt`/`v/vt` pairs when the
 /// source shape authors them. NIF UVs are D3D-style (top-left origin), so
 /// `v` is emitted as `1 - v` for OBJ's bottom-left convention.
-fn write_obj_uv(
+pub(crate) fn write_obj_uv(
     path: &Path,
     positions: &[[f32; 3]],
     triangles: &[[u32; 3]],

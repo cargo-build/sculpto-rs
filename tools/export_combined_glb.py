@@ -48,8 +48,8 @@ fps = int(cfg.get("fps", report.get("fps", 24)))
 # frame (Blender authoring starts at 1, glTF import at 0); the bake frame is
 # shifted by the action's start before it is used as a scene time.
 frame_offset = int(cfg.get("frame_offset", -int(round(report.get("action_start", 1)))))
-# Bevy 0.17 rejects a mesh with more than 64 morph targets; stride thins a
-# dense bake without changing the clip's time range.
+# Bevy 0.20.x (measured on 0.20.1) caps morph targets at 256 (bevy_mesh MAX_MORPH_WEIGHTS); stride
+# thins a dense bake without changing the clip's time range.
 stride = int(cfg.get("stride", "1"))
 material_blend = cfg.get("material_blend")
 material_object = cfg.get("material_object")

@@ -5,12 +5,14 @@ license = "GPL-3.0-only"
 edition = "2021"
 
 [dependencies]
-bevy = { version = "=0.17.3", default-features = false, features = [
-    "animation",
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_animation",
     "bevy_asset",
     "bevy_core_pipeline",
     "bevy_gltf",
+    "bevy_world_serialization",
+    "gltf_animation",
+    "morph_animation",
     "bevy_image",
     "bevy_log",
     "bevy_pbr",

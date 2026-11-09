@@ -1,6 +1,7 @@
 //! Headless Bevy proof: load the accepted actor GLB and the baked cloth GLB
 //! (morph animation), render an offscreen frame, save it as PNG, exit.
 use bevy::asset::RenderAssetUsages;
+use bevy::mesh::morph::{MAX_MORPH_WEIGHTS, MorphWeights};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -59,12 +60,16 @@ fn main() {
         .register_type::<MeshMaterial3d<StandardMaterial>>()
         .register_type::<bevy::camera::visibility::Visibility>()
         .register_type::<bevy::animation::AnimationPlayer>()
-        .register_type::<bevy::animation::AnimationTarget>()
+        .register_type::<bevy::animation::AnimationTargetId>()
+        .register_type::<bevy::animation::AnimatedBy>()
         .register_type::<bevy::camera::primitives::Aabb>()
         .register_type::<bevy::gltf::GltfMaterialExtras>()
         .register_type::<bevy::gltf::GltfMeshName>()
         .register_type::<bevy::gltf::GltfMaterialName>()
+        .register_type::<bevy::gltf::GltfSceneName>()
         .register_type::<bevy::mesh::skinning::SkinnedMesh>()
+        .register_type::<bevy::mesh::skinning::SkinnedMeshBounds>()
+        .register_type::<bevy::camera::visibility::DynamicSkinnedMeshBounds>()
         .register_type::<bevy::mesh::morph::MeshMorphWeights>()
         .register_type::<bevy::gltf::GltfMeshExtras>()
         .register_type::<bevy::mesh::morph::MorphWeights>()
@@ -73,14 +78,20 @@ fn main() {
         .register_type::<InheritedVisibility>()
         .register_type::<ViewVisibility>()
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
-        .insert_resource(AmbientLight {
+        .insert_resource(GlobalAmbientLight {
             brightness: env_f32("SCULPTO_VIEWER_AMBIENT", 0.0),
             ..default()
         })
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (advance_animation, capture_once, benchmark, debug_scene),
+            (
+                advance_animation,
+                capture_once,
+                benchmark,
+                debug_scene,
+                debug_playback,
+            ),
         )
         .run();
 }
@@ -119,6 +130,15 @@ fn setup(
         | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
     let handle = images.add(image);
     commands.insert_resource(Target(handle.clone()));
+    if std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_ok() {
+        let at_cap = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS], None).is_ok();
+        let over_cap = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS + 1], None)
+            .err()
+            .map(|error| error.to_string());
+        info!(
+            "viewer: morph_max={MAX_MORPH_WEIGHTS} at_cap_ok={at_cap} over_cap_error={over_cap:?}"
+        );
+    }
     let count = units.0.max(1);
     let columns = (count as f32).sqrt().ceil() as usize;
     let rows = count.div_ceil(columns);
@@ -135,10 +155,7 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         bevy::core_pipeline::tonemapping::Tonemapping::None,
-        Camera {
-            target: handle.into(),
-            ..default()
-        },
+        bevy::camera::RenderTarget::Image(handle.into()),
         Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
     commands.spawn((
@@ -173,7 +190,7 @@ fn setup(
         let row = index / columns;
         let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
         let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
-        commands.spawn((SceneRoot(scene.clone()), Transform::from_xyz(x, 0.0, z)));
+        commands.spawn((bevy::world_serialization::WorldAssetRoot(scene.clone()), Transform::from_xyz(x, 0.0, z)));
     }
 }
 
@@ -226,9 +243,9 @@ fn capture_once(
     mut captured: Local<bool>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
     mut commands: Commands,
-    mut exit: EventWriter<AppExit>,
+    mut exit: MessageWriter<AppExit>,
 ) {
-    if bench.0 {
+    if bench.0 || std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_ok() {
         return;
     }
     *frames += 1;
@@ -290,7 +307,10 @@ fn capture_once(
 
 /// One-shot scene dump (SCULPTO_VIEWER_DEBUG_SCENE=1): every mesh entity
 /// with its glTF name, visibility components, bounding box and world
-/// transform — catches assets that load silently but never draw.
+/// transform — catches assets that load silently but never draw. When
+/// `SCULPTO_VIEWER_DEBUG_SCENE` is set it also reports the loader facts the
+/// glTF writer must satisfy: vertex count, morph targets, material and skin
+/// joints.
 fn debug_scene(
     mut done: Local<bool>,
     meshes: Query<
@@ -301,9 +321,13 @@ fn debug_scene(
             Option<&InheritedVisibility>,
             Option<&bevy::camera::primitives::Aabb>,
             &GlobalTransform,
+            &Mesh3d,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+            Option<&bevy::mesh::skinning::SkinnedMesh>,
         ),
         With<Mesh3d>,
     >,
+    assets: Res<Assets<Mesh>>,
 ) {
     if *done || std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_err() {
         return;
@@ -312,9 +336,13 @@ fn debug_scene(
         return; // scene spawns asynchronously; wait for it
     }
     *done = true;
-    for (name, gltf_name, vis, inherited, aabb, transform) in &meshes {
+    for (name, gltf_name, vis, inherited, aabb, transform, mesh3d, material, skin) in &meshes {
+        let mesh = assets.get(&mesh3d.0);
+        let morphs = mesh
+            .and_then(Mesh::morph_target_names)
+            .map_or(0, <[String]>::len);
         info!(
-            "mesh name={:?} gltf={:?} vis={:?} inherited={} aabb={} at {:?}",
+            "mesh name={:?} gltf={:?} vis={:?} inherited={} verts={} morph_targets={} material={} joints={} aabb={} at {:?}",
             name.map(|n| n.to_string()),
             gltf_name.map(|g| g.0.clone()),
             vis.copied(),
@@ -322,10 +350,60 @@ fn debug_scene(
                 .copied()
                 .map(|v| format!("{}", v.get()))
                 .unwrap_or_else(|| "ABSENT".into()),
+            mesh.map_or(0, Mesh::count_vertices),
+            morphs,
+            material.is_some(),
+            skin.map_or_else(|| "none".into(), |s| s.joints.len().to_string()),
             aabb.map(|a| format!("{:.2}..={:.2}", a.min(), a.max()))
                 .unwrap_or_else(|| "NONE".into()),
             transform.translation()
         );
+    }
+}
+
+/// Two playback snapshots on the debug run: the count of active clips and the
+/// elapsed time prove animation is advancing, the summed morph weights prove
+/// the cloth clip reaches the targets rather than only the skeleton.
+fn debug_playback(
+    mut tick: Local<u32>,
+    players: Query<&AnimationPlayer>,
+    weights: Query<&MorphWeights>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_err() {
+        return;
+    }
+    *tick += 1;
+    if players.is_empty() || weights.is_empty() {
+        *tick = 249; // the scene is still loading; sample once it is ready
+        return;
+    }
+    if *tick != 250 && *tick != 290 {
+        return;
+    }
+    let active: usize = players
+        .iter()
+        .map(|player| player.playing_animations().count())
+        .sum();
+    let elapsed: Vec<f32> = players
+        .iter()
+        .flat_map(|player| player.playing_animations().map(|(_, a)| a.elapsed()))
+        .collect();
+    let sums: Vec<f32> = weights
+        .iter()
+        .map(|w| w.weights().iter().sum())
+        .collect();
+    info!(
+        "viewer: playback tick={} players={} active_clips={} elapsed={:?} morph_weight_sums={:?}",
+        *tick,
+        players.iter().count(),
+        active,
+        elapsed,
+        sums
+    );
+    if *tick == 290 {
+        info!("viewer: debug snapshots done, exiting");
+        exit.write(AppExit::Success);
     }
 }
 
@@ -337,7 +415,7 @@ fn benchmark(
     bench: Res<Bench>,
     mut frames: Local<u32>,
     mut samples: Local<Vec<f32>>,
-    mut exit: EventWriter<AppExit>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     if !bench.0 {
         return;
