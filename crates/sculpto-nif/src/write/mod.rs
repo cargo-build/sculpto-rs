@@ -12,6 +12,9 @@ pub mod se_shape;
 pub mod shader;
 pub mod skin;
 pub mod strings;
+pub mod tri;
+
+pub use tri::{read_tri, read_tri_with_limit, write_tri};
 
 /// Write a complete NIF for one shape on the requested target.
 ///

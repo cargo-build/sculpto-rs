@@ -15,6 +15,11 @@ use byroredux_nif::parse_nif;
 mod mesh;
 pub mod write;
 
+pub use write::tri::{
+    PositionOffset, TriError, TriFile, TriPositionMorph, TriShape, TriUvMorph, UvOffset,
+    compute_position_multiplier, compute_uv_multiplier, read_tri, read_tri_with_limit, write_tri,
+};
+
 /// Header facts a caller needs to gate a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NifHeader {
