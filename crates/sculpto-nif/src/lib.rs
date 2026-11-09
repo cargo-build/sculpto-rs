@@ -37,6 +37,11 @@ pub struct NifShape {
     pub positions: Vec<[f32; 3]>,
     /// Per-vertex UVs; empty when the mesh authors none.
     pub uvs: Vec<[f32; 2]>,
+    /// Per-vertex normals in source space; empty when the mesh authors none.
+    pub normals: Vec<[f32; 3]>,
+    /// Per-vertex tangents in source space as `[x, y, z, bitangent sign]`;
+    /// empty when the mesh authors none.
+    pub tangents: Vec<[f32; 4]>,
     /// Triangles as vertex-index triples.
     pub triangles: Vec<[u32; 3]>,
     /// Bone names, parallel to `bone_indices`.
@@ -157,6 +162,14 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
                     .map(|[x, y, z]| [*x, -*z, *y])
                     .collect(),
                 uvs: mesh.uvs.clone(),
+                // Same Y-up -> Z-up undo as positions; the sign lane is
+                // rotation-invariant and passes through unchanged.
+                normals: mesh.normals.iter().map(|[x, y, z]| [*x, -*z, *y]).collect(),
+                tangents: mesh
+                    .tangents
+                    .iter()
+                    .map(|[x, y, z, sign]| [*x, -*z, *y, *sign])
+                    .collect(),
                 triangles: chunks
                     .0
                     .iter()

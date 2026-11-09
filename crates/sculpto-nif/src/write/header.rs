@@ -54,6 +54,15 @@ pub enum NifWriteError {
     TooManyVertices { vertices: usize },
     /// A shape has more triangles than the `u16` count can hold.
     TooManyTriangles { triangles: usize },
+    /// Tangents were supplied without normals, so the TBN frame is undefined.
+    TangentsWithoutNormals,
+    /// The target writer cannot serialize tangents yet.
+    TangentsUnsupported { target: NifTarget },
+    /// A normal or tangent is the zero vector and cannot be normalized.
+    ZeroVector {
+        attribute: &'static str,
+        vertex: usize,
+    },
 }
 
 impl fmt::Display for NifWriteError {
@@ -82,6 +91,15 @@ impl fmt::Display for NifWriteError {
                     formatter,
                     "shape has {triangles} triangles, above the u16 count"
                 )
+            }
+            Self::TangentsWithoutNormals => {
+                write!(formatter, "tangents require normals for a TBN frame")
+            }
+            Self::TangentsUnsupported { target } => {
+                write!(formatter, "tangents are not written for {target:?} yet")
+            }
+            Self::ZeroVector { attribute, vertex } => {
+                write!(formatter, "vertex {vertex} has a zero-length {attribute}")
             }
         }
     }
