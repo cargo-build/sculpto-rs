@@ -95,6 +95,9 @@ pub enum SplitError {
     AttributeLengthMismatch { attribute: &'static str },
     /// Skin influences or weights do not match the arena.
     SkinLengthMismatch,
+    /// A morph delta points at a vertex no triangle references; the split
+    /// cannot attach it to any output shape.
+    UnreferencedMorphVertex { target: usize, vertex: u32 },
 }
 
 impl MeshAsset {
@@ -156,6 +159,25 @@ impl MeshAsset {
         }
         if max_vertices < 3 {
             return Err(SplitError::LimitTooSmall);
+        }
+
+        let mut referenced = vec![false; self.positions.len()];
+        for triangle in &self.triangles {
+            for vertex in triangle {
+                referenced[*vertex as usize] = true;
+            }
+        }
+        for (target, morph) in self.morphs.iter().enumerate() {
+            if let Some(delta) = morph
+                .deltas
+                .iter()
+                .find(|delta| !referenced[delta.vertex as usize])
+            {
+                return Err(SplitError::UnreferencedMorphVertex {
+                    target,
+                    vertex: delta.vertex,
+                });
+            }
         }
 
         let mut by_partition: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
@@ -451,6 +473,30 @@ mod tests {
         assert_eq!(
             bad_skin.split_for_limit(3),
             Err(SplitError::SkinLengthMismatch)
+        );
+    }
+
+    #[test]
+    fn an_unreferenced_morph_delta_is_refused_not_dropped() {
+        let mesh = MeshAsset {
+            positions: vec![[0.0; 3]; 4],
+            triangles: vec![[0, 1, 2]],
+            triangle_partitions: vec![PartitionId(0)],
+            morphs: vec![MorphTarget {
+                name: "loose".into(),
+                deltas: vec![MorphDelta {
+                    vertex: 3,
+                    position: [1.0, 0.0, 0.0],
+                }],
+            }],
+            ..MeshAsset::default()
+        };
+        assert_eq!(
+            mesh.split_for_limit(65_535),
+            Err(SplitError::UnreferencedMorphVertex {
+                target: 0,
+                vertex: 3
+            })
         );
     }
 
