@@ -264,7 +264,7 @@ pub(super) fn primitives(
     targets: &Source,
     mesh: usize,
     count: usize,
-) -> Result<(), ActorError> {
+) -> Result<usize, ActorError> {
     let base_mesh = base
         .actor
         .document
@@ -277,9 +277,8 @@ pub(super) fn primitives(
         .meshes()
         .next()
         .ok_or_else(|| invalid("cloth targets", "missing mesh"))?;
-    match base_mesh.primitives().len() == target_mesh.primitives().len()
-        && base_mesh.primitives().len() > 0
-    {
+    let primitive_count = base_mesh.primitives().len();
+    match primitive_count == target_mesh.primitives().len() && primitive_count > 0 {
         true => {}
         false => {
             return Err(invalid(
@@ -373,7 +372,8 @@ pub(super) fn primitives(
                     geometric(targets, &accessor, name, true, vertices, &context)
                 })
             })
-        })
+        })?;
+    Ok(primitive_count)
 }
 
 fn compatible(a: &gltf::Accessor<'_>, b: &gltf::Accessor<'_>) -> bool {
