@@ -46,6 +46,11 @@ pub fn export_nif_schema() -> Value {
     schema_for::<ops::ExportNifParams>()
 }
 
+/// Schema derived from the typed GLB repair parameters.
+pub fn glb_file_schema() -> Value {
+    schema_for::<ops::GlbFileParams>()
+}
+
 fn schema_for<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).expect("schema serialises")
 }
@@ -239,6 +244,30 @@ pub fn export_nif(input: &Value) -> Result<Value, CommandError> {
         "target": outcome.target.as_str(),
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
+        "bytes": outcome.bytes,
+    }))
+}
+
+pub fn gltf_reset_weights(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::GlbFileParams {
+        glb: path(input, "glb")?,
+    };
+    let outcome = ops::gltf_reset_weights(&params)?;
+    Ok(json!({
+        "glb": outcome.glb.display().to_string(),
+        "meshes": outcome.changed,
+        "bytes": outcome.bytes,
+    }))
+}
+
+pub fn gltf_clamp_texcoord(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::GlbFileParams {
+        glb: path(input, "glb")?,
+    };
+    let outcome = ops::gltf_clamp_texcoord(&params)?;
+    Ok(json!({
+        "glb": outcome.glb.display().to_string(),
+        "texcoords": outcome.changed,
         "bytes": outcome.bytes,
     }))
 }

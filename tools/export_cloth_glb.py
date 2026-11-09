@@ -123,28 +123,11 @@ bpy.ops.export_scene.gltf(
 )
 # The exporter samples the animated shape-key values at the current frame for
 # `mesh.weights`; a non-zero default applies that target at load time in every
-# engine (Bevy renders the cloth as a crumpled sheet). Zero the defaults in the
-# container, keeping the animation channels intact.
-import struct as _struct
+# engine (Bevy renders the cloth as a crumpled sheet). `gltf.reset_weights`
+# zeroes the defaults in the container, keeping the animation channels intact.
+from glb_sanitize import reset_mesh_weights
 
-raw = bytearray(open(out_path, "rb").read())
-_magic, _version, _total = _struct.unpack("<III", raw[:12])
-_json_len, _json_type = _struct.unpack("<II", raw[12:20])
-_doc = json.loads(raw[20 : 20 + _json_len])
-_changed = False
-for _mesh in _doc.get("meshes", []):
-    if _mesh.get("weights"):
-        _mesh["weights"] = [0.0] * len(_mesh["weights"])
-        _changed = True
-if _changed:
-    _json = json.dumps(_doc, separators=(",", ":")).encode()
-    _json += b" " * ((-len(_json)) % 4)
-    _tail = bytes(raw[20 + _json_len :])
-    with open(out_path, "wb") as _sink:
-        _sink.write(_struct.pack("<III", _magic, _version, 12 + 8 + len(_json) + len(_tail)))
-        _sink.write(_struct.pack("<II", len(_json), _json_type))
-        _sink.write(_json)
-        _sink.write(_tail)
+reset_mesh_weights(out_path)
 
 print(
     "GLB " + json.dumps(

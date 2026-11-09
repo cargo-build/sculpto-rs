@@ -527,6 +527,7 @@ dependencies = [
  "schemars",
  "sculpto-bake",
  "sculpto-core",
+ "sculpto-gltf",
  "sculpto-mesh",
  "sculpto-nif",
  "serde_json",

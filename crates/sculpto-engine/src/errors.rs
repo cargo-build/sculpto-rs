@@ -11,6 +11,7 @@ use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakeError;
 use sculpto_core::mesh::MeshError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
+use sculpto_gltf::sanitize::SanitizeError;
 use sculpto_mesh::conform::ConformError;
 use sculpto_nif::NifError;
 use sculpto_nif::write::header::NifWriteError;
@@ -138,6 +139,22 @@ pub fn bake(error: BakeError) -> CommandError {
         BakeError::SetNotResolved { .. } => (ErrorKind::NotFound, "set_not_resolved"),
         BakeError::Container { .. } => (ErrorKind::InvalidRequest, "slider_container"),
         BakeError::IndexOutOfBounds { .. } => (ErrorKind::InvalidParams, "index_out_of_bounds"),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A GLB container could not be repaired.
+pub fn gltf(error: SanitizeError) -> CommandError {
+    let (kind, code) = match &error {
+        SanitizeError::TooShort { .. } => (ErrorKind::InvalidRequest, "glb_too_short"),
+        SanitizeError::NotGlb { .. } => (ErrorKind::InvalidRequest, "glb_not_glb"),
+        SanitizeError::FirstChunkNotJson { .. } => {
+            (ErrorKind::InvalidRequest, "glb_first_chunk_not_json")
+        }
+        SanitizeError::JsonTruncated { .. } => (ErrorKind::Refused, "glb_json_truncated"),
+        SanitizeError::JsonInvalid(_) => (ErrorKind::InvalidRequest, "glb_json_invalid"),
+        SanitizeError::JsonNotObject => (ErrorKind::InvalidRequest, "glb_json_not_object"),
+        SanitizeError::TooLarge { .. } => (ErrorKind::Unsupported, "glb_too_large"),
     };
     CommandError::new(kind, code, error.to_string())
 }

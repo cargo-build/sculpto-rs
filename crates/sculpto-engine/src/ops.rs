@@ -18,6 +18,7 @@ use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakePlan;
 use sculpto_core::mesh::MeshAsset;
 use sculpto_core::{SliderSize, document::Document};
+use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_nif::NifShape;
 use sculpto_nif::write::header::NifTarget;
@@ -505,6 +506,59 @@ pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<Vec<u8>, Com
         ExportTarget::Le => sculpto_nif::write::le_shape::write_le_shape(&projected),
     }
     .map_err(errors::nif_write)
+}
+
+/// Everything `gltf.reset_weights` and `gltf.clamp_texcoord` need.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct GlbFileParams {
+    /// GLB file to repair in place.
+    pub glb: PathBuf,
+}
+
+/// What a GLB repair produced.
+#[derive(Debug, Clone)]
+pub struct GlbRepairOutcome {
+    /// Repaired file.
+    pub glb: PathBuf,
+    /// JSON sites the repair changed; zero leaves the bytes untouched.
+    pub changed: usize,
+    /// File size after the repair.
+    pub bytes: usize,
+}
+
+/// Zero every mesh's default morph weights in a GLB.
+pub fn gltf_reset_weights(params: &GlbFileParams) -> Result<GlbRepairOutcome, CommandError> {
+    repair_glb(params, sculpto_gltf::sanitize::reset_mesh_weights)
+}
+
+/// Clamp every `texCoord: -1` in a GLB's materials to UV set 0.
+pub fn gltf_clamp_texcoord(params: &GlbFileParams) -> Result<GlbRepairOutcome, CommandError> {
+    repair_glb(params, sculpto_gltf::sanitize::clamp_texcoord)
+}
+
+/// Apply one adapter repair to the file it names.
+///
+/// The adapter owns the container; this function owns the read and the write,
+/// and an already-clean document is not rewritten, so a re-run is a no-op.
+fn repair_glb(
+    params: &GlbFileParams,
+    repair: fn(&[u8]) -> Result<Repair, SanitizeError>,
+) -> Result<GlbRepairOutcome, CommandError> {
+    let bytes = std::fs::read(&params.glb).map_err(|error| errors::io(&params.glb, error))?;
+    let repaired = repair(&bytes).map_err(errors::gltf)?;
+    let size = match &repaired.bytes {
+        Some(rewritten) => {
+            std::fs::write(&params.glb, rewritten)
+                .map_err(|error| errors::io(&params.glb, error))?;
+            rewritten.len()
+        }
+        None => bytes.len(),
+    };
+    Ok(GlbRepairOutcome {
+        glb: params.glb.clone(),
+        changed: repaired.changed,
+        bytes: size,
+    })
 }
 
 fn unknown_shape(shapes: &[NifShape], name: &str) -> CommandError {

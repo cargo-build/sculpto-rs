@@ -46,6 +46,8 @@
 //! - `JOINTS_0` is `u16` and `WEIGHTS_0` is `f32`: `f32` keeps the model's
 //!   weights bit-exact instead of quantizing them into normalized `u16`.
 
+pub mod sanitize;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
