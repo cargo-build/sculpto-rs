@@ -4,5 +4,6 @@
 pub mod header;
 pub mod le_shape;
 pub mod se_shape;
+pub mod shader;
 pub mod skin;
 pub mod strings;
