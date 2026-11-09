@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SliderSetInfo version="1">
+    <SliderSet name="Tier1 Body">
+        <DataFolder>Tier1</DataFolder>
+        <SourceFile>Body.nif</SourceFile>
+        <OutputPath>meshes\actors\character\character assets</OutputPath>
+        <OutputFile GenWeights="true">tier1body</OutputFile>
+        <Shape target="Tier1 Body">Tier1 Body</Shape>
+        <Slider name="Widen" invert="false" small="0" big="100">
+            <Data name="Tier1Widen" target="Tier1 Body" local="true">Body.osd\Tier1Widen</Data>
+        </Slider>
+    </SliderSet>
+</SliderSetInfo>
