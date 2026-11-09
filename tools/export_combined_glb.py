@@ -26,7 +26,6 @@ import json
 import os
 import re
 import sys
-import struct
 from math import radians
 from pathlib import Path
 
@@ -377,29 +376,14 @@ bpy.ops.export_scene.gltf(
     export_yup=True,
 )
 
-raw = bytearray(open(out_path, "rb").read())
-magic, version, _total = struct.unpack("<III", raw[:12])
-json_len, json_type = struct.unpack("<II", raw[12:20])
-doc = json.loads(raw[20 : 20 + json_len])
-changed = False
-for mesh in doc.get("meshes", []):
-    if mesh.get("weights"):
-        mesh["weights"] = [0.0] * len(mesh["weights"])
-        changed = True
-if changed:
-    payload = json.dumps(doc, separators=(",", ":")).encode()
-    payload += b" " * ((-len(payload)) % 4)
-    tail = bytes(raw[20 + json_len :])
-    with open(out_path, "wb") as sink:
-        sink.write(struct.pack("<III", magic, version, 12 + 8 + len(payload) + len(tail)))
-        sink.write(struct.pack("<II", len(payload), json_type))
-        sink.write(payload)
-        sink.write(tail)
+# The exporter samples the animated shape-key values at the current frame for
+# `mesh.weights`; a non-zero default applies that target at load time, so the
+# container's defaults are zeroed through the adapter. Blender 5.2 also writes
+# `texCoord: -1` for a texture whose UV map does not resolve, which the same
+# module clamps to UV set 0.
+from glb_sanitize import reset_mesh_weights, sanitize_texcoord
 
-# Blender 5.2 texCoord -1 clamp lives in glb_sanitize (shared with
-# skin_underlayers); it rewrites the GLB in place.
-from glb_sanitize import sanitize_texcoord
-
+reset_mesh_weights(out_path)
 sanitize_texcoord(out_path)
 
 print(

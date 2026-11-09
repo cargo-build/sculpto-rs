@@ -51,6 +51,10 @@ pub enum CommandId {
     IntakeCheck,
     /// Export an asset as a NIF.
     ExportNif,
+    /// Zero a GLB's default morph weights.
+    GltfResetWeights,
+    /// Clamp a GLB's negative `texCoord` indices to UV set 0.
+    GltfClampTexcoord,
 }
 
 impl CommandId {
@@ -70,6 +74,8 @@ impl CommandId {
             CommandId::ExportPair => "export.pair",
             CommandId::IntakeCheck => "intake.check",
             CommandId::ExportNif => "export.nif",
+            CommandId::GltfResetWeights => "gltf.reset_weights",
+            CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
         }
     }
 
@@ -318,6 +324,22 @@ const COMMANDS: &[Spec] = &[
         schema: handlers::export_nif_schema,
         handler: handlers::export_nif,
     },
+    Spec {
+        id: CommandId::GltfResetWeights,
+        summary: "Zero every mesh's default morph weights in a written GLB.",
+        mutates: true,
+        stub: false,
+        schema: handlers::glb_file_schema,
+        handler: handlers::gltf_reset_weights,
+    },
+    Spec {
+        id: CommandId::GltfClampTexcoord,
+        summary: "Clamp every `texCoord: -1` in a written GLB's materials to UV set 0.",
+        mutates: true,
+        stub: false,
+        schema: handlers::glb_file_schema,
+        handler: handlers::gltf_clamp_texcoord,
+    },
 ];
 
 /// Every registry row, in declaration order.
@@ -412,6 +434,8 @@ mod tests {
             "export.pair",
             "export.nif",
             "intake.check",
+            "gltf.reset_weights",
+            "gltf.clamp_texcoord",
         ] {
             let error = dispatch(id, &Value::Null).expect_err("missing params are an error");
             assert_ne!(error.kind(), ErrorKind::NotImplemented, "{id} is not wired");

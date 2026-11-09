@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 sculpto-core.workspace = true
 sculpto-bake.workspace = true
+sculpto-gltf.workspace = true
 sculpto-mesh.workspace = true
 sculpto-nif.workspace = true
 schemars = "1"

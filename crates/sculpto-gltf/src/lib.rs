@@ -51,6 +51,8 @@
 
 pub mod pack;
 
+pub mod sanitize;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;

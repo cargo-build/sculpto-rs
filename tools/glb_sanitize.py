@@ -1,51 +1,39 @@
-"""GLB post-write sanitizer shared by the export tools.
+"""GLB post-write sanitizers: thin shells over the ``sculpto`` command surface.
 
-Blender 5.2 writes ``"texCoord": -1`` for material textures whose UV map
-does not resolve on a mesh; engines reject the GLB (u32 expected). UV set
-0 is the only set the cloth shells carry, so clamp it there, at any depth
-of the material JSON.
+Blender 5.2 writes ``"texCoord": -1`` for material textures whose UV map does
+not resolve on a mesh, and samples a non-zero default ``mesh.weights`` from the
+current frame. Engines reject the first (an unsigned set index is expected) and
+apply every morph target for the second. Both repairs are command ids in the
+Rust adapter (``gltf.clamp_texcoord`` and ``gltf.reset_weights``), so this
+module only forwards the path through ``cli_bridge`` and edits no glTF JSON.
 
 Usage (after ``bpy.ops.export_scene.gltf`` wrote ``out_path``):
 
-    from glb_sanitize import sanitize_texcoord
+    from glb_sanitize import reset_mesh_weights, sanitize_texcoord
+    reset_mesh_weights(out_path)
     sanitize_texcoord(out_path)
 """
 
-import json
-import struct
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "blender_addon" / "sculpto_garment"))
+from cli_bridge import CommandError, EnvelopeError, SculptoCli
 
 
-def _clamp(node) -> bool:
-    changed = False
-    if isinstance(node, dict):
-        if node.get("texCoord") == -1:
-            node["texCoord"] = 0
-            changed = True
-        for value in node.values():
-            changed |= _clamp(value)
-    elif isinstance(node, list):
-        for value in node:
-            changed |= _clamp(value)
-    return changed
+def repair(command: str, out_path: str) -> dict:
+    """Run one repair on ``out_path`` in place and return its result member."""
+    try:
+        return SculptoCli().run(command, {"glb": str(out_path)})
+    except (CommandError, EnvelopeError) as error:
+        raise SystemExit(f"{command}: {error}") from error
 
 
 def sanitize_texcoord(out_path: str) -> int:
-    """Clamp every ``texCoord: -1`` to 0 in-place; return the token count."""
-    raw = bytearray(open(out_path, "rb").read())
-    magic, version, _total = struct.unpack("<III", raw[:12])
-    json_len, json_type = struct.unpack("<II", raw[12:20])
-    doc = json.loads(raw[20 : 20 + json_len])
-    changed = False
-    for material in doc.get("materials", []):
-        changed |= _clamp(material)
-    if not changed:
-        return 0
-    payload = json.dumps(doc, separators=(",", ":")).encode()
-    payload += b" " * ((-len(payload)) % 4)
-    tail = bytes(raw[20 + json_len :])
-    with open(out_path, "wb") as sink:
-        sink.write(struct.pack("<III", magic, version, 12 + 8 + len(payload) + len(tail)))
-        sink.write(struct.pack("<II", len(payload), json_type))
-        sink.write(payload)
-        sink.write(tail)
-    return 1
+    """Clamp every ``texCoord: -1`` to UV set 0 in place; return the count."""
+    return repair("gltf.clamp_texcoord", out_path)["texcoords"]
+
+
+def reset_mesh_weights(out_path: str) -> int:
+    """Zero every mesh's default morph weights in place; return the count."""
+    return repair("gltf.reset_weights", out_path)["meshes"]
