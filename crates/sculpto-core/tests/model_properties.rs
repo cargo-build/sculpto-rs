@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 
 use sculpto_core::mesh::{
-    MaterialSlot, MeshAsset, MeshError, MorphDelta, MorphTarget, PartitionId, PhysicsRef, Skin,
+    MaterialSlot, MeshAsset, MeshError, MorphDelta, MorphScope, MorphTarget, PartitionId,
+    PhysicsRef, Skin,
 };
 
 struct Rng(u64);
@@ -79,6 +80,7 @@ fn generated(seed: u64) -> MeshAsset {
             MorphTarget {
                 name: format!("target{target}"),
                 deltas,
+                scope: MorphScope::Whole,
             }
         })
         .collect();

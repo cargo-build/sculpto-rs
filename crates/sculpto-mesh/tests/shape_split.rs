@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sculpto_core::mesh::{MeshAsset, MorphDelta, MorphTarget, PartitionId};
+use sculpto_core::mesh::{MeshAsset, MorphDelta, MorphScope, MorphTarget, PartitionId};
 
 const SE_VERTEX_LIMIT: usize = 65_535;
 
@@ -59,6 +59,7 @@ fn garment_asset(path: &Path) -> MeshAsset {
                 morphs.push(MorphTarget {
                     name: format!("target{target}"),
                     deltas,
+                    scope: MorphScope::Whole,
                 });
             }
             let triangle_count = triangles.len();

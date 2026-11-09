@@ -15,6 +15,8 @@
 //!   `extras.targetNames`. Any morph whose vertex index exceeds the primitive's
 //!   vertex count is refused as [`MeshError::MorphVertexOutOfRange`].
 //!   Normal deltas are omitted as `MorphDelta` carries only position deltas.
+//!   glTF morph targets stay whole-mesh: [`MorphScope`](sculpto_core::mesh::MorphScope)
+//!   narrows the `.tri` shape projection, not the glTF target list.
 //! - Physics: a [`PhysicsRef::Path`](sculpto_core::mesh::PhysicsRef) sidecar
 //!   travels as the documented `extras.sculpto.physics` string on the root
 //!   node — glTF has no native slot for Skyrim-style physics data. An inline
@@ -51,6 +53,8 @@
 
 pub mod pack;
 
+pub mod profile;
+
 pub mod sanitize;
 
 use std::borrow::Cow;
@@ -59,6 +63,8 @@ use std::fmt;
 
 use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, PhysicsRef, TextureSlot};
 use serde_json::{Map, Value, json};
+
+use profile::ConsumerProfile;
 
 /// `f32` accessor component type.
 const FLOAT: u32 = 5126;
@@ -98,6 +104,29 @@ pub enum GltfError {
     /// The model declared more than one material slot.
     MultipleMaterialSlots {
         /// The number of material slots declared.
+        count: usize,
+    },
+    /// A texture channel has no UV coordinates to sample it with: glTF would
+    /// emit `baseColorTexture`/`normalTexture` for a mesh without
+    /// `TEXCOORD_0`, and consumers reject the target later (mikktspace on
+    /// Bevy). Ship the model with UVs or without the texture.
+    TextureWithoutUv {
+        /// The texture channel name.
+        slot: &'static str,
+    },
+    /// The model carries more morph targets than the caller-selected
+    /// [`profile::ConsumerProfile`] measured on its consumer build; nothing
+    /// was written.
+    ConsumerCapExceeded {
+        /// The profile name.
+        profile: String,
+        /// The consumer version requirement the profile targets.
+        requirement: String,
+        /// The exact consumer version that was measured.
+        resolved: String,
+        /// The measured morph-target cap.
+        cap: usize,
+        /// The model's morph-target count that exceeds it.
         count: usize,
     },
     /// A clip has fewer than two samples, so a player could only render it
@@ -164,6 +193,22 @@ impl fmt::Display for GltfError {
                     "model has {count} material slots; glTF export supports at most one"
                 )
             }
+            Self::ConsumerCapExceeded {
+                profile,
+                requirement,
+                resolved,
+                cap,
+                count,
+            } => write!(
+                f,
+                "profile '{profile}' (requirement {requirement}, resolved {resolved}) \
+                 caps morph targets at {cap}; the model carries {count}"
+            ),
+            Self::TextureWithoutUv { slot } => write!(
+                f,
+                "texture slot '{slot}' has no UV coordinates to sample with; \
+                 export UVs with the mesh or drop the texture"
+            ),
             Self::ConstantClip {
                 clip,
                 name,
@@ -269,6 +314,31 @@ pub fn write_glb(asset: &MeshAsset) -> Result<Vec<u8>, GltfError> {
     write_glb_with(asset, &[])
 }
 
+/// [`write_glb`] for a caller-selected [`ConsumerProfile`]: the model's
+/// morph-target count is compared against the profile's measured cap
+/// (`profile.max_morph_targets.value`) before any byte is produced, and a
+/// count above it is refused as [`GltfError::ConsumerCapExceeded`], naming
+/// the profile.
+///
+/// Format limits stay adapter-enforced `FormatLimits`, not profile data;
+/// see [`profile`].
+pub fn write_glb_with_profile(
+    asset: &MeshAsset,
+    profile: &ConsumerProfile,
+) -> Result<Vec<u8>, GltfError> {
+    asset.validate().map_err(GltfError::InvalidMesh)?;
+    if asset.morphs.len() > profile.max_morph_targets.value {
+        return Err(GltfError::ConsumerCapExceeded {
+            profile: profile.name.clone(),
+            requirement: profile.requirement.clone(),
+            resolved: profile.resolved.clone(),
+            cap: profile.max_morph_targets.value,
+            count: asset.morphs.len(),
+        });
+    }
+    write_glb_with(asset, &[])
+}
+
 /// [`write_glb`] with one glTF animation per [`Clip`].
 ///
 /// Every refusal check runs before any byte is produced.
@@ -325,6 +395,18 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
             let slot = &asset.materials[0];
             if slot.texture(TextureSlot::Specular).is_some() {
                 return Err(GltfError::TextureSlotUnsupported { slot: "specular" });
+            }
+            // A texture without UVs would emit a sampler consumers cannot
+            // evaluate (Bevy's mikktspace refuses the target later), so the
+            // writer refuses it up front; an untextured model still writes.
+            if asset.uvs.is_empty() {
+                for channel in [TextureSlot::Diffuse, TextureSlot::Normal] {
+                    if slot.texture(channel).is_some() {
+                        return Err(GltfError::TextureWithoutUv {
+                            slot: channel.as_str(),
+                        });
+                    }
+                }
             }
             Some(slot)
         }
