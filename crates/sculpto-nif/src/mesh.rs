@@ -15,6 +15,7 @@ impl From<&NifShape> for MeshAsset {
             weights: shape.weights.clone(),
         });
         Self {
+            name: shape.name.clone(),
             positions: shape.positions.clone(),
             uvs: shape.uvs.clone(),
             triangles: shape.triangles.clone(),
@@ -23,6 +24,34 @@ impl From<&NifShape> for MeshAsset {
             triangle_partitions: vec![PartitionId(0); shape.triangles.len()],
             skin,
             ..Self::default()
+        }
+    }
+}
+
+/// Project the model back to the reader's shape type.
+///
+/// This is the compatibility path for the existing slice-based consumers:
+/// `NifShape -> MeshAsset -> NifShape` preserves every field `NifShape` owns.
+/// Normals, tangents, materials and morphs have no `NifShape` slot and are
+/// dropped by this projection.
+impl From<&MeshAsset> for NifShape {
+    fn from(mesh: &MeshAsset) -> Self {
+        let (bones, bone_indices, weights) = match &mesh.skin {
+            Some(skin) => (
+                skin.bones.clone(),
+                skin.indices.clone(),
+                skin.weights.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        Self {
+            name: mesh.name.clone(),
+            positions: mesh.positions.clone(),
+            uvs: mesh.uvs.clone(),
+            triangles: mesh.triangles.clone(),
+            bones,
+            bone_indices,
+            weights,
         }
     }
 }
@@ -56,6 +85,15 @@ mod tests {
         assert_eq!(skin.weights.len(), 3);
         assert!(mesh.morphs.is_empty());
         assert!(mesh.materials.is_empty());
+        mesh.validate().expect("valid");
+    }
+
+    #[test]
+    fn shape_roundtrips_through_the_model() {
+        let source = shape();
+        let mesh = MeshAsset::from(&source);
+        let back = NifShape::from(&mesh);
+        assert_eq!(back, source);
         mesh.validate().expect("valid");
     }
 
