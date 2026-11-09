@@ -21,10 +21,12 @@ import bpy
 
 from . import cli_bridge
 from . import pipeline
+from . import rules
 
 if "bpy" in locals():
     import importlib
 
+    importlib.reload(rules)
     importlib.reload(cli_bridge)
     importlib.reload(pipeline)
 
@@ -37,15 +39,10 @@ class SCULPTO_OT_dress(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")  # noqa: F821
-    kind: bpy.props.EnumProperty(  # noqa: F821
-        items=[
-            ("upper-body", "Upper body", "Tunic, shirt, bodice"),
-            ("trousers", "Trousers", "Waist-to-ankle legs"),
-            ("footwear", "Footwear", "Boots and shoes (left foot)"),
-        ],
-        default="upper-body",
-    )
-    clip: bpy.props.StringProperty(name="Clip", default="Combat_Idle")  # noqa: F821
+    # One table (`rules.GARMENT_KINDS`) owns the exposed classes for this
+    # operator, the scene property and the placement/region rules alike.
+    kind: bpy.props.EnumProperty(items=rules.enum_items(), default="upper-body")  # noqa: F821
+    clip: bpy.props.StringProperty(name="Clip", default=rules.DEFAULT_CLIP)  # noqa: F821
 
     def execute(self, context):
         body = context.scene.sculpto_body_pointer
@@ -101,7 +98,7 @@ class SCULPTO_OT_audit(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     directory: bpy.props.StringProperty(subtype="DIR_PATH")  # noqa: F821
-    clip: bpy.props.StringProperty(name="Clip", default="Combat_Idle")  # noqa: F821
+    clip: bpy.props.StringProperty(name="Clip", default=rules.DEFAULT_CLIP)  # noqa: F821
     frames: bpy.props.StringProperty(name="Frames", default="1,20,40,60,80,100")  # noqa: F821
     views: bpy.props.StringProperty(name="Views", default="front,side,back")  # noqa: F821
 
@@ -173,9 +170,9 @@ class SCULPTO_PT_panel(bpy.types.Panel):
         layout = self.layout
         layout.prop(context.scene, "sculpto_body_pointer", text="Body")
         props = layout.operator(SCULPTO_OT_dress.bl_idname, icon="MOD_CLOTH")
-        props.clip = "Combat_Idle"
+        props.clip = rules.DEFAULT_CLIP
         audit = layout.operator(SCULPTO_OT_audit.bl_idname, icon="RENDER_ANIMATION")
-        audit.clip = "Combat_Idle"
+        audit.clip = rules.DEFAULT_CLIP
         layout.operator(SCULPTO_OT_export_nif.bl_idname, icon="EXPORT")
 
 
@@ -186,11 +183,7 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.sculpto_garment_kind = bpy.props.EnumProperty(
-        items=[
-            ("upper-body", "Upper body", "Tunic, shirt, bodice"),
-            ("trousers", "Trousers", "Waist-to-ankle legs"),
-            ("footwear", "Footwear", "Boots and shoes"),
-        ],
+        items=rules.enum_items(),
         default="upper-body",
     )
     bpy.types.Scene.sculpto_body_pointer = bpy.props.PointerProperty(
