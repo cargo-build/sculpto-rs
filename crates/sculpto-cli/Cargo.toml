@@ -19,4 +19,4 @@ sculpto-engine.workspace = true
 serde_json = "1"
 
 [dev-dependencies]
-gltf = { version = "=1.4.1", default-features = false }
+gltf = { version = "1", default-features = false }
