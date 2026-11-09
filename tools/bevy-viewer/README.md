@@ -43,7 +43,7 @@ every combined GLB renumbers its clips (the cloth weight track is animation
 index list from the GLB's JSON chunk before a capture.
 
 `SCULPTO_VIEWER_DEBUG_SCENE=1` replaces the capture with a consumer-limit
-audit on the pinned Bevy version: it probes the morph-target gate (256 accepted,
+audit on the resolved Bevy 0.20.x: it probes the morph-target gate (256 accepted,
 257 rejected), prints one line per loaded mesh with vertex count, morph targets,
 material presence and skin joints, and takes two playback snapshots (active
 clips, elapsed time, summed morph weights) before exiting. This is the command
