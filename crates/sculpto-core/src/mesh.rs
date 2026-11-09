@@ -44,11 +44,81 @@ pub struct Skin {
     pub weights: Vec<[f32; 4]>,
 }
 
+/// Neutral shader family a slot belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShaderKind {
+    /// Ordinary opaque surface.
+    #[default]
+    Default,
+    /// Skinned body or garment surface.
+    Skin,
+    /// Hair or fur surface.
+    Hair,
+    /// Eye surface.
+    Eyes,
+    /// Cloth with alpha rules.
+    Cloth,
+}
+
+/// One texture channel the model knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureSlot {
+    /// Base colour.
+    Diffuse,
+    /// Normal map.
+    Normal,
+    /// Specular or roughness map.
+    Specular,
+}
+
+impl TextureSlot {
+    /// Stable label for errors and reference output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TextureSlot::Diffuse => "diffuse",
+            TextureSlot::Normal => "normal",
+            TextureSlot::Specular => "specular",
+        }
+    }
+}
+
 /// One material slot. Format-specific fields stay in the adapters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaterialSlot {
     /// Slot name, as authored.
     pub name: String,
+    /// Neutral shader family.
+    pub shader: ShaderKind,
+    /// Base-colour texture path.
+    pub diffuse: Option<String>,
+    /// Normal-map path.
+    pub normal: Option<String>,
+    /// Specular/roughness map path.
+    pub specular: Option<String>,
+    /// Render both faces.
+    pub double_sided: bool,
+}
+
+impl MaterialSlot {
+    /// Read one texture channel, so Skyrim and glTF projections share a source.
+    pub fn texture(&self, slot: TextureSlot) -> Option<&str> {
+        match slot {
+            TextureSlot::Diffuse => self.diffuse.as_deref(),
+            TextureSlot::Normal => self.normal.as_deref(),
+            TextureSlot::Specular => self.specular.as_deref(),
+        }
+    }
+}
+
+/// A named material-slot defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialDefect {
+    /// The slot name is empty.
+    EmptyName,
+    /// Another slot already uses this name.
+    DuplicateName,
+    /// A declared texture path is empty.
+    EmptyTexturePath(TextureSlot),
 }
 
 /// One export mesh: flat arena, per-triangle partitions, sparse morphs.
@@ -191,6 +261,8 @@ pub enum MeshError {
     WeightSumOutOfRange { vertex: usize, sum: f32 },
     /// A triangle carries the reader's unmatched-partition sentinel.
     UnmatchedPartition { triangle: usize },
+    /// A material slot violates a named rule.
+    Material { slot: usize, defect: MaterialDefect },
 }
 
 /// Why a mesh cannot be split.
@@ -330,6 +402,34 @@ impl MeshAsset {
                 let sum: f32 = weights.iter().sum();
                 if (sum - 1.0).abs() > 1e-4 {
                     return Err(MeshError::WeightSumOutOfRange { vertex, sum });
+                }
+            }
+        }
+
+        let mut names = std::collections::BTreeSet::new();
+        for (slot, material) in self.materials.iter().enumerate() {
+            if material.name.trim().is_empty() {
+                return Err(MeshError::Material {
+                    slot,
+                    defect: MaterialDefect::EmptyName,
+                });
+            }
+            if !names.insert(material.name.as_str()) {
+                return Err(MeshError::Material {
+                    slot,
+                    defect: MaterialDefect::DuplicateName,
+                });
+            }
+            for texture in [
+                TextureSlot::Diffuse,
+                TextureSlot::Normal,
+                TextureSlot::Specular,
+            ] {
+                if material.texture(texture).is_some_and(str::is_empty) {
+                    return Err(MeshError::Material {
+                        slot,
+                        defect: MaterialDefect::EmptyTexturePath(texture),
+                    });
                 }
             }
         }
@@ -648,6 +748,7 @@ mod tests {
             morphs: Vec::new(),
             materials: vec![MaterialSlot {
                 name: "robe".into(),
+                ..MaterialSlot::default()
             }],
             ..MeshAsset::default()
         };
@@ -847,6 +948,79 @@ mod tests {
             Err(MeshError::NonFinite {
                 attribute: "weights",
                 index: 0
+            })
+        );
+    }
+
+    #[test]
+    fn material_slots_validate_and_share_one_projection() {
+        let mut mesh = one_triangle();
+        mesh.materials = vec![
+            MaterialSlot {
+                name: "body".into(),
+                shader: ShaderKind::Skin,
+                diffuse: Some("body_d.dds".into()),
+                normal: Some("body_n.dds".into()),
+                specular: None,
+                double_sided: false,
+            },
+            MaterialSlot {
+                name: "robe".into(),
+                shader: ShaderKind::Cloth,
+                diffuse: Some("robe_d.dds".into()),
+                ..MaterialSlot::default()
+            },
+        ];
+        mesh.validate().expect("valid slots");
+
+        // A Skyrim projection and a glTF projection read the same value.
+        let body = &mesh.materials[0];
+        assert_eq!(body.texture(TextureSlot::Diffuse), Some("body_d.dds"));
+        assert_eq!(body.texture(TextureSlot::Normal), Some("body_n.dds"));
+        assert_eq!(body.texture(TextureSlot::Specular), None);
+        assert_eq!(body.shader, ShaderKind::Skin);
+        assert!(!body.double_sided);
+
+        let mut empty_name = one_triangle();
+        empty_name.materials = vec![MaterialSlot::default()];
+        assert_eq!(
+            empty_name.validate(),
+            Err(MeshError::Material {
+                slot: 0,
+                defect: MaterialDefect::EmptyName
+            })
+        );
+
+        let mut duplicate = one_triangle();
+        duplicate.materials = vec![
+            MaterialSlot {
+                name: "same".into(),
+                ..MaterialSlot::default()
+            },
+            MaterialSlot {
+                name: "same".into(),
+                ..MaterialSlot::default()
+            },
+        ];
+        assert_eq!(
+            duplicate.validate(),
+            Err(MeshError::Material {
+                slot: 1,
+                defect: MaterialDefect::DuplicateName
+            })
+        );
+
+        let mut empty_path = one_triangle();
+        empty_path.materials = vec![MaterialSlot {
+            name: "robe".into(),
+            diffuse: Some(String::new()),
+            ..MaterialSlot::default()
+        }];
+        assert_eq!(
+            empty_path.validate(),
+            Err(MeshError::Material {
+                slot: 0,
+                defect: MaterialDefect::EmptyTexturePath(TextureSlot::Diffuse)
             })
         );
     }
