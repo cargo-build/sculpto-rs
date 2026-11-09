@@ -7,6 +7,7 @@
 use std::fmt;
 
 use crate::NifHeader;
+use sculpto_core::mesh::MeshError;
 
 /// Numeric NIF version both Skyrim variants use (`20.2.0.7`).
 pub const VERSION: u32 = 0x1402_0007;
@@ -35,7 +36,7 @@ impl NifTarget {
 }
 
 /// Why a header cannot be written or read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NifWriteError {
     /// The user version belongs to a game the writer does not support.
     UnsupportedGame { user_version: u32 },
@@ -47,6 +48,12 @@ pub enum NifWriteError {
     NotGamebryo,
     /// The endian marker is not little-endian.
     UnsupportedEndian { endian: u8 },
+    /// The model failed validation, so no bytes are written.
+    InvalidModel(MeshError),
+    /// A shape has more vertices than the `u16` count can hold.
+    TooManyVertices { vertices: usize },
+    /// A shape has more triangles than the `u16` count can hold.
+    TooManyTriangles { triangles: usize },
 }
 
 impl fmt::Display for NifWriteError {
@@ -62,6 +69,19 @@ impl fmt::Display for NifWriteError {
             Self::NotGamebryo => write!(formatter, "not a Gamebryo NIF header line"),
             Self::UnsupportedEndian { endian } => {
                 write!(formatter, "unsupported endian marker {endian}")
+            }
+            Self::InvalidModel(error) => write!(formatter, "model is invalid: {error:?}"),
+            Self::TooManyVertices { vertices } => {
+                write!(
+                    formatter,
+                    "shape has {vertices} vertices, above the u16 count"
+                )
+            }
+            Self::TooManyTriangles { triangles } => {
+                write!(
+                    formatter,
+                    "shape has {triangles} triangles, above the u16 count"
+                )
             }
         }
     }
