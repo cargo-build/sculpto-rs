@@ -48,8 +48,9 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         .unwrap_or_default();
     let bone_count = bone_names.len();
     // Block 0 is the shape, 1 its data; a skin adds the instance (2), the skin
-    // data (3), a root node (4) that parents the shape, and one node per bone.
-    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 5 + offset as i32).collect();
+    // data (3), the partition (4), a root node (5) that parents the shape, and
+    // one node per bone (6..).
+    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 6 + offset as i32).collect();
     let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
     let skin_ref = skin_plan.as_ref().map_or(-1, |_| 2);
 
@@ -119,25 +120,26 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     }
     push_u16(&mut data, 0); // match groups
 
-    let (instance, skin_data, root, nodes) = match &skin_plan {
+    let (instance, skin_data, partition, root, nodes) = match &skin_plan {
         Some(plan) => (
-            skin::instance(3, skeleton_root, &bone_refs),
+            skin::instance(3, 4, skeleton_root, &bone_refs),
             skin::data(plan)?,
+            skin::partitions(asset, false, 0)?,
             skin::node(-1, &[0]),
             bone_names
                 .iter()
                 .map(|index| skin::node(*index, &[]))
                 .collect::<Vec<_>>(),
         ),
-        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
 
     let mut type_names: Vec<&str> = vec!["NiTriShape", "NiTriShapeData"];
     let mut type_indices: Vec<u16> = vec![0, 1];
     if skin_plan.is_some() {
-        type_names.extend(["NiSkinInstance", "NiSkinData", "NiNode"]);
-        type_indices.extend([2, 3]);
-        type_indices.extend(std::iter::repeat_n(4, bone_count + 1));
+        type_names.extend(["NiSkinInstance", "NiSkinData", "NiSkinPartition", "NiNode"]);
+        type_indices.extend([2, 3, 4]);
+        type_indices.extend(std::iter::repeat_n(5, bone_count + 1));
     }
 
     let mut file = write_header(NifTarget::Le);
@@ -159,6 +161,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     if skin_plan.is_some() {
         push_u32(&mut file, instance.len() as u32);
         push_u32(&mut file, skin_data.len() as u32);
+        push_u32(&mut file, partition.len() as u32);
         push_u32(&mut file, root.len() as u32);
         for node in &nodes {
             push_u32(&mut file, node.len() as u32);
@@ -177,6 +180,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     if skin_plan.is_some() {
         file.extend_from_slice(&instance);
         file.extend_from_slice(&skin_data);
+        file.extend_from_slice(&partition);
         file.extend_from_slice(&root);
         for node in &nodes {
             file.extend_from_slice(node);
