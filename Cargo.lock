@@ -527,6 +527,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sculpto-gltf"
+version = "0.1.0"
+dependencies = [
+ "gltf",
+ "sculpto-core",
+ "serde_json",
+]
+
+[[package]]
 name = "sculpto-mesh"
 version = "0.1.0"
 dependencies = [
