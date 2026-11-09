@@ -77,6 +77,8 @@ pub enum NifWriteError {
     TextureSlotUnsupported { slot: &'static str },
     /// More than one material slot needs per-triangle material authoring.
     MultipleMaterialSlots { count: usize },
+    /// An inline physics sidecar has no file the HDT link could name.
+    InlinePhysicsUnsupported,
 }
 
 impl fmt::Display for NifWriteError {
@@ -140,6 +142,12 @@ impl fmt::Display for NifWriteError {
                 write!(
                     formatter,
                     "{count} material slots need per-triangle authoring"
+                )
+            }
+            Self::InlinePhysicsUnsupported => {
+                write!(
+                    formatter,
+                    "inline physics has no file the HDT link can name"
                 )
             }
         }

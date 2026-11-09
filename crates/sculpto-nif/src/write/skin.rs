@@ -70,11 +70,15 @@ pub fn plan(asset: &MeshAsset) -> Result<Option<SkinPlan>, NifWriteError> {
     }))
 }
 
-/// A named `NiNode` body with an identity transform and the given children.
-pub fn node(name: i32, children: &[i32]) -> Vec<u8> {
+/// A named `NiNode` body with an identity transform, the given children and
+/// extra-data references.
+pub fn node(name: i32, children: &[i32], extra_data: &[i32]) -> Vec<u8> {
     let mut bytes = Vec::new();
     push_i32(&mut bytes, name);
-    push_u32(&mut bytes, 0); // extra data
+    push_u32(&mut bytes, extra_data.len() as u32);
+    for index in extra_data {
+        push_i32(&mut bytes, *index);
+    }
     push_i32(&mut bytes, -1); // controller
     push_u32(&mut bytes, 0); // flags
     for value in [0.0f32, 0.0, 0.0] {

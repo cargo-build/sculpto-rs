@@ -1,13 +1,15 @@
 //! Skyrim LE `NiTriShape` + `NiTriShapeData` writer for one shape.
 //!
 //! The LE wire format keeps geometry in a separate data block. C04 wrote
-//! positions and triangles, C05 added UVs, C06 `f32` normals and C07 adds the
+//! positions and triangles, C05 added UVs, C06 `f32` normals, C07 added the
 //! skin: `NiSkinInstance` + sparse `NiSkinData` weights and one named `NiNode`
-//! per bone. Tangents need the NBT layout, which this writer does not emit yet,
-//! so they are refused instead of dropped.
+//! per bone, C10 the shader and texture set, and C11 the HDT-SMP physics link as
+//! one `NiStringExtraData`. Tangents need the NBT layout, which this writer does
+//! not emit yet, so they are refused instead of dropped.
 
 use sculpto_core::mesh::MeshAsset;
 
+use super::extra;
 use super::header::{NifTarget, NifWriteError, write_header};
 use super::shader;
 use super::skin;
@@ -74,16 +76,39 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         index
     });
     let texture_index = match material.is_some() && !texture_body.is_empty() {
-        true => next_block,
+        true => {
+            let index = next_block;
+            next_block += 1;
+            index
+        }
         false => -1,
     };
+    let physics = extra::physics_link(asset)?;
+    let extra_index = physics.as_ref().map_or(-1, |_| {
+        let index = next_block;
+        next_block += 1;
+        index
+    });
     let shader_body = material.map_or_else(Vec::new, |slot| {
         shader::shader(slot, texture_index, name_index)
     });
+    let extra_body = physics
+        .as_ref()
+        .map_or_else(Vec::new, |link| extra::body(link, &mut strings));
 
     let mut shape = Vec::new();
+    // NiObjectNET: name, extra data, no controller. With a skin the file has a
+    // root `NiNode`, and the game only reads the physics link from there
+    // (`OutfitProject.cpp:250-252`); without one the shape is the root.
+    let shape_extra = match skin_plan.is_some() {
+        true => -1,
+        false => extra_index,
+    };
     push_i32(&mut shape, name_index);
-    push_u32(&mut shape, 0); // extra data
+    push_u32(&mut shape, u32::from(shape_extra >= 0));
+    if shape_extra >= 0 {
+        push_i32(&mut shape, shape_extra);
+    }
     push_i32(&mut shape, -1); // controller
     push_u32(&mut shape, 0); // flags
     for value in [0.0f32, 0.0, 0.0] {
@@ -147,15 +172,19 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     }
     push_u16(&mut data, 0); // match groups
 
+    let root_extra: Vec<i32> = match extra_index {
+        -1 => Vec::new(),
+        index => vec![index],
+    };
     let (instance, skin_data, partition, root, nodes) = match &skin_plan {
         Some(plan) => (
             skin::instance(3, 4, skeleton_root, &bone_refs),
             skin::data(plan)?,
             skin::partitions(asset, false, 0)?,
-            skin::node(-1, &[0]),
+            skin::node(-1, &[0], &root_extra),
             bone_names
                 .iter()
-                .map(|index| skin::node(*index, &[]))
+                .map(|index| skin::node(*index, &[], &[]))
                 .collect::<Vec<_>>(),
         ),
         None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
@@ -175,6 +204,10 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             type_names.push("BSShaderTextureSet");
             type_indices.push(type_names.len() as u16 - 1);
         }
+    }
+    if physics.is_some() {
+        type_names.push(extra::BLOCK_TYPE);
+        type_indices.push(type_names.len() as u16 - 1);
     }
 
     let mut file = write_header(NifTarget::Le);
@@ -208,6 +241,9 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             push_u32(&mut file, texture_body.len() as u32);
         }
     }
+    if physics.is_some() {
+        push_u32(&mut file, extra_body.len() as u32);
+    }
     let max_length = strings.iter().map(str::len).max().unwrap_or(0);
     push_u32(&mut file, strings.len() as u32);
     push_u32(&mut file, max_length as u32);
@@ -232,6 +268,9 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         if texture_index >= 0 {
             file.extend_from_slice(&texture_body);
         }
+    }
+    if physics.is_some() {
+        file.extend_from_slice(&extra_body);
     }
     Ok(file)
 }
