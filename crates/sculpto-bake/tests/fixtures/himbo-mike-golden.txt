@@ -1,0 +1,8 @@
+preset=HIMBO Mike
+set=HIMBO Body - Vanilla Nevernude
+shape=HIMBO - Body
+vertices=9307
+triangles=17994
+bones=24
+morphs=0
+positions_fnv1a64=10ddd52c2af9f242

@@ -1,0 +1,6 @@
+shape=BaseShape
+vertices=3471
+triangles=6516
+bones=22
+morphs=0
+positions_fnv1a64=347c65c8ae5a05fb
