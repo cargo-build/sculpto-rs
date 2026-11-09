@@ -1,33 +1,76 @@
-//! Eight-pair native parity matrix generalising `parity_native.rs`.
+//! Same-family native parity matrix for the HIMBO and CBBE body families.
 //!
-//! Evaluates the two-body parity matrix:
-//! - 2 sets: `HIMBO Body - Vanilla Nevernude`, `CBBE Body`
-//! - 2 presets: `HIMBO Mike`, one CBBE preset on host (e.g. `CBBE Curvy` or `- Zeroed Sliders -`)
-//! - 2 endpoints: `SliderSize::Small` (`_0`), `SliderSize::Big` (`_1`)
+//! Exactly six cells run on a provisioned host, and every pairing is
+//! same-family — a HIMBO slider set with HIMBO presets, the CBBE set with a
+//! CBBE preset. Cross-family pairings (a male set with a CBBE preset) are not
+//! buildable BodySlide combinations and are never constructed:
 //!
-//! For each pair:
-//! - resolve the plan from `SCULPTO_BODYSLIDE_HOME`;
-//! - apply it to the source NIF and compare against the native `_0`/`_1` output
-//!   when present, else print `SKIPPED: <pair> native output absent` and return;
-//! - assertions when native output exists:
-//!   - vertex count exact
-//!   - per-vertex max deviation <= 1e-6
-//!   - weights <= 1e-4
-//!   - triangle set exact
-//! - wrong-endpoint negative control: the same comparison against the other
-//!   endpoint must fail.
+//! - `HIMBO Body - Vanilla Nevernude` × {`HIMBO Mike`, `HIMBO Chonky`}
+//!   × {small `_0`, big `_1`} — four cells;
+//! - `CBBE Body` × `SCULPTO_CBBE_PRESET` × {small, big} — two cells.
 //!
-//! Native files are read from host paths under or alongside the environment home;
-//! no private asset payloads are committed.
+//! The female family has one preset on purpose: `SCULPTO_CBBE_PRESET` must
+//! name the preset the native fixture was built with, so the suite cannot
+//! guess a preset identity it cannot verify. This host has no second female
+//! native build (no `CBBE Curvy` output), so no second female cell is
+//! fabricated.
+//!
+//! Every cell serialises the bake through our SE writer (`write_se_shape`)
+//! and compares the re-read artifact against the native output, so each
+//! comparison is bake-vs-native, never source-vs-native:
+//! - vertex counts asserted (non-zero) before any zip;
+//! - positions <= 1e-6;
+//! - triangles and bone lists exact;
+//! - UVs <= 1e-3 and weights <= 1e-3 — both bounded by our writer's `f16`
+//!   storage, the same tolerance class as the C14 round-trip suite;
+//! - wrong-endpoint negative control required per cell, deviation > 0.1 u —
+//!   one threshold for both families and every entry point;
+//! - a non-identity guard: at least one evaluated cell must carry a non-empty
+//!   plan and move vertices by more than 1e-6 against its source.
+//!
+//! `SCULPTO_BODYSLIDE_HOME` unset: each entry point prints one explicit
+//! `SKIPPED` line and stops. Set: a missing required native fixture (either
+//! endpoint) is a failure, never a skip.
+//!
+//! Native files are read from host paths under or alongside the environment
+//! home (plus `SCULPTO_NATIVE_DIR`/`SCULPTO_NATIVE_NIF*` overrides); no
+//! private asset payloads are committed.
 
 use std::path::{Path, PathBuf};
 
 use sculpto_bake::BakePlan;
+use sculpto_core::mesh::MeshAsset;
 use sculpto_core::{Document, Preset, Project, SliderSet, SliderSize};
+use sculpto_nif::write::se_shape::write_se_shape;
+use sculpto_nif::{NifDocument, NifShape};
+
+/// Position tolerance, one value for both body families.
+const POSITION_TOLERANCE_U: f32 = 1e-6;
+/// UV tolerance: our SE writer stores UVs as `f16` (C14 round-trip suite).
+const UV_TOLERANCE: f32 = 1e-3;
+/// Weight tolerance: our SE writer stores weights as `f16` (C14 round-trip).
+const WEIGHT_TOLERANCE: f32 = 1e-3;
+/// Wrong-endpoint control floor, one threshold for both families and every
+/// entry point.
+const NEGATIVE_CONTROL_MIN_DEVIATION_U: f32 = 0.1;
+/// Non-identity guard floor: somewhere the bake must move vertices further
+/// than this.
+const NON_IDENTITY_MIN_DEVIATION_U: f32 = 1e-6;
+/// Cell count this suite actually runs: 4 HIMBO (two presets × two endpoints)
+/// + 2 CBBE (one env-named preset × two endpoints).
+const EXPECTED_CELLS: usize = 6;
 
 /// Calculate 3D Euclidean distance between two positions.
 fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+/// Maximum elementwise absolute difference of two `f32` slots.
+fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// Body family mapping to project and preset files.
@@ -55,12 +98,11 @@ impl BodyFamily {
     }
 }
 
-/// Specifications for one matrix cell.
+/// Specifications for one same-family matrix cell.
 #[derive(Debug, Clone)]
 pub struct MatrixPair {
-    pub set_family: BodyFamily,
+    pub family: BodyFamily,
     pub set_name: &'static str,
-    pub preset_family: BodyFamily,
     pub preset_name: String,
     pub size: SliderSize,
 }
@@ -72,7 +114,10 @@ impl MatrixPair {
             SliderSize::Small => "Small (0)",
             SliderSize::Big => "Big (1)",
         };
-        format!("{} | {} | {}", self.set_name, self.preset_name, size_str)
+        format!(
+            "{:?} | {} | {} | {}",
+            self.family, self.set_name, self.preset_name, size_str
+        )
     }
 
     /// Suffix corresponding to the endpoint index (`_0` or `_1`).
@@ -92,51 +137,46 @@ impl MatrixPair {
     }
 }
 
-/// Measured outcome for one parity evaluation.
+/// Measured outcome for one parity evaluation. Every field is measured; no
+/// sentinel values.
 #[derive(Debug, Clone)]
 pub struct ParityMeasurement {
+    pub family: BodyFamily,
     pub label: String,
+    pub native_path: PathBuf,
+    pub plan_blocks: usize,
     pub vertices: usize,
     pub max_deviation: f32,
     pub p99_deviation: f32,
     pub max_weight_diff: f32,
+    pub uv_max_diff: f32,
     pub triangles_exact: bool,
-    pub negative_control_max_deviation: f32,
+    pub bones_equal: bool,
+    pub bake_moved_source: f32,
+    pub negative_control_deviation: f32,
 }
 
-/// Discover the host CBBE preset to evaluate.
-///
-/// Priority:
-/// 1. `SCULPTO_CBBE_PRESET` environment variable
-/// 2. `- Zeroed Sliders -` when verified native batch build is found in `/tmp/opencode/bs-cbbe`
-/// 3. Standard host presets (`CBBE Curvy`, `CBBE Slim`, `CBBE Vanilla`)
-pub fn detect_cbbe_preset(home: &Path) -> String {
-    if let Some(var) = std::env::var_os("SCULPTO_CBBE_PRESET") {
-        return var.to_string_lossy().into_owned();
-    }
-    // When the verified opencode batch build is present, default to `- Zeroed Sliders -`
-    if Path::new("/tmp/opencode/bs-cbbe/meshes/actors/character/character assets/femalebody_1.nif")
-        .is_file()
-    {
-        return "- Zeroed Sliders -".to_string();
-    }
-    let presets_file = BodyFamily::Cbbe.preset_path(home);
-    if let Ok(Document::Presets(presets)) = Document::parse_file(&presets_file) {
-        for candidate in &[
-            "CBBE Curvy",
-            "CBBE Slim",
-            "CBBE Vanilla",
-            "- Zeroed Sliders -",
-        ] {
-            if presets.iter().any(|p| p.name == *candidate) {
-                return (*candidate).to_string();
-            }
-        }
-        if let Some(first) = presets.first() {
-            return first.name.clone();
+/// The female preset must be named; the suite never infers a native build's
+/// preset identity.
+fn cbbe_preset_name() -> String {
+    std::env::var("SCULPTO_CBBE_PRESET").unwrap_or_else(|_| {
+        panic!(
+            "SCULPTO_CBBE_PRESET must name the preset the native CBBE fixture \
+             was built with; the suite does not infer it"
+        )
+    })
+}
+
+/// Shared fixture gate: without `SCULPTO_BODYSLIDE_HOME` each entry point
+/// reports one explicit skip; with it, missing fixtures are failures.
+fn home_or_skip() -> Option<PathBuf> {
+    match std::env::var_os("SCULPTO_BODYSLIDE_HOME") {
+        Some(home) => Some(PathBuf::from(home)),
+        None => {
+            println!("SKIPPED: SCULPTO_BODYSLIDE_HOME is not set");
+            None
         }
     }
-    "CBBE Curvy".to_string()
 }
 
 /// Search for a native NIF matching the requested set, preset, and suffix.
@@ -216,14 +256,6 @@ fn find_native_nif(
         return Some(direct);
     }
 
-    // Host fixture: /tmp/opencode/bs-cbbe strictly for CBBE zeroed build
-    if output_file_stem == "femalebody" && preset_name == "- Zeroed Sliders -" {
-        let p = Path::new("/tmp/opencode/bs-cbbe").join(&full_rel_path);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-
     None
 }
 
@@ -245,70 +277,101 @@ fn load_presets(home: &Path, family: BodyFamily) -> Vec<Preset> {
     }
 }
 
+/// Select the shape in a parsed document that corresponds to the source body
+/// shape: same name when the writer kept it, else the largest shape.
+fn select_shape<'a>(
+    document: &'a NifDocument,
+    source_name: &str,
+    label: &str,
+    role: &str,
+) -> &'a NifShape {
+    document
+        .shapes
+        .iter()
+        .find(|s| s.name == source_name)
+        .unwrap_or_else(|| {
+            document
+                .shapes
+                .iter()
+                .max_by_key(|shape| shape.positions.len())
+                .unwrap_or_else(|| panic!("{label}: {role} NIF contains no shapes"))
+        })
+}
+
+/// Read and parse a NIF from `path`, panicking with the cell label on failure.
+fn read_nif(path: &Path, label: &str, role: &str) -> NifDocument {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("{label}: failed to read {role} NIF {path:?}: {e}"));
+    sculpto_nif::read(&bytes)
+        .unwrap_or_else(|e| panic!("{label}: failed to parse {role} NIF {path:?}: {e:?}"))
+}
+
 /// Run parity comparison on one cell of the matrix.
 ///
-/// Returns `Some(ParityMeasurement)` when native output exists and all assertions pass.
-/// Returns `None` when native output is absent, printing a skip notice.
-pub fn evaluate_pair(home: &Path, pair: &MatrixPair) -> Option<ParityMeasurement> {
+/// Every required fixture (native output for the cell and for its opposite
+/// endpoint) must exist: with `SCULPTO_BODYSLIDE_HOME` set a missing fixture
+/// is a failure, not a skip.
+pub fn evaluate_pair(home: &Path, pair: &MatrixPair) -> ParityMeasurement {
     let label = pair.label();
-    let project = load_project(home, pair.set_family);
-    let presets = load_presets(home, pair.preset_family);
+    let project = load_project(home, pair.family);
+    let presets = load_presets(home, pair.family);
 
-    let Some(preset) = presets.iter().find(|p| p.name == pair.preset_name) else {
-        println!(
-            "SKIPPED: {label} (preset not found in {:?})",
-            pair.preset_family.preset_path(home)
-        );
-        return None;
-    };
+    let preset = presets
+        .iter()
+        .find(|p| p.name == pair.preset_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: preset {:?} not found in {:?}",
+                pair.preset_name,
+                pair.family.preset_path(home)
+            )
+        });
 
-    let set = match project.sets.iter().find(|s| s.name == pair.set_name) {
-        Some(set) => set,
-        None => {
-            println!(
-                "SKIPPED: {label} (set not found in {:?})",
-                pair.set_family.osp_path(home)
-            );
-            return None;
-        }
-    };
+    let set = project
+        .sets
+        .iter()
+        .find(|s| s.name == pair.set_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: set {:?} not found in {:?}",
+                pair.set_name,
+                pair.family.osp_path(home)
+            )
+        });
 
-    // Locate matching native output
-    let Some(native_path) = find_native_nif(home, set, &pair.preset_name, pair.endpoint_suffix())
-    else {
-        println!("SKIPPED: {label} native output absent");
-        return None;
-    };
-
-    // Locate opposite native output for negative control
+    // Both endpoints are required: the cell comparison and its negative control.
+    let native_path = find_native_nif(home, set, &pair.preset_name, pair.endpoint_suffix())
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: required native fixture not found — with \
+                 SCULPTO_BODYSLIDE_HOME set a missing fixture is a failure, not a skip"
+            )
+        });
     let opposite_native_path =
-        find_native_nif(home, set, &pair.preset_name, pair.opposite_suffix());
+        find_native_nif(home, set, &pair.preset_name, pair.opposite_suffix()).unwrap_or_else(
+            || {
+                panic!(
+                    "{label}: opposite-endpoint native fixture not found; \
+                     the wrong-endpoint negative control is required"
+                )
+            },
+        );
 
     // Resolve bake plan
-    let plan = match BakePlan::resolve(&project, preset, pair.set_name, pair.size, home) {
-        Ok(plan) => plan,
-        Err(err) => panic!("{label}: plan failed to resolve: {err:?}"),
-    };
+    let plan = BakePlan::resolve(&project, preset, pair.set_name, pair.size, home)
+        .unwrap_or_else(|err| panic!("{label}: plan failed to resolve: {err:?}"));
     assert!(
         plan.unresolved.is_empty(),
         "{label}: unresolved morph records: {:?}",
         plan.unresolved
     );
+    let plan_blocks = plan.block_count();
 
-    // Read source NIF
+    // Read source NIF and select the primary body shape
     let folder = set.data_folder.replace('\\', "/");
     let source_file = set.source_file.replace('\\', "/");
     let source_path = home.join("ShapeData").join(folder).join(source_file);
-    let source_bytes = std::fs::read(&source_path)
-        .unwrap_or_else(|e| panic!("{label}: failed to read source NIF {:?}: {e}", source_path));
-    let source_doc = sculpto_nif::read(&source_bytes).unwrap_or_else(|e| {
-        panic!(
-            "{label}: failed to parse source NIF {:?}: {e:?}",
-            source_path
-        )
-    });
-
-    // Select primary body shape
+    let source_doc = read_nif(&source_path, &label, "source");
     let source_shape = source_doc
         .shapes
         .iter()
@@ -328,294 +391,350 @@ pub fn evaluate_pair(home: &Path, pair: &MatrixPair) -> Option<ParityMeasurement
         .apply(target_name, &source_shape.positions)
         .unwrap_or_else(|e| panic!("{label}: failed to apply offsets: {e:?}"));
 
-    // Read native NIF
-    let native_bytes = std::fs::read(&native_path)
-        .unwrap_or_else(|e| panic!("{label}: failed to read native NIF {:?}: {e}", native_path));
-    let native_doc = sculpto_nif::read(&native_bytes).unwrap_or_else(|e| {
-        panic!(
-            "{label}: failed to parse native NIF {:?}: {e:?}",
-            native_path
-        )
-    });
-    let native_shape = native_doc
-        .shapes
+    // Non-identity evidence for this cell: how far the bake moved the source.
+    let bake_moved_source = ours
         .iter()
-        .find(|s| s.name == source_shape.name)
-        .unwrap_or_else(|| {
-            native_doc
-                .shapes
-                .iter()
-                .max_by_key(|shape| shape.positions.len())
-                .unwrap_or_else(|| panic!("{label}: native NIF contains no shapes"))
-        });
+        .zip(&source_shape.positions)
+        .map(|(a, b)| distance(*a, *b))
+        .fold(0.0f32, f32::max);
 
-    // Assertion 1: vertex count exact
+    // Serialise the bake through our own writer so every comparison below is
+    // bake-vs-native: the artifact carries the baked positions and the
+    // arrays our pipeline passes through.
+    let bake_asset = MeshAsset {
+        positions: ours,
+        ..MeshAsset::from(source_shape)
+    };
+    let baked_bytes = write_se_shape(&bake_asset)
+        .unwrap_or_else(|e| panic!("{label}: our SE writer refused the baked body: {e:?}"));
+    let baked_doc = sculpto_nif::read(&baked_bytes)
+        .unwrap_or_else(|e| panic!("{label}: our written SE NIF failed to parse: {e:?}"));
+    let baked = baked_doc
+        .shapes
+        .first()
+        .unwrap_or_else(|| panic!("{label}: our written SE NIF contains no shapes"));
+
+    // Read native NIF and select the matching shape
+    let native_doc = read_nif(&native_path, &label, "native");
+    let native_shape = select_shape(&native_doc, &source_shape.name, &label, "native");
+
+    // Assertion: vertex counts (non-zero) before any zip
     assert_eq!(
-        ours.len(),
+        baked.positions.len(),
         native_shape.positions.len(),
-        "{label}: vertex counts differ (ours {} vs native {})",
-        ours.len(),
+        "{label}: vertex counts differ (bake {} vs native {})",
+        baked.positions.len(),
         native_shape.positions.len()
     );
+    assert!(
+        !baked.positions.is_empty(),
+        "{label}: empty vertex arrays cannot prove parity"
+    );
 
-    // Compute vertex deviations
-    let mut distances: Vec<f32> = ours
+    // Positions: per-vertex deviation bake vs native
+    let mut distances: Vec<f32> = baked
+        .positions
         .iter()
         .zip(&native_shape.positions)
         .map(|(a, b)| distance(*a, *b))
         .collect();
     distances.sort_by(|a, b| a.partial_cmp(b).expect("finite distances"));
-    let max_deviation = *distances.last().unwrap_or(&0.0);
+    let max_deviation = distances[distances.len() - 1];
     let p99_deviation = distances[(distances.len() as f64 * 0.99) as usize];
 
-    // Assertion 2: per-vertex max deviation <= 1e-6
+    // Assertion: per-vertex max deviation <= 1e-6
     assert!(
-        max_deviation <= 1e-6,
-        "{label}: per-vertex max deviation {:.9} exceeds tolerance 1e-6",
-        max_deviation
+        max_deviation <= POSITION_TOLERANCE_U,
+        "{label}: per-vertex max deviation {max_deviation:.9} exceeds tolerance \
+         {POSITION_TOLERANCE_U}"
     );
 
-    // Compute skin weight differences
-    let mut max_weight_diff = 0.0f32;
-    for (sw, nw) in source_shape.weights.iter().zip(&native_shape.weights) {
-        for (a, b) in sw.iter().zip(nw.iter()) {
-            let diff = (a - b).abs();
-            if diff > max_weight_diff {
-                max_weight_diff = diff;
-            }
-        }
-    }
-
-    // Assertion 3: weights <= 1e-4
+    // Assertion: UV counts (non-zero) before the zip; UVs within the f16 bound
+    assert_eq!(
+        baked.uvs.len(),
+        native_shape.uvs.len(),
+        "{label}: UV counts differ (bake {} vs native {})",
+        baked.uvs.len(),
+        native_shape.uvs.len()
+    );
+    assert!(!baked.uvs.is_empty(), "{label}: native body carries no UVs");
+    let uv_max_diff = baked
+        .uvs
+        .iter()
+        .zip(&native_shape.uvs)
+        .flat_map(|(a, b)| a.iter().zip(b.iter()))
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     assert!(
-        max_weight_diff <= 1e-4,
-        "{label}: max weight difference {:.9} exceeds tolerance 1e-4",
-        max_weight_diff
+        uv_max_diff <= UV_TOLERANCE,
+        "{label}: max UV difference {uv_max_diff:.9} exceeds tolerance {UV_TOLERANCE}"
     );
 
-    // Assertion 4: triangle set exact
-    let triangles_exact = source_shape.triangles == native_shape.triangles;
+    // Assertion: weight counts (non-zero) before the zip; weights within f16
+    assert_eq!(
+        baked.weights.len(),
+        native_shape.weights.len(),
+        "{label}: weighted vertex counts differ (bake {} vs native {})",
+        baked.weights.len(),
+        native_shape.weights.len()
+    );
+    assert!(
+        !baked.weights.is_empty(),
+        "{label}: native body carries no skin weights"
+    );
+    let max_weight_diff = baked
+        .weights
+        .iter()
+        .zip(&native_shape.weights)
+        .map(|(a, b)| max_abs_diff(a, b))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_weight_diff <= WEIGHT_TOLERANCE,
+        "{label}: max weight difference {max_weight_diff:.9} exceeds tolerance \
+         {WEIGHT_TOLERANCE}"
+    );
+
+    // Assertion: triangle set exact between bake and native
+    assert!(
+        !baked.triangles.is_empty(),
+        "{label}: native body carries no triangles"
+    );
+    let triangles_exact = baked.triangles == native_shape.triangles;
     assert!(
         triangles_exact,
-        "{label}: triangle set differs between source and native"
+        "{label}: triangle set differs between our bake and the native output"
     );
 
-    // Negative control: comparison against the other endpoint must fail
-    let negative_control_max_dev = if let Some(opp_path) = opposite_native_path {
-        let opp_bytes = std::fs::read(&opp_path).unwrap_or_else(|e| {
-            panic!(
-                "{label}: failed to read opposite native NIF {:?}: {e}",
-                opp_path
-            )
-        });
-        let opp_doc = sculpto_nif::read(&opp_bytes).unwrap_or_else(|e| {
-            panic!(
-                "{label}: failed to parse opposite native NIF {:?}: {e:?}",
-                opp_path
-            )
-        });
-        let opp_shape = opp_doc
-            .shapes
-            .iter()
-            .find(|s| s.name == source_shape.name)
-            .unwrap_or_else(|| {
-                opp_doc
-                    .shapes
-                    .iter()
-                    .max_by_key(|shape| shape.positions.len())
-                    .unwrap_or_else(|| panic!("{label}: opposite NIF has no shapes"))
-            });
-        let opp_dev = ours
-            .iter()
-            .zip(&opp_shape.positions)
-            .map(|(a, b)| distance(*a, *b))
-            .fold(0.0f32, f32::max);
-        assert!(
-            opp_dev > 1e-6,
-            "{label}: wrong-endpoint negative control failed: deviation {:.9} is <= 1e-6",
-            opp_dev
-        );
-        opp_dev
-    } else {
-        println!("  (negative control skipped: opposite endpoint file absent)");
-        0.0
-    };
+    // Assertion: bone list exact between bake and native
+    let bones_equal = baked.bones == native_shape.bones;
+    assert!(
+        bones_equal,
+        "{label}: bone lists differ between our bake and the native output"
+    );
 
+    // Negative control: the same baked artifact against the other endpoint
+    // must deviate well beyond parity; counts asserted before the zip.
+    let opp_doc = read_nif(&opposite_native_path, &label, "opposite native");
+    let opp_shape = select_shape(&opp_doc, &source_shape.name, &label, "opposite native");
+    assert_eq!(
+        baked.positions.len(),
+        opp_shape.positions.len(),
+        "{label}: opposite-endpoint vertex counts differ (bake {} vs native {})",
+        baked.positions.len(),
+        opp_shape.positions.len()
+    );
+    let negative_control_deviation = baked
+        .positions
+        .iter()
+        .zip(&opp_shape.positions)
+        .map(|(a, b)| distance(*a, *b))
+        .fold(0.0f32, f32::max);
+    assert!(
+        negative_control_deviation > NEGATIVE_CONTROL_MIN_DEVIATION_U,
+        "{label}: wrong-endpoint negative control failed: deviation \
+         {negative_control_deviation:.9} is <= {NEGATIVE_CONTROL_MIN_DEVIATION_U}"
+    );
+
+    // Per-cell provenance and numbers for the acceptance ledger.
     println!(
-        "PASS: {} ({} vertices, max dev {:.9} u, p99 {:.9} u, max weight diff {:.9}, triangles exact {}, neg control dev {:.6} u)",
+        "PASS: {} | native {} | {} vertices | bake-vs-native: max dev {max_deviation:.9} u, \
+         p99 {p99_deviation:.9} u, weight max {max_weight_diff:.9}, triangles exact \
+         {triangles_exact}, uv max {uv_max_diff:.9}, bones equal {bones_equal}",
         label,
-        ours.len(),
-        max_deviation,
-        p99_deviation,
-        max_weight_diff,
-        triangles_exact,
-        negative_control_max_dev
+        native_path.display(),
+        baked.positions.len(),
+    );
+    println!(
+        "  bake moved source by {bake_moved_source:.9} u | plan blocks {plan_blocks} | \
+         neg control (vs {}) dev {negative_control_deviation:.6} u > \
+         {NEGATIVE_CONTROL_MIN_DEVIATION_U}",
+        opposite_native_path.display(),
     );
 
-    Some(ParityMeasurement {
+    ParityMeasurement {
+        family: pair.family,
         label,
-        vertices: ours.len(),
+        native_path,
+        plan_blocks,
+        vertices: baked.positions.len(),
         max_deviation,
         p99_deviation,
         max_weight_diff,
+        uv_max_diff,
         triangles_exact,
-        negative_control_max_deviation: negative_control_max_dev,
-    })
+        bones_equal,
+        bake_moved_source,
+        negative_control_deviation,
+    }
 }
 
-/// Construct the eight matrix combinations (2 sets × 2 presets × 2 endpoints).
-pub fn build_matrix(home: &Path) -> Vec<MatrixPair> {
-    let cbbe_preset = detect_cbbe_preset(home);
+/// Construct the six same-family cells: two HIMBO presets and the env-named
+/// CBBE preset, each at both endpoints. Cross-family pairings are never built.
+pub fn build_matrix() -> Vec<MatrixPair> {
+    let cbbe_preset = cbbe_preset_name();
 
-    let sets = [
-        (BodyFamily::Himbo, "HIMBO Body - Vanilla Nevernude"),
-        (BodyFamily::Cbbe, "CBBE Body"),
-    ];
-    let presets = [
-        (BodyFamily::Himbo, "HIMBO Mike".to_string()),
-        (BodyFamily::Cbbe, cbbe_preset),
-    ];
-    let endpoints = [SliderSize::Small, SliderSize::Big];
-
-    let mut matrix = Vec::with_capacity(8);
-    for &(set_family, set_name) in &sets {
-        for (preset_family, preset_name) in &presets {
-            for &size in &endpoints {
-                matrix.push(MatrixPair {
-                    set_family,
-                    set_name,
-                    preset_family: *preset_family,
-                    preset_name: preset_name.clone(),
-                    size,
-                });
-            }
+    let mut matrix = Vec::with_capacity(EXPECTED_CELLS);
+    for &size in &[SliderSize::Small, SliderSize::Big] {
+        for preset_name in ["HIMBO Mike", "HIMBO Chonky"] {
+            matrix.push(MatrixPair {
+                family: BodyFamily::Himbo,
+                set_name: "HIMBO Body - Vanilla Nevernude",
+                preset_name: preset_name.to_string(),
+                size,
+            });
         }
+        matrix.push(MatrixPair {
+            family: BodyFamily::Cbbe,
+            set_name: "CBBE Body",
+            preset_name: cbbe_preset.clone(),
+            size,
+        });
     }
     matrix
 }
 
 #[test]
-fn eight_pair_matrix_sweep() {
-    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME").map(PathBuf::from) else {
-        println!("SKIPPED: SCULPTO_BODYSLIDE_HOME is not set");
+fn six_cell_same_family_matrix_sweep() {
+    let Some(home) = home_or_skip() else {
         return;
     };
 
-    let matrix = build_matrix(&home);
-    assert_eq!(matrix.len(), 8, "matrix must contain exactly 8 pairs");
+    let matrix = build_matrix();
+    assert_eq!(
+        matrix.len(),
+        EXPECTED_CELLS,
+        "matrix must contain exactly {EXPECTED_CELLS} same-family cells \
+         (4 HIMBO + 2 CBBE)"
+    );
 
-    println!("=== Eight-Pair Native Parity Matrix ===");
-    let mut passed = Vec::new();
-    let mut skipped = Vec::new();
+    println!("=== Same-Family Native Parity Matrix ===");
+    println!("Home: {}", home.display());
+    let passed: Vec<ParityMeasurement> = matrix
+        .iter()
+        .map(|pair| evaluate_pair(&home, pair))
+        .collect();
 
-    for pair in &matrix {
-        match evaluate_pair(&home, pair) {
-            Some(measurement) => passed.push(measurement),
-            None => skipped.push(pair.label()),
-        }
-    }
-
-    println!("=== Matrix Summary ===");
-    println!("Total cells: {}", matrix.len());
-    println!("Evaluated (PASS): {}", passed.len());
-    println!("Skipped (ABSENT): {}", skipped.len());
-    for m in &passed {
-        println!(
-            "  [PASS] {} — max dev: {:.9} u, neg control: {:.6} u",
-            m.label, m.max_deviation, m.negative_control_max_deviation
+    // Every cell must evaluate when the fixture home is set; per-family
+    // coverage is asserted explicitly.
+    assert_eq!(
+        passed.len(),
+        matrix.len(),
+        "every cell must evaluate when SCULPTO_BODYSLIDE_HOME is set"
+    );
+    for family in [BodyFamily::Himbo, BodyFamily::Cbbe] {
+        let expected = matrix.iter().filter(|p| p.family == family).count();
+        let evaluated = passed.iter().filter(|m| m.family == family).count();
+        assert_eq!(
+            evaluated, expected,
+            "{family:?} family must cover all {expected} of its cells"
         );
     }
-    for s in &skipped {
-        println!("  [SKIPPED] {}", s);
-    }
 
-    // When native outputs are present on host, at least the HIMBO Mike default body must pass
-    if !passed.is_empty() {
-        assert!(
-            passed.iter().any(|m| m.label.contains("HIMBO Mike")),
-            "HIMBO Mike must pass when fixtures exist"
+    // Non-identity guard: somewhere the bake must have moved vertices.
+    assert!(
+        passed
+            .iter()
+            .any(|m| m.plan_blocks > 0 && m.bake_moved_source > NON_IDENTITY_MIN_DEVIATION_U),
+        "no cell proved the bake moved vertices (max|ours - source| > \
+         {NON_IDENTITY_MIN_DEVIATION_U} with a non-empty plan); the suite would \
+         pass on an identity transform"
+    );
+
+    println!("=== Matrix Summary ===");
+    println!(
+        "Total cells: {} / Evaluated (PASS): {} / Skipped: 0",
+        matrix.len(),
+        passed.len()
+    );
+    for m in &passed {
+        println!(
+            "  [PASS] {} — {} vertices, max dev {:.9} u, p99 {:.9} u, weight max {:.9}, \
+             triangles exact {}, uv max {:.9}, bones equal {}, neg control {:.6} u, \
+             bake moved source {:.9} u, plan blocks {}, native {}",
+            m.label,
+            m.vertices,
+            m.max_deviation,
+            m.p99_deviation,
+            m.max_weight_diff,
+            m.triangles_exact,
+            m.uv_max_diff,
+            m.bones_equal,
+            m.negative_control_deviation,
+            m.bake_moved_source,
+            m.plan_blocks,
+            m.native_path.display()
         );
     }
 }
 
 #[test]
 fn himbo_mike_small_endpoint() {
-    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME").map(PathBuf::from) else {
+    let Some(home) = home_or_skip() else {
         return;
     };
     let pair = MatrixPair {
-        set_family: BodyFamily::Himbo,
+        family: BodyFamily::Himbo,
         set_name: "HIMBO Body - Vanilla Nevernude",
-        preset_family: BodyFamily::Himbo,
         preset_name: "HIMBO Mike".to_string(),
         size: SliderSize::Small,
     };
-    if let Some(m) = evaluate_pair(&home, &pair) {
-        assert!(m.max_deviation <= 1e-6);
-        assert!(m.max_weight_diff <= 1e-4);
-        assert!(m.triangles_exact);
-        assert!(m.negative_control_max_deviation > 0.1);
-    }
+    let m = evaluate_pair(&home, &pair);
+    assert!(m.max_deviation <= POSITION_TOLERANCE_U);
+    assert!(m.max_weight_diff <= WEIGHT_TOLERANCE);
+    assert!(m.triangles_exact);
+    assert!(m.negative_control_deviation > NEGATIVE_CONTROL_MIN_DEVIATION_U);
 }
 
 #[test]
 fn himbo_mike_big_endpoint() {
-    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME").map(PathBuf::from) else {
+    let Some(home) = home_or_skip() else {
         return;
     };
     let pair = MatrixPair {
-        set_family: BodyFamily::Himbo,
+        family: BodyFamily::Himbo,
         set_name: "HIMBO Body - Vanilla Nevernude",
-        preset_family: BodyFamily::Himbo,
         preset_name: "HIMBO Mike".to_string(),
         size: SliderSize::Big,
     };
-    if let Some(m) = evaluate_pair(&home, &pair) {
-        assert!(m.max_deviation <= 1e-6);
-        assert!(m.max_weight_diff <= 1e-4);
-        assert!(m.triangles_exact);
-        assert!(m.negative_control_max_deviation > 0.1);
-    }
+    let m = evaluate_pair(&home, &pair);
+    assert!(m.max_deviation <= POSITION_TOLERANCE_U);
+    assert!(m.max_weight_diff <= WEIGHT_TOLERANCE);
+    assert!(m.triangles_exact);
+    assert!(m.negative_control_deviation > NEGATIVE_CONTROL_MIN_DEVIATION_U);
 }
 
 #[test]
 fn cbbe_small_endpoint() {
-    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME").map(PathBuf::from) else {
+    let Some(home) = home_or_skip() else {
         return;
     };
-    let cbbe_preset = detect_cbbe_preset(&home);
     let pair = MatrixPair {
-        set_family: BodyFamily::Cbbe,
+        family: BodyFamily::Cbbe,
         set_name: "CBBE Body",
-        preset_family: BodyFamily::Cbbe,
-        preset_name: cbbe_preset,
+        preset_name: cbbe_preset_name(),
         size: SliderSize::Small,
     };
-    if let Some(m) = evaluate_pair(&home, &pair) {
-        assert!(m.max_deviation <= 1e-6);
-        assert!(m.max_weight_diff <= 1e-4);
-        assert!(m.triangles_exact);
-        assert!(m.negative_control_max_deviation > 0.1);
-    }
+    let m = evaluate_pair(&home, &pair);
+    assert!(m.max_deviation <= POSITION_TOLERANCE_U);
+    assert!(m.max_weight_diff <= WEIGHT_TOLERANCE);
+    assert!(m.triangles_exact);
+    assert!(m.negative_control_deviation > NEGATIVE_CONTROL_MIN_DEVIATION_U);
 }
 
 #[test]
 fn cbbe_big_endpoint() {
-    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME").map(PathBuf::from) else {
+    let Some(home) = home_or_skip() else {
         return;
     };
-    let cbbe_preset = detect_cbbe_preset(&home);
     let pair = MatrixPair {
-        set_family: BodyFamily::Cbbe,
+        family: BodyFamily::Cbbe,
         set_name: "CBBE Body",
-        preset_family: BodyFamily::Cbbe,
-        preset_name: cbbe_preset,
+        preset_name: cbbe_preset_name(),
         size: SliderSize::Big,
     };
-    if let Some(m) = evaluate_pair(&home, &pair) {
-        assert!(m.max_deviation <= 1e-6);
-        assert!(m.max_weight_diff <= 1e-4);
-        assert!(m.triangles_exact);
-        assert!(m.negative_control_max_deviation > 0.1);
-    }
+    let m = evaluate_pair(&home, &pair);
+    assert!(m.max_deviation <= POSITION_TOLERANCE_U);
+    assert!(m.max_weight_diff <= WEIGHT_TOLERANCE);
+    assert!(m.triangles_exact);
+    assert!(m.negative_control_deviation > NEGATIVE_CONTROL_MIN_DEVIATION_U);
 }
