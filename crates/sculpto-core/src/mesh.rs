@@ -121,6 +121,35 @@ pub enum MaterialDefect {
     EmptyTexturePath(TextureSlot),
 }
 
+/// A typed reference to the physics sidecar. The sidecar document itself is
+/// owned by the physics adapter; the model carries no solver types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhysicsRef {
+    /// Path to the sidecar file, relative to the asset.
+    Path(String),
+    /// Inline sidecar document, for adapters that cannot ship a second file.
+    Inline(String),
+}
+
+impl PhysicsRef {
+    /// The sidecar document or path this reference names.
+    pub fn sidecar(&self) -> &str {
+        match self {
+            PhysicsRef::Path(path) => path,
+            PhysicsRef::Inline(document) => document,
+        }
+    }
+}
+
+/// A named physics-reference defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicsDefect {
+    /// The path is empty.
+    EmptyPath,
+    /// The inline document is empty.
+    EmptyInline,
+}
+
 /// One export mesh: flat arena, per-triangle partitions, sparse morphs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeshAsset {
@@ -144,6 +173,8 @@ pub struct MeshAsset {
     pub morphs: Vec<MorphTarget>,
     /// Material slots.
     pub materials: Vec<MaterialSlot>,
+    /// Physics sidecar reference, when the asset carries one.
+    pub physics: Option<PhysicsRef>,
 }
 
 /// One sparse offset in the `.tri` projection: a `u16` vertex index.
@@ -263,6 +294,8 @@ pub enum MeshError {
     UnmatchedPartition { triangle: usize },
     /// A material slot violates a named rule.
     Material { slot: usize, defect: MaterialDefect },
+    /// The physics reference is malformed.
+    Physics { defect: PhysicsDefect },
 }
 
 /// Why a mesh cannot be split.
@@ -433,6 +466,20 @@ impl MeshAsset {
                 }
             }
         }
+
+        match &self.physics {
+            Some(PhysicsRef::Path(path)) if path.trim().is_empty() => {
+                return Err(MeshError::Physics {
+                    defect: PhysicsDefect::EmptyPath,
+                });
+            }
+            Some(PhysicsRef::Inline(document)) if document.trim().is_empty() => {
+                return Err(MeshError::Physics {
+                    defect: PhysicsDefect::EmptyInline,
+                });
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -573,6 +620,7 @@ impl MeshAsset {
             skin,
             morphs,
             materials: self.materials.clone(),
+            physics: self.physics.clone(),
         }
     }
 
@@ -948,6 +996,47 @@ mod tests {
             Err(MeshError::NonFinite {
                 attribute: "weights",
                 index: 0
+            })
+        );
+    }
+
+    #[test]
+    fn physics_reference_is_typed_and_split_copies_it() {
+        let mut mesh = one_triangle();
+        mesh.physics = Some(PhysicsRef::Path("robe.sculpto-phys.json".into()));
+        mesh.validate().expect("a path reference is valid");
+        assert_eq!(
+            mesh.physics.as_ref().expect("reference").sidecar(),
+            "robe.sculpto-phys.json"
+        );
+
+        let shapes = mesh.split_for_limit(3).expect("splits");
+        assert!(shapes.iter().all(|shape| shape.physics == mesh.physics));
+
+        mesh.physics = Some(PhysicsRef::Inline("{\"constraints\":[]}".into()));
+        mesh.validate().expect("an inline reference is valid");
+        assert_eq!(
+            mesh.physics.as_ref().expect("reference").sidecar(),
+            "{\"constraints\":[]}"
+        );
+    }
+
+    #[test]
+    fn physics_reference_negative_controls_are_named() {
+        let mut mesh = one_triangle();
+        mesh.physics = Some(PhysicsRef::Path(String::new()));
+        assert_eq!(
+            mesh.validate(),
+            Err(MeshError::Physics {
+                defect: PhysicsDefect::EmptyPath
+            })
+        );
+
+        mesh.physics = Some(PhysicsRef::Inline("  ".into()));
+        assert_eq!(
+            mesh.validate(),
+            Err(MeshError::Physics {
+                defect: PhysicsDefect::EmptyInline
             })
         );
     }
