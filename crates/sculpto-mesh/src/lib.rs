@@ -26,6 +26,7 @@ pub mod check;
 pub mod classify;
 pub mod conform;
 pub mod control;
+pub mod garment;
 pub mod intake;
 pub mod intake_gltf;
 pub mod surface;

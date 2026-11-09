@@ -17,6 +17,7 @@ pub mod errors;
 mod handlers;
 pub mod obj;
 pub mod ops;
+pub mod rules;
 
 /// A stable command identifier.
 ///
@@ -32,6 +33,16 @@ pub enum CommandId {
     Bake,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,
+    /// Offset a body surface into a garment shell, with boundary relief.
+    OutfitOffsets,
+    /// Scale and move a raw asset in front of the body for one garment class.
+    OutfitPlace,
+    /// Cut the body band one garment class covers.
+    OutfitBand,
+    /// Fill garment UVs by ray-casting the placed raw asset.
+    OutfitProjection,
+    /// Transfer body weights to a garment and unpose its rest geometry.
+    OutfitWeights,
     /// Read one shape from a NIF and write it as an OBJ.
     ExportObj,
     /// Bake one shape at both weight endpoints and write them as NIFs.
@@ -48,6 +59,11 @@ impl CommandId {
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
             CommandId::OutfitFit => "outfit.fit",
+            CommandId::OutfitOffsets => "outfit.offsets",
+            CommandId::OutfitPlace => "outfit.place",
+            CommandId::OutfitBand => "outfit.band",
+            CommandId::OutfitProjection => "outfit.projection",
+            CommandId::OutfitWeights => "outfit.weights",
             CommandId::ExportObj => "export.obj",
             CommandId::ExportPair => "export.pair",
             CommandId::ExportNif => "export.nif",
@@ -228,6 +244,46 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::fit,
     },
     Spec {
+        id: CommandId::OutfitOffsets,
+        summary: "Offset a body surface into a garment shell, with boundary relief.",
+        mutates: false,
+        stub: false,
+        schema: rules::offsets_schema,
+        handler: rules::offsets,
+    },
+    Spec {
+        id: CommandId::OutfitPlace,
+        summary: "Scale and move a raw asset in front of the body for one garment class.",
+        mutates: false,
+        stub: false,
+        schema: rules::place_schema,
+        handler: rules::place,
+    },
+    Spec {
+        id: CommandId::OutfitBand,
+        summary: "Cut the body band one garment class covers.",
+        mutates: false,
+        stub: false,
+        schema: rules::band_schema,
+        handler: rules::band,
+    },
+    Spec {
+        id: CommandId::OutfitProjection,
+        summary: "Fill garment UVs by ray-casting the placed raw asset.",
+        mutates: false,
+        stub: false,
+        schema: rules::projection_schema,
+        handler: rules::projection,
+    },
+    Spec {
+        id: CommandId::OutfitWeights,
+        summary: "Transfer body weights to a garment and unpose its rest geometry.",
+        mutates: false,
+        stub: false,
+        schema: rules::weights_schema,
+        handler: rules::weights,
+    },
+    Spec {
         id: CommandId::ExportObj,
         summary: "Read one shape from a NIF and write it as an OBJ.",
         mutates: true,
@@ -336,6 +392,11 @@ mod tests {
         for id in [
             "bake",
             "outfit.fit",
+            "outfit.offsets",
+            "outfit.place",
+            "outfit.band",
+            "outfit.projection",
+            "outfit.weights",
             "export.obj",
             "export.pair",
             "export.nif",
