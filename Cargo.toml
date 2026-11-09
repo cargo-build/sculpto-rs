@@ -16,4 +16,4 @@ sculpto-bake = { path = "crates/sculpto-bake" }
 sculpto-mesh = { path = "crates/sculpto-mesh" }
 sculpto-nif = { path = "crates/sculpto-nif" }
 sculpto-engine = { path = "crates/sculpto-engine" }
-roxmltree = "0.20"
+roxmltree = "0.21"
