@@ -33,17 +33,45 @@ pub struct MorphTarget {
     pub deltas: Vec<MorphDelta>,
 }
 
+/// One ordered skin: bone names and four influences per vertex.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Skin {
+    /// Bone names, indexed by [`Self::indices`].
+    pub bones: Vec<String>,
+    /// Four bone indices per vertex.
+    pub indices: Vec<[u16; 4]>,
+    /// Four weights per vertex, parallel to [`Self::indices`].
+    pub weights: Vec<[f32; 4]>,
+}
+
+/// One material slot. Format-specific fields stay in the adapters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaterialSlot {
+    /// Slot name, as authored.
+    pub name: String,
+}
+
 /// One export mesh: flat arena, per-triangle partitions, sparse morphs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeshAsset {
     /// Vertex positions.
     pub positions: Vec<[f32; 3]>,
+    /// Vertex normals; empty or one per position.
+    pub normals: Vec<[f32; 3]>,
+    /// Vertex UVs; empty or one per position.
+    pub uvs: Vec<[f32; 2]>,
+    /// Vertex tangents; empty or one per position.
+    pub tangents: Vec<[f32; 4]>,
     /// Triangle indices into [`Self::positions`].
     pub triangles: Vec<[u32; 3]>,
     /// One partition id per triangle.
     pub triangle_partitions: Vec<PartitionId>,
+    /// One ordered skin, when the mesh is skinned.
+    pub skin: Option<Skin>,
     /// Morph targets, sparse and vertex-sorted.
     pub morphs: Vec<MorphTarget>,
+    /// Material slots.
+    pub materials: Vec<MaterialSlot>,
 }
 
 /// Why a mesh cannot be split.
@@ -63,6 +91,13 @@ pub enum SplitError {
     MorphVertexOutOfRange,
     /// A morph target is not strictly sorted by vertex.
     MorphDeltasNotSorted,
+    /// An optional per-vertex attribute has a length other than zero or the arena.
+    AttributeLengthMismatch { attribute: &'static str },
+    /// Skin influences or weights do not match the arena.
+    SkinLengthMismatch,
+    /// A morph delta points at a vertex no triangle references; the split
+    /// cannot attach it to any output shape.
+    UnreferencedMorphVertex { target: usize, vertex: u32 },
 }
 
 impl MeshAsset {
@@ -70,6 +105,21 @@ impl MeshAsset {
     pub fn validate(&self) -> Result<(), SplitError> {
         if self.triangles.len() != self.triangle_partitions.len() {
             return Err(SplitError::PartitionLengthMismatch);
+        }
+        for (name, len) in [
+            ("normals", self.normals.len()),
+            ("uvs", self.uvs.len()),
+            ("tangents", self.tangents.len()),
+        ] {
+            if len != 0 && len != self.positions.len() {
+                return Err(SplitError::AttributeLengthMismatch { attribute: name });
+            }
+        }
+        if let Some(skin) = &self.skin
+            && (skin.indices.len() != self.positions.len()
+                || skin.weights.len() != self.positions.len())
+        {
+            return Err(SplitError::SkinLengthMismatch);
         }
         for triangle in &self.triangles {
             for vertex in triangle {
@@ -109,6 +159,25 @@ impl MeshAsset {
         }
         if max_vertices < 3 {
             return Err(SplitError::LimitTooSmall);
+        }
+
+        let mut referenced = vec![false; self.positions.len()];
+        for triangle in &self.triangles {
+            for vertex in triangle {
+                referenced[*vertex as usize] = true;
+            }
+        }
+        for (target, morph) in self.morphs.iter().enumerate() {
+            if let Some(delta) = morph
+                .deltas
+                .iter()
+                .find(|delta| !referenced[delta.vertex as usize])
+            {
+                return Err(SplitError::UnreferencedMorphVertex {
+                    target,
+                    vertex: delta.vertex,
+                });
+            }
         }
 
         let mut by_partition: BTreeMap<PartitionId, Vec<usize>> = BTreeMap::new();
@@ -158,6 +227,14 @@ impl MeshAsset {
             .iter()
             .map(|vertex| self.positions[*vertex as usize])
             .collect();
+        let normals = self.gather(&chunk.vertices, &self.normals);
+        let uvs = self.gather(&chunk.vertices, &self.uvs);
+        let tangents = self.gather(&chunk.vertices, &self.tangents);
+        let skin = self.skin.as_ref().map(|skin| Skin {
+            bones: skin.bones.clone(),
+            indices: self.gather(&chunk.vertices, &skin.indices),
+            weights: self.gather(&chunk.vertices, &skin.weights),
+        });
         let morphs = self
             .morphs
             .iter()
@@ -185,10 +262,25 @@ impl MeshAsset {
         chunk.vertices.clear();
         Self {
             positions,
+            normals,
+            uvs,
+            tangents,
             triangles,
             triangle_partitions,
+            skin,
             morphs,
+            materials: self.materials.clone(),
         }
+    }
+
+    fn gather<T: Copy>(&self, vertices: &[u32], values: &[T]) -> Vec<T> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        vertices
+            .iter()
+            .map(|vertex| values[*vertex as usize])
+            .collect()
     }
 }
 
@@ -245,6 +337,7 @@ mod tests {
                         .collect(),
                 },
             ],
+            ..MeshAsset::default()
         };
         mesh.validate().expect("valid");
         let before_positions: Vec<_> = mesh.positions.clone();
@@ -312,6 +405,7 @@ mod tests {
                 PartitionId(7),
             ],
             morphs: vec![target("m", 0)],
+            ..MeshAsset::default()
         };
         let shapes = mesh.split_for_limit(4).expect("splits");
         assert_eq!(shapes.len(), 4);
@@ -334,6 +428,79 @@ mod tests {
     }
 
     #[test]
+    fn split_preserves_attributes_skin_and_materials() {
+        let positions: Vec<[f32; 3]> = (0..6).map(|i| [i as f32, 0.0, 0.0]).collect();
+        let mesh = MeshAsset {
+            normals: positions.clone(),
+            uvs: (0..6).map(|i| [i as f32 / 10.0, 0.5]).collect(),
+            tangents: (0..6).map(|i| [1.0, 0.0, 0.0, i as f32]).collect(),
+            skin: Some(Skin {
+                bones: vec!["root".into()],
+                indices: vec![[0, 0, 0, 0]; 6],
+                weights: vec![[1.0, 0.0, 0.0, 0.0]; 6],
+            }),
+            positions,
+            triangles: vec![[0, 1, 2], [3, 4, 5]],
+            triangle_partitions: vec![PartitionId(1), PartitionId(1)],
+            morphs: Vec::new(),
+            materials: vec![MaterialSlot {
+                name: "robe".into(),
+            }],
+        };
+        let shapes = mesh.split_for_limit(3).expect("splits");
+        assert_eq!(shapes.len(), 2);
+        for shape in &shapes {
+            assert_eq!(shape.normals, shape.positions);
+            assert_eq!(shape.uvs.len(), 3);
+            assert_eq!(shape.tangents.len(), 3);
+            let skin = shape.skin.as_ref().expect("skin");
+            assert_eq!(skin.indices.len(), 3);
+            assert_eq!(skin.weights.len(), 3);
+            assert_eq!(shape.materials, mesh.materials);
+            shape.validate().expect("valid");
+        }
+
+        let mut bad_normals = mesh.clone();
+        bad_normals.normals.pop();
+        assert_eq!(
+            bad_normals.split_for_limit(3),
+            Err(SplitError::AttributeLengthMismatch {
+                attribute: "normals"
+            })
+        );
+        let mut bad_skin = mesh;
+        bad_skin.skin.as_mut().expect("skin").weights.pop();
+        assert_eq!(
+            bad_skin.split_for_limit(3),
+            Err(SplitError::SkinLengthMismatch)
+        );
+    }
+
+    #[test]
+    fn an_unreferenced_morph_delta_is_refused_not_dropped() {
+        let mesh = MeshAsset {
+            positions: vec![[0.0; 3]; 4],
+            triangles: vec![[0, 1, 2]],
+            triangle_partitions: vec![PartitionId(0)],
+            morphs: vec![MorphTarget {
+                name: "loose".into(),
+                deltas: vec![MorphDelta {
+                    vertex: 3,
+                    position: [1.0, 0.0, 0.0],
+                }],
+            }],
+            ..MeshAsset::default()
+        };
+        assert_eq!(
+            mesh.split_for_limit(65_535),
+            Err(SplitError::UnreferencedMorphVertex {
+                target: 0,
+                vertex: 3
+            })
+        );
+    }
+
+    #[test]
     fn negative_controls_are_named() {
         assert_eq!(
             MeshAsset::default().split_for_limit(4),
@@ -345,6 +512,7 @@ mod tests {
             triangles: vec![[0, 1, 2]],
             triangle_partitions: vec![PartitionId(0)],
             morphs: Vec::new(),
+            ..MeshAsset::default()
         };
         assert_eq!(one.split_for_limit(0), Err(SplitError::ZeroLimit));
         assert_eq!(one.split_for_limit(2), Err(SplitError::LimitTooSmall));

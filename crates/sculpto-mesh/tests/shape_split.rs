@@ -69,6 +69,7 @@ fn produced_garment_splits_into_se_legal_shapes() {
                 triangles,
                 triangle_partitions: vec![PartitionId(0); triangle_count],
                 morphs,
+                ..MeshAsset::default()
             };
             if best
                 .as_ref()
