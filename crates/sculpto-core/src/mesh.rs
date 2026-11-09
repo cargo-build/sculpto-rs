@@ -76,6 +76,88 @@ pub struct MeshAsset {
     pub materials: Vec<MaterialSlot>,
 }
 
+/// One sparse offset in the `.tri` projection: a `u16` vertex index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TriOffset {
+    /// Vertex index, narrowed to the `.tri` field width.
+    pub vertex: u16,
+    /// Position displacement.
+    pub position: [f32; 3],
+}
+
+/// One named `.tri` morph: sparse offsets sorted by vertex.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriMorph {
+    /// Morph name.
+    pub name: String,
+    /// Sparse offsets.
+    pub offsets: Vec<TriOffset>,
+}
+
+/// One `.tri` shape: the sparse morph model the byte writer consumes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriShape {
+    /// Shape name.
+    pub name: String,
+    /// Vertex count the offsets address.
+    pub vertex_count: u32,
+    /// Morphs, one per model target.
+    pub morphs: Vec<TriMorph>,
+}
+
+/// Why a mesh cannot be projected into the `.tri` model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriError {
+    /// The arena has more vertices than the `u32` count can hold.
+    TooManyVertices,
+    /// A morph offset does not fit the `u16` vertex field; split the shape first.
+    IndexOutOfRange { target: usize, vertex: u32 },
+}
+
+impl MeshAsset {
+    /// Project the model into the sparse `.tri` model.
+    ///
+    /// The `.tri` layout stores one `u16` index per offset and has no target
+    /// cap, so every model target survives. A shape above 65 535 vertices must
+    /// be split first ([`Self::split_for_limit`]); this projection refuses an
+    /// index it cannot narrow.
+    pub fn tri_shape(&self) -> Result<TriShape, TriError> {
+        let vertex_count =
+            u32::try_from(self.positions.len()).map_err(|_| TriError::TooManyVertices)?;
+        let morphs = self
+            .morphs
+            .iter()
+            .enumerate()
+            .map(|(target, morph)| {
+                let offsets = morph
+                    .deltas
+                    .iter()
+                    .map(|delta| {
+                        let vertex =
+                            u16::try_from(delta.vertex).map_err(|_| TriError::IndexOutOfRange {
+                                target,
+                                vertex: delta.vertex,
+                            })?;
+                        Ok(TriOffset {
+                            vertex,
+                            position: delta.position,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, TriError>>()?;
+                Ok(TriMorph {
+                    name: morph.name.clone(),
+                    offsets,
+                })
+            })
+            .collect::<Result<Vec<_>, TriError>>()?;
+        Ok(TriShape {
+            name: self.name.clone(),
+            vertex_count,
+            morphs,
+        })
+    }
+}
+
 /// A validation defect over the aligned model arrays.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MeshError {
@@ -765,6 +847,59 @@ mod tests {
             Err(MeshError::NonFinite {
                 attribute: "weights",
                 index: 0
+            })
+        );
+    }
+
+    #[test]
+    fn tri_model_accepts_a_65th_target_and_keeps_it_sparse() {
+        let mut mesh = one_triangle();
+        mesh.name = "body".into();
+        mesh.morphs = (0..65)
+            .map(|target| MorphTarget {
+                name: format!("m{target}"),
+                deltas: vec![MorphDelta {
+                    vertex: target % 3,
+                    position: [target as f32, 0.0, 0.0],
+                }],
+            })
+            .collect();
+        mesh.validate().expect("65 targets are valid");
+        let tri = mesh.tri_shape().expect("fits the .tri model");
+        assert_eq!(tri.name, "body");
+        assert_eq!(tri.vertex_count, 3);
+        assert_eq!(tri.morphs.len(), 65);
+        assert_eq!(tri.morphs[64].name, "m64");
+        assert_eq!(tri.morphs[64].offsets.len(), 1);
+        assert_eq!(tri.morphs[64].offsets[0].vertex, 1);
+        assert_eq!(tri.morphs[64].offsets[0].position, [64.0, 0.0, 0.0]);
+
+        let shapes = mesh.split_for_limit(65_535).expect("splits");
+        assert_eq!(shapes[0].morphs.len(), 65);
+        assert_eq!(shapes[0].tri_shape().expect("tri").morphs.len(), 65);
+    }
+
+    #[test]
+    fn tri_model_refuses_an_index_it_cannot_narrow() {
+        let mut mesh = MeshAsset {
+            positions: vec![[0.0; 3]; 70_000],
+            ..MeshAsset::default()
+        };
+        mesh.triangles = vec![[0, 1, 2]];
+        mesh.triangle_partitions = vec![PartitionId(0)];
+        mesh.morphs = vec![MorphTarget {
+            name: "far".into(),
+            deltas: vec![MorphDelta {
+                vertex: 69_999,
+                position: [1.0, 0.0, 0.0],
+            }],
+        }];
+        mesh.validate().expect("the model itself is valid");
+        assert_eq!(
+            mesh.tri_shape(),
+            Err(TriError::IndexOutOfRange {
+                target: 0,
+                vertex: 69_999
             })
         );
     }
