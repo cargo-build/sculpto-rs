@@ -465,3 +465,84 @@ fn d03_truncated_file_returns_typed_error() {
         );
     }
 }
+
+/// D04: Generates acceptance `.tri` fixture containing morphs for native BodySlide / Outfit Studio shapes:
+/// `HIMBO - Body` and `BaseShape`.
+#[test]
+fn d04_generate_acceptance_tri() {
+    let himbo_shape = TriShape {
+        name: "HIMBO - Body".to_string(),
+        vertex_count: Some(9307),
+        position_morphs: vec![TriPositionMorph {
+            name: "D04BicepsSize".to_string(),
+            offsets: vec![
+                PositionOffset {
+                    vertex: 10,
+                    offset: [1.5, -2.0, 3.25],
+                },
+                PositionOffset {
+                    vertex: 42,
+                    offset: [-5.0, 10.0, 0.0],
+                },
+                PositionOffset {
+                    vertex: 100,
+                    offset: [2.0, 4.0, -1.0],
+                },
+            ],
+        }],
+        uv_morphs: vec![TriUvMorph {
+            name: "D04BicepsUV".to_string(),
+            offsets: vec![
+                UvOffset {
+                    vertex: 10,
+                    offset: [0.01, -0.02],
+                },
+                UvOffset {
+                    vertex: 42,
+                    offset: [0.05, 0.02],
+                },
+            ],
+        }],
+    };
+
+    let base_shape = TriShape {
+        name: "BaseShape".to_string(),
+        vertex_count: Some(18436),
+        position_morphs: vec![TriPositionMorph {
+            name: "D04WaistNarrow".to_string(),
+            offsets: vec![
+                PositionOffset {
+                    vertex: 50,
+                    offset: [0.5, -1.0, 2.0],
+                },
+                PositionOffset {
+                    vertex: 120,
+                    offset: [-2.0, 3.0, 1.5],
+                },
+            ],
+        }],
+        uv_morphs: vec![TriUvMorph {
+            name: "D04WaistUV".to_string(),
+            offsets: vec![UvOffset {
+                vertex: 50,
+                offset: [-0.01, 0.03],
+            }],
+        }],
+    };
+
+    let doc = TriFile::new(vec![himbo_shape, base_shape]);
+    let bytes = write_tri(&doc).expect("writing acceptance tri must succeed");
+
+    // Ensure our reader decodes it with zero difference
+    let roundtrip = read_tri(&bytes).expect("decoding acceptance tri must succeed");
+    assert_eq!(roundtrip.shapes.len(), 2);
+    assert_eq!(roundtrip.shapes[0].name, "HIMBO - Body");
+    assert_eq!(roundtrip.shapes[1].name, "BaseShape");
+
+    let out_path = std::path::Path::new("/tmp/opencode/d04_acceptance.tri");
+    if let Some(parent) = out_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(out_path, &bytes)
+        .expect("writing to /tmp/opencode/d04_acceptance.tri must succeed");
+}
