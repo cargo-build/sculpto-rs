@@ -26,16 +26,18 @@
 //! mirrors the source's separate `fix_flipped_triangles` tool; the source
 //! fit itself repairs no flips. Closest-point, normal-interpolation and
 //! ray math is f32 here except where the shared seam provides f64.
+//! Poke rays use native unwelded, globally oriented normals; the source still
+//! uses welded fit normals for crossing barycentrics and push targets.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-use crate::check::SurfaceIndex;
+use crate::check::{RayHit, SurfaceIndex};
 use crate::mask::VertexMask;
 use crate::point_query::PointIndex;
 use crate::surface_util::{
     OpenEdges, add, barycentric_clamped, coincident_groups, cross, dot, edge_pairs, face_normal_of,
-    first_non_finite, length, past_open_edge, scale, sub, unit,
+    first_non_finite, length, outward_vertex_normals, past_open_edge, scale, sub, unit,
 };
 
 /// A mesh as positions plus triangles indexing them.
@@ -1102,33 +1104,29 @@ impl FitState<'_> {
             .iter()
             .map(|face| [face[0] as u32, face[1] as u32, face[2] as u32])
             .collect();
-        let index = SurfaceIndex::build(current, &faces);
-        let mut pokes = Vec::new();
-        for (vertex, &point) in self.surface.positions.iter().enumerate() {
-            let normal = self.surface.normals[vertex];
-            let inward = scale(normal, -1.0);
-            if inward.iter().all(|component| component.abs() < 1e-4) {
-                continue;
-            }
-            let Some((hit, depth)) =
-                index.first_hit(point, inward, 1e-5, self.options.poke_depth, &[])
-            else {
-                continue;
-            };
-            let face = self.mesh.faces[hit.triangle];
-            let corners = [current[face[0]], current[face[1]], current[face[2]]];
-            if self.surface.culls_poke(vertex, inward, depth) {
-                continue;
-            }
-            let bary = barycentric_clamped(hit.location, corners);
-            pokes.push(SurfacePull {
-                unknowns: face,
-                bary,
-                target: add(point, scale(normal, self.options.min_gap)),
-                weight: 1.0,
-            });
-        }
-        pokes
+        self.surface
+            .poke_hits(
+                (current, &faces),
+                &self.surface.poke_normals,
+                self.options.poke_depth,
+            )
+            .into_iter()
+            .map(|(vertex, hit, depth)| {
+                let point = self.surface.positions[vertex];
+                let normal = self.surface.normals[vertex];
+                let face = self.mesh.faces[hit.triangle];
+                let corners = [current[face[0]], current[face[1]], current[face[2]]];
+                // Native retains fit normals here despite different ray normals.
+                let crossing = sub(point, scale(normal, depth));
+                let bary = barycentric_clamped(crossing, corners);
+                SurfacePull {
+                    unknowns: face,
+                    bary,
+                    target: add(point, scale(normal, self.options.min_gap)),
+                    weight: 1.0,
+                }
+            })
+            .collect()
     }
 
     /// One clipping pass; `false` when nothing clips (`Fit:702-750`).
@@ -1209,16 +1207,18 @@ impl FitState<'_> {
 
 /// The body as the fit queries it: one shared surface index over oriented
 /// faces, plus welded vertex normals.
-struct BodySurface<'a> {
+pub(crate) struct BodySurface<'a> {
     positions: &'a [[f32; 3]],
     faces: Vec<[u32; 3]>,
     normals: Vec<[f32; 3]>,
+    poke_normals: Vec<[f32; 3]>,
     index: SurfaceIndex,
     incident_faces: Vec<Vec<usize>>,
 }
 
 impl<'a> BodySurface<'a> {
-    fn build(positions: &'a [[f32; 3]], faces: &[[u32; 3]]) -> Self {
+    pub(crate) fn build(positions: &'a [[f32; 3]], faces: &[[u32; 3]]) -> Self {
+        let (poke_normals, _) = outward_vertex_normals(positions, faces);
         let faces = orient_faces(positions, faces);
         let normals = welded_vertex_normals(positions, &faces);
         let index = SurfaceIndex::build(positions, &faces);
@@ -1232,6 +1232,7 @@ impl<'a> BodySurface<'a> {
             positions,
             faces,
             normals,
+            poke_normals,
             index,
             incident_faces,
         }
@@ -1262,6 +1263,32 @@ impl<'a> BodySurface<'a> {
                 &self.incident_faces[vertex],
             )
             .is_some_and(|(_, distance)| distance < depth)
+    }
+
+    /// Body-vertex witnesses keep the ray/cull mechanism shared with diagnostics.
+    /// @req DECL0013
+    pub(crate) fn poke_hits(
+        &self,
+        garment: Mesh<'_>,
+        normals: &[[f32; 3]],
+        depth: f32,
+    ) -> Vec<(usize, RayHit, f32)> {
+        let index = SurfaceIndex::build(garment.0, garment.1);
+        self.positions
+            .iter()
+            .enumerate()
+            .filter_map(|(vertex, &point)| {
+                let inward = scale(normals[vertex], -1.0);
+                if inward.iter().all(|component| component.abs() < 1e-4) {
+                    return None;
+                }
+                let (hit, distance) = index.first_hit(point, inward, 1e-5, depth, &[])?;
+                match self.culls_poke(vertex, inward, distance) {
+                    true => None,
+                    false => Some((vertex, hit, distance)),
+                }
+            })
+            .collect()
     }
 }
 
@@ -2159,7 +2186,7 @@ fn barycentric_point(values: &[[f32; 3]], unknowns: [usize; 3], bary: [f32; 3]) 
     )
 }
 
-fn validate_geometry(garment: Mesh<'_>, body: Mesh<'_>) -> Result<(), FitError> {
+pub(crate) fn validate_geometry(garment: Mesh<'_>, body: Mesh<'_>) -> Result<(), FitError> {
     if garment.0.is_empty() {
         return Err(FitError::EmptyGarment);
     }
@@ -2257,3 +2284,6 @@ fn dot_all(a: &[[f32; 3]], b: &[[f32; 3]]) -> f64 {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests;

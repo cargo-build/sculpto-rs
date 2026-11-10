@@ -24,6 +24,7 @@ pub mod actor;
 pub mod aura;
 pub mod check;
 pub mod classify;
+pub mod clip_fix;
 pub mod conform;
 pub mod contact_morph;
 pub mod control;

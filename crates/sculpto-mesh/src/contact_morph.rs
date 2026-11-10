@@ -28,7 +28,7 @@ use crate::mask::VertexMask;
 use crate::point_query::PointIndex;
 use crate::surface_util::{
     OpenEdges, add, barycentric_clamped, coincident_groups, dot, edge_pairs, face_normal_of,
-    first_non_finite, length, past_open_edge, scale, sub, unit,
+    first_non_finite, length, outward_vertex_normals, past_open_edge, scale, sub, unit,
 };
 
 /// Native floor of the contact distance (`MeshDeform.cpp:290`).
@@ -854,73 +854,6 @@ fn average_welds<T: SeamValue>(topology: &Topology, vertices: &[usize], values: 
             .fold(T::zero(), |sum: T, &copy| sum.plus(values[copy]));
         let average = summed.times(1.0 / copies.len() as f32);
         copies.iter().for_each(|&copy| values[copy] = average);
-    }
-}
-
-/// Area-weighted vertex normals turned to point away from the body's inside,
-/// whatever the winding of its triangles, with the sign that was applied
-/// (`ClippingFixer.cpp:139-162,188-206,322-326`). @req DECL0013
-fn outward_vertex_normals(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> (Vec<[f32; 3]>, f32) {
-    if positions.is_empty() {
-        return (Vec::new(), 1.0);
-    }
-    let sign = outward_sign(positions, faces);
-    let mut normals = vec![[0.0f32; 3]; positions.len()];
-    for face in faces {
-        let corners = face.map(|vertex| vertex as usize);
-        let normal = face_normal_of([
-            positions[corners[0]],
-            positions[corners[1]],
-            positions[corners[2]],
-        ]);
-        corners
-            .iter()
-            .for_each(|&corner| normals[corner] = add(normals[corner], normal));
-    }
-    (
-        normals
-            .into_iter()
-            .map(|normal| scale(unit(normal), sign))
-            .collect(),
-        sign,
-    )
-}
-
-/// `1` when the body's triangles mostly face away from its inside, `-1` when they
-/// face into it. The winding order of a NIF body varies, so the centroid decides.
-fn outward_sign(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> f32 {
-    let centroid = scale(
-        positions
-            .iter()
-            .fold([0.0f32; 3], |sum, &position| add(sum, position)),
-        1.0 / positions.len() as f32,
-    );
-    let (outward, inward) = faces
-        .iter()
-        .map(|face| {
-            let corners = face.map(|vertex| vertex as usize);
-            let corners = [
-                positions[corners[0]],
-                positions[corners[1]],
-                positions[corners[2]],
-            ];
-            let center = scale(
-                corners
-                    .iter()
-                    .fold([0.0f32; 3], |sum, &corner| add(sum, corner)),
-                1.0 / 3.0,
-            );
-            match dot(sub(center, centroid), face_normal_of(corners)) > 0.0 {
-                true => (1u32, 0u32),
-                false => (0, 1),
-            }
-        })
-        .fold((0u32, 0u32), |(outward, inward), (one, other)| {
-            (outward + one, inward + other)
-        });
-    match outward >= inward {
-        true => 1.0,
-        false => -1.0,
     }
 }
 

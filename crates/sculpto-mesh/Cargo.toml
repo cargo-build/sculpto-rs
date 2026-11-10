@@ -13,3 +13,6 @@ gltf = { version = "1", default-features = false, features = ["utils", "names", 
 sculpto-core.workspace = true
 sculpto-gltf.workspace = true
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+[dev-dependencies]
+sculpto-nif.workspace = true

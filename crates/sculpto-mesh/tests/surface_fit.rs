@@ -9,9 +9,138 @@
 
 use std::f32::consts::{SQRT_2, TAU};
 use std::ops::Range;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use sculpto_mesh::mask::VertexMask;
 use sculpto_mesh::wrap::{FitError, FitOptions, GapMode, fit_to_body, fit_to_body_from};
+
+/// Host-only source NIFs keep this acceptance independent of generated fit output.
+/// @req DECL0013
+#[test]
+fn sentinel_fit_env_gated() {
+    let root = match std::env::var_os("SCULPTO_FIT_FIXTURE") {
+        Some(root) => root,
+        None => {
+            eprintln!("SKIP sentinel_fit_env_gated: SCULPTO_FIT_FIXTURE is unset");
+            return;
+        }
+    };
+    let read = |name: &str| {
+        let path = Path::new(&root).join(name);
+        let bytes = std::fs::read(&path).expect("configured Sentinel fixture must be readable");
+        sculpto_nif::read(&bytes).expect("configured Sentinel NIF must decode completely")
+    };
+    let body_document = read("body.nif");
+    let tunic = read("tunic.nif");
+    let body = body_document
+        .shapes
+        .iter()
+        .find(|shape| shape.name == "HIMBO - Body")
+        .expect("fixture must contain the configured HIMBO body");
+    assert_eq!((body.positions.len(), body.triangles.len()), (9346, 18074));
+    assert_eq!(
+        tunic.shapes.len(),
+        2,
+        "both authored tunic forms are required"
+    );
+    let expected = [("Armor001", 2737, 4040), ("Armor001_1", 702, 1200)];
+    // Outfit Studio's constant-mode caller defaults (`McpToolsFitting.cpp:645-656`).
+    let options = FitOptions {
+        min_gap: 0.05,
+        relief_smoothing: 10,
+        flip_rings: 0,
+        ..FitOptions::default()
+    };
+    let started = Instant::now();
+    let results: Vec<_> = tunic
+        .shapes
+        .iter()
+        .zip(expected)
+        .map(|(garment, (name, vertices, triangles))| {
+            assert_eq!(garment.name, name);
+            assert_eq!((garment.positions.len(), garment.triangles.len()), (vertices, triangles));
+            let before = sculpto_mesh::check::intersection_pairs(
+                &garment.positions, &garment.triangles, &body.positions, &body.triangles,
+            );
+            let fit_started = Instant::now();
+            let (positions, report) = fit_to_body(
+                (&garment.positions, &garment.triangles),
+                (&body.positions, &body.triangles),
+                None,
+                &options,
+            ).expect("real Sentinel fit must succeed without trimming");
+            let elapsed = fit_started.elapsed();
+            let after = sculpto_mesh::check::intersection_pairs(
+                &positions, &garment.triangles, &body.positions, &body.triangles,
+            );
+            assert_eq!(positions.len(), garment.positions.len());
+            eprintln!("Sentinel {name}: elapsed={elapsed:?} intersections_before={before} intersections_after={after} report={report:?}");
+            (name, report, elapsed)
+        })
+        .collect();
+    let elapsed = started.elapsed();
+    eprintln!("Sentinel total elapsed={elapsed:?}; shapes=2; trim=false");
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "Sentinel fit exceeded 60 seconds: {elapsed:?}"
+    );
+    results.iter().for_each(|(name, report, _)| {
+        assert_eq!(report.inside_after, 0, "{name} remains inside the body");
+    });
+}
+
+/// Compare the port without its extra flip repair against the native kernel.
+/// @req DECL0013
+#[test]
+fn sentinel_native_fit_env_gated() {
+    let root = match std::env::var_os("SCULPTO_FIT_FIXTURE") {
+        Some(root) => root,
+        None => {
+            eprintln!("SKIP sentinel_native_fit_env_gated: SCULPTO_FIT_FIXTURE is unset");
+            return;
+        }
+    };
+    let read = |name: &str| {
+        let bytes = std::fs::read(Path::new(&root).join(name)).expect("configured NIF is readable");
+        sculpto_nif::read(&bytes).expect("configured NIF decodes")
+    };
+    let body_document = read("body.nif");
+    let body = body_document
+        .shapes
+        .iter()
+        .find(|shape| shape.name == "HIMBO - Body")
+        .expect("HIMBO body");
+    let tunic = read("tunic.nif");
+    let options = FitOptions {
+        flip_rings: 0,
+        ..FitOptions::default()
+    };
+    let results: Vec<_> = tunic.shapes.iter().map(|garment| {
+        let native = sculpto_mesh::intake_gltf::read_raw(&Path::new(&root).join(format!("native-zup-{}.obj", garment.name)))
+            .expect("configured native SurfaceFit golden is readable");
+        assert_eq!(native.positions.len(), garment.positions.len());
+        assert_eq!(native.triangles, garment.triangles);
+        let (positions, report) = fit_to_body(
+            (&garment.positions, &garment.triangles),
+            (&body.positions, &body.triangles), None, &options,
+        ).expect("native-options fit");
+        let deviations: Vec<_> = positions.iter().zip(&native.positions).map(|(ours, expected)| {
+            let native_in_source_units = expected.map(|value| value / native.scale.factor);
+            length(sub(*ours, native_in_source_units))
+        }).collect();
+        let max = deviations.iter().copied().fold(0.0, f32::max);
+        let mean = deviations.iter().sum::<f32>() / deviations.len() as f32;
+        eprintln!("Sentinel native {}: max_delta={max} mean_delta={mean} restored_scale={} report={report:?}", garment.name, native.scale.factor);
+        (garment.name.as_str(), max)
+    }).collect();
+    results.iter().for_each(|(name, max)| {
+        assert!(
+            *max <= 1e-4,
+            "{name} native position deviation {max} exceeds 1e-4"
+        );
+    });
+}
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -302,6 +431,10 @@ fn cylinder_sleeve_follows_a_changed_radius() {
     assert_eq!(report.unknowns, 16);
     assert_eq!(report.pulled, 16);
     assert_eq!(report.inside_before, 16);
+    eprintln!(
+        "cylinder: inside_after={} max_gap_error={}",
+        report.inside_after, report.max_gap_error
+    );
     assert_eq!(report.inside_after, 0);
     assert!(
         report.max_gap_error <= 1e-3,
