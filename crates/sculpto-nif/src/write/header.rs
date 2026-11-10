@@ -165,7 +165,11 @@ impl fmt::Display for NifWriteError {
                 formatter,
                 "vertex {vertex} has {influences} influences, above the four NIF lanes"
             ),
-            Self::WeightUnrepresentable { vertex, joint, weight } => write!(
+            Self::WeightUnrepresentable {
+                vertex,
+                joint,
+                weight,
+            } => write!(
                 formatter,
                 "vertex {vertex} joint {joint} weight {weight} cannot be encoded in a native lane"
             ),

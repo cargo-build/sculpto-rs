@@ -12,10 +12,10 @@
 
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
 use sculpto_core::skin::SkinWeights;
+use sculpto_nif::write::header::NifTarget;
 use sculpto_nif::write::header::NifWriteError;
 use sculpto_nif::write::se_shape::write_se_shape;
 use sculpto_nif::write::{InfluencePolicy, write_shape_with_policy};
-use sculpto_nif::write::header::NifTarget;
 use sculpto_nif::{NifShape, read};
 
 fn synthetic_body() -> MeshAsset {

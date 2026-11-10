@@ -116,7 +116,11 @@ fn native_reduction_reports_the_drop_and_le_keeps_the_sparse_row() {
             }],
         );
         let document = read(&output.bytes).expect("the reduced native file parses");
-        let decoded = &document.shapes[0].skin.as_ref().expect("skinned").influences;
+        let decoded = &document.shapes[0]
+            .skin
+            .as_ref()
+            .expect("skinned")
+            .influences;
         match target {
             NifTarget::Le => assert_eq!(decoded, &authored, "LE sparse data retains every value"),
             NifTarget::Se => {

@@ -22,8 +22,8 @@ use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_nif::NifShape;
-use sculpto_nif::write::{DroppedInfluence, InfluencePolicy, WrittenNif, write_shape_with_policy};
 use sculpto_nif::write::header::NifTarget;
+use sculpto_nif::write::{DroppedInfluence, InfluencePolicy, WrittenNif, write_shape_with_policy};
 
 use crate::errors;
 use crate::obj::{pick_shape, read_obj_positions, write_obj, write_obj_uv};

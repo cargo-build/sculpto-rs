@@ -50,8 +50,8 @@ impl From<&MeshAsset> for NifShape {
 
 #[cfg(test)]
 mod tests {
-    use sculpto_core::mesh::Skin;
     use super::*;
+    use sculpto_core::mesh::Skin;
     use sculpto_core::skin::SkinWeights;
 
     fn shape() -> NifShape {

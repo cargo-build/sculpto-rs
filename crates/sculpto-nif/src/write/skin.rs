@@ -339,7 +339,11 @@ pub fn partitions_from_palettes(
     mesh.validate().map_err(NifWriteError::InvalidModel)?;
     mesh.validate_partition_palettes(palettes)
         .map_err(NifWriteError::InvalidModel)?;
-    let target = if global.is_some() { NifTarget::Se } else { NifTarget::Le };
+    let target = if global.is_some() {
+        NifTarget::Se
+    } else {
+        NifTarget::Le
+    };
     let plan = plan(mesh, target, InfluencePolicy::Preserve)?
         .ok_or(NifWriteError::UnnamedBone { index: 0 })?;
     pack_partitions(mesh, palettes, &plan.lanes, global)
@@ -463,12 +467,10 @@ fn pack_partitions(
                     .bones
                     .iter()
                     .position(|candidate| *candidate == bone)
-                    .ok_or(NifWriteError::InvalidModel(
-                        MeshError::PaletteMissingBone {
-                            partition: palette.partition,
-                            bone,
-                        },
-                    ))?;
+                    .ok_or(NifWriteError::InvalidModel(MeshError::PaletteMissingBone {
+                        partition: palette.partition,
+                        bone,
+                    }))?;
                 push_u8(&mut entry, position as u8);
             }
         }
