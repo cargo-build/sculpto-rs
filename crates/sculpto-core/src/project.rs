@@ -693,7 +693,16 @@ fn write_data_ref(out: &mut String, slider_element: &str, reference: &SliderData
             }
             escape_text(&element, "reference", &format!("{file}\\{record}"))?
         }
-        (Some(file), None) => text_value(&element, "file", file)?,
+        (Some(file), None) => {
+            if file.contains(['\\', '/']) {
+                return Err(Error::new(
+                    ErrorKind::InvalidValue,
+                    &element,
+                    "a file-only reference contains a path separator the reader would split as file\\record",
+                ));
+            }
+            text_value(&element, "file", file)?
+        }
         (None, Some(_)) => {
             return Err(Error::new(
                 ErrorKind::MissingRequired,
@@ -823,7 +832,7 @@ fn escape(element: &str, field: &str, value: &str, attribute: bool) -> Result<St
             '>' => out.push_str("&gt;"),
             '"' if attribute => out.push_str("&quot;"),
             '\n' if attribute => out.push_str("&#10;"),
-            '\r' if attribute => out.push_str("&#13;"),
+            '\r' => out.push_str("&#13;"),
             '\t' if attribute => out.push_str("&#9;"),
             other => out.push(other),
         }

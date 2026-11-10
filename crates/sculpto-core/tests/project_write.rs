@@ -248,6 +248,24 @@ fn values_the_reader_cannot_restore_are_refused() {
 }
 
 #[test]
+fn file_only_references_refuse_ambiguous_separators() {
+    for file in ["ShapeData/HIMBO", "ShapeData\\HIMBO", "foo\\", "\\x"] {
+        let mut project = fixture();
+        project.sets[0].sliders[0].data[0].file = Some(file.to_string());
+        project.sets[0].sliders[0].data[0].record = None;
+        assert_eq!(refusal(&project).kind(), ErrorKind::InvalidValue, "{file}");
+    }
+}
+
+#[test]
+fn carriage_returns_in_element_text_round_trip() {
+    let mut project = fixture();
+    project.sets[0].source_file = "body\rsource.nif".to_string();
+    project.sets[0].notes = Some("line1\r\nline2\rline3".to_string());
+    reparse(&project);
+}
+
+#[test]
 fn an_empty_project_round_trips() {
     let project = Project {
         version: 1,

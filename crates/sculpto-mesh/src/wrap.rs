@@ -232,6 +232,8 @@ pub enum FitError {
     NonFiniteGarmentPosition { vertex: usize },
     /// A body vertex position is not finite.
     NonFiniteBodyPosition { vertex: usize },
+    /// Finite inputs exceeded the numeric range of the fit calculation.
+    NonFiniteResult { vertex: usize },
     /// A gap-source vertex position is not finite.
     NonFiniteGapSourcePosition { vertex: usize },
     /// A gap-from vertex position is not finite.
@@ -266,12 +268,14 @@ pub enum FitError {
     Gap(f32),
     /// `min_gap` is negative or not finite.
     MinGap(f32),
-    /// `max_distance` is not a positive finite length.
+    /// `max_distance` is below the native floor of 1e-3 or not finite.
     MaxDistance(f32),
     /// `min_normal_agreement` is outside `-1..=1` or not finite.
     MinNormalAgreement(f32),
-    /// `stiffness` is not positive and finite (the source floors it to 1e-4).
+    /// `stiffness` is below the native floor of 1e-4 or not finite.
     Stiffness(f32),
+    /// The staged stiffness or derived lock weight would overflow.
+    StiffnessSchedule { stiffness: f32, stages: u32 },
     /// `stages` is zero or above the tool's bound of 10.
     Stages(u32),
     /// `iterations` is zero or above the tool's bound of 20.
@@ -375,7 +379,7 @@ impl fmt::Display for FitError {
             }
             Self::MaxDistance(value) => write!(
                 formatter,
-                "the maximum distance {value} is not a positive finite length"
+                "the maximum distance {value} must be finite and at least 1e-3"
             ),
             Self::MinNormalAgreement(value) => write!(
                 formatter,
@@ -383,7 +387,15 @@ impl fmt::Display for FitError {
             ),
             Self::Stiffness(value) => write!(
                 formatter,
-                "the stiffness {value} is not positive and finite; the fit floors it to 1e-4"
+                "the stiffness {value} must be finite and at least 1e-4"
+            ),
+            Self::StiffnessSchedule { stiffness, stages } => write!(
+                formatter,
+                "stiffness {stiffness} across {stages} stages overflows solver weights"
+            ),
+            Self::NonFiniteResult { vertex } => write!(
+                formatter,
+                "the fit exceeds the numeric range at garment vertex {vertex}"
             ),
             Self::Stages(value) => write!(
                 formatter,
@@ -445,7 +457,7 @@ impl FitOptions {
         if !self.min_gap.is_finite() || self.min_gap < 0.0 {
             return Err(FitError::MinGap(self.min_gap));
         }
-        if !self.max_distance.is_finite() || self.max_distance <= 0.0 {
+        if !self.max_distance.is_finite() || self.max_distance < 1e-3 {
             return Err(FitError::MaxDistance(self.max_distance));
         }
         if !self.min_normal_agreement.is_finite()
@@ -453,11 +465,15 @@ impl FitOptions {
         {
             return Err(FitError::MinNormalAgreement(self.min_normal_agreement));
         }
-        if !self.stiffness.is_finite() || self.stiffness <= 0.0 {
+        if !self.stiffness.is_finite() || self.stiffness < 1e-4 {
             return Err(FitError::Stiffness(self.stiffness));
         }
         if self.stages == 0 || self.stages > MAX_STAGES {
             return Err(FitError::Stages(self.stages));
+        }
+        let peak_lambda = self.stiffness * 4.0f32.powi((self.stages - 1) as i32);
+        if !(LOCK_WEIGHT * (1.0 + peak_lambda)).is_finite() {
+            return Err(FitError::StiffnessSchedule { stiffness: self.stiffness, stages: self.stages });
         }
         if self.iterations == 0 || self.iterations > MAX_ITERATIONS {
             return Err(FitError::Iterations(self.iterations));
@@ -579,7 +595,7 @@ fn fit_with_targets(
 
     let mesh = weld(garment.0, garment.1, options.weld_distance);
     let count = mesh.rest.len();
-    let max_distance = options.max_distance.max(1e-3);
+    let max_distance = options.max_distance;
 
     // Per unknown: target gap, lock and rigid part from its vertex copies
     // (`Fit:392-405`). Locks take the strongest copy; the per-vertex lists
@@ -649,7 +665,7 @@ fn fit_with_targets(
     let (inside_before, poke_before) = solver.clipping_counts();
 
     // Stiff first, so the garment moves as a whole before the details fit.
-    let final_lambda = options.stiffness.max(1e-4);
+    let final_lambda = options.stiffness;
     for stage in 0..options.stages {
         let stages_left = options.stages - 1 - stage;
         let lambda = final_lambda * 4.0f32.powi(stages_left as i32);
@@ -679,14 +695,16 @@ fn fit_with_targets(
             break;
         }
     }
-    let (inside_after, poke_after) = solver.clipping_counts();
-
     let positions: Vec<[f32; 3]> = garment
         .0
         .iter()
         .zip(solver.mesh.unknown_of.iter())
         .map(|(&rest, &unknown)| add(rest, solver.displacement[unknown]))
         .collect();
+    if let Some(vertex) = first_non_finite(&positions) {
+        return Err(FitError::NonFiniteResult { vertex });
+    }
+    let (inside_after, poke_after) = solver.clipping_counts();
 
     // How well the pulled unknowns fit now (`Fit:760-778`).
     let fitted: Vec<[f32; 3]> = solver
@@ -1121,7 +1139,7 @@ impl FitState<'_> {
             .zip(self.displacement.iter())
             .map(|(&rest, &displacement)| add(rest, displacement))
             .collect();
-        let lambda = self.options.stiffness.max(1e-4);
+        let lambda = self.options.stiffness;
         let mut system = System::new(&self.mesh, lambda);
         // Hold the fit; everything else that pushes spreads over the
         // neighbors through the smoothness.

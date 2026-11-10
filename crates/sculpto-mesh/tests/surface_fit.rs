@@ -528,6 +528,20 @@ fn poke_detection_uses_the_first_ray_crossing_instead_of_the_closest_triangle() 
 }
 
 #[test]
+fn finite_options_cannot_overflow_the_staged_solver_or_widen_the_search_radius() {
+    let (body, body_faces) = plane(10.0);
+    let (garment, faces) = grid(1.0, 1.0);
+    for options in [
+        FitOptions { max_distance: 0.0001, ..FitOptions::default() },
+        FitOptions { stiffness: 1e33, stages: 10, ..FitOptions::default() },
+        FitOptions { stiffness: 1e-5, ..FitOptions::default() },
+    ] {
+        assert!(fit_to_body((&garment, &faces), (&body, &body_faces), None, &options).is_err(),
+            "out-of-range options must be refused: {options:?}");
+    }
+}
+
+#[test]
 fn symmetric_pulls_the_mesh_toward_body_points_it_does_not_reach() {
     let (body, body_faces) = plates(2.0, 0.0, 2.0);
     let (patch, patch_faces) = grid(1.0, 1.5);
