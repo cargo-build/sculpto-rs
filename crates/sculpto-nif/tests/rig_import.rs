@@ -9,6 +9,7 @@
 
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
 use sculpto_core::rig::{JointId, LocalTransform};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
 use sculpto_nif::{NifDocument, read, yup_matrix_to_zup, yup_transform_to_zup};
@@ -30,8 +31,8 @@ fn skinned() -> MeshAsset {
         bones: vec!["Root".into(), "Spine".into()],
         // Empty means the identity fallback for every bone.
         bind_inverse: Vec::new(),
-        indices: vec![[0, 1, 0, 0]; 3],
-        weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+        influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+            .expect("four-lane rows"),
     });
     asset
 }
@@ -71,7 +72,7 @@ fn an_unskinned_shape_captures_no_graph_and_no_skin_context() {
     assert_eq!(source.local, LocalTransform::default());
     assert_eq!(source.global_skin, None);
     assert_eq!(source.skeleton_root, None);
-    assert!(document.shapes[0].bones.is_empty());
+    assert!(document.shapes[0].skin.is_none());
 }
 
 #[test]
@@ -115,9 +116,12 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
     // The existing shape projection is unchanged by the capture.
     let shape = &document.shapes[0];
     assert_eq!(shape.name, "Skinned");
-    assert_eq!(shape.bones, vec!["Root".to_string(), "Spine".to_string()]);
-    assert_eq!(shape.bind_inverse.len(), 2);
-    assert_eq!(shape.weights[0], [0.75, 0.25, 0.0, 0.0]);
+    let skin = shape.skin.as_ref().expect("the shape carries one skin");
+    assert_eq!(skin.bones, vec!["Root".to_string(), "Spine".to_string()]);
+    assert_eq!(skin.bind_inverse.len(), 2);
+    let row = skin.influences.row(0).expect("vertex 0");
+    assert_eq!(row.joints, &[0, 1]);
+    assert_eq!(row.weights, &[0.75, 0.25]);
 }
 
 #[test]
@@ -150,7 +154,7 @@ fn palette_counts(document: &NifDocument) -> Vec<usize> {
     let mut counts: Vec<usize> = document
         .shapes
         .iter()
-        .map(|shape| shape.bones.len())
+        .map(|shape| shape.skin.as_ref().map_or(0, |skin| skin.bones.len()))
         .collect();
     counts.sort_unstable();
     counts
@@ -182,10 +186,16 @@ fn print_capture(label: &str, document: &NifDocument) {
 fn assert_palette_names_resolve(document: &NifDocument) {
     let rig = document.rig.as_ref().expect("captured body graph");
     document.shapes.iter().for_each(|shape| {
-        shape.bones.iter().for_each(|name| {
-            rig.joint_by_name(name)
-                .expect("each authored body palette name resolves uniquely");
-        });
+        shape
+            .skin
+            .as_ref()
+            .expect("a captured skin")
+            .bones
+            .iter()
+            .for_each(|name| {
+                rig.joint_by_name(name)
+                    .expect("each authored body palette name resolves uniquely");
+            });
     });
 }
 
@@ -270,7 +280,7 @@ fn bijin_body_raw_capture() {
         [global[3][0], global[3][1], global[3][2]]
     );
     assert!(
-        rig.joints().len() > document.shapes[0].bones.len(),
+        rig.joints().len() > document.shapes[0].skin.as_ref().expect("skin").bones.len(),
         "the graph carries nodes the palette does not name"
     );
 }

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderKind, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::read;
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
@@ -47,13 +48,16 @@ fn synthetic_skinned_textured_mesh(name: &str) -> MeshAsset {
         skin: Some(Skin {
             bones: vec!["NPC Root [Root]".into(), "NPC Spine [Spn0]".into()],
             bind_inverse: vec![identity(), identity()],
-            indices: vec![[0, 1, 0, 0], [0, 1, 0, 0], [0, 1, 0, 0], [0, 1, 0, 0]],
-            weights: vec![
-                [0.75, 0.25, 0.0, 0.0],
-                [0.75, 0.25, 0.0, 0.0],
-                [0.75, 0.25, 0.0, 0.0],
-                [0.75, 0.25, 0.0, 0.0],
-            ],
+            influences: SkinWeights::from_quads(
+                &[[0, 1, 0, 0], [0, 1, 0, 0], [0, 1, 0, 0], [0, 1, 0, 0]],
+                &[
+                    [0.75, 0.25, 0.0, 0.0],
+                    [0.75, 0.25, 0.0, 0.0],
+                    [0.75, 0.25, 0.0, 0.0],
+                    [0.75, 0.25, 0.0, 0.0],
+                ],
+            )
+            .expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     };
@@ -195,7 +199,7 @@ fn native_headless_acceptance_se_and_le() {
         "LE re-export verification: {} verts, {} tris, {} bones (source had {} verts, {} tris, {} bones)",
         le_shape.positions.len(),
         le_shape.triangles.len(),
-        le_shape.bones.len(),
+        le_shape.skin.as_ref().expect("le skin").bones.len(),
         le_asset.positions.len(),
         le_asset.triangles.len(),
         le_asset.skin.as_ref().unwrap().bones.len()

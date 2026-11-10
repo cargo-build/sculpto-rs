@@ -207,6 +207,13 @@ pub fn export_obj(input: &Value) -> Result<Value, CommandError> {
     }
 }
 
+fn dropped_influences(drops: &[sculpto_nif::write::DroppedInfluence]) -> Vec<Value> {
+    drops
+        .iter()
+        .map(|drop| json!({ "vertex": drop.vertex, "bone": drop.bone, "weight": drop.weight }))
+        .collect()
+}
+
 pub fn export_pair(input: &Value) -> Result<Value, CommandError> {
     let params = ops::ExportPairParams {
         nif: path(input, "nif")?,
@@ -233,6 +240,8 @@ pub fn export_pair(input: &Value) -> Result<Value, CommandError> {
         "shape": outcome.shape,
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
+        "dropped_influences_0": dropped_influences(&outcome.dropped_influences[0]),
+        "dropped_influences_1": dropped_influences(&outcome.dropped_influences[1]),
     }))
 }
 
@@ -250,6 +259,7 @@ pub fn export_nif(input: &Value) -> Result<Value, CommandError> {
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
         "bytes": outcome.bytes,
+        "dropped_influences": dropped_influences(&outcome.dropped_influences),
     }))
 }
 

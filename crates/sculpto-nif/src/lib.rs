@@ -15,10 +15,13 @@ use std::fmt;
 use byroredux_core::string::StringPool;
 use byroredux_nif::import::{ImportedMesh, import_nif_scene};
 use byroredux_nif::parse_nif;
+use sculpto_core::mesh::Skin;
 use sculpto_core::rig::Rig;
+use sculpto_core::skin::SkinWeights;
 
 mod mesh;
 mod rig;
+mod weights;
 pub mod write;
 
 pub use rig::{ShapeSource, yup_matrix_to_zup, yup_transform_to_zup};
@@ -57,23 +60,22 @@ pub struct NifShape {
     pub tangents: Vec<[f32; 4]>,
     /// Triangles as vertex-index triples.
     pub triangles: Vec<[u32; 3]>,
-    /// Bone names, parallel to `bone_indices`.
-    pub bones: Vec<String>,
-    /// Per-vertex bone indices into `bones`.
-    pub bone_indices: Vec<[u16; 4]>,
-    /// Per-vertex weights, parallel to `bone_indices`.
-    pub weights: Vec<[f32; 4]>,
-    /// Per-bone bind matrices in the source Z-up frame, column-major
-    /// (mesh -> bone at bind). Empty when the mesh carries no skin.
-    pub bind_inverse: Vec<[[f32; 4]; 4]>,
+    /// One skin: palette names, per-bone binds in the source Z-up frame and the
+    /// authored influence rows read from the file's own skin channel.
+    pub skin: Option<Skin>,
 }
 
 impl NifShape {
-    /// Highest weight sum across vertices, useful as a normalization check.
+    /// Highest authored weight sum across vertices.
+    ///
+    /// Stored sums are data, not a unit-sum gate: SE packs half-float lanes, so
+    /// a well-formed body drifts by the format's own rounding.
     pub fn max_weight_sum(&self) -> f32 {
-        self.weights
-            .iter()
-            .map(|weights| weights.iter().sum::<f32>())
+        let Some(skin) = &self.skin else {
+            return 0.0;
+        };
+        (0..skin.influences.rows())
+            .filter_map(|row| skin.influences.row_sum(row))
             .fold(0.0, f32::max)
     }
 }
@@ -162,10 +164,12 @@ fn parse_header(bytes: &[u8]) -> Result<(NifHeader, u32), NifError> {
 /// A NIF starts with an ASCII line (`Gamebryo File Format, Version 20.2.0.7`),
 /// then the numeric header: `u32` version, `u8` endian, `u32` user version.
 ///
-/// Geometry, UV, normal and skin arrays keep their existing projection. The
-/// document also carries the imported node graph and one raw source record per
-/// shape; an invalid node graph, parent or placement is a contextual refusal,
-/// never an identity substitute.
+/// Geometry, UV and normal arrays keep their existing projection. Skin weights
+/// are read from the file's own channel — LE sparse entries and SE packed lanes —
+/// so the stored values are the authored ones, not the importer's renormalized
+/// view. The document also carries the imported node graph and one raw source
+/// record per shape; an invalid graph, placement or weight payload is a
+/// contextual refusal, never an identity substitute.
 pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
     let (header, bsver) = parse_header(bytes)?;
     let scene = parse_nif(bytes).map_err(|error| NifError::Malformed(error.to_string()))?;
@@ -176,12 +180,13 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
     }
     let mut pool = StringPool::new();
     let imported = import_nif_scene(&scene, &mut pool);
+    let weights = weights::capture(bytes, &scene, &imported.meshes)?;
     let nodes: Vec<rig::NodeView<'_>> = imported.nodes.iter().map(rig::NodeView::from).collect();
     let graph = rig::capture_graph(&nodes)?;
     let mut shapes = Vec::with_capacity(imported.meshes.len());
     let mut sources = Vec::with_capacity(imported.meshes.len());
-    for mesh in &imported.meshes {
-        shapes.push(project_shape(mesh)?);
+    for (mesh, influences) in imported.meshes.iter().zip(weights) {
+        shapes.push(project_shape(mesh, influences)?);
         sources.push(rig::capture_shape(
             &rig::MeshView::from(mesh),
             imported.nodes.len(),
@@ -198,7 +203,10 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
 }
 
 /// Project one imported shape onto the adapter's shape type.
-fn project_shape(mesh: &ImportedMesh) -> Result<NifShape, NifError> {
+fn project_shape(
+    mesh: &ImportedMesh,
+    influences: Option<SkinWeights>,
+) -> Result<NifShape, NifError> {
     let chunks = mesh.indices.as_chunks::<3>();
     if !chunks.1.is_empty() {
         return Err(NifError::Malformed(format!(
@@ -207,8 +215,44 @@ fn project_shape(mesh: &ImportedMesh) -> Result<NifShape, NifError> {
             mesh.indices.len()
         )));
     }
+    let name = mesh.name.as_deref().unwrap_or_default();
+    let skin = match (&mesh.skin, influences) {
+        (Some(skin), Some(influences)) => {
+            if influences.rows() != mesh.positions.len() {
+                return Err(NifError::Malformed(format!(
+                    "shape `{name}` has {} vertices but {} weight rows",
+                    mesh.positions.len(),
+                    influences.rows()
+                )));
+            }
+            Some(Skin {
+                bones: skin
+                    .bones
+                    .iter()
+                    .map(|bone| bone.name.to_string())
+                    .collect(),
+                bind_inverse: skin
+                    .bones
+                    .iter()
+                    .map(|bone| yup_matrix_to_zup(&bone.bind_inverse))
+                    .collect(),
+                influences,
+            })
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(NifError::Malformed(format!(
+                "shape `{name}` is skinned but carries no readable weight payload"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(NifError::Malformed(format!(
+                "shape `{name}` carries weight rows but no skin"
+            )));
+        }
+    };
     Ok(NifShape {
-        name: mesh.name.as_deref().map(str::to_string).unwrap_or_default(),
+        name: name.to_string(),
         // Upstream converts to a Y-up renderer frame; morph deltas are
         // authored in the source Z-up frame, so undo it here:
         // (x, y, z) -> (x, -z, y). Applying `.osd` offsets to Y-up
@@ -232,35 +276,6 @@ fn project_shape(mesh: &ImportedMesh) -> Result<NifShape, NifError> {
             .iter()
             .map(|tri| [tri[0], tri[1], tri[2]])
             .collect(),
-        bones: mesh
-            .skin
-            .as_ref()
-            .map(|skin| {
-                skin.bones
-                    .iter()
-                    .map(|bone| bone.name.to_string())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        bone_indices: mesh
-            .skin
-            .as_ref()
-            .map(|skin| skin.vertex_bone_indices.clone())
-            .unwrap_or_default(),
-        weights: mesh
-            .skin
-            .as_ref()
-            .map(|skin| skin.vertex_bone_weights.clone())
-            .unwrap_or_default(),
-        bind_inverse: mesh
-            .skin
-            .as_ref()
-            .map(|skin| {
-                skin.bones
-                    .iter()
-                    .map(|bone| yup_matrix_to_zup(&bone.bind_inverse))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        skin,
     })
 }

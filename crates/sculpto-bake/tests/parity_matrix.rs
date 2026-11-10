@@ -472,22 +472,57 @@ pub fn evaluate_pair(home: &Path, pair: &MatrixPair) -> ParityMeasurement {
     );
 
     // Assertion: weight counts (non-zero) before the zip; weights within f16
+    let baked_skin = baked.skin.as_ref().expect("bake skin");
+    let native_skin = native_shape.skin.as_ref().expect("native skin");
     assert_eq!(
-        baked.weights.len(),
-        native_shape.weights.len(),
+        baked_skin.influences.rows(),
+        native_skin.influences.rows(),
         "{label}: weighted vertex counts differ (bake {} vs native {})",
-        baked.weights.len(),
-        native_shape.weights.len()
+        baked_skin.influences.rows(),
+        native_skin.influences.rows()
     );
     assert!(
-        !baked.weights.is_empty(),
+        baked_skin.influences.rows() > 0,
         "{label}: native body carries no skin weights"
     );
-    let max_weight_diff = baked
-        .weights
-        .iter()
-        .zip(&native_shape.weights)
-        .map(|(a, b)| max_abs_diff(a, b))
+    assert_eq!(
+        baked_skin
+            .influences
+            .row(0)
+            .expect("first baked row")
+            .joints,
+        native_skin
+            .influences
+            .row(0)
+            .expect("first native row")
+            .joints,
+        "{label}: palette order differs on the first vertex"
+    );
+    // The stored rows are the authored ones on our side and the renormalized
+    // native projection on the other, so the shared quantity is the derived
+    // unit-sum view; the source rows themselves are never rewritten.
+    let max_weight_diff = (0..baked_skin.influences.rows())
+        .flat_map(|vertex| {
+            let baked_row = baked_skin
+                .influences
+                .normalized_four_lane(vertex)
+                .expect("the baked row fits four lanes");
+            let native_row = native_skin
+                .influences
+                .normalized_four_lane(vertex)
+                .expect("the native row fits four lanes");
+            assert_eq!(
+                baked_row.joints, native_row.joints,
+                "{label}: palette order differs at vertex {vertex}"
+            );
+            let difference = baked_row
+                .weights
+                .iter()
+                .zip(native_row.weights)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            std::iter::once(difference)
+        })
         .fold(0.0f32, f32::max);
     assert!(
         max_weight_diff <= WEIGHT_TOLERANCE,
@@ -507,7 +542,8 @@ pub fn evaluate_pair(home: &Path, pair: &MatrixPair) -> ParityMeasurement {
     );
 
     // Assertion: bone list exact between bake and native
-    let bones_equal = baked.bones == native_shape.bones;
+    let bones_equal = baked.skin.as_ref().map(|skin| &skin.bones)
+        == native_shape.skin.as_ref().map(|skin| &skin.bones);
     assert!(
         bones_equal,
         "{label}: bone lists differ between our bake and the native output"

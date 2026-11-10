@@ -10,6 +10,7 @@ use sculpto_core::mesh::{
     MaterialSlot, MeshAsset, MeshError, MorphDelta, MorphScope, MorphTarget, PartitionId,
     PhysicsRef, Skin,
 };
+use sculpto_core::skin::SkinWeights;
 
 struct Rng(u64);
 
@@ -84,29 +85,32 @@ fn generated(seed: u64) -> MeshAsset {
             }
         })
         .collect();
+    let quads: Vec<[u16; 4]> = (0..vertices)
+        .map(|_| {
+            [
+                rng.range(0, 4) as u16,
+                rng.range(0, 4) as u16,
+                rng.range(0, 4) as u16,
+                rng.range(0, 4) as u16,
+            ]
+        })
+        .collect();
+    // One lane is always positive: a row with no influence is a named
+    // construction defect now, not a value the generator may emit.
+    let weights: Vec<[f32; 4]> = (0..vertices)
+        .map(|_| {
+            [
+                1.0 + rng.range(0, 100) as f32,
+                rng.range(0, 100) as f32,
+                rng.range(0, 100) as f32,
+                rng.range(0, 100) as f32,
+            ]
+        })
+        .collect();
     let skin = Some(Skin {
         bones: vec!["a".into(), "b".into(), "c".into(), "d".into()],
         bind_inverse: Vec::new(),
-        indices: (0..vertices)
-            .map(|_| {
-                [
-                    rng.range(0, 4) as u16,
-                    rng.range(0, 4) as u16,
-                    rng.range(0, 4) as u16,
-                    rng.range(0, 4) as u16,
-                ]
-            })
-            .collect(),
-        weights: (0..vertices)
-            .map(|_| {
-                [
-                    rng.range(0, 100) as f32,
-                    rng.range(0, 100) as f32,
-                    rng.range(0, 100) as f32,
-                    rng.range(0, 100) as f32,
-                ]
-            })
-            .collect(),
+        influences: SkinWeights::from_quads(&quads, &weights).expect("four-lane rows"),
     });
     let mut mesh = MeshAsset {
         name: format!("seed{seed}"),
@@ -201,11 +205,20 @@ fn weight_normalisation_is_idempotent() {
         let mut mesh = generated(seed);
         mesh.normalize_weights().expect("normalizes");
         mesh.validate().expect("normalized weights validate");
-        let before = mesh.skin.as_ref().expect("skin").weights.clone();
+        mesh.validate_unit_weights()
+            .expect("normalized rows sum to one");
+        let before = mesh.skin.as_ref().expect("skin").influences.clone();
         mesh.normalize_weights().expect("normalizes again");
-        let after = mesh.skin.as_ref().expect("skin").weights.clone();
-        for (vertex, (before, after)) in before.iter().zip(&after).enumerate() {
-            for (left, right) in before.iter().zip(after) {
+        let after = mesh.skin.as_ref().expect("skin").influences.clone();
+        assert_eq!(
+            before.row(0).map(|row| row.joints.len()),
+            after.row(0).map(|row| row.joints.len()),
+            "seed {seed}: normalization must not change the row shape"
+        );
+        for vertex in 0..before.rows() {
+            let before_row = before.row(vertex).expect("row in range");
+            let after_row = after.row(vertex).expect("row in range");
+            for (left, right) in before_row.weights.iter().zip(after_row.weights) {
                 assert!(
                     (left - right).abs() <= 1e-5,
                     "seed {seed}, vertex {vertex}: normalization is not idempotent"
@@ -228,16 +241,12 @@ fn corrupted_fixtures_fail() {
         })
     );
 
-    let mut mesh = generated(8);
-    mesh.skin.as_mut().expect("skin").weights[0] = [0.0; 4];
-    assert!(matches!(
-        mesh.validate(),
-        Err(MeshError::WeightSumOutOfRange { vertex: 0, .. })
-    ));
-    assert_eq!(
-        mesh.normalize_weights(),
-        Err(MeshError::ZeroWeightSum { vertex: 0 })
-    );
+    // A zero-weight row cannot reach the model: the checked constructor owns the
+    // refusal, and the model maps it onto its existing zero-sum defect.
+    let zeroed = SkinWeights::new(vec![0, 1], vec![0], vec![0.0], 4);
+    assert!(matches!(zeroed, Err(_)), "a zero row is refused");
+    let bad_offsets = SkinWeights::new(vec![1, 1], Vec::new(), Vec::new(), 4);
+    assert!(matches!(bad_offsets, Err(_)), "offsets must start at zero");
 
     let mut mesh = generated(9);
     mesh.morphs[0].deltas[0].vertex = mesh.positions.len() as u32;

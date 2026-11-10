@@ -22,6 +22,7 @@ use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_nif::NifShape;
+use sculpto_nif::write::{DroppedInfluence, InfluencePolicy, WrittenNif, write_shape_with_policy};
 use sculpto_nif::write::header::NifTarget;
 
 use crate::errors;
@@ -259,6 +260,8 @@ pub struct ExportPairOutcome {
     pub vertices: usize,
     /// Triangles per file.
     pub triangles: usize,
+    /// Native lane reductions for the `_0` and `_1` files.
+    pub dropped_influences: [Vec<DroppedInfluence>; 2],
 }
 
 /// The `big`/`small` wire token, shared by `bake` and `export.pair`.
@@ -376,20 +379,21 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
     let target = nif_target(document.bsver, document.header.user_version)?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
     let mut asset = MeshAsset::from(shape);
-    let mut bodies = Vec::with_capacity(2);
-    for plan in &plans {
+    let mut encode = |plan: &BakePlan| {
         asset.positions = plan
             .apply(&shape.name, &shape.positions)
             .map_err(errors::bake)?;
-        bodies.push(sculpto_nif::write::write_shape(&asset, target).map_err(errors::nif_write)?);
-    }
+        write_shape_with_policy(&asset, target, InfluencePolicy::NativeFour)
+            .map_err(errors::nif_write)
+    };
+    let bodies = [encode(&plans[0])?, encode(&plans[1])?];
     let stem = pair_stem(&params.out);
     let outs = [
         PathBuf::from(format!("{}_0.nif", stem.display())),
         PathBuf::from(format!("{}_1.nif", stem.display())),
     ];
     for (out, body) in outs.iter().zip(&bodies) {
-        std::fs::write(out, body).map_err(|error| errors::io(out, error))?;
+        std::fs::write(out, &body.bytes).map_err(|error| errors::io(out, error))?;
     }
     Ok(ExportPairOutcome {
         out_0: outs[0].clone(),
@@ -403,6 +407,7 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
         shape: shape.name.clone(),
         vertices: shape.positions.len(),
         triangles: shape.triangles.len(),
+        dropped_influences: bodies.map(|body| body.dropped_influences),
     })
 }
 
@@ -465,6 +470,8 @@ pub struct ExportNifOutcome {
     pub triangles: usize,
     /// Bytes written.
     pub bytes: usize,
+    /// Influences omitted from the target's four-lane view.
+    pub dropped_influences: Vec<DroppedInfluence>,
 }
 
 /// Re-encode one shape of a source NIF for the requested Skyrim target.
@@ -482,13 +489,14 @@ pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandE
     };
     let asset = MeshAsset::from(shape);
     let written = write_nif(&asset, params.target)?;
-    std::fs::write(&params.out, &written).map_err(|error| errors::io(&params.out, error))?;
+    std::fs::write(&params.out, &written.bytes).map_err(|error| errors::io(&params.out, error))?;
     Ok(ExportNifOutcome {
         out: params.out.clone(),
         target: params.target,
         vertices: asset.positions.len(),
         triangles: asset.triangles.len(),
-        bytes: written.len(),
+        bytes: written.bytes.len(),
+        dropped_influences: written.dropped_influences,
     })
 }
 
@@ -497,7 +505,7 @@ pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandE
 /// `export_nif` is the only product caller; the function is public so the
 /// validation gate and the target projection are testable without a NIF round
 /// trip. A refused model returns before any byte exists.
-pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<Vec<u8>, CommandError> {
+pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<WrittenNif, CommandError> {
     asset.validate().map_err(errors::mesh)?;
     // This LE writer has no NBT layout and refuses authored tangents. A
     // texture-ready model always carries them (the reader synthesizes them from
@@ -511,11 +519,12 @@ pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<Vec<u8>, Com
             Cow::Owned(projection)
         }
     };
-    match target {
-        ExportTarget::Se => sculpto_nif::write::se_shape::write_se_shape(&projected),
-        ExportTarget::Le => sculpto_nif::write::le_shape::write_le_shape(&projected),
-    }
-    .map_err(errors::nif_write)
+    let target = match target {
+        ExportTarget::Se => NifTarget::Se,
+        ExportTarget::Le => NifTarget::Le,
+    };
+    write_shape_with_policy(&projected, target, InfluencePolicy::NativeFour)
+        .map_err(errors::nif_write)
 }
 
 /// Everything `gltf.reset_weights` and `gltf.clamp_texcoord` need.

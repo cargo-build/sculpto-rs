@@ -24,6 +24,7 @@ pub mod project;
 pub mod report;
 pub mod rig;
 pub mod shape_data;
+pub mod skin;
 mod xml_util;
 
 pub use document::Document;

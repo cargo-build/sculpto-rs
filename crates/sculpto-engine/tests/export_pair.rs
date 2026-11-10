@@ -177,8 +177,14 @@ fn assert_pair_differs_only_in_positions(small_path: &Path, big_path: &Path) {
     assert_eq!(small_shape.uvs, big_shape.uvs);
     assert_eq!(small_shape.normals, big_shape.normals);
     assert_eq!(small_shape.tangents, big_shape.tangents);
-    assert_eq!(small_shape.bones, big_shape.bones);
-    assert_eq!(small_shape.weights, big_shape.weights);
+    assert_eq!(
+        small_shape.skin.as_ref().map(|skin| &skin.bones),
+        big_shape.skin.as_ref().map(|skin| &skin.bones)
+    );
+    assert_eq!(
+        small_shape.skin.as_ref().map(|skin| &skin.influences),
+        big_shape.skin.as_ref().map(|skin| &skin.influences)
+    );
     assert_eq!(
         small_shape.positions,
         expected(25.0),

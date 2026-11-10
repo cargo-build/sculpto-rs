@@ -42,7 +42,10 @@ fn bijin_body_native_headless_reimport_matches() {
     assert_eq!(source_shape.name, "BaseShape");
     assert_eq!(source_shape.positions.len(), 3471);
     assert_eq!(source_shape.triangles.len(), 6516);
-    assert_eq!(source_shape.bones.len(), 22);
+    assert_eq!(
+        source_shape.skin.as_ref().expect("source skin").bones.len(),
+        22
+    );
 
     // 2. Locate or initialize BodySlide home copy under /tmp/opencode/
     let bs_copy = PathBuf::from("/tmp/opencode/bijin-bodyslide");
@@ -150,12 +153,18 @@ fn bijin_body_native_headless_reimport_matches() {
         "triangle counts must match exactly"
     );
     assert_eq!(
-        reexport_shape.bones.len(),
-        source_shape.bones.len(),
+        reexport_shape
+            .skin
+            .as_ref()
+            .expect("re-export skin")
+            .bones
+            .len(),
+        source_shape.skin.as_ref().expect("source skin").bones.len(),
         "bone counts must match exactly"
     );
     assert_eq!(
-        reexport_shape.bones, source_shape.bones,
+        reexport_shape.skin.as_ref().expect("re-export skin").bones,
+        source_shape.skin.as_ref().expect("source skin").bones,
         "bone list must match"
     );
 

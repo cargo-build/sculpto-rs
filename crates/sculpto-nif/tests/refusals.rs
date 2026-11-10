@@ -9,6 +9,7 @@
 //! `src/write/header.rs`, not here.
 
 use sculpto_core::mesh::{MaterialSlot, MeshAsset, MeshError, PartitionId, ShaderKind, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::NifHeader;
 use sculpto_nif::write::header::{NifTarget, NifWriteError, VERSION, write_header_for};
 use sculpto_nif::write::le_shape::write_le_shape;
@@ -31,8 +32,8 @@ fn skinned(bones: Vec<String>) -> MeshAsset {
         bones,
         // Empty means the identity fallback for every bone.
         bind_inverse: Vec::new(),
-        indices: vec![[0, 1, 0, 0]; 3],
-        weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+        influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+            .expect("four-lane rows"),
     });
     asset
 }

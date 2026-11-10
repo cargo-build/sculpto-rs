@@ -5,6 +5,7 @@
 
 use gltf::{Gltf, Semantic};
 use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_gltf::{GltfError, write_glb};
 
 /// A two-bone skinned triangle with asymmetric bind matrices, so a transpose
@@ -33,12 +34,15 @@ fn two_bone_triangle() -> MeshAsset {
                     [5.0, 0.0, -1.0, 1.0],
                 ],
             ],
-            indices: vec![[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
-            weights: vec![
-                [0.7, 0.3, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-            ],
+            influences: SkinWeights::from_quads(
+                &[[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                &[
+                    [0.7, 0.3, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                ],
+            )
+            .expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     }
@@ -151,7 +155,7 @@ fn skinned_triangle_reports_joints_weights_and_bind_matrices() {
         "JOINTS_0 is u16"
     );
     let joints_read = shorts::<4>(accessor_bytes(&parsed, &joints_accessor));
-    assert_eq!(joints_read, skin_data.indices.as_slice());
+    assert_eq!(joints_read, [[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]]);
 
     let weights_accessor = primitive.get(&Semantic::Weights(0)).expect("WEIGHTS_0");
     assert_eq!(
@@ -274,7 +278,15 @@ fn corrupting_a_weight_changes_the_parsed_accessor() {
 
     let plain = read_first_weights(&two_bone_triangle());
     let mut corrupted = two_bone_triangle();
-    corrupted.skin.as_mut().expect("skin").weights[0] = [0.6, 0.4, 0.0, 0.0];
+    corrupted.skin.as_mut().expect("skin").influences = SkinWeights::from_quads(
+        &[[1, 0, 0, 0], [0, 1, 0, 0], [0, 1, 0, 0]],
+        &[
+            [0.6, 0.4, 0.0, 0.0],
+            [0.7, 0.3, 0.0, 0.0],
+            [0.7, 0.3, 0.0, 0.0],
+        ],
+    )
+    .expect("four-lane rows");
     let corrupted = read_first_weights(&corrupted);
 
     assert_ne!(
@@ -282,7 +294,13 @@ fn corrupting_a_weight_changes_the_parsed_accessor() {
         "the corruption reaches the parsed accessor"
     );
     assert_eq!(plain[0], [0.7, 0.3, 0.0, 0.0]);
-    assert_eq!(corrupted[0], [0.6, 0.4, 0.0, 0.0]);
+    // The wire row is the normalized projection, so compare within f32 noise.
+    for (actual, expected) in corrupted[0].iter().zip([0.6, 0.4, 0.0, 0.0]) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-6,
+            "the corrupted row is written normalized: {actual} vs {expected}"
+        );
+    }
 }
 
 #[test]
@@ -309,15 +327,14 @@ fn an_empty_bind_inverse_writes_identity_matrices() {
 
 #[test]
 fn an_invalid_model_is_refused_without_bytes() {
-    let mut bad_weights = two_bone_triangle();
-    bad_weights.skin.as_mut().expect("skin").weights[0] = [0.5, 0.3, 0.0, 0.0];
+    let mut short_skin = two_bone_triangle();
+    short_skin.skin.as_mut().expect("skin").influences =
+        SkinWeights::from_quads(&[[0, 1, 0, 0]; 2], &[[0.7, 0.3, 0.0, 0.0]; 2])
+            .expect("two four-lane rows");
     assert_eq!(
-        write_glb(&bad_weights),
-        Err(GltfError::InvalidMesh(MeshError::WeightSumOutOfRange {
-            vertex: 0,
-            sum: 0.5 + 0.3
-        })),
-        "an unnormalized skin is refused before any byte is produced"
+        write_glb(&short_skin),
+        Err(GltfError::InvalidMesh(MeshError::SkinLengthMismatch)),
+        "a skin with fewer rows than vertices is refused before any byte is produced"
     );
 
     let no_triangles = MeshAsset {
@@ -325,4 +342,60 @@ fn an_invalid_model_is_refused_without_bytes() {
         ..MeshAsset::default()
     };
     assert_eq!(write_glb(&no_triangles), Err(GltfError::NoTriangles));
+}
+
+#[test]
+fn all_five_influences_survive_paired_sets_with_one_unit_sum() {
+    let mut asset = two_bone_triangle();
+    let source = SkinWeights::new(
+        vec![0, 5, 6, 7],
+        vec![0, 1, 2, 3, 4, 1, 2],
+        vec![0.25, 0.25, 0.25, 0.25, 1.0, 1.5, 0.5],
+        5,
+    )
+    .expect("authored rows");
+    asset.skin = Some(Skin {
+        bones: (0..5).map(|joint| format!("joint{joint}")).collect(),
+        bind_inverse: Vec::new(),
+        influences: source.clone(),
+    });
+    let parsed = Gltf::from_slice(&write_glb(&asset).expect("multi-set GLB"))
+        .expect("consumer decodes the output");
+    let mesh = parsed.document.meshes().next().expect("mesh");
+    let primitive = mesh.primitives().next().expect("primitive");
+    let access = |semantic| primitive.get(&semantic).expect("paired accessor");
+    assert_eq!(
+        shorts::<4>(accessor_bytes(&parsed, &access(Semantic::Joints(1)))),
+        [[4, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    );
+    assert_eq!(
+        floats::<4>(accessor_bytes(&parsed, &access(Semantic::Weights(0)))),
+        [[0.125; 4], [1., 0., 0., 0.], [1., 0., 0., 0.]]
+    );
+    assert_eq!(
+        floats::<4>(accessor_bytes(&parsed, &access(Semantic::Weights(1)))),
+        [[0.5, 0., 0., 0.], [0.; 4], [0.; 4]]
+    );
+    assert!(primitive.get(&Semantic::Joints(2)).is_none());
+    assert_eq!(asset.skin.as_ref().expect("source skin").influences, source);
+}
+
+#[test]
+fn unrepresentable_positive_weight_is_refused_before_glb_output() {
+    let mut asset = two_bone_triangle();
+    let skin = asset.skin.as_mut().expect("skin");
+    skin.influences = SkinWeights::new(
+        vec![0, 2, 3, 4],
+        vec![0, 1, 0, 1],
+        vec![f32::from_bits(1), 8., 1., 1.],
+        2,
+    )
+    .expect("positive finite authored values");
+    assert!(matches!(
+        write_glb(&asset),
+        Err(GltfError::WeightUnrepresentable {
+            vertex: 0,
+            joint: 0
+        })
+    ));
 }

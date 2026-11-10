@@ -11,6 +11,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::skin::{SkinWeightError, SkinWeights};
+
 /// Partition id inside one NIF shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PartitionId(pub u16);
@@ -51,19 +53,18 @@ pub struct MorphTarget {
     pub scope: MorphScope,
 }
 
-/// One ordered skin: bone names and four influences per vertex.
+/// One ordered skin: bone names, binds and the authored per-vertex influences.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Skin {
-    /// Bone names, indexed by [`Self::indices`].
+    /// Bone names, indexed by every [`SkinWeights`] entry.
     pub bones: Vec<String>,
     /// Per-bone bind matrices in mesh space, column-major (mesh -> bone at
     /// bind). Empty means the identity fallback for every bone; otherwise one
     /// matrix per bone.
     pub bind_inverse: Vec<[[f32; 4]; 4]>,
-    /// Four bone indices per vertex.
-    pub indices: Vec<[u16; 4]>,
-    /// Four weights per vertex, parallel to [`Self::indices`].
-    pub weights: Vec<[f32; 4]>,
+    /// Authored influences, one sparse row per vertex; values are never
+    /// normalized or reordered by this model.
+    pub influences: SkinWeights,
 }
 
 /// Neutral shader family a slot belongs to.
@@ -367,6 +368,42 @@ pub enum MeshError {
     Physics { defect: PhysicsDefect },
 }
 
+/// Map a weight-row defect onto the model error.
+///
+/// The model keeps its existing variants so every consumer that already matches
+/// them keeps working; the finer [`SkinWeightError`] stays available at the
+/// constructor and projection boundaries.
+fn skin_weight_error(error: SkinWeightError) -> MeshError {
+    match error {
+        SkinWeightError::PaletteIndex {
+            row,
+            entry,
+            joint,
+            palette,
+        } => MeshError::BoneIndexOutOfRange {
+            vertex: row,
+            influence: entry,
+            bone: joint,
+            bones: palette,
+        },
+        SkinWeightError::EmptyRow { row } => MeshError::ZeroWeightSum { vertex: row },
+        SkinWeightError::BadSum { row, sum } => MeshError::WeightSumOutOfRange { vertex: row, sum },
+        SkinWeightError::NonFinite { row, .. } | SkinWeightError::Negative { row, .. } => {
+            MeshError::NonFinite {
+                attribute: "weights",
+                index: row,
+            }
+        }
+        SkinWeightError::OffsetsStart
+        | SkinWeightError::OffsetsOrder { .. }
+        | SkinWeightError::OffsetsCover { .. }
+        | SkinWeightError::EntryCount { .. }
+        | SkinWeightError::Overflow
+        | SkinWeightError::RowOutOfRange { .. }
+        | SkinWeightError::TooManyInfluences { .. } => MeshError::SkinLengthMismatch,
+    }
+}
+
 /// Why a mesh cannot be split.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SplitError {
@@ -386,8 +423,9 @@ pub enum SplitError {
 impl MeshAsset {
     /// Validate the model against every named invariant the writers rely on.
     ///
-    /// Structural limits are type-level: a skin has exactly four influences per
-    /// vertex because the field is `[u16; 4]` / `[f32; 4]`.
+    /// A skin row has any width the source authored; the four-lane limit is a
+    /// writer projection ([`SkinWeights::four_lane`]), not a model invariant. The
+    /// unit-sum contract is the separate [`MeshAsset::validate_unit_weights`].
     pub fn validate(&self) -> Result<(), MeshError> {
         if self.positions.is_empty() {
             return Err(MeshError::NoVertices);
@@ -405,8 +443,7 @@ impl MeshAsset {
             return Err(MeshError::PartitionLengthMismatch);
         }
         if let Some(skin) = &self.skin
-            && (skin.indices.len() != self.positions.len()
-                || skin.weights.len() != self.positions.len())
+            && skin.influences.rows() != self.positions.len()
         {
             return Err(MeshError::SkinLengthMismatch);
         }
@@ -422,6 +459,9 @@ impl MeshAsset {
                     return Err(MeshError::NonFiniteBind { bone });
                 }
             }
+            skin.influences
+                .validate(skin.bones.len())
+                .map_err(skin_weight_error)?;
         }
 
         for (index, position) in self.positions.iter().enumerate() {
@@ -500,32 +540,6 @@ impl MeshAsset {
             }
         }
 
-        if let Some(skin) = &self.skin {
-            for (vertex, indices) in skin.indices.iter().enumerate() {
-                for (influence, bone) in indices.iter().enumerate() {
-                    if *bone as usize >= skin.bones.len() {
-                        return Err(MeshError::BoneIndexOutOfRange {
-                            vertex,
-                            influence,
-                            bone: *bone,
-                            bones: skin.bones.len(),
-                        });
-                    }
-                }
-                let weights = skin.weights[vertex];
-                if !weights.iter().all(|value| value.is_finite()) {
-                    return Err(MeshError::NonFinite {
-                        attribute: "weights",
-                        index: vertex,
-                    });
-                }
-                let sum: f32 = weights.iter().sum();
-                if (sum - 1.0).abs() > 1e-4 {
-                    return Err(MeshError::WeightSumOutOfRange { vertex, sum });
-                }
-            }
-        }
-
         let mut names = std::collections::BTreeSet::new();
         for (slot, material) in self.materials.iter().enumerate() {
             if material.name.trim().is_empty() {
@@ -573,21 +587,34 @@ impl MeshAsset {
         Ok(())
     }
 
-    /// Normalize every vertex's skin weights to sum to one.
+    /// Normalize every vertex's skin weights to sum to one, in place.
     ///
-    /// Idempotent: a second call divides by a sum already within float noise of
-    /// one. A zero (or non-finite) sum is refused instead of hidden.
+    /// This is the explicit authoring mutation for a copied or derived skin: it
+    /// rewrites stored values, so an import or export path must not call it. A
+    /// zero (or non-finite) sum is refused instead of hidden. @req DECL0008
     pub fn normalize_weights(&mut self) -> Result<(), MeshError> {
         let Some(skin) = &mut self.skin else {
             return Ok(());
         };
-        for (vertex, weights) in skin.weights.iter_mut().enumerate() {
-            let sum: f32 = weights.iter().sum();
-            if sum == 0.0 || !sum.is_finite() {
-                return Err(MeshError::ZeroWeightSum { vertex });
-            }
-            for weight in weights.iter_mut() {
-                *weight /= sum;
+        skin.influences.normalize().map_err(skin_weight_error)
+    }
+
+    /// Require every stored row to already sum to one within `1e-4`.
+    ///
+    /// The unit-sum contract belongs to authored garment weights, not to a
+    /// source body skin: packed half-float lanes drift by the format's own
+    /// rounding, and the normalized view is
+    /// [`SkinWeights::normalized_four_lane`]. @req DECL0008
+    pub fn validate_unit_weights(&self) -> Result<(), MeshError> {
+        let Some(skin) = &self.skin else {
+            return Ok(());
+        };
+        for vertex in 0..skin.influences.rows() {
+            let Some(sum) = skin.influences.row_sum(vertex) else {
+                return Err(MeshError::SkinLengthMismatch);
+            };
+            if (sum - 1.0).abs() > 1e-4 {
+                return Err(MeshError::WeightSumOutOfRange { vertex, sum });
             }
         }
         Ok(())
@@ -598,9 +625,14 @@ impl MeshAsset {
     /// A bone is in a palette only when some vertex of that partition carries a
     /// non-zero weight for it, so the result is the smallest legal palette. The
     /// writers project it; a caller may also compare it against an authored set.
-    pub fn partition_palettes(&self) -> Vec<PartitionPalette> {
+    ///
+    /// # Errors
+    /// [`MeshError::SkinLengthMismatch`] when a triangle names a vertex whose
+    /// influence row does not exist; the rows are read through the checked
+    /// accessor, so a short skin is a named defect rather than a panic.
+    pub fn partition_palettes(&self) -> Result<Vec<PartitionPalette>, MeshError> {
         let Some(skin) = &self.skin else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut by_partition: BTreeMap<PartitionId, BTreeSet<u16>> = BTreeMap::new();
         for (index, triangle) in self.triangles.iter().enumerate() {
@@ -609,20 +641,23 @@ impl MeshAsset {
                 .or_default();
             for vertex in triangle {
                 let vertex = *vertex as usize;
-                for (slot, bone) in skin.indices[vertex].iter().enumerate() {
-                    if skin.weights[vertex][slot] > 0.0 {
-                        entry.insert(*bone);
+                let Some(row) = skin.influences.row(vertex) else {
+                    return Err(MeshError::SkinLengthMismatch);
+                };
+                for (joint, weight) in row.joints.iter().zip(row.weights) {
+                    if *weight > 0.0 {
+                        entry.insert(*joint);
                     }
                 }
             }
         }
-        by_partition
+        Ok(by_partition
             .into_iter()
             .map(|(partition, bones)| PartitionPalette {
                 partition,
                 bones: bones.into_iter().collect(),
             })
-            .collect()
+            .collect())
     }
 
     /// Refuse a palette set that misses a partition or a referenced bone.
@@ -652,11 +687,14 @@ impl MeshAsset {
             };
             for vertex in triangle {
                 let vertex = *vertex as usize;
-                for (slot, bone) in skin.indices[vertex].iter().enumerate() {
-                    if skin.weights[vertex][slot] > 0.0 && !palette.bones.contains(bone) {
+                let Some(row) = skin.influences.row(vertex) else {
+                    return Err(MeshError::SkinLengthMismatch);
+                };
+                for (joint, weight) in row.joints.iter().zip(row.weights) {
+                    if *weight > 0.0 && !palette.bones.contains(joint) {
                         return Err(MeshError::PaletteMissingBone {
                             partition,
-                            bone: *bone,
+                            bone: *joint,
                         });
                     }
                 }
@@ -720,7 +758,7 @@ impl MeshAsset {
                 }
                 if chunk.vertices.len() + new_vertices > max_vertices {
                     let name = self.chunk_name(shapes.len());
-                    shapes.push(self.flush(&mut chunk, partition, name));
+                    shapes.push(self.flush(&mut chunk, partition, name)?);
                 }
                 let mut local = [0_u32; 3];
                 for (slot, vertex) in triangle.iter().enumerate() {
@@ -739,7 +777,7 @@ impl MeshAsset {
             }
             if !chunk.triangles.is_empty() {
                 let name = self.chunk_name(shapes.len());
-                shapes.push(self.flush(&mut chunk, partition, name));
+                shapes.push(self.flush(&mut chunk, partition, name)?);
             }
         }
         Ok(shapes)
@@ -752,7 +790,12 @@ impl MeshAsset {
         }
     }
 
-    fn flush(&self, chunk: &mut Chunk, partition: PartitionId, name: String) -> Self {
+    fn flush(
+        &self,
+        chunk: &mut Chunk,
+        partition: PartitionId,
+        name: String,
+    ) -> Result<Self, SplitError> {
         let positions = chunk
             .vertices
             .iter()
@@ -761,12 +804,17 @@ impl MeshAsset {
         let normals = self.gather(&chunk.vertices, &self.normals);
         let uvs = self.gather(&chunk.vertices, &self.uvs);
         let tangents = self.gather(&chunk.vertices, &self.tangents);
-        let skin = self.skin.as_ref().map(|skin| Skin {
-            bones: skin.bones.clone(),
-            bind_inverse: skin.bind_inverse.clone(),
-            indices: self.gather(&chunk.vertices, &skin.indices),
-            weights: self.gather(&chunk.vertices, &skin.weights),
-        });
+        let skin = match &self.skin {
+            Some(skin) => Some(Skin {
+                bones: skin.bones.clone(),
+                bind_inverse: skin.bind_inverse.clone(),
+                influences: skin
+                    .influences
+                    .gather(&chunk.vertices)
+                    .map_err(|error| SplitError::Invalid(skin_weight_error(error)))?,
+            }),
+            None => None,
+        };
         let morphs = self
             .morphs
             .iter()
@@ -793,7 +841,7 @@ impl MeshAsset {
         let triangle_partitions = vec![partition; triangles.len()];
         chunk.map.clear();
         chunk.vertices.clear();
-        Self {
+        Ok(Self {
             name,
             positions,
             normals,
@@ -805,7 +853,7 @@ impl MeshAsset {
             morphs,
             materials: self.materials.clone(),
             physics: self.physics.clone(),
-        }
+        })
     }
 
     fn gather<T: Copy>(&self, vertices: &[u32], values: &[T]) -> Vec<T> {
@@ -975,8 +1023,8 @@ mod tests {
             skin: Some(Skin {
                 bones: vec!["root".into()],
                 bind_inverse: Vec::new(),
-                indices: vec![[0, 0, 0, 0]; 6],
-                weights: vec![[1.0, 0.0, 0.0, 0.0]; 6],
+                influences: SkinWeights::from_quads(&[[0, 0, 0, 0]; 6], &[[1.0, 0.0, 0.0, 0.0]; 6])
+                    .expect("one influence per vertex"),
             }),
             positions,
             triangles: vec![[0, 1, 2], [3, 4, 5]],
@@ -995,8 +1043,7 @@ mod tests {
             assert_eq!(shape.uvs.len(), 3);
             assert_eq!(shape.tangents.len(), 3);
             let skin = shape.skin.as_ref().expect("skin");
-            assert_eq!(skin.indices.len(), 3);
-            assert_eq!(skin.weights.len(), 3);
+            assert_eq!(skin.influences.rows(), 3);
             assert_eq!(shape.materials, mesh.materials);
             shape.validate().expect("valid");
         }
@@ -1010,7 +1057,9 @@ mod tests {
             }))
         );
         let mut bad_skin = mesh;
-        bad_skin.skin.as_mut().expect("skin").weights.pop();
+        bad_skin.skin.as_mut().expect("skin").influences =
+            SkinWeights::from_quads(&[[0, 0, 0, 0]; 3], &[[1.0, 0.0, 0.0, 0.0]; 3])
+                .expect("three four-lane rows");
         assert_eq!(
             bad_skin.split_for_limit(3),
             Err(SplitError::Invalid(MeshError::SkinLengthMismatch))
@@ -1031,8 +1080,8 @@ mod tests {
         mesh.skin = Some(Skin {
             bones: vec!["root".into()],
             bind_inverse: Vec::new(),
-            indices: vec![[0, 0, 0, 0]; 3],
-            weights: vec![[0.25, 0.25, 0.25, 0.25]; 3],
+            influences: SkinWeights::from_quads(&[[0, 0, 0, 0]; 3], &[[0.25, 0.25, 0.25, 0.25]; 3])
+                .expect("four equal influences"),
         });
         mesh
     }
@@ -1156,38 +1205,45 @@ mod tests {
         );
 
         let mut mesh = skinned();
-        mesh.skin.as_mut().expect("skin").weights.pop();
+        mesh.skin.as_mut().expect("skin").influences =
+            SkinWeights::from_quads(&[[0, 0, 0, 0]; 2], &[[1.0, 0.0, 0.0, 0.0]; 2])
+                .expect("two four-lane rows");
         assert_eq!(mesh.validate(), Err(MeshError::SkinLengthMismatch));
 
+        // A palette index is validated against the current bone list, so a skin
+        // whose bones shrink keeps the old spelling of the refusal.
         let mut mesh = skinned();
-        mesh.skin.as_mut().expect("skin").indices[1][2] = 4;
+        mesh.skin.as_mut().expect("skin").influences =
+            SkinWeights::from_quads(&[[1, 0, 0, 0]; 3], &[[1.0, 0.0, 0.0, 0.0]; 3])
+                .expect("three four-lane rows");
+        mesh.skin.as_mut().expect("skin").bones = vec!["root".into()];
         assert_eq!(
             mesh.validate(),
             Err(MeshError::BoneIndexOutOfRange {
-                vertex: 1,
-                influence: 2,
-                bone: 4,
+                vertex: 0,
+                influence: 0,
+                bone: 1,
                 bones: 1
             })
         );
 
-        let mut mesh = skinned();
-        mesh.skin.as_mut().expect("skin").weights[2] = [0.5, 0.0, 0.0, 0.0];
+        // The stored sum is data; the unit-sum contract belongs to the named
+        // derived view. A non-finite value cannot reach the model at all: the
+        // `SkinWeights` constructor owns that refusal.
+        let mut mesh = one_triangle();
+        mesh.skin = Some(Skin {
+            bones: vec!["root".into()],
+            bind_inverse: Vec::new(),
+            influences: SkinWeights::from_quads(&[[0, 0, 0, 0]; 3], &[[0.5, 0.0, 0.0, 0.0]; 3])
+                .expect("three 0.5 rows are structurally valid"),
+        });
+        mesh.validate()
+            .expect("a stored sum of 0.5 is data, not a structural defect");
         assert_eq!(
-            mesh.validate(),
+            mesh.validate_unit_weights(),
             Err(MeshError::WeightSumOutOfRange {
-                vertex: 2,
+                vertex: 0,
                 sum: 0.5
-            })
-        );
-
-        let mut mesh = skinned();
-        mesh.skin.as_mut().expect("skin").weights[0][0] = f32::NAN;
-        assert_eq!(
-            mesh.validate(),
-            Err(MeshError::NonFinite {
-                attribute: "weights",
-                index: 0
             })
         );
     }
@@ -1246,13 +1302,16 @@ mod tests {
             skin: Some(Skin {
                 bones: vec!["a".into(), "b".into(), "c".into()],
                 bind_inverse: Vec::new(),
-                indices: vec![[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]],
-                weights: vec![
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.5, 0.5, 0.0, 0.0],
-                    [1.0, 0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0, 0.0],
-                ],
+                influences: SkinWeights::from_quads(
+                    &[[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]],
+                    &[
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.5, 0.5, 0.0, 0.0],
+                        [1.0, 0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0, 0.0],
+                    ],
+                )
+                .expect("four-lane rows"),
             }),
             ..MeshAsset::default()
         }
@@ -1263,7 +1322,7 @@ mod tests {
         let mesh = two_partitions();
         mesh.validate().expect("valid");
         assert_eq!(
-            mesh.partition_palettes(),
+            mesh.partition_palettes().expect("palettes derive"),
             vec![
                 PartitionPalette {
                     partition: PartitionId(0),
@@ -1275,12 +1334,17 @@ mod tests {
                 },
             ]
         );
-        mesh.validate_partition_palettes(&mesh.partition_palettes())
+        mesh.validate_partition_palettes(&mesh.partition_palettes().expect("palettes derive"))
             .expect("derived palettes cover every reference");
 
         let mut skinless = mesh.clone();
         skinless.skin = None;
-        assert!(skinless.partition_palettes().is_empty());
+        assert!(
+            skinless
+                .partition_palettes()
+                .expect("a skinless mesh derives no palette")
+                .is_empty()
+        );
         skinless
             .validate_partition_palettes(&[])
             .expect("a skinless mesh needs no palette");

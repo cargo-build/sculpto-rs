@@ -42,7 +42,7 @@ fn reads_a_real_body() {
             shape.name,
             shape.positions.len(),
             shape.triangles.len(),
-            shape.bones.len(),
+            shape.skin.as_ref().map_or(0, |skin| skin.bones.len()),
             shape.max_weight_sum()
         );
     }
@@ -53,7 +53,7 @@ fn reads_a_real_body() {
         .find(|shape| shape.positions.len() > 10_000)
         .expect("a body-sized shape");
     assert!(!body.triangles.is_empty());
-    assert!(!body.bones.is_empty(), "a body is skinned");
+    assert!(body.skin.is_some(), "a body is skinned");
     assert!(
         (body.max_weight_sum() - 1.0).abs() < 0.01,
         "weights normalize"

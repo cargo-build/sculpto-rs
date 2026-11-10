@@ -14,12 +14,22 @@ use gltf::Gltf;
 use gltf::accessor::DataType;
 use gltf::mesh::{Mode, Semantic};
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_gltf::write_glb;
 use serde_json::Value;
 
 /// One synthetic skinned model: two partitions, normals, UVs and asymmetric
 /// extents, so `min`/`max` and the alignment checks cannot pass by accident.
 fn synthetic_model() -> MeshAsset {
+    let quads: Vec<[u16; 4]> = (0..9_u16)
+        .map(|vertex| [vertex % 2, (vertex + 1) % 2, 0, 0])
+        .collect();
+    let weights: Vec<[f32; 4]> = (0..9)
+        .map(|vertex| match vertex % 2 {
+            0 => [0.75, 0.25, 0.0, 0.0],
+            _ => [0.5, 0.5, 0.0, 0.0],
+        })
+        .collect();
     let positions = vec![
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
@@ -58,18 +68,7 @@ fn synthetic_model() -> MeshAsset {
                     [5.0, 0.0, -1.0, 1.0],
                 ],
             ],
-            indices: (0..9_u16)
-                .map(|vertex| [vertex % 2, (vertex + 1) % 2, 0, 0])
-                .collect(),
-            weights: (0..9)
-                .map(|vertex| {
-                    if vertex % 2 == 0 {
-                        [0.75, 0.25, 0.0, 0.0]
-                    } else {
-                        [0.5, 0.5, 0.0, 0.0]
-                    }
-                })
-                .collect(),
+            influences: SkinWeights::from_quads(&quads, &weights).expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     }

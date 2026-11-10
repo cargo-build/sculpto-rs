@@ -2,19 +2,16 @@
 //!
 //! The builder is the one place a reader-side shape becomes the flat export
 //! arena; the NIF reader keeps its own types, and the writer reads the model.
+//! A shape carries one [`sculpto_core::mesh::Skin`], so conversion preserves the same
+//! value: palette names, binds and the authored influence rows survive without
+//! a second projection.
 
-use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
+use sculpto_core::mesh::{MeshAsset, PartitionId};
 
 use crate::NifShape;
 
 impl From<&NifShape> for MeshAsset {
     fn from(shape: &NifShape) -> Self {
-        let skin = (!shape.bones.is_empty()).then(|| Skin {
-            bones: shape.bones.clone(),
-            bind_inverse: shape.bind_inverse.clone(),
-            indices: shape.bone_indices.clone(),
-            weights: shape.weights.clone(),
-        });
         Self {
             name: shape.name.clone(),
             positions: shape.positions.clone(),
@@ -25,7 +22,7 @@ impl From<&NifShape> for MeshAsset {
             // NifShape carries no partition metadata; one partition is the
             // honest default until the reader exposes it.
             triangle_partitions: vec![PartitionId(0); shape.triangles.len()],
-            skin,
+            skin: shape.skin.clone(),
             ..Self::default()
         }
     }
@@ -37,23 +34,8 @@ impl From<&NifShape> for MeshAsset {
 /// `NifShape -> MeshAsset -> NifShape` preserves every field `NifShape` owns.
 /// Materials and morphs have no `NifShape` slot and are dropped by this
 /// projection.
-fn mesh_skin_bind(mesh: &MeshAsset) -> Vec<[[f32; 4]; 4]> {
-    mesh.skin
-        .as_ref()
-        .map(|skin| skin.bind_inverse.clone())
-        .unwrap_or_default()
-}
-
 impl From<&MeshAsset> for NifShape {
     fn from(mesh: &MeshAsset) -> Self {
-        let (bones, bone_indices, weights) = match &mesh.skin {
-            Some(skin) => (
-                skin.bones.clone(),
-                skin.indices.clone(),
-                skin.weights.clone(),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new()),
-        };
         Self {
             name: mesh.name.clone(),
             positions: mesh.positions.clone(),
@@ -61,17 +43,16 @@ impl From<&MeshAsset> for NifShape {
             normals: mesh.normals.clone(),
             tangents: mesh.tangents.clone(),
             triangles: mesh.triangles.clone(),
-            bones,
-            bone_indices,
-            weights,
-            bind_inverse: mesh_skin_bind(mesh),
+            skin: mesh.skin.clone(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use sculpto_core::mesh::Skin;
     use super::*;
+    use sculpto_core::skin::SkinWeights;
 
     fn shape() -> NifShape {
         NifShape {
@@ -81,10 +62,15 @@ mod tests {
             normals: vec![[0.0, 0.0, 1.0]; 3],
             tangents: vec![[1.0, 0.0, 0.0, 1.0]; 3],
             triangles: vec![[0, 1, 2]],
-            bones: vec!["root".into(), "spine".into()],
-            bone_indices: vec![[0, 1, 0, 0]; 3],
-            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
-            bind_inverse: vec![[[0.0; 4]; 4]; 2],
+            skin: Some(Skin {
+                bones: vec!["root".into(), "spine".into()],
+                bind_inverse: vec![[[0.0; 4]; 4]; 2],
+                influences: SkinWeights::from_quads(
+                    &[[0, 1, 0, 0]; 3],
+                    &[[0.75, 0.25, 0.0, 0.0]; 3],
+                )
+                .expect("a four-lane row fits"),
+            }),
         }
     }
 
@@ -99,8 +85,8 @@ mod tests {
         assert_eq!(mesh.triangle_partitions, vec![PartitionId(0)]);
         let skin = mesh.skin.as_ref().expect("skin");
         assert_eq!(skin.bones, vec!["root", "spine"]);
-        assert_eq!(skin.indices.len(), 3);
-        assert_eq!(skin.weights.len(), 3);
+        assert_eq!(skin.influences.rows(), 3);
+        assert_eq!(skin.influences.row(0).expect("vertex 0").joints, &[0, 1]);
         assert!(mesh.morphs.is_empty());
         assert!(mesh.materials.is_empty());
         mesh.validate().expect("valid");
@@ -118,9 +104,7 @@ mod tests {
     #[test]
     fn an_unskinned_shape_has_no_skin() {
         let mut source = shape();
-        source.bones.clear();
-        source.bone_indices.clear();
-        source.weights.clear();
+        source.skin = None;
         let mesh = MeshAsset::from(&source);
         assert!(mesh.skin.is_none());
         mesh.validate().expect("valid");

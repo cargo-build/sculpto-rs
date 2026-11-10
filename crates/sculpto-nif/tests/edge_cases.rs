@@ -14,6 +14,7 @@
 //! 11. PhysicsRef empty values refused.
 
 use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, PhysicsDefect, PhysicsRef, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::read;
 use sculpto_nif::write::header::NifWriteError;
 use sculpto_nif::write::le_shape::write_le_shape;
@@ -243,19 +244,25 @@ fn shared_shape_and_bone_name_deduplication() {
                 [0.0, 0.0, 0.0, 1.0],
             ],
         ],
-        indices: vec![[0, 1, 0, 0]; 3],
-        weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+        influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+            .expect("four-lane rows"),
     });
 
     let se_bytes = write_se_shape(&mesh).expect("SE writes shared name");
     let se_doc = read(&se_bytes).expect("SE parses shared name");
     assert_eq!(se_doc.shapes[0].name, "Root");
-    assert_eq!(se_doc.shapes[0].bones, vec!["Root", "Spine"]);
+    assert_eq!(
+        se_doc.shapes[0].skin.as_ref().expect("se skin").bones,
+        vec!["Root", "Spine"]
+    );
 
     let le_bytes = write_le_shape(&mesh).expect("LE writes shared name");
     let le_doc = read(&le_bytes).expect("LE parses shared name");
     assert_eq!(le_doc.shapes[0].name, "Root");
-    assert_eq!(le_doc.shapes[0].bones, vec!["Root", "Spine"]);
+    assert_eq!(
+        le_doc.shapes[0].skin.as_ref().expect("le skin").bones,
+        vec!["Root", "Spine"]
+    );
 
     // Deduplication check: string table contains ["", "Root", "Spine"], total 3 entries
     // Without dedup, it would contain ["", "Root", "Root", "Spine"] (4 entries).

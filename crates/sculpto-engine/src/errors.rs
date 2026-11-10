@@ -85,6 +85,12 @@ pub fn nif_write(error: NifWriteError) -> CommandError {
         NifWriteError::DuplicateBone { .. } => (ErrorKind::Refused, "nif_write_duplicate_bone"),
         NifWriteError::NameTooLong { .. } => (ErrorKind::Refused, "nif_write_name_too_long"),
         NifWriteError::TooManyBones { .. } => (ErrorKind::Refused, "nif_write_too_many_bones"),
+        NifWriteError::TooManyInfluences { .. } => {
+            (ErrorKind::Refused, "nif_write_too_many_influences")
+        }
+        NifWriteError::WeightUnrepresentable { .. } => {
+            (ErrorKind::Refused, "nif_write_weight_unrepresentable")
+        }
         NifWriteError::SingularBind { .. } => (ErrorKind::Refused, "nif_write_singular_bind"),
         NifWriteError::TextureSlotUnsupported { .. } => {
             (ErrorKind::Refused, "nif_write_texture_slot_unsupported")

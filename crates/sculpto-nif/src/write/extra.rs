@@ -69,6 +69,7 @@ mod tests {
     use byroredux_nif::blocks::tri_shape::{BsTriShape, NiTriShape};
     use byroredux_nif::scene::NifScene;
     use sculpto_core::mesh::{PartitionId, PhysicsRef, Skin};
+    use sculpto_core::skin::SkinWeights;
 
     fn garment() -> MeshAsset {
         MeshAsset {
@@ -91,8 +92,8 @@ mod tests {
         asset.skin = Some(Skin {
             bones: vec!["Root".into(), "Spine".into()],
             bind_inverse: bind,
-            indices: vec![[0, 1, 0, 0]; 3],
-            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+            influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+                .expect("four-lane rows"),
         });
         asset
     }

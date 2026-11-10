@@ -23,6 +23,7 @@ use byroredux_nif::parse_nif;
 use byroredux_nif::scene::NifScene;
 use byroredux_nif::types::BlockRef;
 use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, PhysicsRef, ShaderKind, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::extra::{BLOCK_TYPE, HDT_PHYSICS_NAME};
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
@@ -56,8 +57,8 @@ fn robe() -> MeshAsset {
     asset.skin = Some(Skin {
         bones: vec!["Root".into(), "Spine".into()],
         bind_inverse: vec![identity(), identity()],
-        indices: vec![[0, 1, 0, 0]; 4],
-        weights: vec![[0.75, 0.25, 0.0, 0.0]; 4],
+        influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 4], &[[0.75, 0.25, 0.0, 0.0]; 4])
+            .expect("four-lane rows"),
     });
     asset
 }

@@ -5,6 +5,7 @@
 //! depend on. Update with `GOLDEN_UPDATE=1` only on a deliberate format change.
 
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::header::{NifTarget, write_header};
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
@@ -38,8 +39,8 @@ fn fixture() -> MeshAsset {
         skin: Some(Skin {
             bones: vec!["Root".into(), "Spine".into()],
             bind_inverse: bind,
-            indices: vec![[0, 1, 0, 0]; 3],
-            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+            influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+                .expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     }

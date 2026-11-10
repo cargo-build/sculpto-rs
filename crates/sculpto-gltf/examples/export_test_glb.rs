@@ -1,4 +1,5 @@
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_gltf::write_glb;
 
 fn tier1_fixture_asset() -> MeshAsset {
@@ -42,12 +43,15 @@ fn synthetic_skinned_asset() -> MeshAsset {
                     [5.0, 0.0, -1.0, 1.0],
                 ],
             ],
-            indices: vec![[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
-            weights: vec![
-                [0.7, 0.3, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-            ],
+            influences: SkinWeights::from_quads(
+                &[[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                &[
+                    [0.7, 0.3, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                ],
+            )
+            .expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     }

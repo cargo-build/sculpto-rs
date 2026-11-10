@@ -77,6 +77,22 @@ pub enum NifWriteError {
     TooManyBones { bones: usize },
     /// A bind matrix has zero scale and cannot be decomposed.
     SingularBind { bone: usize },
+    /// A vertex row carries more influences than the four hardware lanes hold.
+    TooManyInfluences {
+        /// The refused vertex.
+        vertex: usize,
+        /// Its influence count.
+        influences: usize,
+    },
+    /// A retained influence would become zero or non-finite in the native lane.
+    WeightUnrepresentable {
+        /// Vertex in source shape order.
+        vertex: usize,
+        /// Joint index in the shape palette.
+        joint: u16,
+        /// Positive authored weight.
+        weight: f32,
+    },
     /// A texture role has no confirmed slot in the target layout.
     TextureSlotUnsupported { slot: &'static str },
     /// More than one material slot needs per-triangle material authoring.
@@ -145,6 +161,14 @@ impl fmt::Display for NifWriteError {
             Self::TooManyBones { bones } => {
                 write!(formatter, "{bones} bones exceed the u8 per-vertex index")
             }
+            Self::TooManyInfluences { vertex, influences } => write!(
+                formatter,
+                "vertex {vertex} has {influences} influences, above the four NIF lanes"
+            ),
+            Self::WeightUnrepresentable { vertex, joint, weight } => write!(
+                formatter,
+                "vertex {vertex} joint {joint} weight {weight} cannot be encoded in a native lane"
+            ),
             Self::SingularBind { bone } => {
                 write!(formatter, "bone {bone} has a singular bind matrix")
             }

@@ -11,12 +11,14 @@
 //! conversion, so every written attribute round-trips.
 
 use sculpto_core::mesh::MeshAsset;
+use sculpto_core::skin::FourLane;
 
 use super::extra;
 use super::header::{NifTarget, NifWriteError, write_header};
 use super::shader;
 use super::skin;
 use super::strings::StringTable;
+use super::{InfluencePolicy, WrittenNif};
 
 const VF_VERTEX: u64 = 0x001;
 const VF_UVS: u64 = 0x002;
@@ -35,6 +37,13 @@ const BLOCK_TYPE: &str = "BSTriShape";
 /// `NiSkinData`, leaving the shape's own vertex/triangle counts and
 /// `data_size` at zero; morphs are deliberately not written yet (C08 onward).
 pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
+    write(asset, InfluencePolicy::Preserve).map(|output| output.bytes)
+}
+
+pub(super) fn write(
+    asset: &MeshAsset,
+    policy: InfluencePolicy,
+) -> Result<WrittenNif, NifWriteError> {
     asset.validate().map_err(NifWriteError::InvalidModel)?;
     let vertices =
         u16::try_from(asset.positions.len()).map_err(|_| NifWriteError::TooManyVertices {
@@ -65,7 +74,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         flags |= VF_TANGENTS;
         vertex_size += 4;
     }
-    let skin_plan = skin::plan(asset)?;
+    let skin_plan = skin::plan(asset, NifTarget::Se, policy)?;
     if skin_plan.is_some() {
         flags |= VF_SKINNED;
         vertex_size += 12;
@@ -133,7 +142,8 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         .as_ref()
         .map_or_else(Vec::new, |link| extra::body(link, &mut strings));
     let data_size = asset.positions.len() as u64 * vertex_size + asset.triangles.len() as u64 * 6;
-    let vertex_bytes = packed_vertices(asset, has_uvs, has_normals, has_tangents)?;
+    let lanes = skin_plan.as_ref().map(|plan| plan.lanes.as_slice());
+    let vertex_bytes = packed_vertices(asset, lanes, has_uvs, has_normals, has_tangents)?;
 
     let mut body = Vec::new();
     // NiObjectNET: name, extra data, no controller. With a skin the file has a
@@ -204,7 +214,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         Some(plan) => (
             skin::instance(2, 3, skeleton_root, &bone_refs),
             skin::data(plan)?,
-            skin::partitions(asset, Some(&global))?,
+            skin::partitions(asset, plan, Some(&global))?,
             skin::node(-1, &[0], &root_extra),
             plan.names
                 .iter()
@@ -299,7 +309,10 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     if physics.is_some() {
         file.extend_from_slice(&extra_body);
     }
-    Ok(file)
+    Ok(WrittenNif {
+        bytes: file,
+        dropped_influences: skin_plan.map_or_else(Vec::new, |plan| plan.dropped_influences),
+    })
 }
 
 /// Pack every mesh vertex into the `BSVertexDataSSE` stream the shape's
@@ -312,6 +325,7 @@ pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
 /// weights, four bone bytes.
 fn packed_vertices(
     asset: &MeshAsset,
+    skin: Option<&[FourLane]>,
     has_uvs: bool,
     has_normals: bool,
     has_tangents: bool,
@@ -364,11 +378,12 @@ fn packed_vertices(
             // Tangent W carries Bitangent Z.
             push_u8(&mut bytes, encode_normal(bitangent[2]));
         }
-        if let Some(skin) = &asset.skin {
-            for weight in skin.weights[index] {
+        if let Some(skin) = skin {
+            let lanes = skin[index];
+            for weight in lanes.weights {
                 push_u16(&mut bytes, half::f16::from_f32(weight).to_bits());
             }
-            for bone in skin.indices[index] {
+            for bone in lanes.joints {
                 push_u8(&mut bytes, bone as u8);
             }
         }
@@ -438,6 +453,7 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 mod tests {
     use super::*;
     use sculpto_core::mesh::{MaterialSlot, PartitionId, ShaderKind, Skin};
+    use sculpto_core::skin::SkinWeights;
 
     fn triangle() -> MeshAsset {
         MeshAsset {
@@ -547,8 +563,8 @@ mod tests {
         asset.skin = Some(Skin {
             bones: vec!["Root".into(), "Spine".into()],
             bind_inverse: bind,
-            indices: vec![[0, 1, 0, 0]; 3],
-            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+            influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+                .expect("four-lane rows"),
         });
         asset
     }
@@ -560,26 +576,19 @@ mod tests {
         let document = crate::read(&bytes).expect("parses");
         let shape = &document.shapes[0];
         assert_eq!(shape.name, "Skinned");
-        assert_eq!(shape.bones, vec!["Root", "Spine"]);
-        assert_eq!(
-            shape.bone_indices,
-            asset.skin.as_ref().expect("skin").indices
-        );
-        for (actual, expected) in shape
-            .weights
-            .iter()
-            .zip(&asset.skin.as_ref().expect("skin").weights)
-        {
-            for (left, right) in actual.iter().zip(expected) {
+        let authored = asset.skin.as_ref().expect("skin");
+        let read = shape.skin.as_ref().expect("the shape carries one skin");
+        assert_eq!(read.bones, authored.bones);
+        for vertex in 0..authored.influences.rows() {
+            let read_row = read.influences.row(vertex).expect("read row");
+            let authored_row = authored.influences.row(vertex).expect("authored row");
+            assert_eq!(read_row.joints, authored_row.joints);
+            for (left, right) in read_row.weights.iter().zip(authored_row.weights) {
                 assert!((left - right).abs() <= 1e-3, "weight drift");
             }
         }
-        assert_eq!(shape.bind_inverse.len(), 2);
-        for (actual, expected) in shape
-            .bind_inverse
-            .iter()
-            .zip(&asset.skin.as_ref().expect("skin").bind_inverse)
-        {
+        assert_eq!(read.bind_inverse.len(), 2);
+        for (actual, expected) in read.bind_inverse.iter().zip(&authored.bind_inverse) {
             for column in 0..4 {
                 for row in 0..4 {
                     assert!(
@@ -644,12 +653,13 @@ mod tests {
             }
         }
         assert_eq!(shape.triangles, asset.triangles);
-        for (actual, expected) in shape
-            .weights
-            .iter()
-            .zip(&asset.skin.as_ref().expect("skin").weights)
-        {
-            for (left, right) in actual.iter().zip(expected) {
+        let read = shape.skin.as_ref().expect("the shape carries one skin");
+        let authored = asset.skin.as_ref().expect("skin");
+        for vertex in 0..authored.influences.rows() {
+            let read_row = read.influences.row(vertex).expect("read row");
+            let authored_row = authored.influences.row(vertex).expect("authored row");
+            assert_eq!(read_row.joints, authored_row.joints);
+            for (left, right) in read_row.weights.iter().zip(authored_row.weights) {
                 assert!((left - right).abs() <= 1e-3, "weight drift");
             }
         }

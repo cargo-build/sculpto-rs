@@ -7,6 +7,7 @@
 use gltf::Gltf;
 use gltf::animation::{Interpolation, Property};
 use sculpto_core::mesh::{MeshAsset, PartitionId, PhysicsRef, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_gltf::{Clip, ClipChannel, GltfError, write_glb, write_glb_with};
 
 /// A two-bone skinned triangle, so clips target real joints.
@@ -19,8 +20,8 @@ fn two_bone_triangle() -> MeshAsset {
         skin: Some(Skin {
             bones: vec!["root".into(), "spine".into()],
             bind_inverse: vec![],
-            indices: vec![[0, 0, 0, 0]; 3],
-            weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+            influences: SkinWeights::from_quads(&[[0, 0, 0, 0]; 3], &[[1.0, 0.0, 0.0, 0.0]; 3])
+                .expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     }

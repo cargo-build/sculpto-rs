@@ -1,7 +1,8 @@
 //! Skin blocks shared by the SE and LE writers.
 //!
-//! The model carries bone names, per-bone bind matrices and four influences per
-//! vertex. Both targets write `NiSkinInstance` + `NiSkinData`; SE additionally
+//! The model carries bone names, per-bone bind matrices and each vertex's
+//! authored influence row, whatever its width. Both targets write
+//! `NiSkinInstance` + `NiSkinData`; SE additionally
 //! packs every vertex once into `NiSkinPartition.global_vertex_data`
 //! (`VF_SKINNED` included) and leaves the shape without inline geometry, while
 //! LE keeps geometry on `NiTriShapeData` and reads weights from the sparse
@@ -10,22 +11,32 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sculpto_core::mesh::MeshAsset;
+use sculpto_core::mesh::{MeshAsset, MeshError, PartitionPalette};
+use sculpto_core::skin::FourLane;
 
-use super::header::NifWriteError;
+use super::header::{NifTarget, NifWriteError};
+use super::{DroppedInfluence, InfluencePolicy};
 
 /// Validated palette, bind matrices and per-bone sparse weights.
-pub struct SkinPlan {
+pub(crate) struct SkinPlan {
     /// Bone names in palette order.
     pub names: Vec<String>,
     /// Per-bone bind matrix, column-major (mesh -> bone at bind).
-    pub bind: Vec<[[f32; 4]; 4]>,
+    bind: Vec<[[f32; 4]; 4]>,
     /// Per bone: `(vertex, weight)` entries with a non-zero influence.
-    pub weights: Vec<Vec<(u16, f32)>>,
+    weights: Vec<Vec<(u16, f32)>>,
+    /// The common hardware view for partition entries and SE packed vertices.
+    pub lanes: Vec<FourLane>,
+    /// Original values omitted from that view.
+    pub dropped_influences: Vec<DroppedInfluence>,
 }
 
 /// Build the skin plan, refusing a palette the file format cannot express.
-pub fn plan(asset: &MeshAsset) -> Result<Option<SkinPlan>, NifWriteError> {
+pub(crate) fn plan(
+    asset: &MeshAsset,
+    target: NifTarget,
+    policy: InfluencePolicy,
+) -> Result<Option<SkinPlan>, NifWriteError> {
     let Some(skin) = &asset.skin else {
         return Ok(None);
     };
@@ -54,22 +65,100 @@ pub fn plan(asset: &MeshAsset) -> Result<Option<SkinPlan>, NifWriteError> {
         false => skin.bind_inverse.clone(),
     };
     let mut weights = vec![Vec::new(); skin.bones.len()];
-    for (vertex, (indices, quad)) in skin.indices.iter().zip(&skin.weights).enumerate() {
-        let vertex = u16::try_from(vertex).map_err(|_| NifWriteError::TooManyVertices {
-            vertices: skin.indices.len(),
+    let mut lanes = Vec::with_capacity(skin.influences.rows());
+    let mut dropped_influences = Vec::new();
+    let mut positive = Vec::new();
+    for index in 0..skin.influences.rows() {
+        let vertex = u16::try_from(index).map_err(|_| NifWriteError::TooManyVertices {
+            vertices: skin.influences.rows(),
         })?;
-        for (slot, bone) in indices.iter().enumerate() {
-            let weight = quad[slot];
-            if weight > 0.0 {
-                weights[*bone as usize].push((vertex, weight));
+        let row = skin
+            .influences
+            .row(index)
+            .ok_or(NifWriteError::InvalidModel(MeshError::SkinLengthMismatch))?;
+        positive.clear();
+        positive.extend(
+            row.joints
+                .iter()
+                .copied()
+                .zip(row.weights.iter().copied())
+                .filter(|(_, weight)| *weight > 0.0),
+        );
+        if target == NifTarget::Le {
+            for &(bone, weight) in &positive {
+                weights[bone as usize].push((vertex, weight));
             }
         }
+        let (lane, dropped) = project_row(&mut positive, index, target, policy)?;
+        dropped_influences.extend(dropped.iter().map(|&(joint, weight)| DroppedInfluence {
+            vertex: index,
+            bone: skin.bones[joint as usize].clone(),
+            weight,
+        }));
+        if target == NifTarget::Se {
+            for (bone, weight) in lane.joints.into_iter().zip(lane.weights) {
+                if weight > 0.0 {
+                    weights[bone as usize].push((vertex, weight));
+                }
+            }
+        }
+        lanes.push(lane);
     }
     Ok(Some(SkinPlan {
         names: skin.bones.clone(),
         bind,
         weights,
+        lanes,
+        dropped_influences,
     }))
+}
+
+/// Keep packed and partition weights consistent without modifying the source row.
+fn project_row(
+    positive: &mut [(u16, f32)],
+    vertex: usize,
+    target: NifTarget,
+    policy: InfluencePolicy,
+) -> Result<(FourLane, &[(u16, f32)]), NifWriteError> {
+    let reduce = positive.len() > 4;
+    if reduce {
+        if policy == InfluencePolicy::Preserve {
+            return Err(NifWriteError::TooManyInfluences {
+                vertex,
+                influences: positive.len(),
+            });
+        }
+        positive.sort_unstable_by(|(left_joint, left), (right_joint, right)| {
+            right.total_cmp(left).then(left_joint.cmp(right_joint))
+        });
+    }
+    let (kept, dropped) = positive.split_at(positive.len().min(4));
+    let divisor = if reduce {
+        kept.iter().map(|&(_, weight)| f64::from(weight)).sum()
+    } else {
+        1.0
+    };
+    let mut lane = FourLane {
+        joints: [0; 4],
+        weights: [0.0; 4],
+    };
+    for (index, &(joint, weight)) in kept.iter().enumerate() {
+        let normalized = (f64::from(weight) / divisor) as f32;
+        let encoded = match target {
+            NifTarget::Le => normalized,
+            NifTarget::Se => half::f16::from_f32(normalized).to_f32(),
+        };
+        if encoded == 0.0 || !encoded.is_finite() {
+            return Err(NifWriteError::WeightUnrepresentable {
+                vertex,
+                joint,
+                weight,
+            });
+        }
+        lane.joints[index] = joint;
+        lane.weights[index] = encoded;
+    }
+    Ok((lane, dropped))
 }
 
 /// A named `NiNode` body with an identity transform, the given children and
@@ -115,7 +204,7 @@ pub fn instance(data: i32, partition: i32, skeleton_root: i32, bones: &[i32]) ->
 }
 
 /// A `NiSkinData` body with an identity global transform and sparse weights.
-pub fn data(plan: &SkinPlan) -> Result<Vec<u8>, NifWriteError> {
+pub(crate) fn data(plan: &SkinPlan) -> Result<Vec<u8>, NifWriteError> {
     let mut bytes = Vec::new();
     push_transform(&mut bytes, &identity(), 0)?;
     push_u32(&mut bytes, plan.names.len() as u32);
@@ -205,34 +294,63 @@ pub struct GlobalVertices<'a> {
 
 /// A `NiSkinPartition` body: one entry per triangle partition.
 ///
-/// Each entry's palette is exactly the bones its vertices reference
-/// ([`MeshAsset::partition_palettes`]); the call is refused if that projection
-/// cannot cover the mesh. A `global` buffer selects the SSE layout: the packed
+/// Each entry's palette contains the bones used by the emitted lanes.
+/// A `global` buffer selects the SSE layout: the packed
 /// vertices are written once before the entries, and both triangle copies use
 /// mesh-global indices (nifly forces `bMappedIndices = false` on stream 100).
 /// Without one the LE layout stores palette-local indices and no global buffer.
-pub fn partitions(
+pub(crate) fn partitions(
     mesh: &MeshAsset,
+    plan: &SkinPlan,
     global: Option<&GlobalVertices<'_>>,
 ) -> Result<Vec<u8>, NifWriteError> {
-    partitions_from_palettes(mesh, &mesh.partition_palettes(), global)
+    let mut bones_by_partition = BTreeMap::<_, BTreeSet<u16>>::new();
+    for (triangle, partition) in mesh.triangles.iter().zip(&mesh.triangle_partitions) {
+        let bones = bones_by_partition.entry(*partition).or_default();
+        for &vertex in triangle {
+            let lane = &plan.lanes[vertex as usize];
+            bones.extend(
+                lane.joints
+                    .into_iter()
+                    .zip(lane.weights)
+                    .filter_map(|(bone, weight)| (weight > 0.0).then_some(bone)),
+            );
+        }
+    }
+    let palettes = bones_by_partition
+        .into_iter()
+        .map(|(partition, bones)| PartitionPalette {
+            partition,
+            bones: bones.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
+    pack_partitions(mesh, &palettes, &plan.lanes, global)
 }
 
-/// Same as [`partitions`], but with a caller-supplied palette set.
+/// Encode an unreduced partition view with a caller-supplied palette set.
 ///
 /// The set is validated first, so an authored palette that omits a referenced
 /// bone is a typed refusal rather than a mesh that deforms wrongly at runtime.
 pub fn partitions_from_palettes(
     mesh: &MeshAsset,
-    palettes: &[sculpto_core::mesh::PartitionPalette],
+    palettes: &[PartitionPalette],
     global: Option<&GlobalVertices<'_>>,
 ) -> Result<Vec<u8>, NifWriteError> {
+    mesh.validate().map_err(NifWriteError::InvalidModel)?;
     mesh.validate_partition_palettes(palettes)
         .map_err(NifWriteError::InvalidModel)?;
-    let skin = mesh
-        .skin
-        .as_ref()
+    let target = if global.is_some() { NifTarget::Se } else { NifTarget::Le };
+    let plan = plan(mesh, target, InfluencePolicy::Preserve)?
         .ok_or(NifWriteError::UnnamedBone { index: 0 })?;
+    pack_partitions(mesh, palettes, &plan.lanes, global)
+}
+
+fn pack_partitions(
+    mesh: &MeshAsset,
+    palettes: &[PartitionPalette],
+    lanes: &[FourLane],
+    global: Option<&GlobalVertices<'_>>,
+) -> Result<Vec<u8>, NifWriteError> {
     if let Some(global) = global {
         let expected = mesh.positions.len() * global.vertex_size as usize;
         if global.vertex_size == 0
@@ -319,10 +437,10 @@ pub fn partitions_from_palettes(
         for vertex in &map {
             push_u16(&mut entry, *vertex);
         }
-        // Weights in map order, four per vertex.
+        // Use the same lane view for weights and palette-local indices.
         push_u8(&mut entry, 1); // has vertex weights
         for vertex in &map {
-            for weight in skin.weights[*vertex as usize] {
+            for weight in lanes[*vertex as usize].weights {
                 push_f32(&mut entry, weight);
             }
         }
@@ -335,13 +453,18 @@ pub fn partitions_from_palettes(
         // Bone indices are palette-local.
         push_u8(&mut entry, 1); // has bone indices
         for vertex in &map {
-            for bone in skin.indices[*vertex as usize] {
+            let lane = &lanes[*vertex as usize];
+            for (bone, weight) in lane.joints.into_iter().zip(lane.weights) {
+                if weight == 0.0 {
+                    push_u8(&mut entry, 0);
+                    continue;
+                }
                 let position = palette
                     .bones
                     .iter()
                     .position(|candidate| *candidate == bone)
                     .ok_or(NifWriteError::InvalidModel(
-                        sculpto_core::mesh::MeshError::PaletteMissingBone {
+                        MeshError::PaletteMissingBone {
                             partition: palette.partition,
                             bone,
                         },
@@ -384,6 +507,7 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
 mod tests {
     use super::*;
     use sculpto_core::mesh::{PartitionId, PartitionPalette, Skin};
+    use sculpto_core::skin::SkinWeights;
 
     fn two_partitions() -> MeshAsset {
         MeshAsset {
@@ -398,13 +522,16 @@ mod tests {
             skin: Some(Skin {
                 bones: vec!["a".into(), "b".into(), "c".into()],
                 bind_inverse: Vec::new(),
-                indices: vec![[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]],
-                weights: vec![
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.5, 0.5, 0.0, 0.0],
-                    [1.0, 0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0, 0.0],
-                ],
+                influences: SkinWeights::from_quads(
+                    &[[0, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]],
+                    &[
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.5, 0.5, 0.0, 0.0],
+                        [1.0, 0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0, 0.0],
+                    ],
+                )
+                .expect("four-lane rows"),
             }),
             ..MeshAsset::default()
         }
@@ -414,8 +541,11 @@ mod tests {
     fn partitions_use_the_exact_palette_per_triangle_range() {
         let mesh = two_partitions();
         mesh.validate().expect("valid");
-        let palettes = mesh.partition_palettes();
-        let bytes = partitions(&mesh, None).expect("partitions write");
+        let palettes = mesh.partition_palettes().expect("palettes derive");
+        let plan = plan(&mesh, NifTarget::Le, InfluencePolicy::Preserve)
+            .expect("valid plan")
+            .expect("skinned");
+        let bytes = partitions(&mesh, &plan, None).expect("partitions write");
         assert!(!bytes.is_empty());
         // Two entries: each palette is the derived one, in partition order.
         assert_eq!(palettes.len(), 2);
@@ -426,7 +556,7 @@ mod tests {
     #[test]
     fn a_palette_that_misses_a_bone_is_refused() {
         let mesh = two_partitions();
-        let mut palettes = mesh.partition_palettes();
+        let mut palettes = mesh.partition_palettes().expect("palettes derive");
         palettes[0].bones = vec![0];
         let error = partitions_from_palettes(&mesh, &palettes, None)
             .expect_err("a missing bone must be refused");
@@ -442,7 +572,8 @@ mod tests {
     #[test]
     fn a_missing_partition_is_refused() {
         let mesh = two_partitions();
-        let mut palettes: Vec<PartitionPalette> = mesh.partition_palettes();
+        let mut palettes: Vec<PartitionPalette> =
+            mesh.partition_palettes().expect("palettes derive");
         palettes.pop();
         assert!(matches!(
             partitions_from_palettes(&mesh, &palettes, None),
@@ -455,6 +586,9 @@ mod tests {
     #[test]
     fn a_global_buffer_that_does_not_pack_the_mesh_is_refused() {
         let mesh = two_partitions();
+        let plan = plan(&mesh, NifTarget::Se, InfluencePolicy::Preserve)
+            .expect("valid plan")
+            .expect("skinned");
         let short = vec![0u8; 63];
         let global = GlobalVertices {
             vertex_desc: (0x001u64 << 44) | 4,
@@ -462,7 +596,7 @@ mod tests {
             bytes: &short,
         };
         assert!(matches!(
-            partitions(&mesh, Some(&global)),
+            partitions(&mesh, &plan, Some(&global)),
             Err(NifWriteError::GlobalVertexMismatch {
                 vertices: 4,
                 vertex_size: 16,
@@ -475,6 +609,6 @@ mod tests {
             vertex_size: 16,
             bytes: &stride,
         };
-        assert!(partitions(&mesh, Some(&mismatched)).is_err());
+        assert!(partitions(&mesh, &plan, Some(&mismatched)).is_err());
     }
 }

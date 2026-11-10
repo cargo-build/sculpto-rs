@@ -48,8 +48,9 @@
 //!   means the identity per bone. A clip channel drives bone `b` through its
 //!   joint node `b + 1`: node 0 is the root/mesh node and the joints follow in
 //!   model bone order.
-//! - `JOINTS_0` is `u16` and `WEIGHTS_0` is `f32`: `f32` keeps the model's
-//!   weights bit-exact instead of quantizing them into normalized `u16`.
+//! - Paired `JOINTS_n`/`WEIGHTS_n` accessors carry every positive influence.
+//!   Joint lanes are `u16`; weights are normalized across the complete row
+//!   and encoded as `f32`. The authored source is unchanged.
 
 pub mod pack;
 
@@ -62,6 +63,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, PhysicsRef, TextureSlot};
+use sculpto_core::skin::{SkinWeightError, SkinWeights};
 use serde_json::{Map, Value, json};
 
 use profile::ConsumerProfile;
@@ -89,6 +91,10 @@ pub enum GltfError {
     InvalidMesh(MeshError),
     /// The model has no triangles, so there is no primitive to write.
     NoTriangles,
+    /// A required normalized influence row was refused.
+    SkinWeights(SkinWeightError),
+    /// A positive normalized value would be encoded as zero.
+    WeightUnrepresentable { vertex: usize, joint: u16 },
     /// An export size exceeds the glTF `u32` field it must fit in.
     TooLarge {
         /// The field that overflowed.
@@ -178,6 +184,11 @@ impl fmt::Display for GltfError {
         match self {
             Self::InvalidMesh(error) => write!(f, "mesh refused: {error:?}"),
             Self::NoTriangles => write!(f, "mesh has no triangles to export"),
+            Self::SkinWeights(error) => write!(f, "skin weights refused: {error}"),
+            Self::WeightUnrepresentable { vertex, joint } => write!(
+                f,
+                "vertex {vertex} joint {joint} would lose its positive weight in glTF f32"
+            ),
             Self::TooLarge { field, size } => {
                 write!(f, "{field} ({size}) exceeds the glTF u32 limit")
             }
@@ -467,20 +478,7 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
 
     let mut skin_json = None;
     if let Some(skin) = &asset.skin {
-        let joints_view = writer.view(&bytes_u16(
-            skin.indices.iter().flat_map(|row| row.iter().copied()),
-        ))?;
-        attributes.insert(
-            "JOINTS_0".into(),
-            json!(writer.accessor(joints_view, UNSIGNED_SHORT, "VEC4", skin.indices.len())),
-        );
-        let weights_view = writer.view(&bytes_f32(
-            skin.weights.iter().flat_map(|row| row.iter().copied()),
-        ))?;
-        attributes.insert(
-            "WEIGHTS_0".into(),
-            json!(writer.accessor(weights_view, FLOAT, "VEC4", skin.weights.len())),
-        );
+        skin_attributes(&mut writer, &skin.influences, &mut attributes)?;
 
         let matrices =
             (0..skin.bones.len()).map(|bone| skin.bind_inverse.get(bone).unwrap_or(&IDENTITY));
@@ -754,6 +752,59 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
     }
     .to_vec()
     .map_err(|error| GltfError::Encode(error.to_string()))
+}
+
+/// Four lanes per set; normalization is over all sets together. @req DECL0008
+fn skin_attributes(
+    writer: &mut Writer,
+    influences: &SkinWeights,
+    attributes: &mut Map<String, Value>,
+) -> Result<(), GltfError> {
+    let rows: Vec<Vec<(u16, f32)>> = (0..influences.rows())
+        .map(|vertex| {
+            influences
+                .normalized_row(vertex)
+                .map_err(GltfError::SkinWeights)?
+                .filter(|(_, weight)| *weight > 0.0)
+                .map(|(joint, weight)| {
+                    let encoded = weight as f32;
+                    match encoded > 0.0 {
+                        true => Ok((joint, encoded)),
+                        false => Err(GltfError::WeightUnrepresentable { vertex, joint }),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    let widest = rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .ok_or(GltfError::InvalidMesh(MeshError::SkinLengthMismatch))?;
+    for set in 0..widest.div_ceil(4) {
+        let lanes = rows
+            .iter()
+            .map(|row| {
+                std::array::from_fn::<_, 4, _>(|lane| {
+                    // Unused wire lanes are zero-weight padding, not source bindings.
+                    row.get(set * 4 + lane).copied().unwrap_or((0, 0.0))
+                })
+            })
+            .collect::<Vec<_>>();
+        let joints = writer.view(&bytes_u16(lanes.iter().flatten().map(|&(joint, _)| joint)))?;
+        let weights = writer.view(&bytes_f32(
+            lanes.iter().flatten().map(|&(_, weight)| weight),
+        ))?;
+        attributes.insert(
+            format!("JOINTS_{set}"),
+            json!(writer.accessor(joints, UNSIGNED_SHORT, "VEC4", rows.len())),
+        );
+        attributes.insert(
+            format!("WEIGHTS_{set}"),
+            json!(writer.accessor(weights, FLOAT, "VEC4", rows.len())),
+        );
+    }
+    Ok(())
 }
 
 /// The accumulating GLB: a growing binary buffer with its views and accessors.

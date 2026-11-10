@@ -24,6 +24,7 @@ use byroredux_nif::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet
 use byroredux_nif::blocks::skin::NiSkinPartition;
 use byroredux_nif::parse_nif;
 use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderKind, Skin};
+use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::header::{NifTarget, VERSION};
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
@@ -158,26 +159,29 @@ fn skinned_two_partitions() -> MeshAsset {
         skin: Some(Skin {
             bones: vec!["Root".into(), "Spine".into(), "Arm".into()],
             bind_inverse: bind,
-            indices: vec![
-                [0, 1, 0, 0],
-                [0, 1, 0, 0],
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 2, 0, 0],
-                [0, 2, 0, 0],
-                [0, 2, 0, 0],
-                [2, 0, 0, 0],
-            ],
-            weights: vec![
-                [0.75, 0.25, 0.0, 0.0],
-                [0.5, 0.5, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-                [0.25, 0.75, 0.0, 0.0],
-                [0.75, 0.25, 0.0, 0.0],
-                [0.4, 0.6, 0.0, 0.0],
-                [0.5, 0.5, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-            ],
+            influences: SkinWeights::from_quads(
+                &[
+                    [0, 1, 0, 0],
+                    [0, 1, 0, 0],
+                    [1, 0, 0, 0],
+                    [0, 1, 0, 0],
+                    [0, 2, 0, 0],
+                    [0, 2, 0, 0],
+                    [0, 2, 0, 0],
+                    [2, 0, 0, 0],
+                ],
+                &[
+                    [0.75, 0.25, 0.0, 0.0],
+                    [0.5, 0.5, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.25, 0.75, 0.0, 0.0],
+                    [0.75, 0.25, 0.0, 0.0],
+                    [0.4, 0.6, 0.0, 0.0],
+                    [0.5, 0.5, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                ],
+            )
+            .expect("four-lane rows"),
         }),
         ..MeshAsset::default()
     }
@@ -322,60 +326,90 @@ fn compare(document: &NifDocument, model: &MeshAsset, target: NifTarget) -> Resu
     }
 
     let authored_skin = model.skin.as_ref();
-    if authored_skin.is_none() && !shape.bones.is_empty() {
-        return Err(format!(
-            "the model has no skin but {} bones read back",
-            shape.bones.len()
-        ));
-    }
-    if let Some(skin) = authored_skin {
-        if shape.bones != skin.bones {
+    match (authored_skin, shape.skin.as_ref()) {
+        (None, None) => {}
+        (Some(_), None) => return Err("the model authors a skin but none read back".to_string()),
+        (None, Some(read)) => {
             return Err(format!(
-                "bone names {:?} differ from authored {:?}",
-                shape.bones, skin.bones
+                "the model has no skin but {} bones read back",
+                read.bones.len()
             ));
         }
-        if shape.bone_indices != skin.indices {
-            return Err(format!(
-                "bone indices differ: {:?} vs authored {:?}",
-                shape.bone_indices, skin.indices
-            ));
-        }
-        for (vertex, (actual, expected)) in shape.weights.iter().zip(&skin.weights).enumerate() {
-            for (slot, (left, right)) in actual.iter().zip(expected).enumerate() {
-                if (left - right).abs() > tolerance.weight {
+        (Some(authored), Some(read)) => {
+            if read.bones != authored.bones {
+                return Err(format!(
+                    "bone names {:?} differ from authored {:?}",
+                    read.bones, authored.bones
+                ));
+            }
+            if read.influences.rows() != authored.influences.rows() {
+                return Err(format!(
+                    "{} weight rows read back, the model authors {}",
+                    read.influences.rows(),
+                    authored.influences.rows()
+                ));
+            }
+            for vertex in 0..authored.influences.rows() {
+                let actual = row_map(&read.influences, vertex);
+                let expected = row_map(&authored.influences, vertex);
+                if actual.len() != expected.len() {
                     return Err(format!(
-                        "weight[{vertex}] slot {slot} drifted beyond {}: {left} vs {right}",
-                        tolerance.weight
+                        "weight[{vertex}] has {} influences, the model authors {}",
+                        actual.len(),
+                        expected.len()
                     ));
                 }
-            }
-        }
-        if shape.bind_inverse.len() != skin.bind_inverse.len() {
-            return Err(format!(
-                "{} bind matrices read back, the model authors {}",
-                shape.bind_inverse.len(),
-                skin.bind_inverse.len()
-            ));
-        }
-        for (bone, (actual, expected)) in shape
-            .bind_inverse
-            .iter()
-            .zip(&skin.bind_inverse)
-            .enumerate()
-        {
-            for (column, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-                for (row, (left, right)) in actual.iter().zip(expected).enumerate() {
-                    if (left - right).abs() > 1e-5 {
+                for (joint, weight) in &expected {
+                    let Some(read) = actual.get(joint) else {
+                        return Err(format!("weight[{vertex}] lost bone {joint}"));
+                    };
+                    if (read - weight).abs() > tolerance.weight {
                         return Err(format!(
-                            "bind[{bone}] [{column}][{row}] drifted: {left} vs {right}"
+                            "weight[{vertex}] bone {joint} drifted beyond {}: {read} vs {weight}",
+                            tolerance.weight
                         ));
+                    }
+                }
+            }
+            if read.bind_inverse.len() != authored.bind_inverse.len() {
+                return Err(format!(
+                    "{} bind matrices read back, the model authors {}",
+                    read.bind_inverse.len(),
+                    authored.bind_inverse.len()
+                ));
+            }
+            for (bone, (actual, expected)) in read
+                .bind_inverse
+                .iter()
+                .zip(&authored.bind_inverse)
+                .enumerate()
+            {
+                for (column, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    for (row, (left, right)) in actual.iter().zip(expected).enumerate() {
+                        if (left - right).abs() > 1e-5 {
+                            return Err(format!(
+                                "bind[{bone}] [{column}][{row}] drifted: {left} vs {right}"
+                            ));
+                        }
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// One vertex's influences as a joint-keyed map, so source order cannot fail
+/// a comparison that is about values.
+fn row_map(weights: &SkinWeights, vertex: usize) -> std::collections::BTreeMap<u16, f32> {
+    let Some(row) = weights.row(vertex) else {
+        return std::collections::BTreeMap::new();
+    };
+    row.joints
+        .iter()
+        .zip(row.weights)
+        .map(|(joint, weight)| (*joint, *weight))
+        .collect()
 }
 
 /// The `NiSkinPartition` block index each target's writer layout produces.
@@ -420,7 +454,7 @@ fn compare_partitions(model: &MeshAsset, target: NifTarget) -> Result<(), String
     let partition = scene
         .get_as::<NiSkinPartition>(partition_block(target))
         .ok_or_else(|| format!("no NiSkinPartition at block {}", partition_block(target)))?;
-    let palettes = model.partition_palettes();
+    let palettes = model.partition_palettes().expect("palettes derive");
     if partition.partitions.len() != palettes.len() {
         return Err(format!(
             "{} skin partitions read back, the model derives {} from ids {:?}",

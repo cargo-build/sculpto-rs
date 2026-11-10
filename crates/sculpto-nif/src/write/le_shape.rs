@@ -14,9 +14,17 @@ use super::header::{NifTarget, NifWriteError, write_header};
 use super::shader;
 use super::skin;
 use super::strings::StringTable;
+use super::{InfluencePolicy, WrittenNif};
 
 /// Write a complete LE NIF containing one `NiTriShape`.
 pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
+    write(asset, InfluencePolicy::Preserve).map(|output| output.bytes)
+}
+
+pub(super) fn write(
+    asset: &MeshAsset,
+    policy: InfluencePolicy,
+) -> Result<WrittenNif, NifWriteError> {
     asset.validate().map_err(NifWriteError::InvalidModel)?;
     let vertices =
         u16::try_from(asset.positions.len()).map_err(|_| NifWriteError::TooManyVertices {
@@ -34,7 +42,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
             target: NifTarget::Le,
         });
     }
-    let skin_plan = skin::plan(asset)?;
+    let skin_plan = skin::plan(asset, NifTarget::Le, policy)?;
     let mut strings = StringTable::new();
     let name_index = match asset.name.is_empty() {
         true => -1,
@@ -180,7 +188,7 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
         Some(plan) => (
             skin::instance(3, 4, skeleton_root, &bone_refs),
             skin::data(plan)?,
-            skin::partitions(asset, None)?,
+            skin::partitions(asset, plan, None)?,
             skin::node(-1, &[0], &root_extra),
             bone_names
                 .iter()
@@ -272,7 +280,10 @@ pub fn write_le_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
     if physics.is_some() {
         file.extend_from_slice(&extra_body);
     }
-    Ok(file)
+    Ok(WrittenNif {
+        bytes: file,
+        dropped_influences: skin_plan.map_or_else(Vec::new, |plan| plan.dropped_influences),
+    })
 }
 
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {
@@ -295,6 +306,7 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 mod tests {
     use super::*;
     use sculpto_core::mesh::{MaterialSlot, PartitionId, ShaderKind, Skin};
+    use sculpto_core::skin::SkinWeights;
 
     fn triangle() -> MeshAsset {
         MeshAsset {
@@ -357,8 +369,8 @@ mod tests {
         asset.skin = Some(Skin {
             bones: vec!["Root".into(), "Spine".into()],
             bind_inverse: bind,
-            indices: vec![[0, 1, 0, 0]; 3],
-            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+            influences: SkinWeights::from_quads(&[[0, 1, 0, 0]; 3], &[[0.75, 0.25, 0.0, 0.0]; 3])
+                .expect("four-lane rows"),
         });
         asset
     }
@@ -394,24 +406,23 @@ mod tests {
         let document = crate::read(&bytes).expect("parses");
         let shape = &document.shapes[0];
         assert_eq!(shape.name, "Skinned");
-        assert_eq!(shape.bones, vec!["Root", "Spine"]);
+        let authored = asset.skin.as_ref().expect("skin");
+        let read = shape.skin.as_ref().expect("the shape carries one skin");
+        assert_eq!(read.bones, authored.bones);
         for vertex in 0..shape.positions.len() {
             let mut weights: std::collections::BTreeMap<&str, f32> =
                 std::collections::BTreeMap::new();
-            for (slot, bone) in shape.bone_indices[vertex].iter().enumerate() {
+            let row = read.influences.row(vertex).expect("read row");
+            for (joint, weight) in row.joints.iter().zip(row.weights) {
                 *weights
-                    .entry(shape.bones[*bone as usize].as_str())
-                    .or_default() += shape.weights[vertex][slot];
+                    .entry(read.bones[*joint as usize].as_str())
+                    .or_default() += weight;
             }
             assert!((weights["Root"] - 0.75).abs() <= 1e-5, "root weight");
             assert!((weights["Spine"] - 0.25).abs() <= 1e-5, "spine weight");
         }
-        assert_eq!(shape.bind_inverse.len(), 2);
-        for (actual, expected) in shape
-            .bind_inverse
-            .iter()
-            .zip(&asset.skin.as_ref().expect("skin").bind_inverse)
-        {
+        assert_eq!(read.bind_inverse.len(), 2);
+        for (actual, expected) in read.bind_inverse.iter().zip(&authored.bind_inverse) {
             for column in 0..4 {
                 for row in 0..4 {
                     assert!(
