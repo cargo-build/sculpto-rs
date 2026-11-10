@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use crate::point_query::PointIndex;
+
 /// One garment vertex pinned to a body vertex with its authored offset.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Binding {
@@ -76,7 +78,7 @@ impl Conform {
         if reference.is_empty() {
             return Err(ConformError::EmptyReference);
         }
-        let tree = KdTree::build(reference);
+        let tree = PointIndex::build(reference);
         let bindings: Vec<Binding> = garment
             .iter()
             .map(|position| {
@@ -171,96 +173,4 @@ fn length(vector: [f32; 3]) -> f32 {
             vector[1].mul_add(vector[1], vector[2] * vector[2]),
         )
         .sqrt()
-}
-
-fn squared_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
-    let delta = subtract(left, right);
-    delta[0].mul_add(delta[0], delta[1].mul_add(delta[1], delta[2] * delta[2]))
-}
-
-/// Static three-dimensional k-d tree over the reference positions.
-struct KdTree<'a> {
-    points: &'a [[f32; 3]],
-    nodes: Vec<KdNode>,
-    root: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct KdNode {
-    point: usize,
-    axis: usize,
-    left: Option<usize>,
-    right: Option<usize>,
-}
-
-impl<'a> KdTree<'a> {
-    fn build(points: &'a [[f32; 3]]) -> Self {
-        let mut tree = Self {
-            points,
-            nodes: Vec::with_capacity(points.len()),
-            root: None,
-        };
-        let mut indices: Vec<usize> = (0..points.len()).collect();
-        tree.root = tree.build_node(&mut indices, 0);
-        tree
-    }
-
-    fn build_node(&mut self, indices: &mut [usize], depth: usize) -> Option<usize> {
-        if indices.is_empty() {
-            return None;
-        }
-        let middle = indices.len() / 2;
-        let axis = depth % 3;
-        let points = self.points;
-        indices.select_nth_unstable_by(middle, |left, right| {
-            points[*left][axis].total_cmp(&points[*right][axis])
-        });
-        let node = self.nodes.len();
-        self.nodes.push(KdNode {
-            point: indices[middle],
-            axis,
-            left: None,
-            right: None,
-        });
-        let (left, rest) = indices.split_at_mut(middle);
-        let left = self.build_node(left, depth + 1);
-        let right = self.build_node(&mut rest[1..], depth + 1);
-        if let Some(entry) = self.nodes.get_mut(node) {
-            entry.left = left;
-            entry.right = right;
-        }
-        Some(node)
-    }
-
-    fn nearest(&self, target: [f32; 3]) -> usize {
-        let mut best = (0usize, f32::INFINITY);
-        self.search(self.root, target, &mut best);
-        best.0
-    }
-
-    fn search(&self, node: Option<usize>, target: [f32; 3], best: &mut (usize, f32)) {
-        let Some(index) = node else {
-            return;
-        };
-        let Some(entry) = self.nodes.get(index) else {
-            return;
-        };
-        let Some(point) = self.points.get(entry.point) else {
-            return;
-        };
-        let distance = squared_distance(*point, target);
-        if distance < best.1 {
-            *best = (entry.point, distance);
-        }
-        let delta = target[entry.axis] - point[entry.axis];
-        let (near, far) = if delta < 0.0 {
-            (entry.left, entry.right)
-        } else {
-            (entry.right, entry.left)
-        };
-        self.search(near, target, best);
-        if delta * delta < best.1 {
-            self.search(far, target, best);
-        }
-    }
 }

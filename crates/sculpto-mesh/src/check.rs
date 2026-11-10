@@ -507,6 +507,11 @@ pub fn intersection_pair_list(
 }
 
 fn point_triangle_distance(p: [f32; 3], tri: &Trie) -> f32 {
+    let difference = sub64(p.map(f64::from), closest_triangle_point(p, tri));
+    dot64(difference, difference).sqrt() as f32
+}
+
+fn closest_triangle_point(p: [f32; 3], tri: &Trie) -> [f64; 3] {
     let p = p.map(f64::from);
     let a = tri.corners[0].map(f64::from);
     let b = tri.corners[1].map(f64::from);
@@ -517,33 +522,31 @@ fn point_triangle_distance(p: [f32; 3], tri: &Trie) -> f32 {
     let d1 = dot64(ab, ap);
     let d2 = dot64(ac, ap);
     if d1 <= 0.0 && d2 <= 0.0 {
-        return dot64(ap, ap).sqrt() as f32;
+        return a;
     }
     let bp = sub64(p, b);
     let d3 = dot64(ab, bp);
     let d4 = dot64(ac, bp);
     if d3 >= 0.0 && d4 <= d3 {
-        return dot64(bp, bp).sqrt() as f32;
+        return b;
     }
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
         let t = d1 / (d1 - d3);
         let q = [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]];
-        let dq = sub64(p, q);
-        return dot64(dq, dq).sqrt() as f32;
+        return q;
     }
     let cp = sub64(p, c);
     let d5 = dot64(ab, cp);
     let d6 = dot64(ac, cp);
     if d6 >= 0.0 && d5 <= d6 {
-        return dot64(cp, cp).sqrt() as f32;
+        return c;
     }
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
         let t = d2 / (d2 - d6);
         let q = [a[0] + t * ac[0], a[1] + t * ac[1], a[2] + t * ac[2]];
-        let dq = sub64(p, q);
-        return dot64(dq, dq).sqrt() as f32;
+        return q;
     }
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
@@ -553,19 +556,16 @@ fn point_triangle_distance(p: [f32; 3], tri: &Trie) -> f32 {
             b[1] + t * (c[1] - b[1]),
             b[2] + t * (c[2] - b[2]),
         ];
-        let dq = sub64(p, q);
-        return dot64(dq, dq).sqrt() as f32;
+        return q;
     }
     let denominator = 1.0 / (va + vb + vc);
     let v = vb * denominator;
     let w = vc * denominator;
-    let q = [
+    [
         a[0] + ab[0] * v + ac[0] * w,
         a[1] + ab[1] * v + ac[1] * w,
         a[2] + ab[2] * v + ac[2] * w,
-    ];
-    let dq = sub64(p, q);
-    dot64(dq, dq).sqrt() as f32
+    ]
 }
 
 fn box_distance(point: [f32; 3], min: [f32; 3], max: [f32; 3]) -> f32 {
@@ -781,6 +781,35 @@ fn ray_triangle(
             origin[2] + ray[2] * distance,
         ],
     ))
+}
+
+/// Shared acceleration for validated control-surface binding. @req DECL0013
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClosestSurfacePoint {
+    pub triangle: usize,
+    pub point: [f32; 3],
+    pub distance: f32,
+}
+
+/// Closest points reuse the diagnostic BVH and its f64 triangle predicate. @req DECL0013
+pub(crate) fn closest_surface_points(
+    points: &[[f32; 3]],
+    positions: &[[f32; 3]],
+    faces: &[[u32; 3]],
+) -> Vec<Option<ClosestSurfacePoint>> {
+    let bvh = Bvh::build(triangles(positions, faces));
+    points
+        .iter()
+        .map(|&point| {
+            bvh.nearest(point)
+                .map(|(triangle, distance)| ClosestSurfacePoint {
+                    triangle,
+                    point: closest_triangle_point(point, &bvh.tries[triangle])
+                        .map(|value| value as f32),
+                    distance,
+                })
+        })
+        .collect()
 }
 
 /// Shared acceleration for validated control-surface binding. @req DECL0013

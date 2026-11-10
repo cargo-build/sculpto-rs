@@ -4,7 +4,7 @@
 //! across surfaces (DECL0002).
 //! The first slice is garment conforming: binding a garment to the body shape
 //! it was authored on and re-applying that binding to a morphed body. The
-//! full mesh model (identity, normals, UVs, weights) is still planned.
+//! mesh model lives in `sculpto-core`; garment operations include weight transfer.
 //! [`actor`] reads and evaluates the embedded glTF actor-motion subset.
 //!
 //! [`aura`](aura) adds the second slice: a cross-section envelope of the body
@@ -26,9 +26,12 @@ pub mod check;
 pub mod classify;
 pub mod conform;
 pub mod control;
+pub mod delta_conform;
 pub mod garment;
 pub mod intake;
 pub mod intake_gltf;
+pub mod mask;
+mod point_query;
 pub mod surface;
 mod topology;
 pub mod uv;
