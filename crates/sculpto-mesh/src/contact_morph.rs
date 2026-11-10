@@ -778,10 +778,7 @@ impl Topology {
         for face in faces {
             let corners = face.map(|vertex| vertex as usize);
             for (a, b) in edge_pairs(&corners) {
-                // Native skips the degenerate corner pair of a collapsed triangle.
-                if a == b {
-                    continue;
-                }
+                // Repeated corners retain native self-neighbours before deduplication.
                 neighbour_sets[a].push(b);
                 neighbour_sets[b].push(a);
             }
