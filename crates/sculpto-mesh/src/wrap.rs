@@ -33,6 +33,10 @@ use std::fmt;
 use crate::check::SurfaceIndex;
 use crate::mask::VertexMask;
 use crate::point_query::PointIndex;
+use crate::surface_util::{
+    OpenEdges, add, barycentric_clamped, coincident_groups, cross, dot, edge_pairs, face_normal_of,
+    first_non_finite, length, past_open_edge, scale, sub, unit,
+};
 
 /// A mesh as positions plus triangles indexing them.
 pub type Mesh<'a> = (&'a [[f32; 3]], &'a [[u32; 3]]);
@@ -1370,61 +1374,6 @@ fn weld(positions: &[[f32; 3]], faces: &[[u32; 3]], weld_distance: f32) -> Welde
     }
 }
 
-/// Groups of points closer than `tolerance` around each first ungrouped
-/// point, on a spatial hash (`CoincidentGroups`, `MeshAnalysis.cpp:244-288`).
-fn coincident_groups(points: &[[f32; 3]], tolerance: f32) -> Vec<Vec<usize>> {
-    let cell = tolerance.max(1e-6);
-    let key = |point: [f32; 3]| -> (i64, i64, i64) {
-        (
-            (point[0] / cell).floor() as i64,
-            (point[1] / cell).floor() as i64,
-            (point[2] / cell).floor() as i64,
-        )
-    };
-    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-    points.iter().enumerate().for_each(|(index, &point)| {
-        grid.entry(key(point)).or_default().push(index);
-    });
-    let tolerance_sq = tolerance * tolerance;
-    let mut group_of = vec![usize::MAX; points.len()];
-    let mut groups = Vec::new();
-    for (index, &point) in points.iter().enumerate() {
-        if group_of[index] != usize::MAX {
-            continue;
-        }
-        let home = key(point);
-        let mut group = vec![index];
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    let Some(cell_points) = grid.get(&(home.0 + dx, home.1 + dy, home.2 + dz))
-                    else {
-                        continue;
-                    };
-                    for &other in cell_points {
-                        let delta = sub(point, points[other]);
-                        if other != index
-                            && group_of[other] == usize::MAX
-                            && dot(delta, delta) <= tolerance_sq
-                        {
-                            group.push(other);
-                        }
-                    }
-                }
-            }
-        }
-        if group.len() < 2 {
-            continue;
-        }
-        let group_index = groups.len();
-        for &member in &group {
-            group_of[member] = group_index;
-        }
-        groups.push(group);
-    }
-    groups
-}
-
 /// Area-weighted unit vertex normal sums over a welded mesh
 /// (`TriangleNormalSums`, `SurfaceFit.cpp:129-143`).
 fn triangle_normal_sums(positions: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[f32; 3]> {
@@ -2101,41 +2050,16 @@ fn signed_standoffs(
     surface: &BodySurface<'_>,
     radius: f32,
 ) -> Vec<Option<f32>> {
-    let mut edge_uses: HashMap<(u32, u32), usize> = HashMap::new();
-    for face in &surface.faces {
-        for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
-            *edge_uses.entry((a.min(b), a.max(b))).or_insert(0) += 1;
-        }
-    }
-    let is_open_edge = |a: u32, b: u32| -> bool {
-        edge_uses
-            .get(&(a.min(b), a.max(b)))
-            .is_some_and(|uses| *uses == 1)
-    };
-    let mut open_vertex = vec![false; surface.positions.len()];
-    for ((a, b), uses) in &edge_uses {
-        if *uses == 1 {
-            open_vertex[*a as usize] = true;
-            open_vertex[*b as usize] = true;
-        }
-    }
+    let open = OpenEdges::build(&surface.faces, surface.positions.len());
     points
         .iter()
         .map(|&point| {
             let hit = surface.hit(point, radius)?;
             let face = surface.faces[hit.triangle];
-            let [u, v, w] = hit.bary;
-            let past_open_edge = (u < ON_SURFACE && is_open_edge(face[1], face[2]))
-                || (v < ON_SURFACE && is_open_edge(face[2], face[0]))
-                || (w < ON_SURFACE && is_open_edge(face[0], face[1]))
-                || (v < ON_SURFACE && w < ON_SURFACE && open_vertex[face[0] as usize])
-                || (u < ON_SURFACE && w < ON_SURFACE && open_vertex[face[1] as usize])
-                || (u < ON_SURFACE && v < ON_SURFACE && open_vertex[face[2] as usize]);
             let offset = sub(point, hit.point);
-            Some(if past_open_edge {
-                length(offset)
-            } else {
-                dot(offset, hit.normal)
+            Some(match past_open_edge(&open, face, hit.bary) {
+                true => length(offset),
+                false => dot(offset, hit.normal),
             })
         })
         .collect()
@@ -2224,33 +2148,6 @@ fn falloff(distance: f32, max_distance: f32) -> f32 {
     f * f
 }
 
-/// Barycentric weights of `p` clamped onto the triangle
-/// (`BarycentricOnTriangle`, `SurfaceFit.cpp:38-59`).
-fn barycentric_clamped(p: [f32; 3], tri: [[f32; 3]; 3]) -> [f32; 3] {
-    let [a, b, c] = tri;
-    let v0 = sub(b, a);
-    let v1 = sub(c, a);
-    let v2 = sub(p, a);
-    let d00 = dot(v0, v0);
-    let d01 = dot(v0, v1);
-    let d11 = dot(v1, v1);
-    let d20 = dot(v2, v0);
-    let d21 = dot(v2, v1);
-    let denominator = d00 * d11 - d01 * d01;
-    if denominator.abs() < 1e-20 {
-        return [1.0, 0.0, 0.0];
-    }
-    let v = ((d11 * d20 - d01 * d21) / denominator).max(0.0);
-    let w = ((d00 * d21 - d01 * d20) / denominator).max(0.0);
-    let u = (1.0 - v - w).max(0.0);
-    let sum = u + v + w;
-    if sum > 0.0 {
-        [u / sum, v / sum, w / sum]
-    } else {
-        [1.0, 0.0, 0.0]
-    }
-}
-
 /// The point at barycentric weights over three unknowns.
 fn barycentric_point(values: &[[f32; 3]], unknowns: [usize; 3], bary: [f32; 3]) -> [f32; 3] {
     add(
@@ -2260,20 +2157,6 @@ fn barycentric_point(values: &[[f32; 3]], unknowns: [usize; 3], bary: [f32; 3]) 
         ),
         scale(values[unknowns[2]], bary[2]),
     )
-}
-
-fn edge_pairs(face: &[usize; 3]) -> [(usize, usize); 3] {
-    [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])]
-}
-
-fn face_normal_of(face: [[f32; 3]; 3]) -> [f32; 3] {
-    cross(sub(face[1], face[0]), sub(face[2], face[0]))
-}
-
-fn first_non_finite(positions: &[[f32; 3]]) -> Option<usize> {
-    positions
-        .iter()
-        .position(|position| !position.iter().all(|value| value.is_finite()))
 }
 
 fn validate_geometry(garment: Mesh<'_>, body: Mesh<'_>) -> Result<(), FitError> {
@@ -2373,41 +2256,4 @@ fn dot_all(a: &[[f32; 3]], b: &[[f32; 3]]) -> f64 {
                 + f64::from(x[2]) * f64::from(y[2])
         })
         .sum()
-}
-
-fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn scale(a: [f32; 3], factor: f32) -> [f32; 3] {
-    [a[0] * factor, a[1] * factor, a[2] * factor]
-}
-
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn length(v: [f32; 3]) -> f32 {
-    dot(v, v).sqrt()
-}
-
-fn unit(v: [f32; 3]) -> [f32; 3] {
-    let len = length(v);
-    if len <= 1e-12 {
-        [0.0, 0.0, 0.0]
-    } else {
-        scale(v, 1.0 / len)
-    }
 }
