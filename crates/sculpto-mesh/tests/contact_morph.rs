@@ -562,12 +562,10 @@ fn follower_blends_the_body_motion_at_its_closest_point() {
 
 #[test]
 fn follower_fades_over_the_outer_quarter_of_the_radius() {
-    let (body_positions, body_faces, top) = pyramid(2.0);
-    let mut body_deltas = vec![[0.0; 3]; body_positions.len()];
-    body_deltas[..top]
-        .iter_mut()
-        .for_each(|delta| *delta = [0.5, 0.0, 0.0]);
-    // The top face slides in its own plane, so every follower keeps its gap.
+    let (body_positions, body_faces) = plate(4.0, 4.0, 0.0);
+    let body_deltas = vec![[0.5, 0.0, 0.0]; body_positions.len()];
+    // A translated plane has constant normals. Gap restoration cannot alter
+    // this fade-only control, unlike the pyramid's varying vertex normals.
     let follower_positions = vec![
         [0.0, 0.0, 0.5],
         [0.0, 0.0, 0.75],
@@ -808,7 +806,7 @@ fn invalid_input_is_refused_by_name() {
         follower_face,
         ContactError::FollowerFaceIndex {
             triangle: 0,
-            vertex: 9
+            vertex: 1
         }
     );
 

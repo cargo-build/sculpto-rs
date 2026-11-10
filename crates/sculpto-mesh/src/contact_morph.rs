@@ -455,7 +455,7 @@ pub fn make_contact_morph(
     // Smoothed over the surface, which rounds the turn at the edge (`MeshDeform.cpp:428-443`).
     let mut next = morph.offsets.clone();
     for _ in 0..options.smoothing {
-        for vertex in 0..count {
+        for (vertex, value) in next.iter_mut().enumerate() {
             let neighbours = &topology.neighbours[vertex];
             if neighbours.is_empty() {
                 continue;
@@ -465,7 +465,7 @@ pub fn make_contact_morph(
                 .map(|&neighbour| morph.offsets[neighbour])
                 .sum::<f32>()
                 / neighbours.len() as f32;
-            next[vertex] = morph.offsets[vertex]
+            *value = morph.offsets[vertex]
                 + (average - morph.offsets[vertex]) * OFFSET_SMOOTHING_STRENGTH;
         }
         average_welds(&topology, &all, &mut next);
@@ -477,7 +477,7 @@ pub fn make_contact_morph(
     // through between its vertices, all of it where the cover is far (`MeshDeform.cpp:445-452`).
     if options.bulge > 0.0 {
         let room_reach = contact + options.bulge;
-        for vertex in 0..count {
+        for (vertex, &position) in body_positions.iter().enumerate() {
             if morph.offsets[vertex] <= 0.0 {
                 continue;
             }
@@ -485,7 +485,7 @@ pub fn make_contact_morph(
                 &cover_index,
                 cover_faces,
                 cover_positions,
-                body_positions[vertex],
+                position,
                 room_reach,
             ) else {
                 continue;
@@ -590,7 +590,7 @@ pub fn follow_deltas(
                 let average = neighbours
                     .iter()
                     .map(|&neighbour| deltas[neighbour])
-                    .fold([0.0f32; 3], |sum, delta| add(sum, delta));
+                    .fold([0.0f32; 3], add);
                 let average = scale(average, 1.0 / neighbours.len() as f32);
                 next[vertex] = add(
                     deltas[vertex],
