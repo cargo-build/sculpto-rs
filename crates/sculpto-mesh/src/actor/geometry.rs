@@ -1,6 +1,6 @@
 //! Primitive identity stays attached to its original ordered geometry.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use glam::{DMat4, DVec3, DVec4};
 use gltf::accessor::{DataType, Dimensions};
@@ -176,11 +176,11 @@ fn joint_matrices(
 
 /// One source influence row: skin-local joint indices and original weights.
 pub(super) struct SkinRow {
-    pub(super) joints: [u16; 4],
-    pub(super) weights: [f64; 4],
+    pub(super) joints: Vec<u16>,
+    pub(super) weights: Vec<f64>,
 }
 
-/// Decode and validate JOINTS_0/WEIGHTS_0 shared by sampling and rig output.
+/// Validate the combined row across all paired sets for sampling and rig output.
 /// @req DECL0013
 pub(super) fn skin_rows(
     actor: &Actor,
@@ -189,12 +189,76 @@ pub(super) fn skin_rows(
     vertex_count: usize,
     context: &str,
 ) -> Result<Vec<SkinRow>, ActorError> {
+    let sets: BTreeSet<_> = primitive
+        .attributes()
+        .filter_map(|(semantic, _)| match semantic {
+            Semantic::Joints(set) | Semantic::Weights(set) => Some(set),
+            _ => None,
+        })
+        .collect();
+    if sets.is_empty() {
+        return Err(invalid(context, "missing JOINTS_0/WEIGHTS_0"));
+    }
+    let mut rows: Vec<_> = (0..vertex_count)
+        .map(|_| SkinRow {
+            joints: Vec::new(),
+            weights: Vec::new(),
+        })
+        .collect();
+    sets.into_iter()
+        .enumerate()
+        .try_for_each(|(expected, set)| {
+            if usize::try_from(set).ok() != Some(expected) {
+                return Err(invalid(
+                    context,
+                    format!("expected influence set {expected}, found {set}"),
+                ));
+            }
+            append_skin_set(actor, primitive, set, &mut rows, context)
+        })?;
+    rows.into_iter()
+        .enumerate()
+        .map(|(vertex, row)| {
+            let location = format!("{context} vertex {vertex}");
+            if !row
+                .weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0)
+                || (row.weights.iter().sum::<f64>() - 1.0).abs() > 2e-6
+            {
+                return Err(invalid(&location, "invalid skin weight total or value"));
+            }
+            match row
+                .joints
+                .iter()
+                .find(|&&joint| usize::from(joint) >= joint_count)
+            {
+                Some(&joint) => Err(invalid(
+                    &location,
+                    format!("joint index {joint} exceeds skin"),
+                )),
+                None => Ok(row),
+            }
+        })
+        .collect()
+}
+
+/// Decode one four-lane wire pair without applying a per-set sum check.
+fn append_skin_set(
+    actor: &Actor,
+    primitive: &gltf::Primitive<'_>,
+    set: u32,
+    rows: &mut [SkinRow],
+    context: &str,
+) -> Result<(), ActorError> {
+    let location = format!("{context} influence set {set}");
+    let context = location.as_str();
     let joint_accessor = primitive
-        .get(&Semantic::Joints(0))
-        .ok_or_else(|| invalid(context, "missing JOINTS_0"))?;
+        .get(&Semantic::Joints(set))
+        .ok_or_else(|| invalid(context, format!("missing JOINTS_{set}")))?;
     let weight_accessor = primitive
-        .get(&Semantic::Weights(0))
-        .ok_or_else(|| invalid(context, "missing WEIGHTS_0"))?;
+        .get(&Semantic::Weights(set))
+        .ok_or_else(|| invalid(context, format!("missing WEIGHTS_{set}")))?;
     decode::accessor(
         &joint_accessor,
         Dimensions::Vec4,
@@ -207,8 +271,8 @@ pub(super) fn skin_rows(
         &[DataType::F32, DataType::U8, DataType::U16],
         context,
     )?;
-    match joint_accessor.count() == vertex_count
-        && weight_accessor.count() == vertex_count
+    match joint_accessor.count() == rows.len()
+        && weight_accessor.count() == rows.len()
         && !joint_accessor.normalized()
         && (weight_accessor.normalized() == (weight_accessor.data_type() != DataType::F32))
     {
@@ -221,13 +285,14 @@ pub(super) fn skin_rows(
         }
     }
     let reader = primitive.reader(|buffer| actor.buffer(buffer));
-    let indices = reader
-        .read_joints(0)
-        .ok_or_else(|| invalid(context, "unreadable JOINTS_0"))?
-        .into_u16();
+    let indices: Vec<_> = reader
+        .read_joints(set)
+        .ok_or_else(|| invalid(context, format!("unreadable JOINTS_{set}")))?
+        .into_u16()
+        .collect();
     let weights: Vec<[f64; 4]> = match reader
-        .read_weights(0)
-        .ok_or_else(|| invalid(context, "unreadable WEIGHTS_0"))?
+        .read_weights(set)
+        .ok_or_else(|| invalid(context, format!("unreadable WEIGHTS_{set}")))?
     {
         ReadWeights::F32(values) => values.map(|value| value.map(f64::from)).collect(),
         ReadWeights::U8(values) => values
@@ -237,34 +302,17 @@ pub(super) fn skin_rows(
             .map(|value| value.map(|v| f64::from(v) / 65535.0))
             .collect(),
     };
-    indices
-        .into_iter()
+    if indices.len() != rows.len() || weights.len() != rows.len() {
+        return Err(invalid(context, "decoded skin attribute count mismatch"));
+    }
+    rows.iter_mut()
+        .zip(indices)
         .zip(weights)
-        .enumerate()
-        .map(|(vertex, (joints, weights))| {
-            let location = format!("{context} vertex {vertex}");
-            match weights
-                .iter()
-                .all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0)
-                && (weights.iter().sum::<f64>() - 1.0).abs() <= 2e-6
-            {
-                true => {}
-                false => {
-                    return Err(invalid(&location, "invalid skin weight total or value"));
-                }
-            }
-            match joints
-                .iter()
-                .find(|&&joint| usize::from(joint) >= joint_count)
-            {
-                Some(&joint) => Err(invalid(
-                    &location,
-                    format!("joint index {joint} exceeds skin"),
-                )),
-                None => Ok(SkinRow { joints, weights }),
-            }
-        })
-        .collect()
+        .for_each(|((row, joints), weights)| {
+            row.joints.extend(joints);
+            row.weights.extend(weights);
+        });
+    Ok(())
 }
 
 fn primitive_vertices(
@@ -280,9 +328,6 @@ fn primitive_vertices(
     }
     if primitive.morph_targets().len() > 0 {
         return Err(unsupported(context, "morph geometry"));
-    }
-    if primitive.attributes().any(|(semantic, _)| matches!(semantic, Semantic::Joints(set) | Semantic::Weights(set) if set > 0)) {
-        return Err(unsupported(context, "additional skin influence sets"));
     }
     let positions = primitive
         .get(&Semantic::Positions)

@@ -93,6 +93,96 @@ fn skin_world_hierarchy_inverse_binds_and_optional_identity() {
     near(sample.vertices[0], [11., 1., 0.75]);
 }
 
+/// The fifth joint contributes half the displacement and survives rig reduction.
+/// @req DECL0013
+#[test]
+fn five_skin_influences_are_sampled_and_retained_in_the_reduced_rig() {
+    let actor = Actor::from_glb(&five_influence_fixture().bytes()).expect("multi-set GLB");
+    let sample = actor
+        .sample(&["Body"], Pose::Rest)
+        .expect("five-joint skin");
+    near(sample.vertices[0], [16.5, 0.0, 0.0]);
+    near(sample.vertices[1], [15.5, 1.0, 0.0]);
+    near(sample.vertices[2], [15.5, 0.0, 1.0]);
+    let rig = actor
+        .rig_sample(&["Body"], Pose::Rest, &["J0", "J1", "J2", "J3", "J4"])
+        .expect("all authored joints retained");
+    for row in rig.influences {
+        assert_eq!(row.len(), 5);
+        let actual: Vec<_> = row.iter().map(|influence| influence.weight).collect();
+        assert_eq!(actual, [0.125, 0.125, 0.125, 0.125, 0.5]);
+    }
+}
+
+fn five_influence_fixture() -> Fixture {
+    let mut fixture = Fixture::triangle();
+    fixture.json["nodes"] = json!([
+        {"name": "Root", "translation": [10., 0., 0.], "children": [1,2,3,4,5,6]},
+        {"name": "J0", "translation": [0., 0., 0.]},
+        {"name": "J1", "translation": [2., 0., 0.]},
+        {"name": "J2", "translation": [4., 0., 0.]},
+        {"name": "J3", "translation": [6., 0., 0.]},
+        {"name": "J4", "translation": [8., 0., 0.]},
+        {"name": "Body", "mesh": 0, "skin": 0, "translation": [99., 0., 0.]},
+    ]);
+    fixture.json["skins"] = json!([{"joints": [1,2,3,4,5]}]);
+    let joints0 = fixture.accessor(&[0, 1, 2, 3].repeat(3), 5121, "VEC4", 3);
+    let weights0 = fixture.floats(&[0.125; 12], "VEC4", 3);
+    let joints1 = fixture.accessor(&[4, 0, 0, 0].repeat(3), 5121, "VEC4", 3);
+    let weights1 = fixture.floats(&[0.5, 0., 0., 0.].repeat(3), "VEC4", 3);
+    let attributes = &mut fixture.json["meshes"][0]["primitives"][0]["attributes"];
+    attributes["JOINTS_0"] = json!(joints0);
+    attributes["WEIGHTS_0"] = json!(weights0);
+    attributes["JOINTS_1"] = json!(joints1);
+    attributes["WEIGHTS_1"] = json!(weights1);
+    fixture
+}
+
+#[test]
+fn additional_skin_sets_validate_pairs_indices_and_the_combined_sum() {
+    (0..6).for_each(|case| {
+        let mut fixture = five_influence_fixture();
+        match case {
+            0 => {
+                fixture.json["meshes"][0]["primitives"][0]["attributes"]
+                    .as_object_mut()
+                    .expect("attributes")
+                    .remove("WEIGHTS_1");
+            }
+            1 => {
+                let attributes = fixture.json["meshes"][0]["primitives"][0]["attributes"]
+                    .as_object_mut()
+                    .expect("attributes");
+                let joints = attributes.remove("JOINTS_1").expect("set1");
+                let weights = attributes.remove("WEIGHTS_1").expect("set1");
+                attributes.insert("JOINTS_2".into(), joints);
+                attributes.insert("WEIGHTS_2".into(), weights);
+            }
+            2 => {
+                let joints = fixture.accessor(&[5, 0, 0, 0].repeat(3), 5121, "VEC4", 3);
+                fixture.json["meshes"][0]["primitives"][0]["attributes"]["JOINTS_1"] =
+                    json!(joints);
+            }
+            _ => {
+                let value = match case {
+                    3 => 0.50001,
+                    4 => f32::NAN,
+                    _ => -0.5,
+                };
+                let weights = fixture.floats(&[value, 0., 0., 0.].repeat(3), "VEC4", 3);
+                fixture.json["meshes"][0]["primitives"][0]["attributes"]["WEIGHTS_1"] =
+                    json!(weights);
+            }
+        }
+        let result =
+            Actor::from_glb(&fixture.bytes()).and_then(|actor| actor.sample(&["Body"], Pose::Rest));
+        assert!(
+            result.is_err(),
+            "malformed extra influence case{case} admitted"
+        );
+    });
+}
+
 #[test]
 fn rest_is_asset_defaults_and_rotation_is_exact_quarter_interval_slerp() {
     [1., -1.].into_iter().for_each(|sign| {
