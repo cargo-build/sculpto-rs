@@ -504,13 +504,23 @@ fn repeated_follower_corners_retain_the_native_self_neighbour() {
     let body = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
     let body_deltas = [[0.0; 3], [0.4, 0.0, 0.0], [0.0; 3]];
     let follower = [[0.5, 0.5, 0.1], [1.5, 0.5, 0.1]];
-    let deltas = follow_deltas(&body, &[[0, 1, 2]], &body_deltas, &follower, &[[0, 0, 1]], 1.0)
-        .expect("native topology permits repeated corners");
+    let deltas = follow_deltas(
+        &body,
+        &[[0, 1, 2]],
+        &body_deltas,
+        &follower,
+        &[[0, 0, 1]],
+        1.0,
+    )
+    .expect("native topology permits repeated corners");
     // Native neighbours are {0,1} and {0}. Starting at .05/.15, two
     // half-strength smoothing passes yield .08125/.0875, not .1/.1.
     assert!((deltas[0][0] - 0.08125).abs() < 1e-6, "{:?}", deltas[0]);
     assert!((deltas[1][0] - 0.0875).abs() < 1e-6, "{:?}", deltas[1]);
-    assert_eq!([deltas[0][1], deltas[0][2], deltas[1][1], deltas[1][2]], [0.0; 4]);
+    assert_eq!(
+        [deltas[0][1], deltas[0][2], deltas[1][1], deltas[1][2]],
+        [0.0; 4]
+    );
 }
 
 #[test]
