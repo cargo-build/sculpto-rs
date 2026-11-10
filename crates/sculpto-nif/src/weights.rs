@@ -669,7 +669,10 @@ mod tests {
         };
         let rows = sparse_rows_from(&data, None).expect("a five-influence row");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], [(0, 0.2), (1, 0.1), (2, 0.1), (3, 0.15), (4, 0.15)]);
+        assert_eq!(
+            rows[0],
+            [(0, 0.2), (1, 0.1), (2, 0.1), (3, 0.15), (4, 0.15)]
+        );
         assert_eq!(rows[1], [(0, 0.3)]);
 
         // A declared count owns the row count: an unweighted tail vertex keeps
