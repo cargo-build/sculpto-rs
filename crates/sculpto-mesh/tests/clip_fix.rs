@@ -458,10 +458,15 @@ fn invalid_options_and_geometry_are_refused() {
     ));
     assert!(matches!(
         signed_distances_to_body((&non_finite, &faces), &[garment[0]], 2.0),
-        Err(ClipFixError::Geometry(FitError::NonFiniteBodyPosition { vertex: 0 }))
+        Err(ClipFixError::Geometry(FitError::NonFiniteBodyPosition {
+            vertex: 0
+        }))
     ));
     assert!(matches!(
         signed_distances_to_body((&body, &bad_faces), &[garment[0]], 2.0),
-        Err(ClipFixError::Geometry(FitError::BodyFaceIndex { triangle: 0, vertex: 4 }))
+        Err(ClipFixError::Geometry(FitError::BodyFaceIndex {
+            triangle: 0,
+            vertex: 4
+        }))
     ));
 }
