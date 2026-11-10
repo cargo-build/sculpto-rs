@@ -5,15 +5,23 @@
 //! (DECL0008). Format quirks stay
 //! here: the upstream scene is Y-up, meshes carry renderer attributes, and a
 //! truncated parse must never look like a complete body.
+//!
+//! [`read`] also returns the imported node graph and one raw source record per
+//! shape (see [`ShapeSource`]). That capture is read-only: nothing is bound,
+//! posed or applied to a vertex.
 
 use std::fmt;
 
 use byroredux_core::string::StringPool;
-use byroredux_nif::import::import_nif_scene;
+use byroredux_nif::import::{ImportedMesh, import_nif_scene};
 use byroredux_nif::parse_nif;
+use sculpto_core::rig::Rig;
 
 mod mesh;
+mod rig;
 pub mod write;
+
+pub use rig::{ShapeSource, yup_matrix_to_zup, yup_transform_to_zup};
 
 pub use write::tri::{
     PositionOffset, TriError, TriFile, TriPositionMorph, TriShape, TriUvMorph, UvOffset,
@@ -81,6 +89,15 @@ pub struct NifDocument {
     pub bsver: u32,
     /// Shapes in scene order.
     pub shapes: Vec<NifShape>,
+    /// Complete imported node graph, or `None` when the file has no imported
+    /// node (for example a bare written shape with no `NiNode`).
+    ///
+    /// Raw capture: joint ids are the imported node indexes and nothing has
+    /// been bound to [`Self::shapes`]. Use it for bind proofs and later rig
+    /// work, not as an applied pose.
+    pub rig: Option<Rig>,
+    /// One raw source record per shape, parallel to [`Self::shapes`].
+    pub sources: Vec<ShapeSource>,
     /// The parser dropped blocks; geometry may be incomplete.
     pub truncated: bool,
 }
@@ -116,20 +133,6 @@ impl fmt::Display for NifError {
 
 impl std::error::Error for NifError {}
 
-/// Convert a column-major Y-up bind matrix back to the source Z-up frame.
-///
-/// The importer applies the basis change `C` (`(x, y, z) -> (x, z, -y)`), so the
-/// source frame is recovered with `C^T * M * C`.
-fn yup_matrix_to_zup(matrix: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    let right = [
-        matrix[0],
-        [-matrix[2][0], -matrix[2][1], -matrix[2][2], -matrix[2][3]],
-        matrix[1],
-        matrix[3],
-    ];
-    right.map(|column| [column[0], -column[2], column[1], column[3]])
-}
-
 fn parse_header(bytes: &[u8]) -> Result<(NifHeader, u32), NifError> {
     let newline = bytes
         .iter()
@@ -154,10 +157,15 @@ fn parse_header(bytes: &[u8]) -> Result<(NifHeader, u32), NifError> {
     Ok((header, bsver))
 }
 
-/// Read a NIF into Sculpto shapes.
+/// Read a NIF into Sculpto shapes and its raw source capture.
 ///
 /// A NIF starts with an ASCII line (`Gamebryo File Format, Version 20.2.0.7`),
 /// then the numeric header: `u32` version, `u8` endian, `u32` user version.
+///
+/// Geometry, UV, normal and skin arrays keep their existing projection. The
+/// document also carries the imported node graph and one raw source record per
+/// shape; an invalid node graph, parent or placement is a contextual refusal,
+/// never an identity substitute.
 pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
     let (header, bsver) = parse_header(bytes)?;
     let scene = parse_nif(bytes).map_err(|error| NifError::Malformed(error.to_string()))?;
@@ -168,80 +176,91 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
     }
     let mut pool = StringPool::new();
     let imported = import_nif_scene(&scene, &mut pool);
-    let shapes = imported
-        .meshes
-        .iter()
-        .map(|mesh| -> Result<NifShape, NifError> {
-            let chunks = mesh.indices.as_chunks::<3>();
-            if !chunks.1.is_empty() {
-                return Err(NifError::Malformed(format!(
-                    "shape `{}` has {} indices, which is not a triangle list",
-                    mesh.name.as_deref().unwrap_or("-"),
-                    mesh.indices.len()
-                )));
-            }
-            Ok(NifShape {
-                name: mesh.name.as_deref().map(str::to_string).unwrap_or_default(),
-                // Upstream converts to a Y-up renderer frame; morph deltas are
-                // authored in the source Z-up frame, so undo it here:
-                // (x, y, z) -> (x, -z, y). Applying `.osd` offsets to Y-up
-                // positions rotates every displacement by 90 degrees.
-                positions: mesh
-                    .positions
-                    .iter()
-                    .map(|[x, y, z]| [*x, -*z, *y])
-                    .collect(),
-                uvs: mesh.uvs.clone(),
-                // Same Y-up -> Z-up undo as positions; the sign lane is
-                // rotation-invariant and passes through unchanged.
-                normals: mesh.normals.iter().map(|[x, y, z]| [*x, -*z, *y]).collect(),
-                tangents: mesh
-                    .tangents
-                    .iter()
-                    .map(|[x, y, z, sign]| [*x, -*z, *y, *sign])
-                    .collect(),
-                triangles: chunks
-                    .0
-                    .iter()
-                    .map(|tri| [tri[0], tri[1], tri[2]])
-                    .collect(),
-                bones: mesh
-                    .skin
-                    .as_ref()
-                    .map(|skin| {
-                        skin.bones
-                            .iter()
-                            .map(|bone| bone.name.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                bone_indices: mesh
-                    .skin
-                    .as_ref()
-                    .map(|skin| skin.vertex_bone_indices.clone())
-                    .unwrap_or_default(),
-                weights: mesh
-                    .skin
-                    .as_ref()
-                    .map(|skin| skin.vertex_bone_weights.clone())
-                    .unwrap_or_default(),
-                bind_inverse: mesh
-                    .skin
-                    .as_ref()
-                    .map(|skin| {
-                        skin.bones
-                            .iter()
-                            .map(|bone| yup_matrix_to_zup(&bone.bind_inverse))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let nodes: Vec<rig::NodeView<'_>> = imported.nodes.iter().map(rig::NodeView::from).collect();
+    let graph = rig::capture_graph(&nodes)?;
+    let mut shapes = Vec::with_capacity(imported.meshes.len());
+    let mut sources = Vec::with_capacity(imported.meshes.len());
+    for mesh in &imported.meshes {
+        shapes.push(project_shape(mesh)?);
+        sources.push(rig::capture_shape(
+            &rig::MeshView::from(mesh),
+            imported.nodes.len(),
+        )?);
+    }
     Ok(NifDocument {
         header,
         bsver,
         shapes,
+        rig: graph,
+        sources,
         truncated: false,
+    })
+}
+
+/// Project one imported shape onto the adapter's shape type.
+fn project_shape(mesh: &ImportedMesh) -> Result<NifShape, NifError> {
+    let chunks = mesh.indices.as_chunks::<3>();
+    if !chunks.1.is_empty() {
+        return Err(NifError::Malformed(format!(
+            "shape `{}` has {} indices, which is not a triangle list",
+            mesh.name.as_deref().unwrap_or("-"),
+            mesh.indices.len()
+        )));
+    }
+    Ok(NifShape {
+        name: mesh.name.as_deref().map(str::to_string).unwrap_or_default(),
+        // Upstream converts to a Y-up renderer frame; morph deltas are
+        // authored in the source Z-up frame, so undo it here:
+        // (x, y, z) -> (x, -z, y). Applying `.osd` offsets to Y-up
+        // positions rotates every displacement by 90 degrees.
+        positions: mesh
+            .positions
+            .iter()
+            .map(|[x, y, z]| [*x, -*z, *y])
+            .collect(),
+        uvs: mesh.uvs.clone(),
+        // Same Y-up -> Z-up undo as positions; the sign lane is
+        // rotation-invariant and passes through unchanged.
+        normals: mesh.normals.iter().map(|[x, y, z]| [*x, -*z, *y]).collect(),
+        tangents: mesh
+            .tangents
+            .iter()
+            .map(|[x, y, z, sign]| [*x, -*z, *y, *sign])
+            .collect(),
+        triangles: chunks
+            .0
+            .iter()
+            .map(|tri| [tri[0], tri[1], tri[2]])
+            .collect(),
+        bones: mesh
+            .skin
+            .as_ref()
+            .map(|skin| {
+                skin.bones
+                    .iter()
+                    .map(|bone| bone.name.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        bone_indices: mesh
+            .skin
+            .as_ref()
+            .map(|skin| skin.vertex_bone_indices.clone())
+            .unwrap_or_default(),
+        weights: mesh
+            .skin
+            .as_ref()
+            .map(|skin| skin.vertex_bone_weights.clone())
+            .unwrap_or_default(),
+        bind_inverse: mesh
+            .skin
+            .as_ref()
+            .map(|skin| {
+                skin.bones
+                    .iter()
+                    .map(|bone| yup_matrix_to_zup(&bone.bind_inverse))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
