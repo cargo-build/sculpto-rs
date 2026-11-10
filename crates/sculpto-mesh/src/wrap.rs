@@ -1085,7 +1085,9 @@ impl FitState<'_> {
             if inward.iter().all(|component| component.abs() < 1e-4) {
                 continue;
             }
-            let Some((hit, depth)) = index.first_hit(point, inward, 1e-5, self.options.poke_depth, &[]) else {
+            let Some((hit, depth)) =
+                index.first_hit(point, inward, 1e-5, self.options.poke_depth, &[])
+            else {
                 continue;
             };
             let face = self.mesh.faces[hit.triangle];
@@ -1226,7 +1228,14 @@ impl<'a> BodySurface<'a> {
 
     /// Native far-side culling ignores source-vertex incident triangles.
     fn culls_poke(&self, vertex: usize, inward: [f32; 3], depth: f32) -> bool {
-        self.index.first_hit(self.positions[vertex], inward, 1e-3, depth, &self.incident_faces[vertex])
+        self.index
+            .first_hit(
+                self.positions[vertex],
+                inward,
+                1e-3,
+                depth,
+                &self.incident_faces[vertex],
+            )
             .is_some_and(|(_, distance)| distance < depth)
     }
 }

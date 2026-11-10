@@ -489,12 +489,23 @@ fn keep_mode_preserves_standoff_and_pushes_out_clipping() {
 
 #[test]
 fn poke_detection_uses_the_first_ray_crossing_instead_of_the_closest_triangle() {
-    let body = [[0.0, 0.0, 1.0], [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 2.0, 0.0]];
+    let body = [
+        [0.0, 0.0, 1.0],
+        [-1.0, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [0.0, 2.0, 0.0],
+    ];
     let body_faces = [[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
     // The near vertical face misses the top vertex's inward ray. The farther
     // horizontal face crosses it exactly at the body's opposite surface.
-    let garment = [[0.1, -0.1, 0.9], [0.1, 0.1, 0.9], [0.1, 0.0, 1.1],
-        [-3.0, -3.0, 0.0], [3.0, -3.0, 0.0], [0.0, 4.0, 0.0]];
+    let garment = [
+        [0.1, -0.1, 0.9],
+        [0.1, 0.1, 0.9],
+        [0.1, 0.0, 1.1],
+        [-3.0, -3.0, 0.0],
+        [3.0, -3.0, 0.0],
+        [0.0, 4.0, 0.0],
+    ];
     let garment_faces = [[0, 1, 2], [3, 4, 5]];
     let options = FitOptions {
         max_distance: 0.001,
@@ -503,9 +514,17 @@ fn poke_detection_uses_the_first_ray_crossing_instead_of_the_closest_triangle() 
         clipping_passes: 0,
         ..FitOptions::default()
     };
-    let (_, report) = fit_to_body((&garment, &garment_faces), (&body, &body_faces), None, &options)
-        .expect("valid disjoint garment faces");
-    assert_eq!(report.poke_before, 1, "a closer face must not hide a ray crossing");
+    let (_, report) = fit_to_body(
+        (&garment, &garment_faces),
+        (&body, &body_faces),
+        None,
+        &options,
+    )
+    .expect("valid disjoint garment faces");
+    assert_eq!(
+        report.poke_before, 1,
+        "a closer face must not hide a ray crossing"
+    );
 }
 
 #[test]
@@ -541,7 +560,10 @@ fn symmetric_pulls_the_mesh_toward_body_points_it_does_not_reach() {
     // plain=2.299998760, symmetric=2.019999981, difference=0.2799987793.
     assert!((plain_positions[center][2] - 2.299_998_8).abs() < 1e-5);
     assert!((symmetric_positions[center][2] - 2.02).abs() < 1e-5);
-    assert!((difference - 0.279_998_78).abs() < 1e-5, "native displacement mismatch: {difference}");
+    assert!(
+        (difference - 0.279_998_78).abs() < 1e-5,
+        "native displacement mismatch: {difference}"
+    );
 }
 
 #[test]

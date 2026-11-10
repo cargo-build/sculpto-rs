@@ -664,7 +664,11 @@ pub fn first_hits(
 }
 
 fn unit_ray(direction: [f32; 3]) -> Option<[f64; 3]> {
-    let length = direction.iter().map(|&c| f64::from(c).powi(2)).sum::<f64>().sqrt();
+    let length = direction
+        .iter()
+        .map(|&c| f64::from(c).powi(2))
+        .sum::<f64>()
+        .sqrt();
     (length > 0.0 && length.is_finite()).then(|| direction.map(|c| f64::from(c) / length))
 }
 
@@ -696,16 +700,19 @@ impl Bvh {
                 {
                     if !excluded.contains(&triangle)
                         && let Some((distance, location)) =
-                        ray_triangle(origin, ray, &self.tries[triangle].corners)
+                            ray_triangle(origin, ray, &self.tries[triangle].corners)
                         && distance > minimum
                         && distance <= best
                         && (hit.is_none() || distance < best)
                     {
                         best = distance;
-                        hit = Some((RayHit {
-                            triangle,
-                            location: location.map(|value| value as f32),
-                        }, distance));
+                        hit = Some((
+                            RayHit {
+                                triangle,
+                                location: location.map(|value| value as f32),
+                            },
+                            distance,
+                        ));
                     }
                 }
             } else {
@@ -836,7 +843,14 @@ impl SurfaceIndex {
         maximum: f32,
         excluded: &[usize],
     ) -> Option<(RayHit, f32)> {
-        self.bvh.first_hit(origin, unit_ray(direction)?, f64::from(minimum), f64::from(maximum), excluded)
+        self.bvh
+            .first_hit(
+                origin,
+                unit_ray(direction)?,
+                f64::from(minimum),
+                f64::from(maximum),
+                excluded,
+            )
             .map(|(hit, distance)| (hit, distance as f32))
     }
 }

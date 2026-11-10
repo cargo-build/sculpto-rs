@@ -8,8 +8,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use sculpto_core::shape_data::{parse_bare_bsd, MorphData, MorphContainer};
 use sculpto_core::Document;
+use sculpto_core::shape_data::{MorphContainer, MorphData, parse_bare_bsd};
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("SCULPTO_BODYSLIDE_HOME").map(PathBuf::from)
@@ -58,10 +58,16 @@ fn real_body_sets_and_presets_hold_structural_invariants() {
         let Document::Project(project) = document else {
             panic!("{} is not a project", path.display());
         };
-        let written = project.to_osp_xml()
+        let written = project
+            .to_osp_xml()
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        assert_eq!(Document::parse_str(&written, path.display().to_string()).expect("written project parses"),
-            Document::Project(project.clone()), "{}: OSP round trip lost data", path.display());
+        assert_eq!(
+            Document::parse_str(&written, path.display().to_string())
+                .expect("written project parses"),
+            Document::Project(project.clone()),
+            "{}: OSP round trip lost data",
+            path.display()
+        );
         for set in &project.sets {
             set_count += 1;
             let shapes: BTreeSet<&str> = set
@@ -173,7 +179,11 @@ fn morph_containers_decode() {
         let encoded = container.to_bytes().expect("real morph data encodes");
         let reparsed = match &container {
             MorphData::Named(named) => {
-                assert!(!named.blocks.is_empty(), "{}: empty container", path.display());
+                assert!(
+                    !named.blocks.is_empty(),
+                    "{}: empty container",
+                    path.display()
+                );
                 blocks += named.blocks.len();
                 MorphData::Named(MorphContainer::parse(&encoded).expect("written OSD parses"))
             }
@@ -182,7 +192,12 @@ fn morph_containers_decode() {
                 MorphData::Bare(parse_bare_bsd(&encoded).expect("written BSD parses"))
             }
         };
-        assert_eq!(reparsed, container, "{}: morph round trip lost data", path.display());
+        assert_eq!(
+            reparsed,
+            container,
+            "{}: morph round trip lost data",
+            path.display()
+        );
         offsets += container.offset_count();
     }
     eprintln!(

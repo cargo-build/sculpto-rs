@@ -29,6 +29,8 @@ mod xml_util;
 pub use document::Document;
 pub use error::{Error, ErrorKind, Result};
 pub use preset::{Preset, PresetValue, SliderSize};
-pub use project::{OutputFile, Project, ReferenceInfo, ShapeRef, SliderDataRef, SliderDef, SliderSet};
+pub use project::{
+    OutputFile, Project, ReferenceInfo, ShapeRef, SliderDataRef, SliderDef, SliderSet,
+};
 pub use report::UnknownElement;
 pub use shape_data::{MorphBlock, MorphContainer, MorphData, VertexOffset};
