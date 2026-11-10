@@ -94,7 +94,14 @@ pub enum GltfError {
     /// A required normalized influence row was refused.
     SkinWeights(SkinWeightError),
     /// A positive normalized value would be encoded as zero.
-    WeightUnrepresentable { vertex: usize, joint: u16 },
+    WeightUnrepresentable {
+        /// Vertex in source order.
+        vertex: usize,
+        /// Joint in the skin palette.
+        joint: u16,
+        /// Positive normalized value before encoding.
+        weight: f64,
+    },
     /// An export size exceeds the glTF `u32` field it must fit in.
     TooLarge {
         /// The field that overflowed.
@@ -185,9 +192,9 @@ impl fmt::Display for GltfError {
             Self::InvalidMesh(error) => write!(f, "mesh refused: {error:?}"),
             Self::NoTriangles => write!(f, "mesh has no triangles to export"),
             Self::SkinWeights(error) => write!(f, "skin weights refused: {error}"),
-            Self::WeightUnrepresentable { vertex, joint } => write!(
+            Self::WeightUnrepresentable { vertex, joint, weight } => write!(
                 f,
-                "vertex {vertex} joint {joint} would lose its positive weight in glTF f32"
+                "vertex {vertex} joint {joint} weight {weight:.9e} would encode as zero in glTF f32"
             ),
             Self::TooLarge { field, size } => {
                 write!(f, "{field} ({size}) exceeds the glTF u32 limit")
@@ -770,7 +777,7 @@ fn skin_attributes(
                     let encoded = weight as f32;
                     match encoded > 0.0 {
                         true => Ok((joint, encoded)),
-                        false => Err(GltfError::WeightUnrepresentable { vertex, joint }),
+                        false => Err(GltfError::WeightUnrepresentable { vertex, joint, weight }),
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()

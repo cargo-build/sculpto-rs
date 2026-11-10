@@ -395,7 +395,8 @@ fn unrepresentable_positive_weight_is_refused_before_glb_output() {
         write_glb(&asset),
         Err(GltfError::WeightUnrepresentable {
             vertex: 0,
-            joint: 0
-        })
+            joint: 0,
+            weight,
+        }) if weight > 0.0 && weight as f32 == 0.0
     ));
 }

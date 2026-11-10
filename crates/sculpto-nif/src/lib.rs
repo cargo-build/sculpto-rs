@@ -24,7 +24,7 @@ mod rig;
 mod weights;
 pub mod write;
 
-pub use rig::{ShapeSource, yup_matrix_to_zup, yup_transform_to_zup};
+pub use rig::{NifRigError, ShapeSource, yup_matrix_to_zup, yup_transform_to_zup};
 
 pub use write::tri::{
     PositionOffset, TriError, TriFile, TriPositionMorph, TriShape, TriUvMorph, UvOffset,

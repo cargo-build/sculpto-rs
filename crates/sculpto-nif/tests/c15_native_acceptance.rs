@@ -162,6 +162,9 @@ fn native_headless_acceptance_se_and_le() {
     );
 
     let se_doc = read(&se_reexport_bytes).expect("read re-exported SE NIF");
+    assert_eq!(se_doc.shapes.len(), 1, "SE document must have 1 shape");
+    assert_eq!(se_doc.shapes[0].positions.len(), se_asset.positions.len());
+    assert_eq!(se_doc.shapes[0].triangles.len(), se_asset.triangles.len());
     eprintln!(
         "SE re-export verification: {} shapes (source had 1 shape, {} verts, {} tris, {} bones)",
         se_doc.shapes.len(),
@@ -195,6 +198,8 @@ fn native_headless_acceptance_se_and_le() {
     let le_shape = &le_doc.shapes[0];
     assert_eq!(le_shape.positions.len(), le_asset.positions.len());
     assert_eq!(le_shape.triangles.len(), le_asset.triangles.len());
+    // The synthetic automation has emitted empty bone palettes on re-export.
+    // Its acceptance checks the geometry counts in both input paths.
     eprintln!(
         "LE re-export verification: {} verts, {} tris, palette size {:?} (source had {} verts, {} tris, {} bones)",
         le_shape.positions.len(),

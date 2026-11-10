@@ -17,6 +17,8 @@ use std::fmt;
 
 use glam::{DMat4, DQuat, DVec3};
 
+pub mod rest;
+
 /// Squared-length tolerance for a unit rotation quaternion.
 ///
 /// Source rotations arrive as `f32` matrices whose quaternion is unit to about

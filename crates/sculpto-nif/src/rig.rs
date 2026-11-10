@@ -1,22 +1,23 @@
 //! Raw source capture: the imported node graph, one placement and skin context
 //! per shape, and the Y-up to source Z-up basis rule.
 //!
-//! Read side only. [`capture_graph`] turns the importer's node list into the
-//! neutral [`Rig`]; the graph is captured so a later checked binding stage can
-//! resolve palette entries, and it is never applied to geometry here.
-//! [`capture_shape`] keeps the object placement and the source global-to-skin
-//! matrix `G` as two separate raw facts. Nothing in this module binds a skin,
-//! derives a palette joint, reconstructs a rest pose or writes a factor.
+//! [`capture_graph`] turns the importer's node list into the neutral [`Rig`].
+//! [`capture_shape`] keeps object placement and the source global-to-skin
+//! matrix `G` separate. [`NifDocument::bind_rest`] checks the captured
+//! source data through the neutral rest proof.
 //!
 //! Joint ids are the imported node indexes, empty source names are captured as
 //! unnamed, and `NifDocument::sources` is parallel to `NifDocument::shapes`.
 //!
 //! @req DECL0008
 
+use std::fmt;
+
 use byroredux_nif::import::{ImportedMesh, ImportedNode};
+use sculpto_core::rig::rest::{RestBindError, RestBinding, SkinRestSource};
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigError, RigFrame, TransformDefect};
 
-use crate::NifError;
+use crate::{NifDocument, NifError};
 
 /// Raw source facts for one shape: where its object node sits and which skin
 /// factors the source carried.
@@ -39,6 +40,89 @@ pub struct ShapeSource {
     pub global_skin: Option<[[f32; 4]; 4]>,
     /// Source skin-instance skeleton-root name, when the file resolves one.
     pub skeleton_root: Option<String>,
+}
+
+impl NifDocument {
+    /// Resolve the source skeleton and prove rest reconstruction for every skin.
+    ///
+    /// Uses authored skin-local positions and G. Skinned object placement
+    /// remains part of the source record. @req DECL0008
+    pub fn bind_rest(&self) -> Result<RestBinding<'_>, NifRigError> {
+        let rig = self.rig.as_ref().ok_or(NifRigError::MissingRig)?;
+        if self.shapes.len() != self.sources.len() {
+            return Err(NifRigError::SourceCount {
+                shapes: self.shapes.len(),
+                sources: self.sources.len(),
+            });
+        }
+        let sources = self
+            .shapes
+            .iter()
+            .zip(&self.sources)
+            .enumerate()
+            .filter_map(|(index, (shape, source))| {
+                shape.skin.as_ref().map(|skin| (index, shape, source, skin))
+            })
+            .map(|(index, shape, source, skin)| {
+                let root = source.skeleton_root.as_deref().ok_or(NifRigError::MissingSource {
+                    shape: index,
+                    field: "skeleton root",
+                })?;
+                let global_to_skin = source.global_skin.ok_or(NifRigError::MissingSource {
+                    shape: index,
+                    field: "global-to-skin matrix",
+                })?;
+                let root = rig
+                    .joint_by_name(root)
+                    .map_err(|error| NifRigError::Root { shape: index, error })?;
+                Ok(SkinRestSource {
+                    shape: index,
+                    root,
+                    positions: &shape.positions,
+                    skin,
+                    global_to_skin,
+                })
+            })
+            .collect::<Result<Vec<_>, NifRigError>>()?;
+        RestBinding::prove(rig, RigFrame::SourceZUp, &sources).map_err(NifRigError::Rest)
+    }
+}
+
+/// A source NIF did not contain enough consistent data for checked binding.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NifRigError {
+    /// The file has no authored graph.
+    MissingRig,
+    /// There is no one-to-one shape-to-source mapping.
+    SourceCount { shapes: usize, sources: usize },
+    /// A skinned shape lacks required source context.
+    MissingSource { shape: usize, field: &'static str },
+    /// A required skeleton root could not be resolved.
+    Root { shape: usize, error: RigError },
+    /// The rest proof refused the authored binding.
+    Rest(RestBindError),
+}
+
+impl fmt::Display for NifRigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRig => write!(formatter, "NIF has no source rig"),
+            Self::SourceCount { shapes, sources } => write!(formatter, "{shapes} NIF shapes have {sources} source records"),
+            Self::MissingSource { shape, field } => write!(formatter, "shape {shape} has no {field}"),
+            Self::Root { shape, error } => write!(formatter, "shape {shape} skeleton root: {error}"),
+            Self::Rest(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for NifRigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Root { error, .. } => Some(error),
+            Self::Rest(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// One imported node reduced to the fields the capture consumes.

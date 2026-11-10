@@ -8,11 +8,12 @@
 //! claim nothing.
 
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
+use sculpto_core::rig::rest::REST_TOLERANCE;
 use sculpto_core::rig::{JointId, LocalTransform};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
-use sculpto_nif::{NifDocument, read, yup_matrix_to_zup, yup_transform_to_zup};
+use sculpto_nif::{NifDocument, NifRigError, read, yup_matrix_to_zup, yup_transform_to_zup};
 
 fn triangle() -> MeshAsset {
     MeshAsset {
@@ -73,6 +74,7 @@ fn an_unskinned_shape_captures_no_graph_and_no_skin_context() {
     assert_eq!(source.global_skin, None);
     assert_eq!(source.skeleton_root, None);
     assert!(document.shapes[0].skin.is_none());
+    assert!(matches!(document.bind_rest(), Err(NifRigError::MissingRig)));
 }
 
 #[test]
@@ -122,6 +124,7 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
     let row = skin.influences.row(0).expect("vertex 0");
     assert_eq!(row.joints, &[0, 1]);
     assert_eq!(row.weights, &[0.75, 0.25]);
+    assert!(matches!(document.bind_rest(), Err(NifRigError::Root { shape: 0, .. })));
 }
 
 #[test]
@@ -183,20 +186,27 @@ fn print_capture(label: &str, document: &NifDocument) {
     }
 }
 
-fn assert_palette_names_resolve(document: &NifDocument) {
-    let rig = document.rig.as_ref().expect("captured body graph");
-    document.shapes.iter().for_each(|shape| {
-        shape
-            .skin
-            .as_ref()
-            .expect("a captured skin")
-            .bones
-            .iter()
-            .for_each(|name| {
-                rig.joint_by_name(name)
-                    .expect("each authored body palette name resolves uniquely");
-            });
-    });
+fn measure_bound_rest(document: &NifDocument, expects_correction: bool) {
+    let binding = document.bind_rest().expect("source rig reconstructs at rest");
+    assert!(std::ptr::eq(binding.rig(), document.rig.as_ref().expect("source rig")));
+    let basis = binding.basis();
+    assert_eq!(basis != identity().map(|column| column.map(f64::from)), expects_correction);
+    assert_eq!(binding.skins().len(), document.shapes.len());
+    for shape in binding.skins() {
+        let source = shape.source();
+        assert_eq!(shape.palette().len(), source.skin.bones.len());
+        let measurement = shape.measurement();
+        eprintln!(
+            "  rest `{}`: {} vertices, joint diagnostic {:.9e}, influence {:.9e}, vertex {:.9e}",
+            document.shapes[source.shape].name,
+            source.positions.len(),
+            measurement.max_joint,
+            measurement.max_influence,
+            measurement.max_vertex
+        );
+        assert!(measurement.max_influence <= REST_TOLERANCE);
+        assert!(measurement.max_vertex <= REST_TOLERANCE);
+    }
 }
 
 #[test]
@@ -208,7 +218,7 @@ fn himbo_body_raw_capture() {
     let bytes = std::fs::read(&path).expect("the HIMBO fixture is readable");
     let document = read(&bytes).expect("the HIMBO body reads");
     print_capture("HIMBO", &document);
-    assert_palette_names_resolve(&document);
+    measure_bound_rest(&document, false);
 
     let rig = document
         .rig
@@ -256,7 +266,7 @@ fn bijin_body_raw_capture() {
     let bytes = std::fs::read(&path).expect("the Bijin fixture is readable");
     let document = read(&bytes).expect("the Bijin body reads");
     print_capture("Bijin", &document);
-    assert_palette_names_resolve(&document);
+    measure_bound_rest(&document, true);
 
     let rig = document
         .rig
@@ -283,4 +293,19 @@ fn bijin_body_raw_capture() {
         rig.joints().len() > document.shapes[0].skin.as_ref().expect("skin").bones.len(),
         "the graph carries nodes the palette does not name"
     );
+}
+
+#[test]
+fn three_ba_body_rest_reconstructs_in_its_authored_frame() {
+    let Ok(path) = std::env::var("SCULPTO_3BA_NIF") else {
+        eprintln!("SCULPTO_3BA_NIF not set; skipping the configured 3BA rest control");
+        return;
+    };
+    let bytes = std::fs::read(path).expect("the 3BA fixture is readable");
+    let document = read(&bytes).expect("the 3BA body reads");
+    let body = document.shapes.iter().max_by_key(|shape| shape.positions.len()).expect("a body");
+    assert_eq!(body.positions.len(), 18436);
+    assert_eq!(body.skin.as_ref().expect("the body has a skin").bones.len(), 49);
+    assert_eq!(document.shapes.len(), 3);
+    measure_bound_rest(&document, false);
 }
