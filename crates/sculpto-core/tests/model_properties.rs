@@ -244,9 +244,9 @@ fn corrupted_fixtures_fail() {
     // A zero-weight row cannot reach the model: the checked constructor owns the
     // refusal, and the model maps it onto its existing zero-sum defect.
     let zeroed = SkinWeights::new(vec![0, 1], vec![0], vec![0.0], 4);
-    assert!(matches!(zeroed, Err(_)), "a zero row is refused");
+    assert!(zeroed.is_err(), "a zero row is refused");
     let bad_offsets = SkinWeights::new(vec![1, 1], Vec::new(), Vec::new(), 4);
-    assert!(matches!(bad_offsets, Err(_)), "offsets must start at zero");
+    assert!(bad_offsets.is_err(), "offsets must start at zero");
 
     let mut mesh = generated(9);
     mesh.morphs[0].deltas[0].vertex = mesh.positions.len() as u32;

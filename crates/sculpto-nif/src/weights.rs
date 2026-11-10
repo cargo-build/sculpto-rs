@@ -601,10 +601,11 @@ mod tests {
 
     #[test]
     fn the_skin_channel_sits_after_every_enabled_attribute() {
-        let everything = VF_VERTEX | VF_UVS | VF_NORMALS | VF_TANGENTS | VF_VERTEX_COLORS;
+        let everything =
+            VF_VERTEX | VF_UVS | VF_NORMALS | VF_TANGENTS | VF_VERTEX_COLORS | VF_SKINNED;
         assert_eq!(skin_offset(everything, true), Some(32));
         assert_eq!(skin_offset(everything, false), Some(24));
-        assert_eq!(skin_offset(VF_VERTEX, true), Some(16));
+        assert_eq!(skin_offset(VF_VERTEX | VF_SKINNED, true), Some(16));
         assert_eq!(skin_offset(VF_SKINNED, true), Some(0));
         assert_eq!(skin_offset(VF_UVS, true), None);
     }
@@ -622,7 +623,7 @@ mod tests {
 
         let lanes = decode_lanes(&vertex, vertex.len(), attrs, true).expect("one packed vertex");
         assert_eq!(lanes.len(), 1);
-        let (weights, joints) = lanes[0];
+        let FourLane { weights, joints } = lanes[0];
         assert_eq!(joints, [3, 4, 5, 0]);
         assert_eq!(weights[0], 0.5);
         assert_eq!(weights[1], 0.25);
@@ -668,12 +669,8 @@ mod tests {
         };
         let rows = sparse_rows_from(&data, None).expect("a five-influence row");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].len(), 5);
-        assert_eq!(rows[1].len(), 1);
-        let sum: f32 = rows[0].iter().map(|(_, weight)| *weight).sum();
-        assert!((sum - 1.0).abs() < 1.0e-6);
-        assert_eq!(rows[0][0], (0, 0.2));
-        assert_eq!(rows[0][4], (4, 0.15));
+        assert_eq!(rows[0], [(0, 0.2), (1, 0.1), (2, 0.1), (3, 0.15), (4, 0.15)]);
+        assert_eq!(rows[1], [(0, 0.3)]);
 
         // A declared count owns the row count: an unweighted tail vertex keeps
         // its empty row, and an entry past the declaration is refused.

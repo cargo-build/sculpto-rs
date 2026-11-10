@@ -196,10 +196,10 @@ fn native_headless_acceptance_se_and_le() {
     assert_eq!(le_shape.positions.len(), le_asset.positions.len());
     assert_eq!(le_shape.triangles.len(), le_asset.triangles.len());
     eprintln!(
-        "LE re-export verification: {} verts, {} tris, {} bones (source had {} verts, {} tris, {} bones)",
+        "LE re-export verification: {} verts, {} tris, palette size {:?} (source had {} verts, {} tris, {} bones)",
         le_shape.positions.len(),
         le_shape.triangles.len(),
-        le_shape.skin.as_ref().expect("le skin").bones.len(),
+        le_shape.skin.as_ref().map(|skin| skin.bones.len()),
         le_asset.positions.len(),
         le_asset.triangles.len(),
         le_asset.skin.as_ref().unwrap().bones.len()

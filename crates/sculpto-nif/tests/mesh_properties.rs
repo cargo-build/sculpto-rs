@@ -62,8 +62,8 @@ fn shape(seed: u64) -> NifShape {
                 })
                 .collect(),
             influences: SkinWeights::from_quads(
-                &[[0, 1, 0, 0]; vertices],
-                &[[0.75, 0.25, 0.0, 0.0]; vertices],
+                &vec![[0, 1, 0, 0]; vertices],
+                &vec![[0.75, 0.25, 0.0, 0.0]; vertices],
             )
             .expect("four-lane rows"),
         }),

@@ -66,14 +66,6 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-/// Maximum elementwise absolute difference of two `f32` slots.
-fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
-}
-
 /// Body family mapping to project and preset files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyFamily {

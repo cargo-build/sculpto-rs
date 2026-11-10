@@ -47,13 +47,13 @@ fn packed_se_lanes_keep_their_quantized_values() {
         .expect("the shape carries one skin");
 
     assert_eq!(skin.influences.rows(), 3);
-    for vertex in 0..3 {
+    for (vertex, authored) in weights.iter().enumerate() {
         let row = skin.influences.row(vertex).expect("one row per vertex");
         let stored = row.weights;
         assert_eq!(row.joints, &[0, 1, 2], "packed lane order survives");
         assert_eq!(stored.len(), 3, "a zero lane is padding, not an influence");
         for (slot, value) in stored.iter().enumerate() {
-            let expected = half::f16::from_f32(weights[vertex][slot]).to_f32();
+            let expected = half::f16::from_f32(authored[slot]).to_f32();
             assert_eq!(*value, expected, "half-float value, not a renormalized one");
         }
         let sum: f32 = stored.iter().sum();
@@ -77,11 +77,11 @@ fn le_sparse_weights_are_read_exactly() {
 
     assert_eq!(skin.bones, vec!["bone0", "bone1", "bone2"]);
     assert_eq!(skin.influences.rows(), 3);
-    for vertex in 0..3 {
+    for (vertex, authored) in weights.iter().enumerate() {
         let row = skin.influences.row(vertex).expect("one row per vertex");
         assert_eq!(row.joints, &[0, 1, 2]);
-        for (stored, written) in row.weights.iter().zip(weights[vertex]) {
-            assert_eq!(*stored, written, "LE sparse values are f32 and exact");
+        for (stored, written) in row.weights.iter().zip(authored) {
+            assert_eq!(stored, written, "LE sparse values are f32 and exact");
         }
     }
 }

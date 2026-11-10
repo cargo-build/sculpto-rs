@@ -578,7 +578,7 @@ mod tests {
             })
         );
         assert_eq!(
-            SkinWeights::new(vec![0, 2], vec![0], vec![1.0, 1.0], 1),
+            SkinWeights::new(vec![0, 2], vec![0], vec![1.0], 1),
             Err(SkinWeightError::OffsetsCover {
                 offset: 2,
                 entries: 1

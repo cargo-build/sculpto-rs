@@ -1353,7 +1353,7 @@ mod tests {
     #[test]
     fn partition_palette_defects_are_named() {
         let mesh = two_partitions();
-        let mut palettes = mesh.partition_palettes();
+        let mut palettes = mesh.partition_palettes().expect("palettes derive");
 
         palettes[0].bones.retain(|bone| *bone != 1);
         assert_eq!(
@@ -1364,7 +1364,7 @@ mod tests {
             })
         );
 
-        let mut missing = mesh.partition_palettes();
+        let mut missing = mesh.partition_palettes().expect("palettes derive");
         missing.pop();
         assert_eq!(
             mesh.validate_partition_palettes(&missing),
@@ -1373,7 +1373,7 @@ mod tests {
             })
         );
 
-        let mut duplicate = mesh.partition_palettes();
+        let mut duplicate = mesh.partition_palettes().expect("palettes derive");
         duplicate.push(duplicate[0].clone());
         assert_eq!(
             mesh.validate_partition_palettes(&duplicate),
