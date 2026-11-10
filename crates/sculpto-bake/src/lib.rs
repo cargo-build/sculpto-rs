@@ -2,9 +2,9 @@
 //!
 //! Resolution is the half of a bake that touches no geometry: it selects the
 //! slider set the preset names, computes one percentage per slider and joins
-//! each `Data` reference to a named block inside an `.osd`/`.bsd` container.
-//! Everything it cannot resolve is reported by name instead of skipped, because
-//! a silently missing record is a wrong body.
+//! each `Data` reference to offsets inside an `.osd` named block or a bare
+//! `.bsd` record set. Everything it cannot resolve is reported by name instead
+//! of skipped, because a silently missing record is a wrong body.
 //!
 //! Application takes positions, not a mesh: the NIF adapter supplies vertices
 //! later, and this crate deliberately does not depend on a format reader.
@@ -13,14 +13,16 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use sculpto_core::{MorphContainer, Preset, Project, SliderSize, VertexOffset};
+use sculpto_core::shape_data::MorphData;
+use sculpto_core::{Preset, Project, SliderSize, VertexOffset};
 
 /// One resolved block and the shape it deforms.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedShape {
     /// Target shape name as authored in the project.
     pub target: String,
-    /// Block name inside the container.
+    /// Block name inside the container. A bare `.bsd` stores no name, so this is
+    /// the name the project reference supplies.
     pub block: String,
     /// Sparse offsets in document order.
     pub offsets: Vec<VertexOffset>,
@@ -179,15 +181,19 @@ impl BakePlan {
         overrides: &BTreeMap<String, f32>,
     ) -> Result<Self, BakeError> {
         Self::resolve_with_overrides(project, preset, set_name, size, home, overrides, |path| {
-            MorphContainer::parse_file(path).map_err(|source| BakeError::Container {
+            MorphData::from_file(path).map_err(|source| BakeError::Container {
                 path: path.to_path_buf(),
                 source,
             })
         })
     }
 
-    /// Resolve with a caller-supplied container loader.
-    pub fn resolve_with<F>(
+    /// Resolve with a caller-supplied morph data loader.
+    ///
+    /// The loader returns anything that converts into [`MorphData`]: a bare
+    /// `.bsd` record set or a named `.osd` container, so both real formats reach
+    /// the plan through one codec.
+    pub fn resolve_with<F, T>(
         project: &Project,
         preset: &Preset,
         set_name: &str,
@@ -196,7 +202,8 @@ impl BakePlan {
         load: F,
     ) -> Result<Self, BakeError>
     where
-        F: FnMut(&Path) -> Result<MorphContainer, BakeError>,
+        F: FnMut(&Path) -> Result<T, BakeError>,
+        T: Into<MorphData>,
     {
         Self::resolve_with_overrides(
             project,
@@ -209,11 +216,11 @@ impl BakePlan {
         )
     }
 
-    /// Resolve with both overrides and a caller-supplied container loader.
+    /// Resolve with both overrides and a caller-supplied morph data loader.
     ///
     /// `home` is the BodySlide directory: local references resolve under
     /// `ShapeData/<data folder>/`, non-local ones under `Data/`.
-    pub fn resolve_with_overrides<F>(
+    pub fn resolve_with_overrides<F, T>(
         project: &Project,
         preset: &Preset,
         set_name: &str,
@@ -223,7 +230,8 @@ impl BakePlan {
         mut load: F,
     ) -> Result<Self, BakeError>
     where
-        F: FnMut(&Path) -> Result<MorphContainer, BakeError>,
+        F: FnMut(&Path) -> Result<T, BakeError>,
+        T: Into<MorphData>,
     {
         let set = project
             .sets
@@ -239,7 +247,7 @@ impl BakePlan {
             .map(|value| ((value.slider.as_str(), value.size), value.percent))
             .collect();
 
-        let mut cache: BTreeMap<PathBuf, MorphContainer> = BTreeMap::new();
+        let mut cache: BTreeMap<PathBuf, MorphData> = BTreeMap::new();
         let mut sliders = Vec::new();
         let mut unresolved = Vec::new();
         let mut deferred = Vec::new();
@@ -298,22 +306,18 @@ impl BakePlan {
                         });
                         continue;
                     }
-                    cache.insert(path.clone(), load(&path)?);
+                    cache.insert(path.clone(), load(&path)?.into());
                 }
-                let container = &cache[&path];
+                let data_file = &cache[&path];
                 let block_name = data
                     .record
                     .clone()
                     .unwrap_or_else(|| format!("{}{}", data.target, slider.name));
-                match container
-                    .blocks
-                    .iter()
-                    .find(|block| block.name == block_name)
-                {
-                    Some(block) => shapes.push(PlannedShape {
+                match data_file.offsets(&block_name) {
+                    Some(offsets) => shapes.push(PlannedShape {
                         target: data.target.clone(),
                         block: block_name,
-                        offsets: block.offsets.clone(),
+                        offsets: offsets.to_vec(),
                     }),
                     None => unresolved.push(UnresolvedRef {
                         slider: slider.name.clone(),
@@ -417,5 +421,76 @@ fn container_path(home: &Path, set: &sculpto_core::SliderSet, local: bool, file:
         home.join("ShapeData").join(folder).join(file)
     } else {
         home.join("Data").join(file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sculpto_core::{Document, shape_data};
+
+    const PROJECT: &str = r#"<SliderSetInfo version="1">
+  <SliderSet name="Body">
+    <DataFolder>HIMBO</DataFolder>
+    <SourceFile>body.nif</SourceFile>
+    <OutputPath>meshes</OutputPath>
+    <OutputFile>body</OutputFile>
+    <Shape target="Body">Body</Shape>
+    <Slider name="Lean" small="0" big="100">
+      <Data target="Body" local="true">body.bsd</Data>
+    </Slider>
+  </SliderSet>
+</SliderSetInfo>"#;
+
+    /// The production loader, not a stub: a bare `.bsd` is resolved by name from
+    /// the project reference, because the file stores none.
+    #[test]
+    fn bare_bsd_resolves_through_the_production_loader() {
+        let root = std::env::temp_dir().join(format!("sculpto-bake-bsd-{}", std::process::id()));
+        let folder = root.join("ShapeData/HIMBO");
+        std::fs::create_dir_all(&folder).expect("temp dir");
+        let records = [
+            VertexOffset {
+                index: 1,
+                delta: [0.5, 0.0, 0.0],
+            },
+            VertexOffset {
+                index: 2,
+                delta: [0.0, -1.0, 0.0],
+            },
+        ];
+        std::fs::write(
+            folder.join("body.bsd"),
+            shape_data::to_bsd_bytes(&records).expect("writes"),
+        )
+        .expect("fixture file");
+
+        let Document::Project(project) =
+            Document::parse_str(PROJECT, "inline.osp").expect("parses")
+        else {
+            panic!("expected a project");
+        };
+        let Document::Presets(presets) = Document::parse_str(
+            r#"<SliderPresets><Preset name="Chonky" set="Body"><SetSlider name="Lean" size="big" value="50"/></Preset></SliderPresets>"#,
+            "inline.xml",
+        )
+        .expect("parses")
+        else {
+            panic!("expected presets");
+        };
+
+        let plan = BakePlan::resolve(&project, &presets[0], "Body", SliderSize::Big, &root)
+            .expect("bare .bsd resolves");
+        assert!(plan.unresolved.is_empty(), "{:?}", plan.unresolved);
+        assert_eq!(plan.sliders[0].shapes[0].block, "BodyLean");
+        assert_eq!(plan.sliders[0].shapes[0].offsets.len(), 2);
+
+        let out = plan
+            .apply("Body", &[[0.0; 3], [1.0; 3], [2.0; 3]])
+            .expect("applies");
+        assert_eq!(out[1], [1.25, 1.0, 1.0]);
+        assert_eq!(out[2], [2.0, 1.5, 2.0]);
+        assert_eq!(out[0], [0.0; 3]);
+        std::fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 }

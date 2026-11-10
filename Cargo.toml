@@ -18,3 +18,4 @@ sculpto-nif = { path = "crates/sculpto-nif" }
 sculpto-engine = { path = "crates/sculpto-engine" }
 sculpto-gltf = { path = "crates/sculpto-gltf" }
 roxmltree = "0.21"
+glam = "0.34"

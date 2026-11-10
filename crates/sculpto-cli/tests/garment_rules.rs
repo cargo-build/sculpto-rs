@@ -214,6 +214,7 @@ fn weights_reproduce_the_python_transfer_and_unpose() {
             "garment_positions": weights["garment_positions"],
             "body_positions": weights["body_positions"],
             "body_weights": weights["body_weights"],
+            "max_results": 1,
         }),
     );
     let expected = weights["transferred"].as_array().expect("python weights");

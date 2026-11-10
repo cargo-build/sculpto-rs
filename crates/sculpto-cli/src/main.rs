@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sculpto_bake::BakePlan;
-use sculpto_core::shape_data::MAGIC as SHAPE_DATA_MAGIC;
-use sculpto_core::{Document, MorphContainer, SliderSize};
+use sculpto_core::shape_data::{MAGIC as SHAPE_DATA_MAGIC, MorphData};
+use sculpto_core::{Document, SliderSize};
 use sculpto_mesh::aura::{Aura, AuraMode, AuraParams};
 use sculpto_mesh::check;
 use sculpto_mesh::classify;
@@ -32,7 +32,7 @@ commands:
   actor sample [options] sample explicit GLB mesh nodes at REST or clip/time
   actor rig [options]   sample parts plus reduced rig graph/influences JSON
   actor pack-cloth [options] pack baked cloth into an unchanged GLB actor
-  inspect <path>        parse a document or morph container and print a summary
+  inspect <path>        parse a document or a `.osd`/`.bsd` morph data file
   bake [options]        resolve a preset, apply it to a body NIF, write an OBJ
   batch [options]       bake every matching set in a project to OBJ files
   sliders [options]     print each slider's effective percentage
@@ -193,9 +193,9 @@ fn main() -> ExitCode {
 
 fn inspect(path: &Path) -> ExitCode {
     if is_shape_data(path) {
-        return match MorphContainer::parse_file(path) {
-            Ok(container) => {
-                print!("{}", render_shape_data(path, &container));
+        return match MorphData::from_file(path) {
+            Ok(data) => {
+                print!("{}", render_shape_data(path, &data));
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -289,9 +289,19 @@ fn render(path: &Path, document: &Document) -> String {
     }
 }
 
-/// A `.osd`/`.bsd` container is binary, so the XML dispatcher must not see it.
+/// A `.osd`/`.bsd` data file is binary, so the XML dispatcher must not see it.
+///
+/// The tag decides for a named container; a bare `.bsd` has no tag at all, so
+/// its suffix decides, exactly as the reference does (`SliderSet.cpp:376-380`).
 fn is_shape_data(path: &Path) -> bool {
     use std::io::Read;
+    let bare = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bsd"));
+    if bare {
+        return true;
+    }
     let mut magic = [0u8; 4];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut magic))
@@ -299,22 +309,42 @@ fn is_shape_data(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn render_shape_data(path: &Path, container: &MorphContainer) -> String {
-    let mut out = format!(
-        "{}: morph container v{}, {} blocks, {} offsets\n",
-        path.display(),
-        container.version,
-        container.blocks.len(),
-        container.offset_count()
-    );
-    for block in &container.blocks {
-        out.push_str(&format!(
-            "  block {:<40} offsets={}\n",
-            block.name,
-            block.offsets.len()
-        ));
+fn render_shape_data(path: &Path, data: &MorphData) -> String {
+    match data {
+        MorphData::Named(container) => {
+            let mut out = format!(
+                "{}: morph container v{}, {} blocks, {} offsets\n",
+                path.display(),
+                container.version,
+                container.blocks.len(),
+                container.offset_count()
+            );
+            for block in &container.blocks {
+                out.push_str(&format!(
+                    "  block {:<40} offsets={}\n",
+                    block.name,
+                    block.offsets.len()
+                ));
+            }
+            out
+        }
+        MorphData::Bare(offsets) => {
+            // A bare set stores no name; report the facts it does carry instead
+            // of guessing a shape from the file name.
+            let highest = offsets
+                .iter()
+                .map(|offset| offset.index)
+                .max()
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{}: bare morph data, {} offsets, highest vertex index {}\n",
+                path.display(),
+                offsets.len(),
+                highest
+            )
+        }
     }
-    out
 }
 
 /// Suffix for a summary line; an empty string keeps known dialects noise-free.

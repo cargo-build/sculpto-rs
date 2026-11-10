@@ -1,4 +1,5 @@
-//! `.osd`/`.bsd` morph-container decoding.
+//! Named `.osd` morph-container decoding. Bare `.bsd` record sets are covered by
+//! `shape_data_write.rs`, which owns the writer and the format split.
 
 use sculpto_core::{ErrorKind, MorphContainer, shape_data::MAGIC};
 

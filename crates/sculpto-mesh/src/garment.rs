@@ -11,10 +11,19 @@
 //!
 //! [DECL0002]: ../../../doc/rules/0002-DECL-rules-inside-the-core.md
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use glam::Mat4;
+
+use crate::delta_conform::{
+    DeltaConformError, DeltaOptions, ProximityCache, ProximityOptions, generate_delta,
+};
+use crate::mask::{MaskError, VertexMask};
+use crate::weight_norm::{
+    MAX_INFLUENCES, SUM_TOLERANCE, WeightDefect, WeightError, WeightNormalizer,
+    first_weight_defect, pack_influences,
+};
 
 /// Clearance the reconstructed surface keeps from the body, metres.
 pub const GARMENT_OFFSET_M: f64 = 0.008;
@@ -484,42 +493,564 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
 /// One vertex's bone influences, keyed by bone name.
 pub type Influences = BTreeMap<String, f32>;
 
-/// Weights the nearest body vertex carries, normalized to sum to one.
+/// Proximity radius a transfer uses when the caller sets none (`Automorph.h:96`).
+pub const DEFAULT_TRANSFER_RADIUS: f32 = 10.0;
+/// Neighbours a transfer blends when the caller sets none (`Automorph.h:99`).
+pub const DEFAULT_TRANSFER_MAX_RESULTS: usize = 10;
+
+/// How a weight copy reads the body and classifies the garment's bones.
 ///
-/// The body already carries the reviewed rigging, so each garment vertex takes
-/// the body vertex's weights instead of a bone-space reconstruction. Ties resolve
-/// to the lowest body index, so a rerun is identical. @req DECL0002
+/// The defaults are the native copy: a ten-unit radius, ten blended neighbours,
+/// no masks, a new unweighted garment, every source bone copied, no extra
+/// normalizable bones, and neither remainder spreading nor the second
+/// normalization pass (`BoneWeightCopyOptions`, `ProjectOperations.h:66-80`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferOptions {
+    /// Inclusive proximity radius; zero uses the native insertion-tree mode.
+    pub radius: f32,
+    /// Body neighbours blended per garment vertex, applied after exclusion.
+    pub max_results: usize,
+    /// Per-body-vertex mask; a value above zero excludes the vertex.
+    pub body_mask: Option<Vec<f32>>,
+    /// Per-garment-vertex mask; a value above zero keeps the vertex's whole map.
+    pub garment_mask: Option<Vec<f32>>,
+    /// Current garment influences; absent means a new, unweighted garment.
+    pub current: Option<Vec<Influences>>,
+    /// Source bones to copy, in order; empty copies every source bone.
+    pub copy: Vec<String>,
+    /// Extra bones that absorb the normalization remainder.
+    pub normalizable: Vec<String>,
+    /// Native remainder spreading over the normalizable class.
+    pub spread: bool,
+    /// Native `BoneWeightCopyOptions::normalize` second all-normalizable pass.
+    pub normalize: bool,
+}
+
+impl Default for TransferOptions {
+    fn default() -> Self {
+        Self {
+            radius: DEFAULT_TRANSFER_RADIUS,
+            max_results: DEFAULT_TRANSFER_MAX_RESULTS,
+            body_mask: None,
+            garment_mask: None,
+            current: None,
+            copy: Vec::new(),
+            normalizable: Vec::new(),
+            spread: false,
+            normalize: false,
+        }
+    }
+}
+
+/// Why a weight copy was refused.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransferError {
+    /// The garment has no vertices to weight.
+    EmptyGarment,
+    /// The body has no vertices to copy weights from.
+    EmptyBody,
+    /// The neighbour cap is zero, so no weight could be blended.
+    ZeroMaxResults,
+    /// A list does not match the vertices it describes.
+    LengthMismatch {
+        /// Input field name.
+        field: &'static str,
+        /// Entries the field needs.
+        expected: usize,
+        /// Entries the field carries.
+        actual: usize,
+    },
+    /// A mask is not a finite weight per vertex.
+    Mask {
+        /// Input field name.
+        field: &'static str,
+        /// Why the mask was refused.
+        error: MaskError,
+    },
+    /// A garment mask above zero has no current weights to preserve.
+    MissingCurrentWeights { vertex: usize },
+    /// A preserved vertex cannot satisfy the unchanged sum/influence contract.
+    InvalidPreservedWeights {
+        vertex: usize,
+        mass: f64,
+        positive: usize,
+    },
+    /// A supplied influence map is not a valid weight set.
+    Influence {
+        /// Input field name.
+        field: &'static str,
+        /// Vertex inside that field.
+        vertex: usize,
+        /// Why the map was refused.
+        error: WeightError,
+    },
+    /// The proximity cache or a per-bone blend refused the geometry.
+    Proximity(DeltaConformError),
+    /// The copy selection does not form valid weight classes.
+    Normalize(WeightError),
+    /// A copied vertex could not be normalized or packed.
+    Vertex {
+        /// Garment vertex.
+        vertex: usize,
+        /// Why the vertex was refused.
+        error: WeightError,
+    },
+}
+
+impl fmt::Display for TransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyGarment => write!(formatter, "the garment has no vertices to weight"),
+            Self::EmptyBody => {
+                write!(formatter, "the body has no vertices to copy weights from")
+            }
+            Self::ZeroMaxResults => write!(formatter, "`max_results` must be at least one"),
+            Self::LengthMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "`{field}` has {actual} entries for {expected} vertices"
+            ),
+            Self::Mask { field, error } => write!(formatter, "`{field}`: {error}"),
+            Self::MissingCurrentWeights { vertex } => write!(
+                formatter,
+                "garment vertex {vertex} is masked but has no current weights"
+            ),
+            Self::InvalidPreservedWeights {
+                vertex,
+                mass,
+                positive,
+            } => write!(
+                formatter,
+                "masked garment vertex {vertex} has weight sum {mass} and {positive} positive influences"
+            ),
+            Self::Influence {
+                field,
+                vertex,
+                error,
+            } => write!(formatter, "`{field}` vertex {vertex}: {error}"),
+            Self::Proximity(error) => write!(formatter, "the proximity copy failed: {error}"),
+            Self::Normalize(error) => write!(formatter, "the weight classes are invalid: {error}"),
+            Self::Vertex { vertex, error } => write!(formatter, "garment vertex {vertex}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TransferError {}
+
+/// Copy body skin weights onto a garment with the reference's interpolation.
+///
+/// Every selected body bone becomes one sparse weight field; each garment
+/// vertex follows the inverse-distance blend of its cached body neighbours
+/// (`Automorph::GenerateResultDiff` over the Y channel). The resulting per-vertex
+/// maps are then normalized by [`WeightNormalizer`]
+/// (`BoneWeightAutoNormalizer`) and packed to
+/// [`MAX_INFLUENCES`](crate::weight_norm::MAX_INFLUENCES) positive influences
+/// that sum to one within
+/// [`SUM_TOLERANCE`](crate::weight_norm::SUM_TOLERANCE).
+///
+/// A body mask above zero removes that body vertex from the cache before the
+/// neighbour cap (`OutfitProject.cpp:2868-2876`). A garment mask above zero
+/// keeps that vertex's whole current map, so it is never zeroed, normalized or
+/// packed (`OutfitProject.cpp:2891`, `2910`). Its existing sum and influence
+/// count must already satisfy the output contract; otherwise the copy refuses.
+/// A fresh one-neighbour copy preserves the accepted nearest-copy precision,
+/// including weights below the native edit normalizer's pruning epsilon.
+///
+/// Bones the garment already carries outside `copy` and `normalizable` stay
+/// locked and bit-identical. The native rigid-prop detection
+/// (`keepRigidParts`) is not ported here.
+///
+/// # Errors
+///
+/// Fails on a body weight count or current-weight count that does not match its
+/// vertices, an empty garment or body, a zero neighbour cap, a mask that is not
+/// one finite weight in `0.0..=1.0` per vertex, a masked vertex without current
+/// weights, a weight that is not a finite non-negative number, an invalid bone
+/// selection, refused geometry, and a vertex the copy cannot give a positive
+/// weight. A vertex is never returned with a zero sum.
+///
+/// @req DECL0002
 pub fn transfer(
     garment_positions: &[[f32; 3]],
     body_positions: &[[f32; 3]],
     body_weights: &[Influences],
-) -> Result<Vec<Influences>, GarmentRuleError> {
-    if garment_positions.is_empty() || body_positions.is_empty() {
-        return Err(GarmentRuleError::EmptyMesh);
+    options: &TransferOptions,
+) -> Result<Vec<Influences>, TransferError> {
+    if body_weights.len() != body_positions.len() {
+        return Err(TransferError::LengthMismatch {
+            field: "body_weights",
+            expected: body_positions.len(),
+            actual: body_weights.len(),
+        });
     }
-    let grid = Nearest::build(body_positions);
-    garment_positions
+    if garment_positions.is_empty() {
+        return Err(TransferError::EmptyGarment);
+    }
+    if body_positions.is_empty() {
+        return Err(TransferError::EmptyBody);
+    }
+    if options.max_results == 0 {
+        return Err(TransferError::ZeroMaxResults);
+    }
+
+    let body_mask = transfer_mask(
+        options.body_mask.as_deref(),
+        "body_mask",
+        body_positions.len(),
+    )?;
+    let garment_mask = transfer_mask(
+        options.garment_mask.as_deref(),
+        "garment_mask",
+        garment_positions.len(),
+    )?;
+    body_weights
         .iter()
-        .map(|&point| {
-            let nearest = grid
-                .nearest(point)
-                .ok_or(GarmentRuleError::NoNearestVertex)?;
-            Ok(normalize(&body_weights[nearest as usize]))
+        .enumerate()
+        .try_for_each(|(vertex, influences)| {
+            validate_influences("body_weights", vertex, influences)
+        })?;
+    let mut weights = current_rows(
+        options.current.as_deref(),
+        garment_positions.len(),
+        &garment_mask,
+    )?;
+    validate_preserved_weights(&weights, &garment_mask)?;
+    let source_weights = normalized_source_rows(body_weights);
+
+    let copy = match options.copy.is_empty() {
+        true => source_bones(body_weights),
+        false => options.copy.clone(),
+    };
+    let locked = locked_bones(&weights, &copy, &options.normalizable);
+    let bones: Vec<String> = copy.iter().chain(&options.normalizable).cloned().collect();
+    let normalizer = WeightNormalizer::new(&bones, &locked, copy.len(), options.spread)
+        .map_err(TransferError::Normalize)?;
+
+    let excluded = body_mask
+        .as_ref()
+        .map(|mask| mask.masked().into_keys().collect::<BTreeSet<usize>>());
+    let cache = ProximityCache::build(
+        body_positions,
+        garment_positions,
+        &ProximityOptions {
+            radius: options.radius,
+        },
+        excluded.as_ref(),
+    )
+    .map_err(TransferError::Proximity)?;
+
+    // A fresh nearest copy has no edited garment weights to prioritize. Retain
+    // its published small-weight behavior instead of pruning through edit epsilon.
+    if options.max_results == 1
+        && weights.iter().all(Influences::is_empty)
+        && options.normalizable.is_empty()
+        && !options.spread
+        && !options.normalize
+    {
+        return (0..garment_positions.len())
+            .map(|vertex| {
+                let neighbor = cache
+                    .neighbors(vertex)
+                    .and_then(|neighbors| neighbors.first())
+                    .ok_or(TransferError::Vertex {
+                        vertex,
+                        error: WeightError::MissingUnlockedMass { remainder: 1.0 },
+                    })?;
+                let selected: Influences = source_weights[neighbor.vertex]
+                    .iter()
+                    .filter(|(bone, _)| copy.contains(bone))
+                    .map(|(bone, weight)| (bone.clone(), *weight))
+                    .collect();
+                pack_influences(&selected, &locked)
+                    .map_err(|error| TransferError::Vertex { vertex, error })
+            })
+            .collect();
+    }
+
+    let touched = copy_bones(
+        &cache,
+        &source_weights,
+        &copy,
+        &garment_mask,
+        &mut weights,
+        options.max_results,
+    )?;
+    normalize_vertices(&normalizer, &mut weights, &touched)?;
+    if options.normalize {
+        // The reference's second pass treats every copied bone as normalizable,
+        // which closes the sums the copy left short (`ProjectOperations.cpp:627-647`).
+        let closer =
+            WeightNormalizer::new(&bones, &locked, 0, false).map_err(TransferError::Normalize)?;
+        normalize_vertices(&closer, &mut weights, &touched)?;
+    }
+    pack_vertices(&mut weights, &locked, &garment_mask)?;
+    Ok(weights)
+}
+
+/// Preserve source proportions and explicit zero keys before native edit clamping. @req DECL0002
+fn normalized_source_rows(rows: &[Influences]) -> Vec<Influences> {
+    rows.iter()
+        .map(|row| {
+            let total: f32 = row.values().sum();
+            match total {
+                0.0 => row.clone(),
+                value if value.is_finite() => row
+                    .iter()
+                    .map(|(bone, weight)| (bone.clone(), weight / value))
+                    .collect(),
+                _ => {
+                    let wide_total: f64 = row.values().map(|weight| f64::from(*weight)).sum();
+                    row.iter()
+                        .map(|(bone, weight)| {
+                            (bone.clone(), (f64::from(*weight) / wide_total) as f32)
+                        })
+                        .collect()
+                }
+            }
         })
         .collect()
 }
 
-/// Divide the influences by their sum; an empty set stays empty.
-fn normalize(weights: &Influences) -> Influences {
-    let total: f32 = weights.values().sum();
-    let divisor = match total {
-        0.0 => 1.0,
-        other => other,
-    };
+/// Invalid locked-by-mask input must refuse rather than violate output invariants. @req DECL0002
+fn validate_preserved_weights(
+    weights: &[Influences],
+    mask: &Option<VertexMask>,
+) -> Result<(), TransferError> {
+    weights.iter().enumerate().try_for_each(|(vertex, row)| {
+        if !preserved(mask, vertex) {
+            return Ok(());
+        }
+        let mass: f64 = row.values().map(|weight| f64::from(*weight)).sum();
+        let positive = row.values().filter(|&&weight| weight > 0.0).count();
+        match positive <= MAX_INFLUENCES && (mass - 1.0).abs() <= f64::from(SUM_TOLERANCE) {
+            true => Ok(()),
+            false => Err(TransferError::InvalidPreservedWeights {
+                vertex,
+                mass,
+                positive,
+            }),
+        }
+    })
+}
+
+/// Copy every selected bone field onto the garment, in selection order.
+fn copy_bones(
+    cache: &ProximityCache,
+    body_weights: &[Influences],
+    copy: &[String],
+    garment_mask: &Option<VertexMask>,
+    weights: &mut [Influences],
+    max_results: usize,
+) -> Result<BTreeSet<usize>, TransferError> {
+    let mut touched = BTreeSet::new();
+    for bone in copy {
+        let delta = copy_bone_delta(cache, body_weights, bone, max_results)
+            .map_err(TransferError::Proximity)?;
+        // Native zeroes the garment's existing weights for this bone before it
+        // writes the interpolated result (`OutfitProject.cpp:2887-2917`).
+        weights
+            .iter_mut()
+            .enumerate()
+            .for_each(|(vertex, influences)| {
+                if preserved(garment_mask, vertex) || !influences.contains_key(bone) {
+                    return;
+                }
+                influences.insert(bone.clone(), 0.0);
+                touched.insert(vertex);
+            });
+        delta.iter().for_each(|(vertex, offset)| {
+            if preserved(garment_mask, *vertex) {
+                return;
+            }
+            weights[*vertex].insert(bone.clone(), offset[1]);
+            touched.insert(*vertex);
+        });
+    }
+    Ok(touched)
+}
+
+/// One bone's sparse weight field, blended onto the cached garment neighbours.
+///
+/// A body vertex that carries the bone contributes its weight on the Y channel,
+/// including an explicit zero; a missing entry stays missing, so the nearest
+/// neighbour without the bone cancels it (`Automorph.cpp:571-610`).
+fn copy_bone_delta(
+    cache: &ProximityCache,
+    body_weights: &[Influences],
+    bone: &str,
+    max_results: usize,
+) -> Result<BTreeMap<usize, [f32; 3]>, DeltaConformError> {
+    let body_diffs: BTreeMap<usize, [f32; 3]> = body_weights
+        .iter()
+        .enumerate()
+        .filter_map(|(vertex, influences)| {
+            influences
+                .get(bone)
+                .map(|weight| (vertex, [0.0, *weight, 0.0]))
+        })
+        .collect();
+    generate_delta(
+        cache,
+        &body_diffs,
+        &DeltaOptions {
+            mask: None,
+            max_results,
+            no_squeeze: false,
+            solid_mode: false,
+            axis_x: false,
+            axis_y: true,
+            axis_z: false,
+            transform: None,
+        },
+    )
+}
+
+/// Every bone the body carries, sorted: the default copy selection.
+fn source_bones(body_weights: &[Influences]) -> Vec<String> {
+    body_weights
+        .iter()
+        .flat_map(|influences| influences.keys().cloned())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// Bones the garment already carries outside the copy and normalizable classes.
+///
+/// The class lists hold a handful of bones, so the linear membership test is
+/// cheaper than a second index.
+fn locked_bones(
+    weights: &[Influences],
+    copy: &[String],
+    normalizable: &[String],
+) -> BTreeSet<String> {
     weights
         .iter()
-        .map(|(bone, weight)| (bone.clone(), weight / divisor))
+        .flat_map(|influences| influences.keys())
+        .filter(|bone| !copy.contains(*bone) && !normalizable.contains(*bone))
+        .cloned()
         .collect()
+}
+
+/// Start from the garment's current maps, or from an empty new garment.
+fn current_rows(
+    current: Option<&[Influences]>,
+    vertices: usize,
+    garment_mask: &Option<VertexMask>,
+) -> Result<Vec<Influences>, TransferError> {
+    match current {
+        None => match (0..vertices).find(|vertex| preserved(garment_mask, *vertex)) {
+            Some(vertex) => Err(TransferError::MissingCurrentWeights { vertex }),
+            None => Ok(vec![Influences::new(); vertices]),
+        },
+        Some(rows) => match rows.len() != vertices {
+            true => Err(TransferError::LengthMismatch {
+                field: "current_weights",
+                expected: vertices,
+                actual: rows.len(),
+            }),
+            false => {
+                rows.iter()
+                    .enumerate()
+                    .try_for_each(|(vertex, influences)| {
+                        validate_influences("current_weights", vertex, influences)
+                    })?;
+                Ok(rows.to_vec())
+            }
+        },
+    }
+}
+
+/// Validate one native mask: one finite value in `0.0..=1.0` per vertex.
+fn transfer_mask(
+    mask: Option<&[f32]>,
+    field: &'static str,
+    vertices: usize,
+) -> Result<Option<VertexMask>, TransferError> {
+    mask.map(|values| {
+        let mask = VertexMask::from_values(values.to_vec())
+            .map_err(|error| TransferError::Mask { field, error })?;
+        match mask.len() != vertices {
+            true => Err(TransferError::LengthMismatch {
+                field,
+                expected: vertices,
+                actual: mask.len(),
+            }),
+            false => Ok(mask),
+        }
+    })
+    .transpose()
+}
+
+/// A mask value above zero marks a preserved garment or an excluded body vertex.
+fn preserved(mask: &Option<VertexMask>, vertex: usize) -> bool {
+    mask.as_ref()
+        .and_then(|mask| mask.get(vertex))
+        .is_some_and(|value| value > 0.0)
+}
+
+/// A supplied weight map must be finite and non-negative.
+fn validate_influences(
+    field: &'static str,
+    vertex: usize,
+    influences: &Influences,
+) -> Result<(), TransferError> {
+    match first_weight_defect(influences) {
+        Some((bone, WeightDefect::NonFinite { weight })) => Err(TransferError::Influence {
+            field,
+            vertex,
+            error: WeightError::NonFiniteWeight {
+                bone: bone.to_string(),
+                weight,
+            },
+        }),
+        Some((bone, WeightDefect::Negative { weight })) => Err(TransferError::Influence {
+            field,
+            vertex,
+            error: WeightError::NegativeWeight {
+                bone: bone.to_string(),
+                weight,
+            },
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Normalize every vertex the copy touched, ascending.
+fn normalize_vertices(
+    normalizer: &WeightNormalizer,
+    weights: &mut [Influences],
+    touched: &BTreeSet<usize>,
+) -> Result<(), TransferError> {
+    for vertex in touched {
+        normalizer
+            .adjust(&mut weights[*vertex])
+            .map_err(|error| TransferError::Vertex {
+                vertex: *vertex,
+                error,
+            })?;
+    }
+    Ok(())
+}
+
+/// Pack every unpreserved vertex into the NIF influence budget.
+fn pack_vertices(
+    weights: &mut [Influences],
+    locked: &BTreeSet<String>,
+    garment_mask: &Option<VertexMask>,
+) -> Result<(), TransferError> {
+    for (vertex, influences) in weights.iter_mut().enumerate() {
+        if preserved(garment_mask, vertex) {
+            continue;
+        }
+        let packed = pack_influences(influences, locked)
+            .map_err(|error| TransferError::Vertex { vertex, error })?;
+        *influences = packed;
+    }
+    Ok(())
 }
 
 /// The rest geometry an unpose recovered, and what it could not.
@@ -606,89 +1137,6 @@ fn row_major_to_columns(matrix: &[[f32; 4]; 4]) -> [f32; 16] {
         matrix[2][3],
         matrix[3][3],
     ]
-}
-
-/// Uniform bucket grid over the body vertices for the nearest-vertex query.
-struct Nearest {
-    cell: f32,
-    rings: i32,
-    buckets: HashMap<[i32; 3], Vec<u32>>,
-    positions: Vec<[f32; 3]>,
-}
-
-impl Nearest {
-    fn build(positions: &[[f32; 3]]) -> Self {
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for position in positions {
-            for axis in 0..3 {
-                min[axis] = min[axis].min(position[axis]);
-                max[axis] = max[axis].max(position[axis]);
-            }
-        }
-        // One bucket per expected vertex, on the largest axis: a flat or
-        // degenerate extent would collapse a volume-based spacing to zero.
-        let largest = (0..3)
-            .map(|axis| f64::from(max[axis] - min[axis]))
-            .fold(0.0f64, f64::max);
-        let across = (positions.len() as f64).cbrt().ceil().max(1.0);
-        let cell = (largest / across).max(1e-4f64) as f32;
-        let mut buckets: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
-        for (index, position) in positions.iter().enumerate() {
-            buckets
-                .entry(Self::key(*position, cell))
-                .or_default()
-                .push(index as u32);
-        }
-        Self {
-            cell,
-            rings: across as i32 + 1,
-            buckets,
-            positions: positions.to_vec(),
-        }
-    }
-
-    fn key(position: [f32; 3], cell: f32) -> [i32; 3] {
-        position.map(|value| (value / cell).floor() as i32)
-    }
-
-    /// Nearest vertex index; ties go to the lowest index inside the searched
-    /// ring, and the ring stops once no outside vertex can be closer.
-    fn nearest(&self, point: [f32; 3]) -> Option<u32> {
-        let home = Self::key(point, self.cell);
-        let mut best: Option<(u32, f32)> = None;
-        for ring in 0..=self.rings {
-            for dz in -ring..=ring {
-                for dy in -ring..=ring {
-                    for dx in -ring..=ring {
-                        if ring > 0 && dx.abs() != ring && dy.abs() != ring && dz.abs() != ring {
-                            continue;
-                        }
-                        let key = [home[0] + dx, home[1] + dy, home[2] + dz];
-                        let Some(bucket) = self.buckets.get(&key) else {
-                            continue;
-                        };
-                        for &index in bucket {
-                            let distance = distance_squared(point, self.positions[index as usize]);
-                            if best.is_none_or(|(_, current)| distance < current) {
-                                best = Some((index, distance));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((_, distance)) = best
-                && distance < (ring as f32 * self.cell).powi(2)
-            {
-                break;
-            }
-        }
-        best.map(|(index, _)| index)
-    }
-}
-
-fn distance_squared(a: [f32; 3], b: [f32; 3]) -> f32 {
-    (0..3).map(|axis| (a[axis] - b[axis]).powi(2)).sum()
 }
 
 #[cfg(test)]
@@ -853,17 +1301,47 @@ mod tests {
     }
 
     #[test]
-    fn transfer_takes_the_nearest_body_vertex_and_normalizes() {
+    fn transfer_takes_the_nearest_body_vertex_at_one_neighbour() {
         let body = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
         let weights = [
             influences(&[("Chest", 2.0)]),
             influences(&[("Chest", 0.25), ("Hips", 0.75)]),
         ];
         let garment = [[0.1, 0.0, 0.0], [0.9, 0.0, 0.0]];
-        let transferred = transfer(&garment, &body, &weights).expect("transferred");
+        let options = TransferOptions {
+            max_results: 1,
+            ..TransferOptions::default()
+        };
+        let transferred = transfer(&garment, &body, &weights, &options).expect("transferred");
         assert_eq!(transferred[0]["Chest"], 1.0);
         assert_eq!(transferred[1]["Hips"], 0.75);
         assert_eq!(transferred[0].len(), 1);
+    }
+
+    #[test]
+    fn transfer_interpolates_by_default_and_keeps_a_masked_vertex() {
+        let body = [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]];
+        let weights = [
+            influences(&[("Chest", 1.0), ("Spine", 0.0)]),
+            influences(&[("Chest", 0.5), ("Spine", 0.5)]),
+        ];
+        let garment = [[0.0, 0.0, 0.0]];
+        let transferred =
+            transfer(&garment, &body, &weights, &TransferOptions::default()).expect("transferred");
+        // Equal distances: Chest (1 + 0.5) / 2 and Spine (0 + 0.5) / 2.
+        assert_eq!(transferred[0]["Chest"], 0.75);
+        assert_eq!(transferred[0]["Spine"], 0.25);
+
+        let current = [influences(&[("Hips", 0.7), ("Chest", 0.3)])];
+        let preserved = TransferOptions {
+            garment_mask: Some(vec![1.0]),
+            current: Some(current.to_vec()),
+            ..TransferOptions::default()
+        };
+        assert_eq!(
+            transfer(&garment, &body, &weights, &preserved).expect("preserved"),
+            current
+        );
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! every pack that uses a newer authoring feature. Unknown children are
 //! therefore accepted and reported here; document identity (root element,
 //! version) and invariants (missing required values, duplicate names) stay
-//! fatal. Keeping the element bytes for re-emission belongs to the writer,
-//! which is not accepted yet (DECL0003).
+//! fatal. The writer does not re-emit them: `Project::to_osp_xml` refuses a
+//! project whose report is non-empty, so an accepted file is never silently
+//! narrowed on the way out.
 
 use roxmltree::Node;
 

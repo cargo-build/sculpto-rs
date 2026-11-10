@@ -650,30 +650,39 @@ pub fn first_hits(
     positions: &[[f32; 3]],
     faces: &[[u32; 3]],
 ) -> Vec<Option<RayHit>> {
-    let length = direction
-        .iter()
-        .map(|c| f64::from(*c).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    if length == 0.0 || faces.is_empty() {
+    let Some(ray) = unit_ray(direction) else {
         return vec![None; origins.len()];
-    }
-    let ray = direction.map(|c| f64::from(c) / length);
+    };
     let bvh = Bvh::build(triangles(positions, faces));
     origins
         .iter()
-        .map(|&origin| bvh.first_hit(origin, ray))
+        .map(|&origin| {
+            bvh.first_hit(origin, ray, f64::NEG_INFINITY, f64::INFINITY, &[])
+                .map(|(hit, _)| hit)
+        })
         .collect()
 }
 
+fn unit_ray(direction: [f32; 3]) -> Option<[f64; 3]> {
+    let length = direction.iter().map(|&c| f64::from(c).powi(2)).sum::<f64>().sqrt();
+    (length > 0.0 && length.is_finite()).then(|| direction.map(|c| f64::from(c) / length))
+}
+
 impl Bvh {
-    /// Nearest triangle along `ray` (unit length, already f64).
-    fn first_hit(&self, origin: [f32; 3], ray: [f64; 3]) -> Option<RayHit> {
+    /// Nearest non-excluded triangle in `(minimum, maximum]` along the unit ray.
+    fn first_hit(
+        &self,
+        origin: [f32; 3],
+        ray: [f64; 3],
+        minimum: f64,
+        maximum: f64,
+        excluded: &[usize],
+    ) -> Option<(RayHit, f64)> {
         if self.nodes.is_empty() {
             return None;
         }
         let origin = origin.map(f64::from);
-        let mut best = f64::INFINITY;
+        let mut best = maximum;
         let mut hit = None;
         let mut stack = vec![0usize];
         while let Some(node) = stack.pop() {
@@ -685,15 +694,18 @@ impl Bvh {
                 for &triangle in
                     &self.order[entry.start as usize..(entry.start + entry.count) as usize]
                 {
-                    if let Some((distance, location)) =
+                    if !excluded.contains(&triangle)
+                        && let Some((distance, location)) =
                         ray_triangle(origin, ray, &self.tries[triangle].corners)
-                        && distance < best
+                        && distance > minimum
+                        && distance <= best
+                        && (hit.is_none() || distance < best)
                     {
                         best = distance;
-                        hit = Some(RayHit {
+                        hit = Some((RayHit {
                             triangle,
                             location: location.map(|value| value as f32),
-                        });
+                        }, distance));
                     }
                 }
             } else {
@@ -783,12 +795,50 @@ fn ray_triangle(
     ))
 }
 
-/// Shared acceleration for validated control-surface binding. @req DECL0013
+/// A shared surface hit keeps the original triangle index. @req DECL0013
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClosestSurfacePoint {
     pub triangle: usize,
     pub point: [f32; 3],
     pub distance: f32,
+}
+
+/// Reuse one diagnostic BVH across fitting correspondence iterations. @req DECL0013
+pub(crate) struct SurfaceIndex {
+    bvh: Bvh,
+}
+
+impl SurfaceIndex {
+    /// Callers validate finite geometry and triangle indices before construction. @req DECL0013
+    pub(crate) fn build(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> Self {
+        Self {
+            bvh: Bvh::build(triangles(positions, faces)),
+        }
+    }
+
+    pub(crate) fn closest(&self, point: [f32; 3]) -> Option<ClosestSurfacePoint> {
+        self.bvh
+            .nearest(point)
+            .map(|(triangle, distance)| ClosestSurfacePoint {
+                triangle,
+                point: closest_triangle_point(point, &self.bvh.tries[triangle])
+                    .map(|value| value as f32),
+                distance,
+            })
+    }
+
+    /// Reuse the cached tree for native poke and far-side queries. @req DECL0013
+    pub(crate) fn first_hit(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        minimum: f32,
+        maximum: f32,
+        excluded: &[usize],
+    ) -> Option<(RayHit, f32)> {
+        self.bvh.first_hit(origin, unit_ray(direction)?, f64::from(minimum), f64::from(maximum), excluded)
+            .map(|(hit, distance)| (hit, distance as f32))
+    }
 }
 
 /// Closest points reuse the diagnostic BVH and its f64 triangle predicate. @req DECL0013
@@ -797,19 +847,8 @@ pub(crate) fn closest_surface_points(
     positions: &[[f32; 3]],
     faces: &[[u32; 3]],
 ) -> Vec<Option<ClosestSurfacePoint>> {
-    let bvh = Bvh::build(triangles(positions, faces));
-    points
-        .iter()
-        .map(|&point| {
-            bvh.nearest(point)
-                .map(|(triangle, distance)| ClosestSurfacePoint {
-                    triangle,
-                    point: closest_triangle_point(point, &bvh.tries[triangle])
-                        .map(|value| value as f32),
-                    distance,
-                })
-        })
-        .collect()
+    let index = SurfaceIndex::build(positions, faces);
+    points.iter().map(|&point| index.closest(point)).collect()
 }
 
 /// Shared acceleration for validated control-surface binding. @req DECL0013

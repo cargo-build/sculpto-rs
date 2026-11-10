@@ -14,7 +14,11 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde_json::{Value, json};
 
-use sculpto_mesh::garment::{self, BodyExtent, GarmentKind, Influences, RawExtent, RawTriangle};
+use sculpto_mesh::garment::{
+    self, BodyExtent, GarmentKind, Influences, RawExtent, RawTriangle, TransferError,
+    TransferOptions,
+};
+use sculpto_mesh::weight_norm::WeightError;
 
 use crate::errors;
 use crate::handlers::{missing, string};
@@ -109,7 +113,9 @@ pub struct ProjectionParams {
 ///
 /// `stage = transfer` needs `garment_positions`, `body_positions` and
 /// `body_weights`; `stage = unpose` needs `positions`, `weights` and
-/// `skinning`.
+/// `skinning`. The transfer options follow the native bone-weight copy and
+/// default to ten units, ten neighbours, no masks, a new unweighted garment,
+/// every source bone copied and no spreading.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct WeightsParams {
     /// `transfer` or `unpose`.
@@ -120,6 +126,24 @@ pub struct WeightsParams {
     pub body_positions: Option<Vec<[f32; 3]>>,
     /// Per-body-vertex influences, bone name to weight.
     pub body_weights: Option<Vec<BTreeMap<String, f32>>>,
+    /// Transfer proximity radius; 10 when absent.
+    pub radius: Option<f32>,
+    /// Body neighbours blended per garment vertex; 10 when absent.
+    pub max_results: Option<usize>,
+    /// Per-body-vertex mask; a value above zero excludes the vertex.
+    pub body_mask: Option<Vec<f32>>,
+    /// Per-garment-vertex mask; a value above zero keeps its current weights.
+    pub garment_mask: Option<Vec<f32>>,
+    /// Current per-garment-vertex influences; absent means a new garment.
+    pub current_weights: Option<Vec<BTreeMap<String, f32>>>,
+    /// Body bones to copy, in order; absent or empty copies all source bones.
+    pub copy: Option<Vec<String>>,
+    /// Extra garment bones that absorb the normalization remainder.
+    pub normalizable: Option<Vec<String>>,
+    /// Spread an unassigned remainder over the normalizable bones.
+    pub spread: Option<bool>,
+    /// Re-run the native all-normalizable pass after the copy.
+    pub normalize: Option<bool>,
     /// Per-garment-vertex positions the unpose restores.
     pub positions: Option<Vec<[f32; 3]>>,
     /// Per-garment-vertex influences the unpose blends.
@@ -296,6 +320,77 @@ fn influences(input: &Value, field: &str) -> Result<Vec<Influences>, CommandErro
         .collect()
 }
 
+fn optional_number(input: &Value, field: &str) -> Result<Option<f64>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| errors::invalid(field, "is not a number")),
+    }
+}
+
+fn optional_count(input: &Value, field: &str) -> Result<Option<usize>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| errors::invalid(field, "is not a non-negative integer")),
+    }
+}
+
+fn optional_bool(input: &Value, field: &str) -> Result<Option<bool>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| errors::invalid(field, "is not a boolean")),
+    }
+}
+
+fn optional_numbers(input: &Value, field: &str) -> Result<Option<Vec<f32>>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => array(input, field)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| number(value, field, index).map(|value| value as f32))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+    }
+}
+
+fn optional_strings(input: &Value, field: &str) -> Result<Option<Vec<String>>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(values) => values
+            .as_array()
+            .ok_or_else(|| errors::invalid(field, "is not an array of strings"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| errors::invalid(field, "is not an array of strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+    }
+}
+
+fn optional_influences(
+    input: &Value,
+    field: &str,
+) -> Result<Option<Vec<Influences>>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => influences(input, field).map(Some),
+    }
+}
+
 fn skinning(input: &Value) -> Result<BTreeMap<String, [[f32; 4]; 4]>, CommandError> {
     object(input, "skinning")?
         .as_object()
@@ -428,14 +523,23 @@ pub fn weights(input: &Value) -> Result<Value, CommandError> {
             let garment_positions = triples(input, "garment_positions")?;
             let body_positions = triples(input, "body_positions")?;
             let body_weights = influences(input, "body_weights")?;
-            if body_positions.len() != body_weights.len() {
-                return Err(errors::invalid(
-                    "body_weights",
-                    "one influence set per body vertex is required",
-                ));
-            }
-            let transferred = garment::transfer(&garment_positions, &body_positions, &body_weights)
-                .map_err(errors::garment_rule)?;
+            let defaults = TransferOptions::default();
+            let options = TransferOptions {
+                radius: optional_number(input, "radius")?
+                    .map_or(defaults.radius, |value| value as f32),
+                max_results: optional_count(input, "max_results")?.unwrap_or(defaults.max_results),
+                body_mask: optional_numbers(input, "body_mask")?,
+                garment_mask: optional_numbers(input, "garment_mask")?,
+                current: optional_influences(input, "current_weights")?,
+                copy: optional_strings(input, "copy")?.unwrap_or(defaults.copy),
+                normalizable: optional_strings(input, "normalizable")?
+                    .unwrap_or(defaults.normalizable),
+                spread: optional_bool(input, "spread")?.unwrap_or(defaults.spread),
+                normalize: optional_bool(input, "normalize")?.unwrap_or(defaults.normalize),
+            };
+            let transferred =
+                garment::transfer(&garment_positions, &body_positions, &body_weights, &options)
+                    .map_err(weight_transfer)?;
             Ok(json!({
                 "stage": "transfer",
                 "vertices": transferred.len(),
@@ -461,5 +565,178 @@ pub fn weights(input: &Value) -> Result<Value, CommandError> {
             "unknown_weight_stage",
             format!("`stage` must be `transfer` or `unpose`, not `{other}`"),
         )),
+    }
+}
+
+/// A refused weight copy → the stable `kind` + `code` contract.
+fn weight_transfer(error: TransferError) -> CommandError {
+    let (kind, code) = match &error {
+        TransferError::EmptyGarment => (ErrorKind::InvalidParams, "weight_empty_garment"),
+        TransferError::EmptyBody => (ErrorKind::InvalidParams, "weight_empty_body"),
+        TransferError::ZeroMaxResults => (ErrorKind::InvalidParams, "weight_zero_max_results"),
+        TransferError::LengthMismatch { .. } => {
+            (ErrorKind::InvalidParams, "weight_length_mismatch")
+        }
+        TransferError::Mask { .. } => (ErrorKind::InvalidParams, "weight_mask"),
+        TransferError::MissingCurrentWeights { .. } => {
+            (ErrorKind::InvalidParams, "weight_missing_current")
+        }
+        TransferError::InvalidPreservedWeights { .. } => {
+            (ErrorKind::Refused, "weight_invalid_preserved")
+        }
+        TransferError::Influence { error, .. } => weight_class(error),
+        TransferError::Proximity(_) => (ErrorKind::InvalidParams, "weight_proximity"),
+        TransferError::Normalize(error) => weight_class(error),
+        TransferError::Vertex { error, .. } => weight_class(error),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A weight-class or packing refusal → kind and stable code.
+fn weight_class(error: &WeightError) -> (ErrorKind, &'static str) {
+    match error {
+        WeightError::EmptyBoneName => (ErrorKind::InvalidParams, "weight_empty_bone_name"),
+        WeightError::DuplicateBone { .. } => (ErrorKind::InvalidParams, "weight_duplicate_bone"),
+        WeightError::AmbiguousClass { .. } => (ErrorKind::InvalidParams, "weight_ambiguous_class"),
+        WeightError::ModifiedOutOfRange { .. } => {
+            (ErrorKind::InvalidParams, "weight_modified_out_of_range")
+        }
+        WeightError::UnclassifiedBone { .. } => (ErrorKind::Refused, "weight_unclassified_bone"),
+        WeightError::NonFiniteWeight { .. } => (ErrorKind::InvalidParams, "weight_non_finite"),
+        WeightError::NegativeWeight { .. } => (ErrorKind::InvalidParams, "weight_negative"),
+        WeightError::ImpossibleLockedMass { .. } => {
+            (ErrorKind::Refused, "weight_impossible_locked_mass")
+        }
+        WeightError::TooManyLocked { .. } => (ErrorKind::Refused, "weight_too_many_locked"),
+        WeightError::LockedMassOverOne { .. } => {
+            (ErrorKind::Refused, "weight_locked_mass_over_one")
+        }
+        WeightError::MissingUnlockedMass { .. } => {
+            (ErrorKind::Refused, "weight_missing_unlocked_mass")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_keeps_the_response_shape_and_interpolates_by_default() {
+        let output = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            "body_weights": [
+                {"Chest": 1.0, "Spine": 0.0},
+                {"Chest": 0.5, "Spine": 0.5},
+            ],
+        }))
+        .expect("the default transfer should answer");
+        assert_eq!(output["stage"], "transfer");
+        assert_eq!(output["vertices"], 1);
+        let vertex = output["weights"][0].as_object().expect("influences");
+        assert_eq!(vertex["Chest"].as_f64(), Some(0.75));
+        assert_eq!(vertex["Spine"].as_f64(), Some(0.25));
+    }
+
+    #[test]
+    fn transfer_reads_the_extended_options_and_preserves_a_masked_vertex() {
+        let output = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            "body_weights": [
+                {"Chest": 0.2, "Spine": 0.8},
+                {"Chest": 0.8, "Spine": 0.2},
+            ],
+            "radius": 5.0,
+            "max_results": 1,
+            "body_mask": [1.0, 0.0],
+            "copy": ["Chest", "Spine"],
+            "normalize": true,
+        }))
+        .expect("the masked transfer should answer");
+        let vertex = output["weights"][0].as_object().expect("influences");
+        let chest = vertex["Chest"].as_f64().expect("Chest");
+        let spine = vertex["Spine"].as_f64().expect("Spine");
+        assert!(
+            (chest - 0.8).abs() < 1e-6,
+            "the excluded body vertex must not blend"
+        );
+        assert!((spine - 0.2).abs() < 1e-6);
+
+        let preserved = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0]],
+            "body_weights": [{"Chest": 1.0}],
+            "garment_mask": [1.0],
+            "current_weights": [{"Hips": 0.7, "Spine": 0.3}],
+        }))
+        .expect("a preserved vertex keeps its map");
+        let hips = preserved["weights"][0]["Hips"]
+            .as_f64()
+            .expect("preserved Hips");
+        assert!((hips - 0.7).abs() < 1e-6, "preserved Hips is {hips}");
+        assert!(preserved["weights"][0].get("Chest").is_none());
+    }
+
+    #[test]
+    fn invalid_transfer_inputs_are_typed_refusals() {
+        let negative = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0]],
+            "body_weights": [{"Chest": -1.0}],
+        }))
+        .expect_err("a negative weight is refused");
+        assert_eq!(negative.kind(), ErrorKind::InvalidParams);
+        assert_eq!(negative.code(), "weight_negative");
+        assert!(
+            negative.message().contains("body_weights") && negative.message().contains("vertex 0"),
+            "the refusal names the input and vertex: {}",
+            negative.message()
+        );
+
+        let masked = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0]],
+            "body_weights": [{"Chest": 1.0}],
+            "garment_mask": [1.0],
+        }))
+        .expect_err("a mask needs current weights");
+        assert_eq!(masked.code(), "weight_missing_current");
+
+        let no_neighbours = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0]],
+            "body_weights": [{"Chest": 1.0}],
+            "max_results": 0,
+        }))
+        .expect_err("a zero neighbour cap is refused");
+        assert_eq!(no_neighbours.code(), "weight_zero_max_results");
+
+        let short_mask = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0]],
+            "body_weights": [{"Chest": 1.0}],
+            "body_mask": [0.0, 1.0],
+        }))
+        .expect_err("a mask needs one value per vertex");
+        assert_eq!(short_mask.code(), "weight_length_mismatch");
+
+        let unweighted = weights(&json!({
+            "stage": "transfer",
+            "garment_positions": [[0.0, 0.0, 0.0]],
+            "body_positions": [[1.0, 0.0, 0.0]],
+            "body_weights": [{}],
+        }))
+        .expect_err("a vertex with no source weight is refused");
+        assert_eq!(unweighted.kind(), ErrorKind::Refused);
+        assert_eq!(unweighted.code(), "weight_missing_unlocked_mass");
     }
 }

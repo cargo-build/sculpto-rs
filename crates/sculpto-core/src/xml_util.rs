@@ -100,3 +100,14 @@ pub(crate) fn required_text(node: Node<'_, '_>) -> crate::error::Result<String> 
             )
         })
 }
+
+/// Optional element text: `None` when the element is absent or empty.
+///
+/// The reference clears an owning field when the element is missing *or* has no
+/// text, so absence and emptiness are the same modeled state.
+pub(crate) fn optional_text(node: Node<'_, '_>) -> Option<String> {
+    node.text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}

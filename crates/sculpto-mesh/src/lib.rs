@@ -35,3 +35,5 @@ mod point_query;
 pub mod surface;
 mod topology;
 pub mod uv;
+pub mod weight_norm;
+pub mod wrap;

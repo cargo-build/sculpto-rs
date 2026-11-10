@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-glam = "0.34"
+glam.workspace = true
 robust = "1"
 gltf = { version = "1", default-features = false, features = ["utils", "names", "extras"] }
 sculpto-core.workspace = true
