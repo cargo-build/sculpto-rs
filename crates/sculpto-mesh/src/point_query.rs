@@ -25,6 +25,76 @@ struct KdNode {
 }
 
 impl<'points> PointIndex<'points> {
+    /// Native zero-radius search retains record minima in insertion-tree traversal. @req DECL0013
+    pub(crate) fn build_native(points: &'points [[f32; 3]]) -> Self {
+        let mut tree = Self {
+            points,
+            nodes: Vec::with_capacity(points.len()),
+            root: (!points.is_empty()).then_some(0),
+        };
+        points.iter().enumerate().for_each(|(point, position)| {
+            let mut current = tree.root.filter(|_| !tree.nodes.is_empty());
+            let mut parent = None;
+            let mut axis = 0;
+            while let Some(index) = current {
+                let entry = tree.nodes[index];
+                let left = position[entry.axis] < points[entry.point][entry.axis];
+                parent = Some((index, left));
+                axis = (entry.axis + 1) % 3;
+                current = match left {
+                    true => entry.left,
+                    false => entry.right,
+                };
+            }
+            let index = tree.nodes.len();
+            tree.nodes.push(KdNode {
+                point,
+                axis,
+                left: None,
+                right: None,
+            });
+            if let Some((parent, left)) = parent {
+                match left {
+                    true => tree.nodes[parent].left = Some(index),
+                    false => tree.nodes[parent].right = Some(index),
+                }
+            }
+        });
+        tree
+    }
+
+    /// Preserve kd_nn(0)'s accumulated record minima, before exclusions/caps. @req DECL0013
+    pub(crate) fn zero_radius_neighbors(&self, target: [f32; 3]) -> Vec<(usize, f32)> {
+        let mut pending: Vec<_> = self.root.into_iter().map(|index| (index, false)).collect();
+        let mut minimum = f32::MAX;
+        let mut found = Vec::new();
+        while let Some((index, returning)) = pending.pop() {
+            let entry = self.nodes[index];
+            let point = self.points[entry.point];
+            let delta = point[entry.axis] - target[entry.axis];
+            let (near, far) = match delta > 0.0 {
+                true => (entry.left, entry.right),
+                false => (entry.right, entry.left),
+            };
+            if !returning {
+                pending.push((index, true));
+                pending.extend(near.map(|index| (index, false)));
+                continue;
+            }
+            let [x, y, z] = subtract(target, point);
+            let distance = (x * x + y * y + z * z).sqrt();
+            if distance <= minimum {
+                minimum = distance;
+                found.push((entry.point, distance));
+            }
+            if delta.abs() < minimum {
+                pending.extend(far.map(|index| (index, false)));
+            }
+        }
+        found.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+        found
+    }
+
     /// Radius neighbors use reference distance order before any exclusion/cap. @req DECL0013
     pub(crate) fn within_radius(&self, target: [f32; 3], radius: f32) -> Vec<(usize, f32)> {
         let mut found = Vec::new();

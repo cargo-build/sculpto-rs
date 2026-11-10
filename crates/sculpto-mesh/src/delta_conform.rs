@@ -38,7 +38,7 @@ const DEFAULT_MAX_RESULTS: usize = 10;
 /// How far a garment vertex looks for body vertices to follow.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProximityOptions {
-    /// Search radius in position units, inclusive; `0.0` keeps exact matches.
+    /// Inclusive radius; zero uses the native insertion-tree nearest-search mode.
     pub radius: f32,
 }
 
@@ -120,11 +120,18 @@ impl ProximityCache {
             return Err(DeltaConformError::NonFiniteGarmentPosition { vertex });
         }
 
-        let index = PointIndex::build(body);
+        let index = match options.radius == 0.0 {
+            true => PointIndex::build_native(body),
+            false => PointIndex::build(body),
+        };
         let mut neighbors = Vec::with_capacity(garment.len());
         for position in garment {
             let mut row = Vec::new();
-            for (vertex, distance) in index.within_radius(*position, options.radius) {
+            let candidates = match options.radius == 0.0 {
+                true => index.zero_radius_neighbors(*position),
+                false => index.within_radius(*position, options.radius),
+            };
+            for (vertex, distance) in candidates {
                 if excluded.is_some_and(|excluded| excluded.contains(&vertex)) {
                     continue;
                 }

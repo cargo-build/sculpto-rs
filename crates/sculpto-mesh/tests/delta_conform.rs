@@ -118,6 +118,62 @@ fn radius_limits_the_neighbours() {
 }
 
 #[test]
+fn zero_radius_follows_noncoincident_body_and_retains_native_record_minima() {
+    let body = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let garment = [[0.1, 0.0, 0.0]];
+    let cache =
+        ProximityCache::build(&body, &garment, &ProximityOptions { radius: 0.0 }, None).unwrap();
+    let row = cache.neighbors(0).unwrap();
+    // Native visits child 1, then the closer root 0; it keeps both record minima.
+    assert_eq!(
+        row.iter()
+            .map(|neighbor| neighbor.vertex)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let diffs = BTreeMap::from([(0, [1.0, 0.0, 0.0]), (1, [3.0, 0.0, 0.0])]);
+    let output = generate_delta(&cache, &diffs, &DeltaOptions::default()).unwrap();
+    let inverse_far = 1.0 / (0.9_f32 * 0.9 + 1.0).sqrt();
+    let expected = (10.0 + 3.0 * inverse_far) / (10.0 + inverse_far);
+    assert!((output[&0][0] - expected).abs() < 1e-6);
+    assert_ne!(output[&0][0], 1.0);
+    let positive =
+        ProximityCache::build(&body, &garment, &ProximityOptions { radius: 0.01 }, None).unwrap();
+    assert!(positive.neighbors(0).unwrap().is_empty());
+}
+
+#[test]
+fn zero_radius_exclusion_happens_after_native_query() {
+    let body = [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+    let garment = [[1.1, 0.0, 0.0]];
+    let excluded = BTreeSet::from([0]);
+    let cache = ProximityCache::build(
+        &body,
+        &garment,
+        &ProximityOptions { radius: 0.0 },
+        Some(&excluded),
+    )
+    .unwrap();
+    assert!(
+        cache
+            .neighbors(0)
+            .unwrap()
+            .iter()
+            .all(|neighbor| neighbor.vertex != 0)
+    );
+    let capped = generate_delta(
+        &cache,
+        &BTreeMap::from([(1, [2.0, 0.0, 0.0])]),
+        &DeltaOptions {
+            max_results: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(capped[&0], [2.0, 0.0, 0.0]);
+}
+
+#[test]
 fn excluded_body_vertices_leave_the_cache() {
     let body = [[1.0, 0.0, 0.0], [20.0, 0.0, 0.0]];
     let garment = [[0.0, 0.0, 0.0]];
