@@ -91,12 +91,9 @@ impl SkinWeights {
         offsets.push(0);
         for (quad, lanes) in quads.iter().zip(weights) {
             for (joint, weight) in quad.iter().zip(lanes) {
-                match *weight != 0.0 {
-                    true => {
-                        joints.push(*joint);
-                        values.push(*weight);
-                    }
-                    false => {}
+                if *weight != 0.0 {
+                    joints.push(*joint);
+                    values.push(*weight);
                 }
             }
             offsets.push(u32::try_from(joints.len()).map_err(|_| SkinWeightError::Overflow)?);

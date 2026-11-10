@@ -29,7 +29,7 @@ use byroredux_nif::import::ImportedMesh;
 use byroredux_nif::scene::NifScene;
 use byroredux_nif::stream::NifStream;
 use byroredux_nif::types::BlockRef;
-use sculpto_core::skin::SkinWeights;
+use sculpto_core::skin::{FourLane, SkinWeights};
 
 use crate::NifError;
 
@@ -143,7 +143,7 @@ impl SourceShape {
 /// A body mesh usually carries `BSDismemberSkinInstance`, so reading only the
 /// plain type would leave every LE body without a source palette — and a skinned
 /// mesh with no readable skin is a refusal, not a silent fallback. @req DECL0008
-fn instance_of<'a>(scene: &'a NifScene, index: usize) -> Option<&'a NiSkinInstance> {
+fn instance_of(scene: &NifScene, index: usize) -> Option<&NiSkinInstance> {
     match scene.get_as::<NiSkinInstance>(index) {
         Some(instance) => Some(instance),
         None => scene
@@ -342,9 +342,8 @@ fn sparse_rows_from(
             if vertex >= rows.len() {
                 return Err("LE weight names a vertex past the shape".to_string());
             }
-            match entry.weight != 0.0 {
-                true => rows[vertex].push((bone, entry.weight)),
-                false => {}
+            if entry.weight != 0.0 {
+                rows[vertex].push((bone, entry.weight));
             }
         }
     }
@@ -375,7 +374,6 @@ fn packed_rows(
             header,
             range,
             shape,
-            shape.num_vertices,
             attrs,
             full_precision,
             name,
@@ -383,12 +381,12 @@ fn packed_rows(
     };
     Ok(lanes
         .into_iter()
-        .map(|(weights, joints)| {
+        .map(|FourLane { weights, joints }| {
             joints
-                .iter()
+                .into_iter()
                 .zip(weights)
                 .filter_map(|(joint, weight)| match weight != 0.0 {
-                    true => Some((u16::from(*joint), weight)),
+                    true => Some((joint, weight)),
                     false => None,
                 })
                 .collect()
@@ -403,7 +401,7 @@ fn global_buffer_rows(
     attrs: u16,
     full_precision: bool,
     name: &str,
-) -> Result<Vec<([f32; 4], [u8; 4])>, NifError> {
+) -> Result<Vec<FourLane>, NifError> {
     let partition = instance
         .skin_partition_ref
         .index()
@@ -420,17 +418,15 @@ fn global_buffer_rows(
 }
 
 /// SE inline shapes: locate the vertex run in the original block bytes.
-#[allow(clippy::too_many_arguments)]
 fn inline_rows(
     bytes: &[u8],
     header: &NifHeader,
     range: &Range<usize>,
     shape: &BsTriShape,
-    vertices: u16,
     attrs: u16,
     full_precision: bool,
     name: &str,
-) -> Result<Vec<([f32; 4], [u8; 4])>, NifError> {
+) -> Result<Vec<FourLane>, NifError> {
     if header.user_version_2 >= BSVER_FALLOUT4 {
         return Err(shape_error(
             name,
@@ -445,7 +441,7 @@ fn inline_rows(
         .map_err(|_| shape_error(name, "vertex stride exceeds the address space"))?
         * 4;
     let needed = stride
-        .checked_mul(vertices as usize)
+        .checked_mul(usize::from(shape.num_vertices))
         .ok_or_else(|| shape_error(name, "inline vertex run overflows the address space"))?;
     let end = (start as usize)
         .checked_add(needed)
@@ -487,7 +483,7 @@ fn decode_lanes(
     stride: usize,
     attrs: u16,
     full_precision: bool,
-) -> Result<Vec<([f32; 4], [u8; 4])>, String> {
+) -> Result<Vec<FourLane>, String> {
     let offset = skin_offset(attrs, full_precision)
         .ok_or_else(|| "vertex descriptor has no skinned channel".to_string())?;
     if stride == 0 || offset + SKIN_CHANNEL_BYTES > stride {
@@ -511,9 +507,8 @@ fn decode_lanes(
             bits.copy_from_slice(&channel[slot * 2..slot * 2 + 2]);
             *weight = f32::from(half::f16::from_bits(u16::from_le_bytes(bits)));
         }
-        let mut joints = [0_u8; 4];
-        joints.copy_from_slice(&channel[8..12]);
-        lanes.push((weights, joints));
+        let joints = [channel[8], channel[9], channel[10], channel[11]].map(u16::from);
+        lanes.push(FourLane { joints, weights });
     }
     Ok(lanes)
 }

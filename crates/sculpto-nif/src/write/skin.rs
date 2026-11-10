@@ -89,12 +89,17 @@ pub(crate) fn plan(
                 weights[bone as usize].push((vertex, weight));
             }
         }
-        let (lane, dropped) = project_row(&mut positive, index, target, policy)?;
-        dropped_influences.extend(dropped.iter().map(|&(joint, weight)| DroppedInfluence {
-            vertex: index,
-            bone: skin.bones[joint as usize].clone(),
-            weight,
-        }));
+        let lane = project_row(&mut positive, index, target, policy)?;
+        dropped_influences.extend(
+            positive
+                .iter()
+                .skip(4)
+                .map(|&(joint, weight)| DroppedInfluence {
+                    vertex: index,
+                    bone: skin.bones[joint as usize].clone(),
+                    weight,
+                }),
+        );
         if target == NifTarget::Se {
             for (bone, weight) in lane.joints.into_iter().zip(lane.weights) {
                 if weight > 0.0 {
@@ -119,7 +124,7 @@ fn project_row(
     vertex: usize,
     target: NifTarget,
     policy: InfluencePolicy,
-) -> Result<(FourLane, &[(u16, f32)]), NifWriteError> {
+) -> Result<FourLane, NifWriteError> {
     let reduce = positive.len() > 4;
     if reduce {
         if policy == InfluencePolicy::Preserve {
@@ -132,7 +137,7 @@ fn project_row(
             right.total_cmp(left).then(left_joint.cmp(right_joint))
         });
     }
-    let (kept, dropped) = positive.split_at(positive.len().min(4));
+    let kept = &positive[..positive.len().min(4)];
     let divisor = if reduce {
         kept.iter().map(|&(_, weight)| f64::from(weight)).sum()
     } else {
@@ -158,7 +163,7 @@ fn project_row(
         lane.joints[index] = joint;
         lane.weights[index] = encoded;
     }
-    Ok((lane, dropped))
+    Ok(lane)
 }
 
 /// A named `NiNode` body with an identity transform, the given children and
