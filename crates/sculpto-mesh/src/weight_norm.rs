@@ -213,14 +213,11 @@ impl WeightNormalizer {
             }
             None => {}
         }
-        match influences
+        if let Some(name) = influences
             .keys()
             .find(|bone| !self.classified(bone.as_str()))
         {
-            Some(name) => {
-                return Err(WeightError::UnclassifiedBone { name: name.clone() });
-            }
-            None => {}
+            return Err(WeightError::UnclassifiedBone { name: name.clone() });
         }
 
         let exact_locked: f32 = self

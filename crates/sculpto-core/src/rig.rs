@@ -510,9 +510,8 @@ fn topological_order(joints: &[Joint]) -> Result<Vec<JointId>, RigError> {
     let mut state = vec![UNVISITED; joints.len()];
     let mut order = Vec::with_capacity(joints.len());
     for start in 0..joints.len() {
-        match state[start] {
-            PLACED => continue,
-            _ => {}
+        if state[start] == PLACED {
+            continue;
         }
         let mut path = Vec::new();
         let mut cursor = Some(start);

@@ -699,15 +699,15 @@ fn fit_with_targets(
     let mut pulled = 0usize;
     let mut error_sum = 0.0f64;
     let mut max_gap_error = 0.0f32;
-    for index in 0..count {
+    for (index, &position) in fitted.iter().enumerate() {
         if solver.last_weight[index] <= 0.0 || solver.lock_of[index] >= 1.0 {
             continue;
         }
-        let Some(hit) = solver.surface.hit(fitted[index], max_distance) else {
+        let Some(hit) = solver.surface.hit(position, max_distance) else {
             continue;
         };
         pulled += 1;
-        let signed = dot(sub(fitted[index], hit.point), hit.normal);
+        let signed = dot(sub(position, hit.point), hit.normal);
         let error = (signed - solver.gap_of[index]).abs();
         error_sum += f64::from(error);
         max_gap_error = max_gap_error.max(error);
@@ -1821,8 +1821,8 @@ impl Similarity {
     fn apply(&self, point: [f32; 3]) -> [f64; 3] {
         let point = point.map(f64::from);
         let mut out = [0.0f64; 3];
-        for row in 0..3 {
-            out[row] = self.scale
+        for (row, value) in out.iter_mut().enumerate() {
+            *value = self.scale
                 * (self.rotation[row][0] * point[0]
                     + self.rotation[row][1] * point[1]
                     + self.rotation[row][2] * point[2])
@@ -1957,12 +1957,12 @@ fn best_fit_transform(
         }
     }
 
-    for row in 0..3 {
+    for (row, &target) in to_centroid.iter().enumerate() {
         let moved = result.scale
             * (result.rotation[row][0] * from_centroid[0]
                 + result.rotation[row][1] * from_centroid[1]
                 + result.rotation[row][2] * from_centroid[2]);
-        result.translation[row] = to_centroid[row] - moved;
+        result.translation[row] = target - moved;
     }
     result
 }
@@ -1979,10 +1979,10 @@ fn largest_eigenvector(mut matrix: [[f64; 4]; 4]) -> [f64; 4] {
     for _ in 0..50 {
         let mut off_diagonal = 0.0;
         let mut diagonal = 0.0;
-        for p in 0..4 {
-            diagonal += matrix[p][p] * matrix[p][p];
-            for q in (p + 1)..4 {
-                off_diagonal += matrix[p][q] * matrix[p][q];
+        for (p, row) in matrix.iter().enumerate() {
+            diagonal += row[p] * row[p];
+            for value in row.iter().skip(p + 1) {
+                off_diagonal += value * value;
             }
         }
         if off_diagonal <= 1e-24 * diagonal || off_diagonal < 1e-300 {
@@ -1997,20 +1997,21 @@ fn largest_eigenvector(mut matrix: [[f64; 4]; 4]) -> [f64; 4] {
                 let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
                 let c = 1.0 / (t * t + 1.0).sqrt();
                 let s = t * c;
-                for k in 0..4 {
-                    let (akp, akq) = (matrix[k][p], matrix[k][q]);
-                    matrix[k][p] = c * akp - s * akq;
-                    matrix[k][q] = s * akp + c * akq;
+                for row in &mut matrix {
+                    let (akp, akq) = (row[p], row[q]);
+                    row[p] = c * akp - s * akq;
+                    row[q] = s * akp + c * akq;
                 }
-                for k in 0..4 {
-                    let (apk, aqk) = (matrix[p][k], matrix[q][k]);
-                    matrix[p][k] = c * apk - s * aqk;
-                    matrix[q][k] = s * apk + c * aqk;
+                let (before_q, from_q) = matrix.split_at_mut(q);
+                for (apk, aqk) in before_q[p].iter_mut().zip(from_q[0].iter_mut()) {
+                    let (old_p, old_q) = (*apk, *aqk);
+                    *apk = c * old_p - s * old_q;
+                    *aqk = s * old_p + c * old_q;
                 }
-                for k in 0..4 {
-                    let (vkp, vkq) = (vectors[k][p], vectors[k][q]);
-                    vectors[k][p] = c * vkp - s * vkq;
-                    vectors[k][q] = s * vkp + c * vkq;
+                for row in &mut vectors {
+                    let (vkp, vkq) = (row[p], row[q]);
+                    row[p] = c * vkp - s * vkq;
+                    row[q] = s * vkp + c * vkq;
                 }
             }
         }

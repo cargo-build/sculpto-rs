@@ -378,8 +378,8 @@ fn fully_locked_vertices_stay_bit_identical_through_clip() {
             "locked vertex {vertex} moved"
         );
     }
-    for vertex in 0..9 {
-        let radius = xz_radius(positions[vertex]);
+    for (vertex, &position) in positions.iter().enumerate().take(9) {
+        let radius = xz_radius(position);
         assert!(
             (radius - 1.8).abs() < 0.01,
             "free low vertex {vertex} at radius {radius}"
@@ -478,11 +478,11 @@ fn keep_mode_preserves_standoff_and_pushes_out_clipping() {
         "clipping vertex must be pushed out, got {}",
         positions[0][2]
     );
-    for vertex in 1..4 {
+    for (vertex, position) in positions.iter().enumerate().take(4).skip(1) {
         assert!(
-            (positions[vertex][2] - 0.5).abs() < 0.01,
+            (position[2] - 0.5).abs() < 0.01,
             "kept vertex {vertex} drifted to {}",
-            positions[vertex][2]
+            position[2]
         );
     }
 }
