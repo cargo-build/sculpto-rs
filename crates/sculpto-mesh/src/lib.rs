@@ -33,6 +33,7 @@ pub mod garment;
 pub mod intake;
 pub mod intake_gltf;
 pub mod mask;
+pub mod silhouette;
 mod point_query;
 pub mod surface;
 mod surface_util;
