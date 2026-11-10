@@ -369,15 +369,7 @@ fn packed_rows(
     // bodies ship `num_vertices == 0` with the packed run in the partition.
     let lanes = match shape.bone_weights.is_empty() {
         true => global_buffer_rows(scene, instance, attrs, full_precision, name)?,
-        false => inline_rows(
-            bytes,
-            header,
-            range,
-            shape,
-            attrs,
-            full_precision,
-            name,
-        )?,
+        false => inline_rows(bytes, header, range, shape, attrs, full_precision, name)?,
     };
     Ok(lanes
         .into_iter()

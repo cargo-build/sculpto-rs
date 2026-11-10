@@ -90,16 +90,13 @@ pub(crate) fn plan(
             }
         }
         let lane = project_row(&mut positive, index, target, policy)?;
-        dropped_influences.extend(
-            positive
-                .iter()
-                .skip(4)
-                .map(|&(joint, weight)| DroppedInfluence {
-                    vertex: index,
-                    bone: skin.bones[joint as usize].clone(),
-                    weight,
-                }),
-        );
+        dropped_influences.extend(positive.iter().skip(4).map(|&(joint, weight)| {
+            DroppedInfluence {
+                vertex: index,
+                bone: skin.bones[joint as usize].clone(),
+                weight,
+            }
+        }));
         if target == NifTarget::Se {
             for (bone, weight) in lane.joints.into_iter().zip(lane.weights) {
                 if weight > 0.0 {
