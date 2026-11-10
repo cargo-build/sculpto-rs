@@ -192,7 +192,11 @@ impl fmt::Display for GltfError {
             Self::InvalidMesh(error) => write!(f, "mesh refused: {error:?}"),
             Self::NoTriangles => write!(f, "mesh has no triangles to export"),
             Self::SkinWeights(error) => write!(f, "skin weights refused: {error}"),
-            Self::WeightUnrepresentable { vertex, joint, weight } => write!(
+            Self::WeightUnrepresentable {
+                vertex,
+                joint,
+                weight,
+            } => write!(
                 f,
                 "vertex {vertex} joint {joint} weight {weight:.9e} would encode as zero in glTF f32"
             ),
@@ -777,7 +781,11 @@ fn skin_attributes(
                     let encoded = weight as f32;
                     match encoded > 0.0 {
                         true => Ok((joint, encoded)),
-                        false => Err(GltfError::WeightUnrepresentable { vertex, joint, weight }),
+                        false => Err(GltfError::WeightUnrepresentable {
+                            vertex,
+                            joint,
+                            weight,
+                        }),
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()

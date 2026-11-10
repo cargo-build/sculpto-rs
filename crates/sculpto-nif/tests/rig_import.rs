@@ -124,7 +124,10 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
     let row = skin.influences.row(0).expect("vertex 0");
     assert_eq!(row.joints, &[0, 1]);
     assert_eq!(row.weights, &[0.75, 0.25]);
-    assert!(matches!(document.bind_rest(), Err(NifRigError::Root { shape: 0, .. })));
+    assert!(matches!(
+        document.bind_rest(),
+        Err(NifRigError::Root { shape: 0, .. })
+    ));
 }
 
 #[test]
@@ -187,10 +190,18 @@ fn print_capture(label: &str, document: &NifDocument) {
 }
 
 fn measure_bound_rest(document: &NifDocument, expects_correction: bool) {
-    let binding = document.bind_rest().expect("source rig reconstructs at rest");
-    assert!(std::ptr::eq(binding.rig(), document.rig.as_ref().expect("source rig")));
+    let binding = document
+        .bind_rest()
+        .expect("source rig reconstructs at rest");
+    assert!(std::ptr::eq(
+        binding.rig(),
+        document.rig.as_ref().expect("source rig")
+    ));
     let basis = binding.basis();
-    assert_eq!(basis != identity().map(|column| column.map(f64::from)), expects_correction);
+    assert_eq!(
+        basis != identity().map(|column| column.map(f64::from)),
+        expects_correction
+    );
     assert_eq!(binding.skins().len(), document.shapes.len());
     for shape in binding.skins() {
         let source = shape.source();
@@ -303,9 +314,16 @@ fn three_ba_body_rest_reconstructs_in_its_authored_frame() {
     };
     let bytes = std::fs::read(path).expect("the 3BA fixture is readable");
     let document = read(&bytes).expect("the 3BA body reads");
-    let body = document.shapes.iter().max_by_key(|shape| shape.positions.len()).expect("a body");
+    let body = document
+        .shapes
+        .iter()
+        .max_by_key(|shape| shape.positions.len())
+        .expect("a body");
     assert_eq!(body.positions.len(), 18436);
-    assert_eq!(body.skin.as_ref().expect("the body has a skin").bones.len(), 49);
+    assert_eq!(
+        body.skin.as_ref().expect("the body has a skin").bones.len(),
+        49
+    );
     assert_eq!(document.shapes.len(), 3);
     measure_bound_rest(&document, false);
 }

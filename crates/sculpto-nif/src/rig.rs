@@ -64,17 +64,21 @@ impl NifDocument {
                 shape.skin.as_ref().map(|skin| (index, shape, source, skin))
             })
             .map(|(index, shape, source, skin)| {
-                let root = source.skeleton_root.as_deref().ok_or(NifRigError::MissingSource {
-                    shape: index,
-                    field: "skeleton root",
-                })?;
+                let root = source
+                    .skeleton_root
+                    .as_deref()
+                    .ok_or(NifRigError::MissingSource {
+                        shape: index,
+                        field: "skeleton root",
+                    })?;
                 let global_to_skin = source.global_skin.ok_or(NifRigError::MissingSource {
                     shape: index,
                     field: "global-to-skin matrix",
                 })?;
-                let root = rig
-                    .joint_by_name(root)
-                    .map_err(|error| NifRigError::Root { shape: index, error })?;
+                let root = rig.joint_by_name(root).map_err(|error| NifRigError::Root {
+                    shape: index,
+                    error,
+                })?;
                 Ok(SkinRestSource {
                     shape: index,
                     root,
@@ -107,9 +111,16 @@ impl fmt::Display for NifRigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingRig => write!(formatter, "NIF has no source rig"),
-            Self::SourceCount { shapes, sources } => write!(formatter, "{shapes} NIF shapes have {sources} source records"),
-            Self::MissingSource { shape, field } => write!(formatter, "shape {shape} has no {field}"),
-            Self::Root { shape, error } => write!(formatter, "shape {shape} skeleton root: {error}"),
+            Self::SourceCount { shapes, sources } => write!(
+                formatter,
+                "{shapes} NIF shapes have {sources} source records"
+            ),
+            Self::MissingSource { shape, field } => {
+                write!(formatter, "shape {shape} has no {field}")
+            }
+            Self::Root { shape, error } => {
+                write!(formatter, "shape {shape} skeleton root: {error}")
+            }
             Self::Rest(error) => write!(formatter, "{error}"),
         }
     }

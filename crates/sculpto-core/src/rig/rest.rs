@@ -103,12 +103,10 @@ impl<'a> RestBinding<'a> {
             resolved
                 .iter()
                 .map(|shape| {
-                    shape
-                        .measure(basis)
-                        .map_err(|defect| RestBindError::Shape {
-                            shape: shape.source.shape,
-                            defect,
-                        })
+                    shape.measure(basis).map_err(|defect| RestBindError::Shape {
+                        shape: shape.source.shape,
+                        defect,
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()
         };
@@ -254,7 +252,11 @@ impl<'a> ResolvedSkin<'a> {
                 let contribution = (actual - expected) * weight;
                 let error = contribution.length();
                 if !error.is_finite() {
-                    return Err(SkinRestDefect::InfluenceRest { vertex, bone, error });
+                    return Err(SkinRestDefect::InfluenceRest {
+                        vertex,
+                        bone,
+                        error,
+                    });
                 }
                 if error > REST_TOLERANCE {
                     outlier.get_or_insert((bone, error));
@@ -267,7 +269,11 @@ impl<'a> ResolvedSkin<'a> {
                 return Err(SkinRestDefect::VertexRest { vertex, error });
             }
             if let Some((bone, error)) = outlier {
-                return Err(SkinRestDefect::InfluenceRest { vertex, bone, error });
+                return Err(SkinRestDefect::InfluenceRest {
+                    vertex,
+                    bone,
+                    error,
+                });
             }
             max_vertex = max_vertex.max(error);
         }
@@ -281,8 +287,7 @@ impl<'a> ResolvedSkin<'a> {
 
 fn checked_affine(matrix: [[f32; 4]; 4]) -> Option<DMat4> {
     let matrix = DMat4::from_cols_array_2d(&matrix.map(|column| column.map(f64::from)));
-    (matrix.row(3).to_array() == [0.0, 0.0, 0.0, 1.0] && invertible(matrix))
-        .then_some(matrix)
+    (matrix.row(3).to_array() == [0.0, 0.0, 0.0, 1.0] && invertible(matrix)).then_some(matrix)
 }
 
 fn invertible(matrix: DMat4) -> bool {
@@ -311,7 +316,10 @@ pub enum RestBindError {
     /// The caller declared a different frame for the skin.
     Frame { rig: RigFrame, skin: RigFrame },
     /// One shape or palette entry is inconsistent.
-    Shape { shape: usize, defect: SkinRestDefect },
+    Shape {
+        shape: usize,
+        defect: SkinRestDefect,
+    },
 }
 
 /// The failed requirement for one shape.
@@ -338,7 +346,11 @@ pub enum SkinRestDefect {
     /// A bind or its product with the rest world is invalid.
     Bind { bone: usize },
     /// One weighted contribution exceeds the reconstruction tolerance.
-    InfluenceRest { vertex: usize, bone: u16, error: f64 },
+    InfluenceRest {
+        vertex: usize,
+        bone: u16,
+        error: f64,
+    },
     /// A weighted vertex exceeds the reconstruction tolerance.
     VertexRest { vertex: usize, error: f64 },
 }
@@ -347,7 +359,10 @@ impl fmt::Display for RestBindError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoSkins => write!(formatter, "no skinned shape to bind"),
-            Self::Frame { rig, skin } => write!(formatter, "rig frame {rig:?} differs from skin frame {skin:?}"),
+            Self::Frame { rig, skin } => write!(
+                formatter,
+                "rig frame {rig:?} differs from skin frame {skin:?}"
+            ),
             Self::Shape { shape, defect } => write!(formatter, "shape {shape}: {defect}"),
         }
     }
@@ -373,17 +388,34 @@ impl fmt::Display for SkinRestDefect {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptySkin => write!(formatter, "skin has no vertices or palette"),
-            Self::BindCount { bones, binds } => write!(formatter, "{bones} palette entries have {binds} bind matrices"),
-            Self::VertexCount { positions, rows } => write!(formatter, "{positions} vertices have {rows} skin rows"),
+            Self::BindCount { bones, binds } => write!(
+                formatter,
+                "{bones} palette entries have {binds} bind matrices"
+            ),
+            Self::VertexCount { positions, rows } => {
+                write!(formatter, "{positions} vertices have {rows} skin rows")
+            }
             Self::Position { vertex } => write!(formatter, "vertex {vertex} is not finite"),
             Self::Weights(error) => write!(formatter, "{error}"),
             Self::Rig(error) => write!(formatter, "{error}"),
             Self::DuplicateJoint { joint } => write!(formatter, "palette maps joint {joint} twice"),
-            Self::OutsideRoot { root, joint } => write!(formatter, "joint {joint} is outside skeleton root {root}"),
+            Self::OutsideRoot { root, joint } => {
+                write!(formatter, "joint {joint} is outside skeleton root {root}")
+            }
             Self::GlobalToSkin => write!(formatter, "invalid global-to-skin matrix"),
             Self::Bind { bone } => write!(formatter, "invalid bind for palette entry {bone}"),
-            Self::InfluenceRest { vertex, bone, error } => write!(formatter, "vertex {vertex} palette entry {bone} contribution error {error:.6e} exceeds {REST_TOLERANCE:.1e}"),
-            Self::VertexRest { vertex, error } => write!(formatter, "vertex {vertex} rest error {error:.6e} exceeds {REST_TOLERANCE:.1e}"),
+            Self::InfluenceRest {
+                vertex,
+                bone,
+                error,
+            } => write!(
+                formatter,
+                "vertex {vertex} palette entry {bone} contribution error {error:.6e} exceeds {REST_TOLERANCE:.1e}"
+            ),
+            Self::VertexRest { vertex, error } => write!(
+                formatter,
+                "vertex {vertex} rest error {error:.6e} exceeds {REST_TOLERANCE:.1e}"
+            ),
         }
     }
 }
