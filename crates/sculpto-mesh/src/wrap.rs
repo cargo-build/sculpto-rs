@@ -473,7 +473,10 @@ impl FitOptions {
         }
         let peak_lambda = self.stiffness * 4.0f32.powi((self.stages - 1) as i32);
         if !(LOCK_WEIGHT * (1.0 + peak_lambda)).is_finite() {
-            return Err(FitError::StiffnessSchedule { stiffness: self.stiffness, stages: self.stages });
+            return Err(FitError::StiffnessSchedule {
+                stiffness: self.stiffness,
+                stages: self.stages,
+            });
         }
         if self.iterations == 0 || self.iterations > MAX_ITERATIONS {
             return Err(FitError::Iterations(self.iterations));

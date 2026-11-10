@@ -532,12 +532,24 @@ fn finite_options_cannot_overflow_the_staged_solver_or_widen_the_search_radius()
     let (body, body_faces) = plane(10.0);
     let (garment, faces) = grid(1.0, 1.0);
     for options in [
-        FitOptions { max_distance: 0.0001, ..FitOptions::default() },
-        FitOptions { stiffness: 1e33, stages: 10, ..FitOptions::default() },
-        FitOptions { stiffness: 1e-5, ..FitOptions::default() },
+        FitOptions {
+            max_distance: 0.0001,
+            ..FitOptions::default()
+        },
+        FitOptions {
+            stiffness: 1e33,
+            stages: 10,
+            ..FitOptions::default()
+        },
+        FitOptions {
+            stiffness: 1e-5,
+            ..FitOptions::default()
+        },
     ] {
-        assert!(fit_to_body((&garment, &faces), (&body, &body_faces), None, &options).is_err(),
-            "out-of-range options must be refused: {options:?}");
+        assert!(
+            fit_to_body((&garment, &faces), (&body, &body_faces), None, &options).is_err(),
+            "out-of-range options must be refused: {options:?}"
+        );
     }
 }
 
