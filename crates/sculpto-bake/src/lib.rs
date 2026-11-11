@@ -41,6 +41,38 @@ pub struct PlannedSlider {
     pub shapes: Vec<PlannedShape>,
 }
 
+impl PlannedSlider {
+    /// Apply this slider to a copy of the target's positions.
+    ///
+    /// # Errors
+    /// Refuses an offset outside the provided vertex array.
+    pub fn apply(&self, target: &str, positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, BakeError> {
+        let mut out = positions.to_vec();
+        self.apply_to(target, &mut out)?;
+        Ok(out)
+    }
+
+    fn apply_to(&self, target: &str, positions: &mut [[f32; 3]]) -> Result<(), BakeError> {
+        let scale = self.percent / 100.0 * if self.invert { -1.0 } else { 1.0 };
+        let vertices = positions.len();
+        for shape in self.shapes.iter().filter(|shape| shape.target == target) {
+            for offset in &shape.offsets {
+                let slot = positions.get_mut(usize::from(offset.index)).ok_or_else(|| {
+                    BakeError::IndexOutOfBounds {
+                        slider: self.name.clone(),
+                        index: offset.index,
+                        vertices,
+                    }
+                })?;
+                for (component, delta) in slot.iter_mut().zip(offset.delta) {
+                    *component += scale * delta;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Why a `Data` reference could not be joined to an offset block.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedReason {
@@ -389,24 +421,7 @@ impl BakePlan {
     pub fn apply(&self, target: &str, positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, BakeError> {
         let mut out = positions.to_vec();
         for slider in &self.sliders {
-            let scale = slider.percent / 100.0 * if slider.invert { -1.0 } else { 1.0 };
-            for shape in &slider.shapes {
-                if shape.target != target {
-                    continue;
-                }
-                for offset in &shape.offsets {
-                    let slot =
-                        out.get_mut(offset.index as usize)
-                            .ok_or(BakeError::IndexOutOfBounds {
-                                slider: slider.name.clone(),
-                                index: offset.index,
-                                vertices: positions.len(),
-                            })?;
-                    for (component, delta) in slot.iter_mut().zip(offset.delta) {
-                        *component += scale * delta;
-                    }
-                }
-            }
+            slider.apply_to(target, &mut out)?;
         }
         Ok(out)
     }

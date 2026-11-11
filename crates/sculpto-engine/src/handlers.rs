@@ -31,6 +31,11 @@ pub fn fit_schema() -> Value {
     schema_for::<ops::FitParams>()
 }
 
+/// Schema for the authored garment slider conformance command.
+pub fn conform_schema() -> Value {
+    schema_for::<ops::ConformParams>()
+}
+
 /// Schema for the outfit census and cloth selection.
 pub fn outfit_inspect_schema() -> Value {
     schema_for::<ops::OutfitInspectParams>()
@@ -174,6 +179,17 @@ pub fn bake(input: &Value) -> Result<Value, CommandError> {
 }
 
 pub fn fit(input: &Value) -> Result<Value, CommandError> {
+    let percent = match input.get("percent") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_f64().map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| errors::invalid("percent", "must be a finite number"))?),
+    };
+    let slider = match input.get("slider") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) if !name.trim().is_empty() => Some(name.clone()),
+        Some(_) => return Err(errors::invalid("slider", "must be a nonempty name")),
+    };
     let params = ops::FitParams {
         nif: path(input, "nif")?,
         shape: string(input, "shape")?,
@@ -182,12 +198,16 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         out: path(input, "out")?,
         body_after: optional_path(input, "body_after"),
         out_after: optional_path(input, "out_after"),
+        conform: checked_optional_path(input, "conform")?,
+        slider,
+        percent,
+        body_nif: checked_optional_path(input, "body_nif")?,
     };
     let outcome = ops::garment_fit(&params)?;
     let follow = outcome.follow.map(|(body, garment, difference)| {
         json!({ "body": body, "garment": garment, "difference": difference })
     });
-    Ok(json!({
+    let mut result = json!({
         "out": outcome.out.display().to_string(),
         "vertices": outcome.vertices,
         "garment": outcome.garment,
@@ -195,6 +215,42 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         "offset_mean": outcome.offset_mean,
         "offset_max": outcome.offset_max,
         "follow": follow,
+    });
+    if let Some(pairs) = outcome.intersection_pairs {
+        result["intersection_pairs"] = json!(pairs);
+    }
+    if let Some(inside) = outcome.inside_after {
+        result["inside_after"] = json!(inside);
+    }
+    Ok(result)
+}
+
+pub fn conform(input: &Value) -> Result<Value, CommandError> {
+    let outcome = ops::conform_sliders(&ops::ConformParams {
+        nif: path(input, "nif")?,
+        shape: string(input, "shape")?,
+        body_nif: checked_optional_path(input, "body_nif")?,
+        body_shape: string(input, "body_shape")?,
+        project: path(input, "project")?,
+        presets: path(input, "presets")?,
+        preset: string(input, "preset")?,
+        set: string(input, "set")?,
+        home: checked_optional_path(input, "home")?,
+        out: path(input, "out")?,
+    })?;
+    let deferred: Vec<_> = outcome.deferred.into_iter().map(|slider| {
+        let reason = match slider.reason {
+            sculpto_bake::DeferredReason::Uv => "uv",
+            sculpto_bake::DeferredReason::Zap => "zap",
+            sculpto_bake::DeferredReason::ClampSemantics => "clamp_semantics",
+        };
+        json!({ "name": slider.name, "reason": reason })
+    }).collect();
+    Ok(json!({
+        "out": outcome.out.display().to_string(),
+        "vertices": outcome.vertices,
+        "sliders": outcome.sliders,
+        "deferred": deferred,
     }))
 }
 

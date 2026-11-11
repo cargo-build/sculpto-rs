@@ -76,10 +76,12 @@ pub fn repair_after_fit(
     )?;
     let clipped = coherent_positions(garment.0, &clipped, &mesh, &locked)?;
     let repaired_pairs = contacts(&clipped);
+    let repaired_inside = inside_count((&clipped, garment.1), &surface, options);
     let positions = if repaired_pairs <= report.intersection_pairs
+        && repaired_inside <= report.inside_after
         && count_flipped(garment.0, &clipped, garment.1) == 0
     {
-        report.inside_after = inside_count((&clipped, garment.1), &surface, options);
+        report.inside_after = repaired_inside;
         report.intersection_pairs = repaired_pairs;
         report.poke_repair_applied = true;
         clipped
@@ -98,6 +100,7 @@ pub fn repair_after_fit(
     if inside < report.inside_after
         && pairs <= report.intersection_pairs
         && count_flipped(&positions, &projected, garment.1) == 0
+        && count_flipped(garment.0, &projected, garment.1) == 0
         && (options.max_strain == 0.0 || strain <= options.max_strain)
     {
         report.inside_after = inside;

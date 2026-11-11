@@ -33,6 +33,9 @@ use sculpto_nif::{NifDocument, NifRigError, NifShape};
 use crate::errors;
 use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, write_obj_uv};
 
+mod slider;
+pub use slider::{ConformOutcome, ConformParams, conform_sliders};
+
 /// A source NIF and its optional authored outfit declaration.
 #[derive(Debug, Clone, JsonSchema)]
 pub struct OutfitInspectParams {
@@ -773,6 +776,14 @@ pub struct FitParams {
     pub body_after: Option<PathBuf>,
     /// Output for the follow measurement.
     pub out_after: Option<PathBuf>,
+    /// Generated garment OSD for a slider preview.
+    pub conform: Option<PathBuf>,
+    /// Name of the conformed slider to apply.
+    pub slider: Option<String>,
+    /// Slider percentage for the selected block.
+    pub percent: Option<f32>,
+    /// Source body NIF for a slider preview. Defaults to the garment NIF.
+    pub body_nif: Option<PathBuf>,
 }
 
 /// What `outfit.fit` produced.
@@ -792,10 +803,19 @@ pub struct FitOutcome {
     pub offset_max: f32,
     /// Follow measurement when a second body was given.
     pub follow: Option<(f32, f32, f32)>,
+    /// Measured triangle contacts when previewing a conformed slider.
+    pub intersection_pairs: Option<usize>,
+    /// Inside groups when previewing a conformed slider.
+    pub inside_after: Option<usize>,
 }
 
 /// Bind a garment to its authored body and apply the bind to a morphed body.
 pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
+    if params.conform.is_some() || params.slider.is_some()
+        || params.percent.is_some() || params.body_nif.is_some()
+    {
+        return slider::preview(params);
+    }
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let garment = pick_shape(&document.shapes, Some(&params.shape))?;
@@ -827,6 +847,8 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         offset_mean: conform.offset_mean(),
         offset_max: conform.offset_max(),
         follow,
+        intersection_pairs: None,
+        inside_after: None,
     })
 }
 

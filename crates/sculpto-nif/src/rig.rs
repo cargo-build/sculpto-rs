@@ -14,6 +14,7 @@
 use std::fmt;
 
 use byroredux_nif::import::{ImportedMesh, ImportedNode};
+use byroredux_core::math::{DMat4, DVec3};
 use sculpto_core::rig::rest::{RestBindError, RestBinding, SkinRestSource};
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigError, RigFrame, TransformDefect};
 
@@ -42,7 +43,71 @@ pub struct ShapeSource {
     pub skeleton_root: Option<String>,
 }
 
+/// Checked conversion between the stored mesh and the NIF source scene.
+#[derive(Debug, Clone, Copy)]
+pub struct ShapePlacement {
+    to_source: DMat4,
+    to_mesh: DMat4,
+}
+
+impl ShapePlacement {
+    /// Convert a stored position into the source scene.
+    pub fn position_in_source(self, point: [f32; 3]) -> [f32; 3] {
+        self.to_source.transform_point3(DVec3::from(point.map(f64::from)))
+            .to_array().map(|value| value as f32)
+    }
+
+    /// Convert a source scene position into stored mesh coordinates.
+    pub fn position_in_mesh(self, point: [f32; 3]) -> [f32; 3] {
+        self.to_mesh.transform_point3(DVec3::from(point.map(f64::from)))
+            .to_array().map(|value| value as f32)
+    }
+
+    /// Convert a stored offset into the source scene.
+    pub fn offset_in_source(self, offset: [f32; 3]) -> [f32; 3] {
+        self.to_source.transform_vector3(DVec3::from(offset.map(f64::from)))
+            .to_array().map(|value| value as f32)
+    }
+
+    /// Convert a source scene offset into stored mesh coordinates.
+    pub fn offset_in_mesh(self, offset: [f32; 3]) -> [f32; 3] {
+        self.to_mesh.transform_vector3(DVec3::from(offset.map(f64::from)))
+            .to_array().map(|value| value as f32)
+    }
+}
+
 impl NifDocument {
+    /// Place one shape in the source scene for geometric correspondence.
+    ///
+    /// Skin-local points use inverse G. Unskinned points use the node chain.
+    /// @req DECL0008
+    ///
+    /// # Errors
+    /// Refuses a missing source record, parent or invertible affine placement.
+    pub fn shape_placement(&self, shape: usize) -> Result<ShapePlacement, NifRigError> {
+        let missing = |field| NifRigError::MissingSource { shape, field };
+        let source = self.sources.get(shape).ok_or_else(|| missing("placement"))?;
+        let mesh = self.shapes.get(shape).ok_or_else(|| missing("geometry"))?;
+        let invalid = || NifRigError::Placement { shape };
+        let (to_source, to_mesh) = if mesh.skin.is_some() {
+            let matrix = source.global_skin.ok_or_else(|| missing("global-to-skin matrix"))?;
+            let to_mesh = DMat4::from_cols_array_2d(&matrix.map(|col| col.map(f64::from)));
+            (placement_inverse(to_mesh).ok_or_else(invalid)?, to_mesh)
+        } else {
+            let local = source.local.matrix().map_err(|_| invalid())?;
+            let parent = match source.parent {
+                Some(id) => {
+                    let rig = self.rig.as_ref().ok_or_else(|| missing("parent rig"))?;
+                    DMat4::from_cols_array_2d(&rig.rest_world(id).map_err(|_| invalid())?)
+                }
+                None => DMat4::IDENTITY,
+            };
+            let to_source = parent * DMat4::from_cols_array_2d(&local);
+            (to_source, placement_inverse(to_source).ok_or_else(invalid)?)
+        };
+        Ok(ShapePlacement { to_source, to_mesh })
+    }
+
     /// Resolve the source skeleton and prove rest reconstruction for every skin.
     ///
     /// Uses authored skin-local positions and G. Skinned object placement
@@ -110,6 +175,8 @@ pub enum NifRigError {
     SourceCount { shapes: usize, sources: usize },
     /// A skinned shape lacks required source context.
     MissingSource { shape: usize, field: &'static str },
+    /// A required object or skin placement is singular or invalid.
+    Placement { shape: usize },
     /// A required skeleton root could not be resolved.
     Root { shape: usize, error: RigError },
     /// The rest proof refused the authored binding.
@@ -127,12 +194,26 @@ impl fmt::Display for NifRigError {
             Self::MissingSource { shape, field } => {
                 write!(formatter, "shape {shape} has no {field}")
             }
+            Self::Placement { shape } => write!(formatter, "shape {shape} has invalid placement"),
             Self::Root { shape, error } => {
                 write!(formatter, "shape {shape} skeleton root: {error}")
             }
             Self::Rest(error) => write!(formatter, "{error}"),
         }
     }
+}
+
+fn placement_inverse(matrix: DMat4) -> Option<DMat4> {
+    let determinant = matrix.determinant();
+    if !matrix.is_finite()
+        || matrix.row(3).to_array() != [0.0, 0.0, 0.0, 1.0]
+        || !determinant.is_finite()
+        || determinant == 0.0
+    {
+        return None;
+    }
+    let inverse = matrix.inverse();
+    inverse.is_finite().then_some(inverse)
 }
 
 impl std::error::Error for NifRigError {

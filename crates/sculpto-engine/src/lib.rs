@@ -33,6 +33,8 @@ pub enum CommandId {
     Bake,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,
+    /// Write garment offsets for an authored body slider set.
+    OutfitConform,
     /// Report the source shapes and the cloth selection.
     OutfitInspect,
     /// Offset a body surface into a garment shell, with boundary relief.
@@ -67,6 +69,7 @@ impl CommandId {
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
             CommandId::OutfitFit => "outfit.fit",
+            CommandId::OutfitConform => "outfit.conform",
             CommandId::OutfitInspect => "outfit.inspect",
             CommandId::OutfitOffsets => "outfit.offsets",
             CommandId::OutfitPlace => "outfit.place",
@@ -254,6 +257,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: handlers::fit_schema,
         handler: handlers::fit,
+    },
+    Spec {
+        id: CommandId::OutfitConform,
+        summary: "Conform authored body sliders and write one garment OSD.",
+        mutates: true,
+        stub: false,
+        schema: handlers::conform_schema,
+        handler: handlers::conform,
     },
     Spec {
         id: CommandId::OutfitInspect,

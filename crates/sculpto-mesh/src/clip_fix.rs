@@ -136,7 +136,14 @@ impl fmt::Display for ClipFixError {
     }
 }
 
-impl std::error::Error for ClipFixError {}
+impl std::error::Error for ClipFixError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Geometry(error) | Self::FitOptions(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl ClipFixOptions {
     fn validate(&self) -> Result<(), ClipFixError> {

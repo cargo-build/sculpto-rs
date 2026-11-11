@@ -422,6 +422,10 @@ fn checked_writer_preserves_graph_bind_and_placement() {
         assert!((back.sources[0].local.rotation[2] - half).abs() < 1e-6);
         assert_eq!(back.sources[0].skeleton_root.as_deref(), Some("Scene"));
         assert_eq!(back.sources[0].global_skin, Some(global));
+        let shape_frame = back.shape_placement(0).expect("checked skin-local placement");
+        assert_eq!(shape_frame.position_in_source([2.0, 1.0, 1.0]), [2.0, 1.0, 2.0]);
+        assert_eq!(shape_frame.position_in_mesh([2.0, 1.0, 2.0]), [2.0, 1.0, 1.0]);
+        assert_eq!(shape_frame.offset_in_source([0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]);
         assert_eq!(back.shapes[0].skin, asset.skin);
     }
     asset.triangles[0] = [1, 0, 2];

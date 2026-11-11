@@ -39,6 +39,9 @@ commands:
   presets [options]     list presets in a SliderPresets collection
   export-obj [options]  read a NIF and write one shape as an OBJ
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
+  outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
+                 --presets <xml> --preset <name> --set <name> --out <osd>
+                 [--body-nif <path>] [--home <path>]
   garment fit [options] bind a garment to its authored body, then fit it to a bake
   garment follow [options] transport render positions through a deformed control
   garment aura [options] press a garment onto the body's cross-section aura
@@ -95,6 +98,10 @@ garment fit options:
   --out <obj>          fitted garment OBJ
   --body-after <obj>   second bake; reports how body and garment moved
   --out-after <obj>    fitted garment for --body-after
+  --conform <osd>      preview a conformed garment slider
+  --slider <name>      slider to preview with --conform
+  --percent <number>   slider percentage for --conform
+  --body-nif <path>    source body NIF for a slider preview, otherwise --nif
 
 garment follow options:
   --reference <obj>   original control surface
@@ -179,6 +186,9 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
         [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
             outfit_inspect(rest)
+        }
+        [command, action, rest @ ..] if command == "outfit" && action == "conform" => {
+            outfit_conform(rest)
         }
         [command, rest @ ..] if command == "garment" => garment(rest),
         [command, rest @ ..] if command == "run" => run::run(rest),
@@ -404,6 +414,36 @@ fn outfit_inspect(args: &[String]) -> ExitCode {
     }
 }
 
+fn outfit_conform(args: &[String]) -> ExitCode {
+    let input = parse_flags(args).and_then(|flags| {
+        if let Some(key) = flags.keys().find(|key| !matches!(
+            key.as_str(), "nif" | "shape" | "body-nif" | "body-shape" | "project"
+            | "presets" | "preset" | "set" | "home" | "out"
+        )) {
+            return Err(format!("unknown option `--{key}`"));
+        }
+        Ok(serde_json::json!({
+            "nif": required(&flags, "nif")?,
+            "shape": required(&flags, "shape")?,
+            "body_nif": flags.get("body-nif"),
+            "body_shape": required(&flags, "body-shape")?,
+            "project": required(&flags, "project")?,
+            "presets": required(&flags, "presets")?,
+            "preset": required(&flags, "preset")?,
+            "set": required(&flags, "set")?,
+            "home": flags.get("home"),
+            "out": required(&flags, "out")?,
+        }))
+    });
+    match input {
+        Ok(input) => run::dispatch_payload("outfit.conform", &input),
+        Err(error) => {
+            eprintln!("outfit conform: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn bake(args: &[String]) -> ExitCode {
     match bake_inner(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -575,6 +615,8 @@ fn garment_follow_inner(args: &[String]) -> Result<(), String> {
 
 fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
+    let percent = flags.get("percent").map(|value| value.parse::<f32>())
+        .transpose().map_err(|error| format!("invalid --percent: {error}"))?;
     let params = ops::FitParams {
         nif: PathBuf::from(required(&flags, "nif")?),
         shape: required(&flags, "shape")?.to_string(),
@@ -583,6 +625,10 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         out: PathBuf::from(required(&flags, "out")?),
         body_after: flags.get("body-after").map(PathBuf::from),
         out_after: flags.get("out-after").map(PathBuf::from),
+        conform: flags.get("conform").map(PathBuf::from),
+        slider: flags.get("slider").cloned(),
+        percent,
+        body_nif: flags.get("body-nif").map(PathBuf::from),
     };
     let outcome = ops::garment_fit(&params).map_err(|error| error.to_string())?;
     println!(
@@ -599,6 +645,9 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
             "follow (bound vertices): body moved {:.6}, garment moved {:.6}, max difference {:.9}",
             body, garment, difference
         );
+    }
+    if let (Some(pairs), Some(inside)) = (outcome.intersection_pairs, outcome.inside_after) {
+        println!("body contacts {pairs}, inside groups {inside}");
     }
     Ok(())
 }

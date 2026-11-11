@@ -13,6 +13,7 @@ use sculpto_core::mesh::MeshError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
 use sculpto_gltf::sanitize::SanitizeError;
 use sculpto_mesh::conform::ConformError;
+use sculpto_mesh::delta_conform::DeltaConformError;
 use sculpto_mesh::garment::GarmentRuleError;
 use sculpto_mesh::intake_gltf::{DefectOverLimit, IntakeError};
 use sculpto_mesh::outfit::OutfitError;
@@ -52,6 +53,23 @@ pub fn nif(error: NifError) -> CommandError {
         NifError::Truncated { .. } => (ErrorKind::Refused, "nif_truncated"),
     };
     CommandError::new(kind, code, error.to_string())
+}
+
+/// A conform operation could not build or evaluate its shared correspondence.
+pub fn delta_conform(error: DeltaConformError) -> CommandError {
+    use DeltaConformError::*;
+    let code = match error {
+        InvalidRadius { .. } => "conform_radius",
+        EmptyBody | EmptyGarment => "conform_empty_mesh",
+        ExcludedOutOfRange { .. } | NeighborOutOfRange { .. } => "conform_neighbor_index",
+        NonFiniteBodyPosition { .. } | NonFiniteGarmentPosition { .. } => "conform_non_finite_mesh",
+        ZeroNeighborCap => "conform_neighbor_cap",
+        MaskLength { .. } | MaskWeight { .. } => "conform_mask",
+        NonFiniteTransform { .. } => "conform_transform",
+        DiffOutOfRange { .. } => "conform_diff_index",
+        NonFiniteDiff { .. } => "conform_non_finite_diff",
+    };
+    CommandError::new(ErrorKind::Refused, code, error.to_string())
 }
 
 /// The authored outfit selection could not bind to the source shapes.
