@@ -144,10 +144,7 @@ fn wrong_sources_unknown_shapes_and_overlapping_regions_are_refused() {
 fn invalid_manifest_json_and_blank_names_share_the_parameter_error() {
     let fixture = Fixture::new("manifest", "robe");
     let path = fixture.manifest(json!([]));
-    for data in [
-        "{ broken json",
-        r#"{"outfit":" ","nif":"outfit.nif"}"#,
-    ] {
+    for data in ["{ broken json", r#"{"outfit":" ","nif":"outfit.nif"}"#] {
         std::fs::write(&path, data).expect("invalid manifest fixture");
         let error = dispatch("outfit.inspect", &request(&fixture.nif, Some(&path)))
             .expect_err("the manifest is invalid");

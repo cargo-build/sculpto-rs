@@ -61,8 +61,13 @@ pub fn complete_family_rig(
             .parent
             .and_then(|parent| mapped[parent.index()])
             .ok_or(TemplateError::Roots)?;
-        let parent_world = worlds[parent.index()].ok_or(TemplateError::InvalidRest { joint: parent })?;
-        let matched = node.name.as_deref().and_then(|name| names.get(name)).copied();
+        let parent_world =
+            worlds[parent.index()].ok_or(TemplateError::InvalidRest { joint: parent })?;
+        let matched = node
+            .name
+            .as_deref()
+            .and_then(|name| names.get(name))
+            .copied();
         let (id, local) = match matched {
             Some(id) => {
                 let original = &mut joints[id.index()];
@@ -71,7 +76,13 @@ pub fn complete_family_rig(
                     Some(old_parent) if old_parent == roots.authored => {
                         reparent_rest(authored, id, parent_world)?
                     }
-                    old_parent => return Err(TemplateError::ParentConflict { joint: id, authored: old_parent, template: parent }),
+                    old_parent => {
+                        return Err(TemplateError::ParentConflict {
+                            joint: id,
+                            authored: old_parent,
+                            template: parent,
+                        });
+                    }
                 };
                 original.parent = Some(parent);
                 original.rest = local;
@@ -79,7 +90,9 @@ pub fn complete_family_rig(
                 (id, local)
             }
             None => {
-                let id = JointId::new(u32::try_from(joints.len()).map_err(|_| TemplateError::TooManyJoints)?);
+                let id = JointId::new(
+                    u32::try_from(joints.len()).map_err(|_| TemplateError::TooManyJoints)?,
+                );
                 let mut joint = node.clone();
                 joint.parent = Some(parent);
                 joints.push(joint);
@@ -111,7 +124,10 @@ fn index_names<'a>(
         if let Some(name) = node.name.as_deref()
             && names.insert(name, JointId::new(index as u32)).is_some()
         {
-            return Err(TemplateError::DuplicateName { side, name: name.into() });
+            return Err(TemplateError::DuplicateName {
+                side,
+                name: name.into(),
+            });
         }
     }
     Ok(names)
@@ -146,7 +162,11 @@ fn rest_world(rig: &Rig, joint: JointId) -> Result<DMat4, TemplateError> {
     Ok(world)
 }
 
-fn reparent_rest(authored: &Rig, joint: JointId, parent: DMat4) -> Result<LocalTransform, TemplateError> {
+fn reparent_rest(
+    authored: &Rig,
+    joint: JointId,
+    parent: DMat4,
+) -> Result<LocalTransform, TemplateError> {
     let parent_determinant = parent.determinant();
     if !parent_determinant.is_finite() || parent_determinant <= 0.0 {
         return Err(TemplateError::InvalidRest { joint });
@@ -162,7 +182,9 @@ fn reparent_rest(authored: &Rig, joint: JointId, parent: DMat4) -> Result<LocalT
         rotation: rotation.to_array().map(|value| value as f32),
         translation: translation.to_array().map(|value| value as f32),
     };
-    local.validate().map_err(|_| TemplateError::InvalidRest { joint })?;
+    local
+        .validate()
+        .map_err(|_| TemplateError::InvalidRest { joint })?;
     Ok(local)
 }
 
@@ -172,7 +194,11 @@ fn verify_authored_worlds(authored: &Rig, completed: &Rig) -> Result<(), Templat
         let resolved = rest_world(completed, joint)?;
         let error = [DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z]
             .into_iter()
-            .map(|point| source.transform_point3(point).distance(resolved.transform_point3(point)))
+            .map(|point| {
+                source
+                    .transform_point3(point)
+                    .distance(resolved.transform_point3(point))
+            })
             .try_fold(0.0_f64, |max, error| {
                 if error.is_finite() {
                     Ok(max.max(error))
@@ -191,7 +217,10 @@ fn verify_authored_worlds(authored: &Rig, completed: &Rig) -> Result<(), Templat
 #[derive(Debug, Clone, PartialEq)]
 pub enum TemplateError {
     /// Rig frames differ.
-    Frame { authored: RigFrame, template: RigFrame },
+    Frame {
+        authored: RigFrame,
+        template: RigFrame,
+    },
     /// Each supplied root must be the graph's sole scene root.
     Roots,
     /// A scene root name collides with a different joint in the other rig.
@@ -201,7 +230,11 @@ pub enum TemplateError {
     /// No non-root names match between the two graphs.
     NoSharedJoints,
     /// A known non-root parent disagrees with the template.
-    ParentConflict { joint: JointId, authored: Option<JointId>, template: JointId },
+    ParentConflict {
+        joint: JointId,
+        authored: Option<JointId>,
+        template: JointId,
+    },
     /// The result exceeds the joint ID space.
     TooManyJoints,
     /// A rest transform cannot be represented.
@@ -215,15 +248,42 @@ pub enum TemplateError {
 impl fmt::Display for TemplateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Frame { authored, template } => write!(formatter, "authored frame {authored:?} differs from template frame {template:?}"),
-            Self::Roots => write!(formatter, "expected one explicitly paired scene root in each rig"),
-            Self::RootAlias => write!(formatter, "a scene root name collides with a non-root joint"),
-            Self::DuplicateName { side, name } => write!(formatter, "{side} rig repeats joint name `{name}`"),
-            Self::NoSharedJoints => write!(formatter, "family template has no matching body joint names"),
-            Self::ParentConflict { joint, authored, template } => write!(formatter, "joint {joint} has authored parent {authored:?} and template parent {template}"),
+            Self::Frame { authored, template } => write!(
+                formatter,
+                "authored frame {authored:?} differs from template frame {template:?}"
+            ),
+            Self::Roots => write!(
+                formatter,
+                "expected one explicitly paired scene root in each rig"
+            ),
+            Self::RootAlias => write!(
+                formatter,
+                "a scene root name collides with a non-root joint"
+            ),
+            Self::DuplicateName { side, name } => {
+                write!(formatter, "{side} rig repeats joint name `{name}`")
+            }
+            Self::NoSharedJoints => write!(
+                formatter,
+                "family template has no matching body joint names"
+            ),
+            Self::ParentConflict {
+                joint,
+                authored,
+                template,
+            } => write!(
+                formatter,
+                "joint {joint} has authored parent {authored:?} and template parent {template}"
+            ),
             Self::TooManyJoints => write!(formatter, "completed rig exceeds the joint ID range"),
-            Self::InvalidRest { joint } => write!(formatter, "joint {joint} has an unrepresentable rest transform"),
-            Self::RestMismatch { joint, error } => write!(formatter, "joint {joint} rest drift {error:.6e} exceeds {REST_TOLERANCE:.1e}"),
+            Self::InvalidRest { joint } => write!(
+                formatter,
+                "joint {joint} has an unrepresentable rest transform"
+            ),
+            Self::RestMismatch { joint, error } => write!(
+                formatter,
+                "joint {joint} rest drift {error:.6e} exceeds {REST_TOLERANCE:.1e}"
+            ),
             Self::Rig(error) => write!(formatter, "{error}"),
         }
     }
