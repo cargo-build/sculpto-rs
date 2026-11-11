@@ -8,5 +8,6 @@ license.workspace = true
 
 [dependencies]
 sculpto-core.workspace = true
+glam.workspace = true
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 gltf = { version = "1", default-features = false, features = ["names", "extras"] }

@@ -538,6 +538,7 @@ dependencies = [
 name = "sculpto-gltf"
 version = "0.1.0"
 dependencies = [
+ "glam 0.34.3",
  "gltf",
  "sculpto-core",
  "serde_json",

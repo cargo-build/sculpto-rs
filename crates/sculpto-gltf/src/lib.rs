@@ -58,6 +58,10 @@ pub mod profile;
 
 pub mod sanitize;
 
+mod rigged;
+
+pub use rigged::write_rigged_glb;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -89,6 +93,8 @@ const IDENTITY: [[f32; 4]; 4] = [
 pub enum GltfError {
     /// `MeshAsset::validate()` refused the model; nothing was written.
     InvalidMesh(MeshError),
+    /// Exported geometry must correspond to one checked rest shape.
+    RigBinding { shape: usize, field: &'static str },
     /// The model has no triangles, so there is no primitive to write.
     NoTriangles,
     /// A required normalized influence row was refused.
@@ -190,6 +196,9 @@ impl fmt::Display for GltfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMesh(error) => write!(f, "mesh refused: {error:?}"),
+            Self::RigBinding { shape, field } => {
+                write!(f, "shape {shape} checked rig mismatch: {field}")
+            }
             Self::NoTriangles => write!(f, "mesh has no triangles to export"),
             Self::SkinWeights(error) => write!(f, "skin weights refused: {error}"),
             Self::WeightUnrepresentable {
@@ -365,6 +374,14 @@ pub fn write_glb_with_profile(
 ///
 /// Every refusal check runs before any byte is produced.
 pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, GltfError> {
+    encode_glb(asset, clips, None)
+}
+
+fn encode_glb(
+    asset: &MeshAsset,
+    clips: &[Clip],
+    rigged: Option<&rigged::Layout<'_>>,
+) -> Result<Vec<u8>, GltfError> {
     asset.validate().map_err(GltfError::InvalidMesh)?;
     if asset.triangles.is_empty() {
         return Err(GltfError::NoTriangles);
@@ -498,11 +515,15 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
                 matrix.iter().flat_map(|column| column.iter().copied())
             })))?;
         let ibm = writer.accessor(ibm_view, FLOAT, "MAT4", skin.bones.len());
-        let joint_nodes: Vec<usize> = (1..=skin.bones.len()).collect();
+        let joint_nodes: Vec<usize> = match rigged {
+            Some(layout) => layout.joint_nodes(),
+            None => (1..=skin.bones.len()).collect(),
+        };
+        let skeleton = rigged.map_or(joint_nodes[0], rigged::Layout::root);
         skin_json = Some(json!({
             "inverseBindMatrices": ibm,
             "joints": joint_nodes,
-            "skeleton": joint_nodes[0],
+            "skeleton": skeleton,
         }));
     }
 
@@ -625,10 +646,11 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
                 "output": output,
             }));
             let bone = channel_bone(channel);
-            // Validated above: `bone + 1` is that bone's joint node.
+            let node = rigged.map_or(bone + 1, |layout| layout.bone_node(bone));
+            // Clip indices address the palette; checked rigs map it to full nodes.
             channels.push(json!({
                 "sampler": samplers.len() - 1,
-                "target": { "node": bone + 1, "path": path },
+                "target": { "node": node, "path": path },
             }));
         }
 
@@ -699,7 +721,9 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
         mesh_node.insert("extras".into(), json!({ "sculpto": { "physics": path } }));
     }
     let mut nodes = vec![Value::Object(mesh_node)];
-    if let Some(skin) = &asset.skin {
+    if let Some(layout) = rigged {
+        nodes = layout.nodes(nodes.remove(0));
+    } else if let Some(skin) = &asset.skin {
         let mut children = Vec::with_capacity(skin.bones.len());
         for bone in &skin.bones {
             let mut node = Map::new();
@@ -711,7 +735,7 @@ pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, Gltf
         }
         nodes[0]["children"] = json!(children);
     }
-    let scene_nodes = [0_usize];
+    let scene_nodes = [rigged.map_or(0, rigged::Layout::scene)];
 
     let mut root = Map::new();
     root.insert(
