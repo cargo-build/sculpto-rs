@@ -30,20 +30,6 @@ impl<'a> CheckedScene<'a> {
             .iter()
             .find(|skin| skin.source().shape == shape)
             .ok_or_else(|| fail("a checked shape needs a source skin"))?;
-        let authored = skin.source();
-        let native = |matrix: &[[f32; 4]; 4]| {
-            NativeTransform::from_matrix(matrix.map(|col| col.map(f64::from))).is_some()
-        };
-        if !native(&authored.global_to_skin) {
-            return Err(fail(
-                "global-to-skin needs a positive uniform native transform",
-            ));
-        }
-        if !authored.skin.bind_inverse.iter().all(native) {
-            return Err(fail(
-                "a skin-to-bone bind needs a positive uniform native transform",
-            ));
-        }
         let parent = source
             .parent
             .filter(|&parent| rig.joint(parent).is_some())

@@ -227,6 +227,7 @@ fn push_transform(
     matrix: &[[f32; 4]; 4],
     bone: usize,
 ) -> Result<(), NifWriteError> {
+    // Factor out a scale without orthogonalizing the authored matrix.
     let scale =
         (matrix[0][0] * matrix[0][0] + matrix[0][1] * matrix[0][1] + matrix[0][2] * matrix[0][2])
             .sqrt();
