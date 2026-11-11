@@ -47,10 +47,8 @@ fn sentinel_fit_env_gated() {
         "both authored tunic forms are required"
     );
     let expected = [("Armor001", 2737, 4040), ("Armor001_1", 702, 1200)];
-    let frame = OrthographicFrame::new(
-        [[-31.0, 31.0], [7.0, 118.0]],
-        RasterSettings::default(),
-    ).expect("frozen Sentinel frame");
+    let frame = OrthographicFrame::new([[-31.0, 31.0], [7.0, 118.0]], RasterSettings::default())
+        .expect("frozen Sentinel frame");
     let options = FitOptions {
         gap_mode: GapMode::Keep,
         min_gap: 0.05,
@@ -119,9 +117,9 @@ fn guarded_repair_keeps_locked_seam_copies_and_rigid_vertices() {
         rigid_parts: vec![-1, -1, -1, 0],
         ..FitOptions::default()
     };
-    let (positions, report) = repair_after_fit(
-        (&garment, &[]), (&body.0, &body.1), Some(&mask), &options,
-    ).expect("guarded repair");
+    let (positions, report) =
+        repair_after_fit((&garment, &[]), (&body.0, &body.1), Some(&mask), &options)
+            .expect("guarded repair");
     assert_eq!(&positions[..2], &garment[..2]);
     assert_eq!(positions[3], garment[3]);
     assert!(positions[2][0] > 1.0);
@@ -133,8 +131,12 @@ fn guarded_repair_preserves_an_already_clear_garment() {
     let body = tube(1.0, 16, -2.0, 2.0);
     let garment = [[1.08, 0.0, 0.0]];
     let (positions, report) = repair_after_fit(
-        (&garment, &[]), (&body.0, &body.1), None, &FitOptions::default(),
-    ).expect("guarded repair");
+        (&garment, &[]),
+        (&body.0, &body.1),
+        None,
+        &FitOptions::default(),
+    )
+    .expect("guarded repair");
     assert_eq!(positions, garment);
     assert_eq!(report.inside_after, 0);
     assert!(!report.poke_repair_applied);
@@ -203,16 +205,24 @@ fn sentinel_native_fit_env_gated() {
             garment.name, native.scale.factor, native_report.inside_after, native_report.poke_after);
         (garment.name.as_str(), max, mean, report, native_report)
     }).collect();
-    results.iter().for_each(|(name, max, mean, report, native)| {
-        // Bound the pointwise residual by native CleanPull's on-surface band.
-        // The stricter 1e-4 pointwise count stays visible as a diagnostic.
-        assert!(
-            *max <= 1e-3 && *mean <= 1e-4,
-            "{name} native position deviations max={max} mean={mean}"
-        );
-        assert_eq!(report.inside_after, native.inside_after, "{name} native inside groups");
-        assert_eq!(report.poke_after, native.poke_after, "{name} native poke witnesses");
-    });
+    results
+        .iter()
+        .for_each(|(name, max, mean, report, native)| {
+            // Bound the pointwise residual by native CleanPull's on-surface band.
+            // The stricter 1e-4 pointwise count stays visible as a diagnostic.
+            assert!(
+                *max <= 1e-3 && *mean <= 1e-4,
+                "{name} native position deviations max={max} mean={mean}"
+            );
+            assert_eq!(
+                report.inside_after, native.inside_after,
+                "{name} native inside groups"
+            );
+            assert_eq!(
+                report.poke_after, native.poke_after,
+                "{name} native poke witnesses"
+            );
+        });
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
