@@ -921,7 +921,7 @@ pub fn intersection_pairs(
 }
 
 /// What kind of physical self contact a pair is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WitnessKind {
     /// Triangles intersect beyond any shared vertex or edge.
     Crossing,
@@ -930,7 +930,7 @@ pub enum WitnessKind {
 }
 
 /// One physical self contact at rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Witness {
     pub left: usize,
     pub right: usize,

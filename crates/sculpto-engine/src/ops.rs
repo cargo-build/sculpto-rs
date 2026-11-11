@@ -789,7 +789,7 @@ pub struct FitParams {
     pub percent: Option<f32>,
     /// Source body NIF for a slider or manifest fit. Defaults to the garment NIF.
     pub body_nif: Option<PathBuf>,
-    /// Source-bound outfit manifest selecting ordinary and Blender Cloth regions.
+    /// Source-bound region manifest. All declared shapes belong to the garment NIF.
     pub manifest: Option<PathBuf>,
 }
 

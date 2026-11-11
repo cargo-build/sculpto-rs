@@ -1,6 +1,8 @@
 //! Guarded post-fit contact repair. @req DECL0013
 
-use crate::check::intersection_pairs;
+use std::collections::HashSet;
+
+use crate::check::{Witness, intersection_pairs, self_intersection_witnesses};
 use crate::clip_fix::{ClipFixError, ClipFixOptions, fix_clipping};
 use crate::mask::VertexMask;
 
@@ -27,6 +29,7 @@ pub struct FitRepairReport {
 ///
 /// Keep the repaired preview unless the full fit improves at least one
 /// contact measure, preserves both bounds and retains original orientation.
+/// New self contacts are checked against the original garment. @req DECL0013
 ///
 /// # Errors
 /// Refuses invalid fit or repair inputs and non-finite results.
@@ -37,7 +40,13 @@ pub fn fit_and_repair(
     options: &FitOptions,
 ) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
     let repair = |mesh: Mesh<'_>| repair_after_fit(mesh, body, lock, options);
-    let (preview, before) = repair(garment)?;
+    let (mut preview, mut before) = repair(garment)?;
+    let original_contacts: HashSet<_> =
+        self_intersection_witnesses(garment.0, garment.1).into_iter().collect();
+    if !preserves_self_contacts(&original_contacts, (&preview, garment.1)) {
+        preview = garment.0.to_vec();
+        before = measure_contacts(garment, body, &BodySurface::build(body.0, body.1), options);
+    }
     if before.inside_after == 0 && before.intersection_pairs == 0 {
         return Ok((preview, before));
     }
@@ -52,6 +61,7 @@ pub fn fit_and_repair(
         && (after.inside_after < before.inside_after
             || after.intersection_pairs < before.intersection_pairs)
         && count_flipped(garment.0, &candidate, garment.1) == 0
+        && preserves_self_contacts(&original_contacts, (&candidate, garment.1))
     {
         Ok((candidate, after))
     } else {
@@ -80,12 +90,7 @@ pub fn repair_after_fit(
     let surface = BodySurface::build(body.0, body.1);
     let contacts =
         |positions: &[[f32; 3]]| intersection_pairs(positions, garment.1, body.0, body.1);
-    let mut report = FitRepairReport {
-        inside_after: inside_count(garment, &surface, options),
-        intersection_pairs: contacts(garment.0),
-        poke_repair_applied: false,
-        projection_applied: false,
-    };
+    let mut report = measure_contacts(garment, body, &surface, options);
     if report.inside_after == 0 && report.intersection_pairs == 0 {
         return Ok((garment.0.to_vec(), report));
     }
@@ -146,6 +151,26 @@ pub fn repair_after_fit(
         return Ok((projected, report));
     }
     Ok((positions, report))
+}
+
+pub(crate) fn preserves_self_contacts(original: &HashSet<Witness>, garment: Mesh<'_>) -> bool {
+    self_intersection_witnesses(garment.0, garment.1)
+        .iter()
+        .all(|contact| original.contains(contact))
+}
+
+pub(crate) fn measure_contacts(
+    garment: Mesh<'_>,
+    body: Mesh<'_>,
+    surface: &BodySurface<'_>,
+    options: &FitOptions,
+) -> FitRepairReport {
+    FitRepairReport {
+        inside_after: inside_count(garment, surface, options),
+        intersection_pairs: intersection_pairs(garment.0, garment.1, body.0, body.1),
+        poke_repair_applied: false,
+        projection_applied: false,
+    }
 }
 
 fn coherent_positions(

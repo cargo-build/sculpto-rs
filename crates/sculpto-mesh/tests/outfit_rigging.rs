@@ -52,8 +52,9 @@ fn compact_region_retains_settings_and_cloth_excludes_inside_counts() {
         "unused source vertex must retain its position"
     );
     assert!(fitted[3..6].iter().all(|point| point[2] > 0.0));
-    assert_eq!(report.ordinary.inside_after, 0);
-    assert_eq!(report.ordinary.intersection_pairs, 0);
+    let ordinary = report.ordinary.expect("ordinary faces have measured clearance");
+    assert_eq!(ordinary.inside_after, 0);
+    assert_eq!(ordinary.intersection_pairs, 0);
 }
 
 #[test]
@@ -101,7 +102,7 @@ fn whole_cloth_selection_reports_contacts_without_fitting() {
     .expect("whole cloth selection");
     assert_eq!(fitted, garment);
     assert_eq!(report.ordinary_triangles, 0);
-    assert_eq!(report.ordinary.inside_after, 0);
+    assert!(report.ordinary.is_none());
     assert!(report.cloth_intersection_pairs > 0);
     assert_eq!(report.cloth_intersection_pairs, report.intersection_pairs);
 }

@@ -6,13 +6,13 @@ use std::fmt;
 use serde::Serialize;
 
 use super::{ClothDefect, ClothPart, ClothPath, ClothRegion, select_cloth};
-use crate::check::intersection_pairs;
+use crate::check::{intersection_pairs, self_intersection_witnesses};
 use crate::clip_fix::ClipFixError;
 use crate::control::compact;
 use crate::mask::VertexMask;
 use crate::topology::key;
-use crate::wrap::repair::{FitRepairReport, fit_and_repair};
-use crate::wrap::{FitOptions, Mesh, validate_geometry, validate_lengths};
+use crate::wrap::repair::{FitRepairReport, fit_and_repair, measure_contacts, preserves_self_contacts};
+use crate::wrap::{BodySurface, FitOptions, Mesh, validate_geometry, validate_lengths};
 
 /// Measured paths and contacts on the complete returned garment.
 #[derive(Debug, Clone, Serialize)]
@@ -23,8 +23,8 @@ pub struct RegionFitReport {
     pub ordinary_triangles: usize,
     /// Triangle count retained for Blender Cloth.
     pub cloth_triangles: usize,
-    /// Clearance measured only on the ordinary region.
-    pub ordinary: FitRepairReport,
+    /// Ordinary clearance, absent when the garment has no ordinary faces.
+    pub ordinary: Option<FitRepairReport>,
     /// Body contacts on the retained cloth region.
     pub cloth_intersection_pairs: usize,
     /// Body contacts on the complete garment.
@@ -133,29 +133,35 @@ pub fn fit_rigged_regions(
             .collect(),
         ..options.clone()
     };
-    let (fitted, ordinary) = match triangles.is_empty() {
-        true => (
-            positions,
-            FitRepairReport {
-                inside_after: 0,
-                intersection_pairs: 0,
-                poke_repair_applied: false,
-                projection_applied: false,
-            },
-        ),
-        false => fit_and_repair(
+    let (fitted, mut ordinary) = match triangles.is_empty() {
+        true => (Vec::new(), None),
+        false => {
+            let (positions, report) = fit_and_repair(
             (&positions, &triangles),
             body,
             Some(&locks),
             &compact_options,
         )
-        .map_err(RegionFitError::Fit)?,
+            .map_err(RegionFitError::Fit)?;
+            (positions, Some(report))
+        }
     };
     let mut output = garment.0.to_vec();
     origins
         .iter()
         .zip(fitted)
         .for_each(|(&index, position)| output[index as usize] = position);
+    let original_contacts = self_intersection_witnesses(garment.0, garment.1)
+        .into_iter().collect();
+    if !preserves_self_contacts(&original_contacts, (&output, garment.1)) {
+        output.copy_from_slice(garment.0);
+        ordinary = Some(measure_contacts(
+            (&positions, &triangles),
+            body,
+            &BodySurface::build(body.0, body.1),
+            &compact_options,
+        ));
+    }
     let report = RegionFitReport {
         selection,
         ordinary_triangles: ordinary_faces.len(),
