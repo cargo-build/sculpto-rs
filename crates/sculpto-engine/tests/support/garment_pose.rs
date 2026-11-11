@@ -1,13 +1,13 @@
-//! Transferred garment weights reach the existing Actor evaluator. @req DECL0008
+//! Shared checked-weight/pose checks for authored and fitted garments. @req DECL0008
 //!
 //! FIT-08 foundation evidence: real garment parts take the target body's
 //! authored weights through `garment::transfer`, keep that body's palette,
 //! inverse binds and source `G`, pass the checked rest proof at the body's exact
 //! basis, export through `write_rigged_glb` and move in the existing `Actor`.
 //!
-//! This is a weight and pose foundation, not a fit result, a cloth simulation or
-//! full RIG-04 animation acceptance: the garment keeps its authored source rest
-//! geometry, so a fitted or conformed garment is not what these tests measure.
+//! Source-rest controls retain authored geometry. The enclosing acceptance
+//! suite also supplies written fitted positions to the same checker. This
+//! bounded pose probe does not establish cloth or full RIG-04 acceptance.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -261,20 +261,145 @@ fn select_probe(rig: &Rig, skin: &Skin, label: &str) -> Probe {
 }
 
 /// One configured body and garment pair.
-struct Case {
-    label: &'static str,
-    body: PathBuf,
-    body_shape: &'static str,
-    body_counts: (usize, usize),
-    template: PathBuf,
-    garment: PathBuf,
-    garment_shape: &'static str,
-    garment_counts: (usize, usize),
-    copy_radius: f32,
-    default_radius_refusal: Option<usize>,
+pub(super) struct Case {
+    pub label: &'static str,
+    pub body: PathBuf,
+    pub body_shape: &'static str,
+    pub body_counts: (usize, usize),
+    pub template: PathBuf,
+    pub garment: PathBuf,
+    pub garment_shape: &'static str,
+    pub garment_counts: (usize, usize),
+    pub copy_radius: f32,
+    pub default_radius_refusal: Option<usize>,
 }
 
-fn transferred_garment(case: &Case) {
+pub(super) enum Geometry<'a> {
+    Authored,
+    Fitted(&'a [[f32; 3]]),
+}
+
+pub(super) struct Measurements {
+    pub widest: usize,
+    pub sum_error: f32,
+    pub moving: usize,
+    pub detached: usize,
+    pub max_rest: f64,
+    pub max_error: f64,
+    pub controls: Option<CopyControlMeasurements>,
+}
+
+#[derive(Debug)]
+pub(super) struct CopyControlMeasurements {
+    pub locked_bone: String,
+    pub locked_vertices: usize,
+    pub excluded_body_vertex: usize,
+    pub preserved_garment_vertex: usize,
+    pub max_locked_delta: f32,
+}
+
+fn controlled_copy(
+    case: &Case,
+    garment: &[[f32; 3]],
+    body: &[[f32; 3]],
+    body_rows: &[Influences],
+    copied: Vec<Influences>,
+) -> (Vec<Influences>, CopyControlMeasurements) {
+    let totals = copied.iter().flat_map(|row| row.iter()).fold(
+        BTreeMap::<String, f64>::new(),
+        |mut sums, (bone, weight)| {
+            *sums.entry(bone.clone()).or_insert(0.0) += f64::from(*weight);
+            sums
+        },
+    );
+    let (locked_bone, total) = totals
+        .iter()
+        .max_by(|(an, a), (bn, b)| a.total_cmp(b).then_with(|| an.cmp(bn)))
+        .expect("copied positive bone mass");
+    assert!(*total > 0.0, "the lock must protect actual garment mass");
+    let query = to_f64(*garment.get(1).expect("an unmasked probe vertex"));
+    let excluded_body_vertex = body
+        .iter()
+        .enumerate()
+        .min_by(|(ai, a), (bi, b)| {
+            query
+                .distance_squared(to_f64(**a))
+                .total_cmp(&query.distance_squared(to_f64(**b)))
+                .then_with(|| ai.cmp(bi))
+        })
+        .map(|(index, _)| index)
+        .expect("body sample to exclude");
+    let mut body_mask = vec![0.0; body.len()];
+    body_mask[excluded_body_vertex] = 1.0;
+    let mut garment_mask = vec![0.0; garment.len()];
+    garment_mask[0] = 1.0;
+    let copy = body_rows
+        .iter()
+        .flat_map(|row| row.keys())
+        .filter(|bone| *bone != locked_bone)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let options = TransferOptions {
+        radius: case.copy_radius,
+        body_mask: Some(body_mask),
+        garment_mask: Some(garment_mask),
+        copy,
+        current: Some(copied),
+        ..TransferOptions::default()
+    };
+    let rows = transfer(garment, body, body_rows, &options).unwrap_or_else(|error| {
+        panic!(
+            "{}: masked copy with a real locked bone: {error}",
+            case.label
+        )
+    });
+    let original = options.current.as_ref().expect("declared current weights");
+    assert_eq!(
+        rows[0], original[0],
+        "{}: masked garment row must stay exact",
+        case.label
+    );
+    let mut max_locked_delta = 0.0_f32;
+    let locked_vertices = original
+        .iter()
+        .zip(&rows)
+        .enumerate()
+        .filter(|(vertex, (before, after))| {
+            let expected = before.get(locked_bone);
+            let actual = after.get(locked_bone);
+            assert_eq!(
+                expected.map(|v| v.to_bits()),
+                actual.map(|v| v.to_bits()),
+                "{}: locked bone {locked_bone}, vertex {vertex}",
+                case.label
+            );
+            match (expected, actual) {
+                (Some(before), Some(after)) => {
+                    max_locked_delta = max_locked_delta.max((before - after).abs());
+                    *before > 0.0
+                }
+                (None, None) => false,
+                _ => unreachable!("the exact optional lock assertion passed"),
+            }
+        })
+        .count();
+    assert!(locked_vertices > 0, "nonvacuous real bone lock");
+    (
+        rows,
+        CopyControlMeasurements {
+            locked_bone: locked_bone.clone(),
+            locked_vertices,
+            excluded_body_vertex,
+            preserved_garment_vertex: 0,
+            max_locked_delta,
+        },
+    )
+}
+
+pub(super) fn transferred_garment(case: &Case, geometry: Geometry<'_>) -> Measurements {
+    let fitted = matches!(&geometry, Geometry::Fitted(_));
     let body_document = read_document(&case.body, case.label);
     let template_document = read_document(&case.template, case.label);
     let garment_document = read_document(&case.garment, case.label);
@@ -363,13 +488,29 @@ fn transferred_garment(case: &Case) {
                 case.label, garment_shape.name
             )
         });
-    // The authored scene geometry stays the independent rest expectation; the
-    // copy runs in the target body's skin frame, which one `G` reaches from it.
-    let scene: Vec<[f32; 3]> = garment_shape
-        .positions
-        .iter()
-        .map(|&point| placement.position_in_source(point))
-        .collect();
+    // The input scene is the independent rest expectation; one `G` reaches
+    // the target body's skin frame from it.
+    let (scene, scope) = match geometry {
+        Geometry::Authored => (
+            garment_shape
+                .positions
+                .iter()
+                .map(|&point| placement.position_in_source(point))
+                .collect(),
+            "authored source-rest pose foundation",
+        ),
+        Geometry::Fitted(points) => {
+            assert_eq!(
+                points.len(),
+                garment_shape.positions.len(),
+                "fitted vertex identity"
+            );
+            (
+                points.to_vec(),
+                "fitted-output pose; geometry acceptance measured separately",
+            )
+        }
+    };
     let into_body_frame = affine(body_global);
     let body_frame: Vec<[f32; 3]> = scene
         .iter()
@@ -405,6 +546,14 @@ fn transferred_garment(case: &Case) {
             case.label
         )
     });
+    let (copied, controls) = match fitted {
+        true => {
+            let (rows, controls) =
+                controlled_copy(case, &body_frame, &body_shape.positions, &body_rows, copied);
+            (rows, Some(controls))
+        }
+        false => (copied, None),
+    };
     let (widest, sum_error) = copied_weight_contract(&copied, case.label);
     let garment_skin = copied_skin(
         &body_skin.bones,
@@ -532,7 +681,7 @@ fn transferred_garment(case: &Case) {
     }
 
     eprintln!(
-        "{}: weight and pose foundation only, not a fit or RIG-04 acceptance; copy_radius={} body={} body_vertices={} garment={} garment_vertices={} triangles={} palette={} influences<={} sum_error={:.9e} joint={} moving={} detached={} rest={:.9e} pose_error={:.9e} stationary={:.9e} max_motion={:.9e}",
+        "{}: {scope}; copy_radius={} body={} body_vertices={} garment={} garment_vertices={} triangles={} palette={} influences<={} sum_error={:.9e} joint={} moving={} detached={} rest={:.9e} pose_error={:.9e} stationary={:.9e} max_motion={:.9e}",
         case.label,
         case.copy_radius,
         body_shape.name,
@@ -589,6 +738,19 @@ fn transferred_garment(case: &Case) {
         "{}: the source body must be preserved",
         case.label
     );
+    eprintln!(
+        "{}: fitted weight mask/lock controls={controls:?}",
+        case.label
+    );
+    Measurements {
+        widest,
+        sum_error,
+        moving,
+        detached,
+        max_rest,
+        max_error,
+        controls,
+    }
 }
 
 #[test]
@@ -667,7 +829,7 @@ fn configured_garment_weight_copy_reaches_actor() {
         },
     ];
     for case in &cases {
-        transferred_garment(case);
+        transferred_garment(case, Geometry::Authored);
     }
 }
 

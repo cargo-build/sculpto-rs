@@ -11,6 +11,8 @@ garment surfaces, evaluates skeletal GLB actors and packs baked cloth motion.
 Blender, Bevy and Unity adapters are optional; building the core requires none
 of them. The complete raw-garment-to-finished-outfit workflow is experimental.
 
+Current work: [FIT-08 progress, measured result and remaining acceptance](FIT08-STATUS.md).
+
 ## Build and use
 
 The [agent and engine navigator](AGENTS.md#start-here--engine-help) connects

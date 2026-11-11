@@ -525,6 +525,7 @@ dependencies = [
 name = "sculpto-engine"
 version = "0.1.0"
 dependencies = [
+ "glam 0.34.3",
  "schemars",
  "sculpto-bake",
  "sculpto-core",
