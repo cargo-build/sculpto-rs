@@ -181,9 +181,13 @@ pub fn bake(input: &Value) -> Result<Value, CommandError> {
 pub fn fit(input: &Value) -> Result<Value, CommandError> {
     let percent = match input.get("percent") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(value.as_f64().map(|value| value as f32)
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| errors::invalid("percent", "must be a finite number"))?),
+        Some(value) => Some(
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| errors::invalid("percent", "must be a finite number"))?,
+        ),
     };
     let slider = match input.get("slider") {
         None | Some(Value::Null) => None,
@@ -238,14 +242,18 @@ pub fn conform(input: &Value) -> Result<Value, CommandError> {
         home: checked_optional_path(input, "home")?,
         out: path(input, "out")?,
     })?;
-    let deferred: Vec<_> = outcome.deferred.into_iter().map(|slider| {
-        let reason = match slider.reason {
-            sculpto_bake::DeferredReason::Uv => "uv",
-            sculpto_bake::DeferredReason::Zap => "zap",
-            sculpto_bake::DeferredReason::ClampSemantics => "clamp_semantics",
-        };
-        json!({ "name": slider.name, "reason": reason })
-    }).collect();
+    let deferred: Vec<_> = outcome
+        .deferred
+        .into_iter()
+        .map(|slider| {
+            let reason = match slider.reason {
+                sculpto_bake::DeferredReason::Uv => "uv",
+                sculpto_bake::DeferredReason::Zap => "zap",
+                sculpto_bake::DeferredReason::ClampSemantics => "clamp_semantics",
+            };
+            json!({ "name": slider.name, "reason": reason })
+        })
+        .collect();
     Ok(json!({
         "out": outcome.out.display().to_string(),
         "vertices": outcome.vertices,

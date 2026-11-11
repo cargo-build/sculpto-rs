@@ -224,6 +224,17 @@ fn an_le_input_pair_is_written_for_le() {
 }
 
 #[test]
+fn a_source_shape_target_alias_reaches_both_endpoints() {
+    let (root, nif) = home("target-alias", NifTarget::Se);
+    let project = PROJECT.replace("target=\"Body\"", "target=\"BodyData\"");
+    std::fs::write(root.join("SliderSets/body.osp"), project).expect("aliased project");
+    let value = export(&root, &nif, "alias", serde_json::json!({}));
+    assert_eq!(value["ok"], true, "{value}");
+    assert_pair_differs_only_in_positions(&root.join("alias_0.nif"), &root.join("alias_1.nif"));
+    std::fs::remove_dir_all(&root).expect("remove alias fixture");
+}
+
+#[test]
 fn the_naming_rule_accepts_previous_outputs_back() {
     let (root, nif) = home("naming", NifTarget::Se);
     // Each form must resolve to the same pair, including the `_0` output of

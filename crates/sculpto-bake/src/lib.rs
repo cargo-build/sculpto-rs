@@ -57,13 +57,13 @@ impl PlannedSlider {
         let vertices = positions.len();
         for shape in self.shapes.iter().filter(|shape| shape.target == target) {
             for offset in &shape.offsets {
-                let slot = positions.get_mut(usize::from(offset.index)).ok_or_else(|| {
-                    BakeError::IndexOutOfBounds {
+                let slot = positions
+                    .get_mut(usize::from(offset.index))
+                    .ok_or_else(|| BakeError::IndexOutOfBounds {
                         slider: self.name.clone(),
                         index: offset.index,
                         vertices,
-                    }
-                })?;
+                    })?;
                 for (component, delta) in slot.iter_mut().zip(offset.delta) {
                     *component += scale * delta;
                 }

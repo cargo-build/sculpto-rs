@@ -266,6 +266,12 @@ impl Project {
 }
 
 impl SliderSet {
+    /// Morph target used by the authored records for a source shape.
+    pub fn target_for_shape(&self, name: &str) -> Option<&str> {
+        self.shapes.iter().find(|shape| shape.name == name)
+            .map(|shape| shape.target.as_str())
+    }
+
     fn parse(node: Node<'_, '_>, origin: &Path) -> Result<Self> {
         let name = required_attr(node, "name").map_err(|e| e.with_path(origin))?;
         let mut data_folder = None;

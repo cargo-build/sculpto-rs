@@ -210,8 +210,9 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
     let bytes = std::fs::read(&source).map_err(|error| errors::io(&source, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
+    let target = set.target_for_shape(&shape.name).unwrap_or(&shape.name);
     let baked = plan
-        .apply(&shape.name, &shape.positions)
+        .apply(target, &shape.positions)
         .map_err(errors::bake)?;
     write_obj(&params.out, &baked, &shape.triangles)
         .map_err(|error| errors::io(&params.out, error))?;
@@ -469,12 +470,15 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
     let target = nif_target(document.bsver, document.header.user_version)?;
     let index = pick_shape_index(&document.shapes, params.shape.as_deref())?;
     let shape = &document.shapes[index];
+    let set = project.sets.iter().find(|set| set.name == params.set)
+        .ok_or_else(|| errors::not_found("set", &params.set))?;
+    let morph_target = set.target_for_shape(&shape.name).unwrap_or(&shape.name);
     let rig = export_rig(&document, index, params.rig_template.as_deref())?;
     let source = rig.as_deref().map(|rig| (&document, rig, index));
     let mut asset = MeshAsset::from(shape);
     let mut encode = |plan: &BakePlan| {
         asset.positions = plan
-            .apply(&shape.name, &shape.positions)
+            .apply(morph_target, &shape.positions)
             .map_err(errors::bake)?;
         encode_nif(&asset, target, source)
     };
@@ -811,8 +815,10 @@ pub struct FitOutcome {
 
 /// Bind a garment to its authored body and apply the bind to a morphed body.
 pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
-    if params.conform.is_some() || params.slider.is_some()
-        || params.percent.is_some() || params.body_nif.is_some()
+    if params.conform.is_some()
+        || params.slider.is_some()
+        || params.percent.is_some()
+        || params.body_nif.is_some()
     {
         return slider::preview(params);
     }

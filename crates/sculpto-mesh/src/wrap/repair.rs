@@ -6,7 +6,7 @@ use crate::mask::VertexMask;
 
 use super::{
     BodySurface, FitOptions, Mesh, ON_SURFACE, REPORT_STRAIN_THRESHOLD, Welded, add, count_flipped,
-    first_non_finite, scale, strain_stats, sub, validate_geometry, validate_lengths, weld,
+    first_non_finite, fit_to_body, scale, strain_stats, sub, validate_geometry, validate_lengths, weld,
 };
 
 /// Measurements on the geometry actually returned by the repair.
@@ -20,6 +20,41 @@ pub struct FitRepairReport {
     pub poke_repair_applied: bool,
     /// The local projection reduced inside groups without introducing defects.
     pub projection_applied: bool,
+}
+
+/// Repair a preview and try the configured SurfaceFit mode if contacts remain.
+///
+/// Keep the repaired preview unless the full fit improves at least one
+/// contact measure, preserves both bounds and retains original orientation.
+///
+/// # Errors
+/// Refuses invalid fit or repair inputs and non-finite results.
+pub fn fit_and_repair(
+    garment: Mesh<'_>,
+    body: Mesh<'_>,
+    lock: Option<&VertexMask>,
+    options: &FitOptions,
+) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
+    let repair = |mesh: Mesh<'_>| repair_after_fit(mesh, body, lock, options);
+    let (preview, before) = repair(garment)?;
+    if before.inside_after == 0 && before.intersection_pairs == 0 {
+        return Ok((preview, before));
+    }
+    let (positions, fit) = fit_to_body(garment, body, lock, options).map_err(ClipFixError::FitOptions)?;
+    if fit.flipped != 0 {
+        return Ok((preview, before));
+    }
+    let (candidate, after) = repair((&positions, garment.1))?;
+    if after.inside_after <= before.inside_after
+        && after.intersection_pairs <= before.intersection_pairs
+        && (after.inside_after < before.inside_after
+            || after.intersection_pairs < before.intersection_pairs)
+        && count_flipped(garment.0, &candidate, garment.1) == 0
+    {
+        Ok((candidate, after))
+    } else {
+        Ok((preview, before))
+    }
 }
 
 /// Repair a fitted garment, measuring and retaining the better geometry.

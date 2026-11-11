@@ -416,10 +416,21 @@ fn outfit_inspect(args: &[String]) -> ExitCode {
 
 fn outfit_conform(args: &[String]) -> ExitCode {
     let input = parse_flags(args).and_then(|flags| {
-        if let Some(key) = flags.keys().find(|key| !matches!(
-            key.as_str(), "nif" | "shape" | "body-nif" | "body-shape" | "project"
-            | "presets" | "preset" | "set" | "home" | "out"
-        )) {
+        if let Some(key) = flags.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "nif"
+                    | "shape"
+                    | "body-nif"
+                    | "body-shape"
+                    | "project"
+                    | "presets"
+                    | "preset"
+                    | "set"
+                    | "home"
+                    | "out"
+            )
+        }) {
             return Err(format!("unknown option `--{key}`"));
         }
         Ok(serde_json::json!({
@@ -615,8 +626,11 @@ fn garment_follow_inner(args: &[String]) -> Result<(), String> {
 
 fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
-    let percent = flags.get("percent").map(|value| value.parse::<f32>())
-        .transpose().map_err(|error| format!("invalid --percent: {error}"))?;
+    let percent = flags
+        .get("percent")
+        .map(|value| value.parse::<f32>())
+        .transpose()
+        .map_err(|error| format!("invalid --percent: {error}"))?;
     let params = ops::FitParams {
         nif: PathBuf::from(required(&flags, "nif")?),
         shape: required(&flags, "shape")?.to_string(),
