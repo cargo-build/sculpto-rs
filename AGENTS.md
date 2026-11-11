@@ -1,5 +1,9 @@
 # Sculpto implementation
 
+The product direction is agent-first authoring: prioritize discoverable
+headless commands and structured results for agents through the same Rust engine.
+Keep remaining command/workflow gaps explicit; direction is not acceptance.
+
 This independent repository contains the GPL-3.0-only implementation. Use
 Rust 2024 and the declared toolchain; keep core behavior in Rust and optional
 host adapters thin. Private asset payloads and renders never belong in VCS.

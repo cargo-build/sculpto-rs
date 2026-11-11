@@ -1,5 +1,10 @@
 # Sculpto
 
+**Direction: agent-first authoring.** Agents are the primary users of its
+headless operations: discoverable commands, typed inputs, structured results
+and classified errors. Interactive surfaces share the same engine. This
+direction does not claim complete command or workflow coverage.
+
 GPL-3.0-only Rust authoring tools for character bodies and outfits. The pure
 core reads BodySlide data, bakes morphs, imports NIF meshes, prepares and fits
 garment surfaces, evaluates skeletal GLB actors and packs baked cloth motion.
