@@ -110,9 +110,14 @@ this summary when those contracts materially change:
   partitions/material/morph fidelity and the `export.tri` command surface.
 - RIG-04/05: complete posed NIF/GLB round trips and supported-family binding
   acceptance. Existing rig/remap code is a foundation, not that acceptance.
+- SHP-01–06: multi-shape NIF writers, export surface and native acceptance;
+  `export.nif` currently exports one shape.
 - MOD-02–04/06: material/texture completeness and native end-to-end outfit load.
 - ARC-01/02/04–06: archetypes, attachments and qualified one-button adaptation.
 - Authoring surfaces, engine session/undo/invalidation and hairstyle workflow
   remain future work; existing Blender prototypes do not establish acceptance.
+
+This is a capability summary, not the complete open task set. BAS and CLS
+residuals also remain in the managed ledger; consult it before planning work.
 
 Gameplay, animation authoring and world building are outside this toolkit.

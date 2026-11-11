@@ -15,7 +15,7 @@ later reads back. Normals are omitted: every consumer here rebuilds topology
 from positions and triangles.
 
 Optional `bounds=xmin,xmax,height_min,height_max` selects a complete wardrobe
-cell in display coordinates; crossing faces are rejected. `topology=position`
+cell in Blender world X/Z coordinates; crossing faces are rejected. `topology=position`
 connects exact-position render seams while retaining corner UVs. This is not
 cloth reconstruction. `material_blend=<path>` retains packed source materials
 for downstream appearance transfer; OBJ/MTL alone is not a PBR handoff.
