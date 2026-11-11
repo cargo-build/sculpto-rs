@@ -665,12 +665,12 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     if let Some(regions) = &outcome.regions {
         match &regions.ordinary {
             Some(ordinary) => println!(
-            "regions: ordinary {} faces / {} body contacts / {} inside; Blender Cloth {} faces / {} body contacts",
-            regions.ordinary_triangles,
-            ordinary.intersection_pairs,
-            ordinary.inside_after,
-            regions.cloth_triangles,
-            regions.cloth_intersection_pairs,
+                "regions: ordinary {} faces / {} body contacts / {} inside; Blender Cloth {} faces / {} body contacts",
+                regions.ordinary_triangles,
+                ordinary.intersection_pairs,
+                ordinary.inside_after,
+                regions.cloth_triangles,
+                regions.cloth_intersection_pairs,
             ),
             None => println!(
                 "regions: ordinary 0 faces; Blender Cloth {} faces / {} body contacts",

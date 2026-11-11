@@ -52,7 +52,9 @@ fn compact_region_retains_settings_and_cloth_excludes_inside_counts() {
         "unused source vertex must retain its position"
     );
     assert!(fitted[3..6].iter().all(|point| point[2] > 0.0));
-    let ordinary = report.ordinary.expect("ordinary faces have measured clearance");
+    let ordinary = report
+        .ordinary
+        .expect("ordinary faces have measured clearance");
     assert_eq!(ordinary.inside_after, 0);
     assert_eq!(ordinary.intersection_pairs, 0);
 }

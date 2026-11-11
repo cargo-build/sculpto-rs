@@ -156,9 +156,18 @@ fn guarded_repair_does_not_push_one_layer_into_another() {
         [-5.0, 5.0, -5.0],
     ];
     let body_faces = [
-        [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
-        [0, 4, 5], [0, 5, 1], [1, 5, 6], [1, 6, 2],
-        [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0],
+        [0, 1, 2],
+        [0, 2, 3],
+        [4, 6, 5],
+        [4, 7, 6],
+        [0, 4, 5],
+        [0, 5, 1],
+        [1, 5, 6],
+        [1, 6, 2],
+        [2, 6, 7],
+        [2, 7, 3],
+        [3, 7, 4],
+        [3, 4, 0],
     ];
     let garment = [
         [-1.0, -1.0, -0.1],
@@ -169,9 +178,12 @@ fn guarded_repair_does_not_push_one_layer_into_another() {
         [0.2, 0.8, 0.24],
     ];
     let faces = [[0, 1, 2], [3, 4, 5]];
-    let locks = VertexMask::from_values(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
-        .expect("fixed upper layer");
-    assert_eq!(sculpto_mesh::check::self_intersection_pairs(&garment, &faces), 0);
+    let locks =
+        VertexMask::from_values(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("fixed upper layer");
+    assert_eq!(
+        sculpto_mesh::check::self_intersection_pairs(&garment, &faces),
+        0
+    );
     let (proposal, _) = sculpto_mesh::clip_fix::fix_clipping(
         (&garment, &faces),
         (&body, &body_faces),
@@ -193,7 +205,10 @@ fn guarded_repair_does_not_push_one_layer_into_another() {
         &FitOptions::default(),
     )
     .expect("guarded layered repair");
-    assert_eq!(sculpto_mesh::check::self_intersection_pairs(&repaired, &faces), 0);
+    assert_eq!(
+        sculpto_mesh::check::self_intersection_pairs(&repaired, &faces),
+        0
+    );
     assert_eq!(
         report.intersection_pairs,
         sculpto_mesh::check::intersection_pairs(&repaired, &faces, &body, &body_faces)
@@ -210,11 +225,21 @@ fn guarded_repair_does_not_push_one_layer_into_another() {
         &FitOptions::default(),
     )
     .expect("layered mixed garment");
-    assert_eq!(&mixed[3..], &garment[3..], "selected cloth must remain fixed");
-    assert_eq!(sculpto_mesh::check::self_intersection_pairs(&mixed, &faces), 0);
+    assert_eq!(
+        &mixed[3..],
+        &garment[3..],
+        "selected cloth must remain fixed"
+    );
+    assert_eq!(
+        sculpto_mesh::check::self_intersection_pairs(&mixed, &faces),
+        0
+    );
     assert_eq!(regions.ordinary_triangles, 1);
     assert_eq!(regions.cloth_triangles, 1);
-    assert_eq!(regions.ordinary.expect("ordinary measurement").inside_after, 3);
+    assert_eq!(
+        regions.ordinary.expect("ordinary measurement").inside_after,
+        3
+    );
 }
 
 /// Compare the port without its extra flip repair against the native kernel.

@@ -41,8 +41,9 @@ pub fn fit_and_repair(
 ) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
     let repair = |mesh: Mesh<'_>| repair_after_fit(mesh, body, lock, options);
     let (mut preview, mut before) = repair(garment)?;
-    let original_contacts: HashSet<_> =
-        self_intersection_witnesses(garment.0, garment.1).into_iter().collect();
+    let original_contacts: HashSet<_> = self_intersection_witnesses(garment.0, garment.1)
+        .into_iter()
+        .collect();
     if !preserves_self_contacts(&original_contacts, (&preview, garment.1)) {
         preview = garment.0.to_vec();
         before = measure_contacts(garment, body, &BodySurface::build(body.0, body.1), options);

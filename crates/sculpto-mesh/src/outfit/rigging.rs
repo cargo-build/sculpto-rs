@@ -11,7 +11,9 @@ use crate::clip_fix::ClipFixError;
 use crate::control::compact;
 use crate::mask::VertexMask;
 use crate::topology::key;
-use crate::wrap::repair::{FitRepairReport, fit_and_repair, measure_contacts, preserves_self_contacts};
+use crate::wrap::repair::{
+    FitRepairReport, fit_and_repair, measure_contacts, preserves_self_contacts,
+};
 use crate::wrap::{BodySurface, FitOptions, Mesh, validate_geometry, validate_lengths};
 
 /// Measured paths and contacts on the complete returned garment.
@@ -137,11 +139,11 @@ pub fn fit_rigged_regions(
         true => (Vec::new(), None),
         false => {
             let (positions, report) = fit_and_repair(
-            (&positions, &triangles),
-            body,
-            Some(&locks),
-            &compact_options,
-        )
+                (&positions, &triangles),
+                body,
+                Some(&locks),
+                &compact_options,
+            )
             .map_err(RegionFitError::Fit)?;
             (positions, Some(report))
         }
@@ -152,7 +154,8 @@ pub fn fit_rigged_regions(
         .zip(fitted)
         .for_each(|(&index, position)| output[index as usize] = position);
     let original_contacts = self_intersection_witnesses(garment.0, garment.1)
-        .into_iter().collect();
+        .into_iter()
+        .collect();
     if !preserves_self_contacts(&original_contacts, (&output, garment.1)) {
         output.copy_from_slice(garment.0);
         ordinary = Some(measure_contacts(
