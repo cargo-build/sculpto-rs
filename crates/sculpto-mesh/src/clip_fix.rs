@@ -92,6 +92,8 @@ pub struct ClipFixReport {
 pub enum ClipFixError {
     /// The garment or body failed the shared fit geometry validation.
     Geometry(FitError),
+    /// The authoring repair received invalid fit options or per-vertex settings.
+    FitOptions(FitError),
     /// The lock mask is not one value per garment vertex.
     LockLength { expected: usize, actual: usize },
     /// `strength` is outside `0..=1` or not finite; the source clamps it.
@@ -108,6 +110,7 @@ impl fmt::Display for ClipFixError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Geometry(error) => write!(formatter, "invalid mesh geometry: {error}"),
+            Self::FitOptions(error) => write!(formatter, "invalid repair options: {error}"),
             Self::LockLength { expected, actual } => write!(
                 formatter,
                 "the lock mask has {actual} values for {expected} garment vertices"

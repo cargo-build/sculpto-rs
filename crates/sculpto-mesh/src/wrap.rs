@@ -1073,12 +1073,7 @@ impl FitState<'_> {
             .collect();
         let mut inside = vec![false; count];
         for (index, &point) in current.iter().enumerate() {
-            if let Some(hit) = self.surface.hit(point, self.max_distance)
-                && clean_pull(point, hit.point, hit.normal)
-                && dot(sub(point, hit.point), hit.normal) < 0.0
-            {
-                inside[index] = true;
-            }
+            inside[index] = self.surface.inside_hit(point, self.max_distance).is_some();
         }
         let pokes = if self.mesh.faces.is_empty() || self.options.poke_depth <= 0.0 {
             Vec::new()
@@ -1250,6 +1245,12 @@ impl<'a> BodySurface<'a> {
             point,
             radius,
         )
+    }
+
+    fn inside_hit(&self, point: [f32; 3], radius: f32) -> Option<SurfaceHit> {
+        self.hit(point, radius).filter(|hit| {
+            clean_pull(point, hit.point, hit.normal) && dot(sub(point, hit.point), hit.normal) < 0.0
+        })
     }
 
     /// Native far-side culling ignores source-vertex incident triangles.
@@ -2287,3 +2288,5 @@ fn dot_all(a: &[[f32; 3]], b: &[[f32; 3]]) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+pub mod repair;
