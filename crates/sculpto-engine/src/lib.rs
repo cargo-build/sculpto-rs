@@ -33,6 +33,8 @@ pub enum CommandId {
     Bake,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,
+    /// Report the source shapes and the cloth selection.
+    OutfitInspect,
     /// Offset a body surface into a garment shell, with boundary relief.
     OutfitOffsets,
     /// Scale and move a raw asset in front of the body for one garment class.
@@ -65,6 +67,7 @@ impl CommandId {
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
             CommandId::OutfitFit => "outfit.fit",
+            CommandId::OutfitInspect => "outfit.inspect",
             CommandId::OutfitOffsets => "outfit.offsets",
             CommandId::OutfitPlace => "outfit.place",
             CommandId::OutfitBand => "outfit.band",
@@ -253,6 +256,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::fit,
     },
     Spec {
+        id: CommandId::OutfitInspect,
+        summary: "List outfit shapes and identify Blender Cloth or ordinary rigged regions.",
+        mutates: false,
+        stub: false,
+        schema: handlers::outfit_inspect_schema,
+        handler: handlers::outfit_inspect,
+    },
+    Spec {
         id: CommandId::OutfitOffsets,
         summary: "Offset a body surface into a garment shell, with boundary relief.",
         mutates: false,
@@ -425,6 +436,7 @@ mod tests {
         for id in [
             "bake",
             "outfit.fit",
+            "outfit.inspect",
             "outfit.offsets",
             "outfit.place",
             "outfit.band",

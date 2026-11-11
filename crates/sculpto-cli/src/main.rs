@@ -38,6 +38,7 @@ commands:
   sliders [options]     print each slider's effective percentage
   presets [options]     list presets in a SliderPresets collection
   export-obj [options]  read a NIF and write one shape as an OBJ
+  outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
   garment fit [options] bind a garment to its authored body, then fit it to a bake
   garment follow [options] transport render positions through a deformed control
   garment aura [options] press a garment onto the body's cross-section aura
@@ -176,6 +177,9 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "batch" => batch(rest),
         [command, rest @ ..] if command == "presets" => presets(rest),
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
+        [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
+            outfit_inspect(rest)
+        }
         [command, rest @ ..] if command == "garment" => garment(rest),
         [command, rest @ ..] if command == "run" => run::run(rest),
         [command, rest @ ..] if command == "commands" => run::commands(rest),
@@ -376,6 +380,25 @@ fn required<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a s
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| format!("`--{name}` is required"))
+}
+
+fn outfit_inspect(args: &[String]) -> ExitCode {
+    let input = parse_flags(args).and_then(|flags| {
+        if let Some(key) = flags.keys().find(|key| !matches!(key.as_str(), "nif" | "manifest")) {
+            return Err(format!("unknown option `--{key}`"));
+        }
+        Ok(serde_json::json!({
+            "nif": required(&flags, "nif")?,
+            "manifest": flags.get("manifest"),
+        }))
+    });
+    match input {
+        Ok(input) => run::dispatch_payload("outfit.inspect", &input),
+        Err(error) => {
+            eprintln!("outfit inspect: {error}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn bake(args: &[String]) -> ExitCode {

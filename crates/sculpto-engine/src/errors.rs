@@ -15,6 +15,7 @@ use sculpto_gltf::sanitize::SanitizeError;
 use sculpto_mesh::conform::ConformError;
 use sculpto_mesh::garment::GarmentRuleError;
 use sculpto_mesh::intake_gltf::{DefectOverLimit, IntakeError};
+use sculpto_mesh::outfit::OutfitError;
 use sculpto_nif::NifError;
 use sculpto_nif::write::header::NifWriteError;
 
@@ -51,6 +52,18 @@ pub fn nif(error: NifError) -> CommandError {
         NifError::Truncated { .. } => (ErrorKind::Refused, "nif_truncated"),
     };
     CommandError::new(kind, code, error.to_string())
+}
+
+/// The authored outfit selection could not bind to the source shapes.
+pub fn outfit(error: OutfitError) -> CommandError {
+    let code = match &error {
+        OutfitError::BlankOutfit => "outfit_manifest_invalid",
+        OutfitError::UnknownShape(_) => "outfit_shape_unknown",
+        OutfitError::AmbiguousShape(_) => "outfit_shape_ambiguous",
+        OutfitError::DuplicateShape(_) => "outfit_shape_duplicate",
+        OutfitError::InvalidCloth { .. } => "outfit_cloth_invalid",
+    };
+    CommandError::new(ErrorKind::Refused, code, error.to_string())
 }
 
 /// A NIF writer refused the model.

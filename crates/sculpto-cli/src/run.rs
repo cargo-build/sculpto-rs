@@ -130,7 +130,11 @@ pub fn run(args: &[String]) -> ExitCode {
         },
     };
 
-    let result = dispatch(&command, &payload);
+    dispatch_payload(&command, &payload)
+}
+
+pub(crate) fn dispatch_payload(command: &str, payload: &Value) -> ExitCode {
+    let result = dispatch(command, payload);
     let exit = match &result {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => match error.kind() {

@@ -12,6 +12,7 @@ robust = "1"
 gltf = { version = "1", default-features = false, features = ["utils", "names", "extras"] }
 sculpto-core.workspace = true
 sculpto-gltf.workspace = true
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 [dev-dependencies]

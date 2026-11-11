@@ -31,6 +31,11 @@ pub fn fit_schema() -> Value {
     schema_for::<ops::FitParams>()
 }
 
+/// Schema for the outfit census and cloth selection.
+pub fn outfit_inspect_schema() -> Value {
+    schema_for::<ops::OutfitInspectParams>()
+}
+
 /// Schema derived from the typed `export.obj` parameters.
 pub fn export_obj_schema() -> Value {
     schema_for::<ops::ExportObjParams>()
@@ -108,6 +113,23 @@ fn path(input: &Value, field: &str) -> Result<PathBuf, CommandError> {
 
 fn optional_path(input: &Value, field: &str) -> Option<PathBuf> {
     optional_string(input, field).map(PathBuf::from)
+}
+
+pub fn outfit_inspect(input: &Value) -> Result<Value, CommandError> {
+    let manifest = match input.get("manifest") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+        Some(_) => return Err(errors::invalid("manifest", "must be a nonempty path")),
+    };
+    let outcome = ops::inspect_outfit(&ops::OutfitInspectParams {
+        nif: path(input, "nif")?,
+        manifest,
+    })?;
+    Ok(json!({
+        "outfit": outcome.outfit,
+        "shapes": outcome.shapes,
+        "manifest_errors": [],
+    }))
 }
 
 pub fn bake(input: &Value) -> Result<Value, CommandError> {

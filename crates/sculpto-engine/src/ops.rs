@@ -21,12 +21,78 @@ use sculpto_core::{SliderSize, document::Document};
 use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
+use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
 use sculpto_nif::NifShape;
 use sculpto_nif::write::header::NifTarget;
 use sculpto_nif::write::{DroppedInfluence, InfluencePolicy, WrittenNif, write_shape_with_policy};
 
 use crate::errors;
 use crate::obj::{pick_shape, read_obj_positions, write_obj, write_obj_uv};
+
+/// A source NIF and its optional authored outfit declaration.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct OutfitInspectParams {
+    /// Outfit NIF to inspect.
+    pub nif: PathBuf,
+    /// JSON manifest bound to this source.
+    pub manifest: Option<PathBuf>,
+}
+
+/// What the outfit contains and how each garment part should move.
+#[derive(Debug)]
+pub struct OutfitInspectOutcome {
+    /// Authored outfit name when a manifest was supplied.
+    pub outfit: Option<String>,
+    /// Census and cloth selection in source order.
+    pub shapes: Vec<ShapeReport>,
+}
+
+/// Read an outfit without changing its geometry or rig.
+pub fn inspect_outfit(params: &OutfitInspectParams) -> Result<OutfitInspectOutcome, CommandError> {
+    let source = std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let manifest = params.manifest.as_deref()
+        .map(|path| read_outfit_manifest(path, &source))
+        .transpose()?;
+    let bytes = std::fs::read(&source).map_err(|error| errors::io(&source, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let shapes: Vec<_> = document.shapes.iter()
+        .map(|shape| ShapeInfo {
+            name: &shape.name,
+            vertices: shape.positions.len(),
+            triangles: shape.triangles.len(),
+        })
+        .collect();
+    let shapes = census(&shapes, manifest.as_ref()).map_err(errors::outfit)?;
+    Ok(OutfitInspectOutcome {
+        outfit: manifest.map(|manifest| manifest.outfit),
+        shapes,
+    })
+}
+
+fn read_outfit_manifest(path: &Path, nif: &Path) -> Result<OutfitManifest, CommandError> {
+    let path = std::fs::canonicalize(path).map_err(|error| errors::io(path, error))?;
+    let bytes = std::fs::read(&path).map_err(|error| errors::io(&path, error))?;
+    let manifest: OutfitManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidParams,
+            "outfit_manifest_invalid",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    if manifest.nif.as_os_str().is_empty() {
+        return Err(errors::invalid("manifest.nif", "source path is required"));
+    }
+    let declared = path.parent().unwrap_or(Path::new(".")).join(&manifest.nif);
+    let expected = std::fs::canonicalize(&declared).map_err(|error| errors::io(&declared, error))?;
+    if expected.as_path() != nif {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "outfit_source_mismatch",
+            format!("{} declares {}, but the request names {}", path.display(), declared.display(), nif.display()),
+        ));
+    }
+    Ok(manifest)
+}
 
 /// Everything `bake` needs.
 #[derive(Debug, Clone, JsonSchema)]
