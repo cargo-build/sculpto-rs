@@ -208,6 +208,10 @@ enum ManifestRole<'a> {
 }
 
 /// Resolve shape roles and account for every garment face exactly once.
+///
+/// # Errors
+/// Refuses invalid outfit identities, ambiguous shape references and
+/// regions that overlap or name faces outside the source shape.
 /// @req DECL0010
 pub fn census(
     shapes: &[ShapeInfo<'_>],

@@ -56,14 +56,14 @@ pub fn nif(error: NifError) -> CommandError {
 
 /// The authored outfit selection could not bind to the source shapes.
 pub fn outfit(error: OutfitError) -> CommandError {
-    let code = match &error {
-        OutfitError::BlankOutfit => "outfit_manifest_invalid",
-        OutfitError::UnknownShape(_) => "outfit_shape_unknown",
-        OutfitError::AmbiguousShape(_) => "outfit_shape_ambiguous",
-        OutfitError::DuplicateShape(_) => "outfit_shape_duplicate",
-        OutfitError::InvalidCloth { .. } => "outfit_cloth_invalid",
+    let (kind, code) = match &error {
+        OutfitError::BlankOutfit => (ErrorKind::InvalidParams, "outfit_manifest_invalid"),
+        OutfitError::UnknownShape(_) => (ErrorKind::Refused, "outfit_shape_unknown"),
+        OutfitError::AmbiguousShape(_) => (ErrorKind::Refused, "outfit_shape_ambiguous"),
+        OutfitError::DuplicateShape(_) => (ErrorKind::InvalidParams, "outfit_shape_duplicate"),
+        OutfitError::InvalidCloth { .. } => (ErrorKind::Refused, "outfit_cloth_invalid"),
     };
-    CommandError::new(ErrorKind::Refused, code, error.to_string())
+    CommandError::new(kind, code, error.to_string())
 }
 
 /// A NIF writer refused the model.

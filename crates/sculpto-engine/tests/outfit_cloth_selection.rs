@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use sculpto_core::mesh::{MeshAsset, PartitionId};
-use sculpto_engine::dispatch;
+use sculpto_engine::{ErrorKind, dispatch};
 use sculpto_nif::write::se_shape::write_se_shape;
 use serde_json::{Value, json};
 
@@ -129,6 +129,31 @@ fn wrong_sources_unknown_shapes_and_overlapping_regions_are_refused() {
         .expect_err("each source face has one route");
     assert_eq!(error.code(), "outfit_cloth_invalid");
     assert!(error.message().contains("triangle 1"));
+
+    let outside = fixture.manifest(json!([{
+        "name": "robe",
+        "blender_cloth": [{ "name": "hem", "triangles": [4] }],
+    }]));
+    let error = dispatch("outfit.inspect", &request(&fixture.nif, Some(&outside)))
+        .expect_err("an ordinal at the triangle count is outside the source");
+    assert_eq!(error.code(), "outfit_cloth_invalid");
+    assert!(error.message().contains("triangle 4 outside"));
+}
+
+#[test]
+fn invalid_manifest_json_and_blank_names_share_the_parameter_error() {
+    let fixture = Fixture::new("manifest", "robe");
+    let path = fixture.manifest(json!([]));
+    for data in [
+        "{ broken json",
+        r#"{"outfit":" ","nif":"outfit.nif"}"#,
+    ] {
+        std::fs::write(&path, data).expect("invalid manifest fixture");
+        let error = dispatch("outfit.inspect", &request(&fixture.nif, Some(&path)))
+            .expect_err("the manifest is invalid");
+        assert_eq!(error.code(), "outfit_manifest_invalid");
+        assert_eq!(error.kind(), ErrorKind::InvalidParams);
+    }
 }
 
 #[test]

@@ -48,6 +48,10 @@ pub struct OutfitInspectOutcome {
 }
 
 /// Read an outfit without changing its geometry or rig.
+///
+/// # Errors
+/// Refuses unreadable sources, invalid manifests and selections that cannot
+/// bind to the imported shapes.
 pub fn inspect_outfit(params: &OutfitInspectParams) -> Result<OutfitInspectOutcome, CommandError> {
     let source =
         std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
