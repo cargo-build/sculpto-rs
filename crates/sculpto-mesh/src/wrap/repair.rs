@@ -11,7 +11,7 @@ use super::{
 };
 
 /// Measurements on the geometry actually returned by the repair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct FitRepairReport {
     /// Welded garment groups still inside according to the SurfaceFit query.
     pub inside_after: usize,

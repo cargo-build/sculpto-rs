@@ -456,7 +456,7 @@ impl std::error::Error for FitError {}
 impl FitOptions {
     /// Reject values the source would silently clamp or skip, so no option is
     /// quietly ignored. @req DECL0013
-    fn validate(&self) -> Result<(), FitError> {
+    pub(crate) fn validate(&self) -> Result<(), FitError> {
         if !self.gap.is_finite() {
             return Err(FitError::Gap(self.gap));
         }
@@ -2228,7 +2228,7 @@ fn validate_faces(
     Ok(())
 }
 
-fn validate_lengths(
+pub(crate) fn validate_lengths(
     vertices: usize,
     lock: Option<&VertexMask>,
     options: &FitOptions,

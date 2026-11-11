@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod rigging;
+
 /// The source asset and its authored part identities.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +90,7 @@ pub enum SelectionSource {
 }
 
 /// The path for one portion of a shape.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClothPart {
     /// The authored region name, when one is supplied.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,6 +178,8 @@ impl fmt::Display for OutfitError {
 }
 
 impl std::error::Error for OutfitError {}
+
+impl std::error::Error for ClothDefect {}
 
 impl fmt::Display for ClothDefect {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

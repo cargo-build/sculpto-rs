@@ -101,7 +101,8 @@ garment fit options:
   --conform <osd>      preview a conformed garment slider
   --slider <name>      slider to preview with --conform
   --percent <number>   slider percentage for --conform
-  --body-nif <path>    source body NIF for a slider preview, otherwise --nif
+  --body-nif <path>    source body NIF for a slider or manifest fit, otherwise --nif
+  --manifest <json>    fit ordinary regions and retain declared Blender Cloth geometry
 
 garment follow options:
   --reference <obj>   original control surface
@@ -643,6 +644,7 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         slider: flags.get("slider").cloned(),
         percent,
         body_nif: flags.get("body-nif").map(PathBuf::from),
+        manifest: flags.get("manifest").map(PathBuf::from),
     };
     let outcome = ops::garment_fit(&params).map_err(|error| error.to_string())?;
     println!(
@@ -658,6 +660,16 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         println!(
             "follow (bound vertices): body moved {:.6}, garment moved {:.6}, max difference {:.9}",
             body, garment, difference
+        );
+    }
+    if let Some(regions) = &outcome.regions {
+        println!(
+            "regions: ordinary {} faces / {} body contacts / {} inside; Blender Cloth {} faces / {} body contacts",
+            regions.ordinary_triangles,
+            regions.ordinary.intersection_pairs,
+            regions.ordinary.inside_after,
+            regions.cloth_triangles,
+            regions.cloth_intersection_pairs,
         );
     }
     if let (Some(pairs), Some(inside)) = (outcome.intersection_pairs, outcome.inside_after) {

@@ -787,8 +787,10 @@ pub struct FitParams {
     pub slider: Option<String>,
     /// Slider percentage for the selected block.
     pub percent: Option<f32>,
-    /// Source body NIF for a slider preview. Defaults to the garment NIF.
+    /// Source body NIF for a slider or manifest fit. Defaults to the garment NIF.
     pub body_nif: Option<PathBuf>,
+    /// Source-bound outfit manifest selecting ordinary and Blender Cloth regions.
+    pub manifest: Option<PathBuf>,
 }
 
 /// What `outfit.fit` produced.
@@ -812,6 +814,8 @@ pub struct FitOutcome {
     pub intersection_pairs: Option<usize>,
     /// Inside groups when previewing a conformed slider.
     pub inside_after: Option<usize>,
+    /// Explicit ordinary and cloth measurements when a manifest was supplied.
+    pub regions: Option<sculpto_mesh::outfit::rigging::RegionFitReport>,
 }
 
 /// Bind a garment to its authored body and apply the bind to a morphed body.
@@ -819,9 +823,12 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
     if params.conform.is_some()
         || params.slider.is_some()
         || params.percent.is_some()
-        || params.body_nif.is_some()
+        || (params.body_nif.is_some() && params.manifest.is_none())
     {
         return slider::preview(params);
+    }
+    if params.manifest.is_some() {
+        return slider::fit_regions(params);
     }
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
@@ -856,6 +863,7 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         follow,
         intersection_pairs: None,
         inside_after: None,
+        regions: None,
     })
 }
 

@@ -206,6 +206,7 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         slider,
         percent,
         body_nif: checked_optional_path(input, "body_nif")?,
+        manifest: checked_optional_path(input, "manifest")?,
     };
     let outcome = ops::garment_fit(&params)?;
     let follow = outcome.follow.map(|(body, garment, difference)| {
@@ -225,6 +226,9 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
     }
     if let Some(inside) = outcome.inside_after {
         result["inside_after"] = json!(inside);
+    }
+    if let Some(regions) = outcome.regions {
+        result["regions"] = json!(regions);
     }
     Ok(result)
 }
