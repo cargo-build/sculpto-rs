@@ -2,8 +2,8 @@
 
 use glam::DMat4;
 use sculpto_core::mesh::MeshAsset;
-use sculpto_core::rig::rest::{BoundRestSkin, RestBinding};
 use sculpto_core::rig::RigFrame;
+use sculpto_core::rig::rest::{BoundRestSkin, RestBinding};
 use serde_json::{Value, json};
 
 use crate::{Clip, GltfError, encode_glb};
@@ -36,7 +36,10 @@ impl<'a> Layout<'a> {
         shape: usize,
     ) -> Result<Self, GltfError> {
         let mismatch = |field| GltfError::RigBinding { shape, field };
-        let mut matches = binding.skins().iter().filter(|skin| skin.source().shape == shape);
+        let mut matches = binding
+            .skins()
+            .iter()
+            .filter(|skin| skin.source().shape == shape);
         let skin = matches.next().ok_or_else(|| mismatch("shape identity"))?;
         if matches.next().is_some() {
             return Err(mismatch("ambiguous shape identity"));
@@ -55,7 +58,11 @@ impl<'a> Layout<'a> {
     }
 
     pub(crate) fn joint_nodes(&self) -> Vec<usize> {
-        self.skin.palette().iter().map(|joint| joint.index() + 1).collect()
+        self.skin
+            .palette()
+            .iter()
+            .map(|joint| joint.index() + 1)
+            .collect()
     }
 
     pub(crate) fn root(&self) -> usize {
@@ -68,7 +75,11 @@ impl<'a> Layout<'a> {
 
     pub(crate) fn nodes(&self, mut mesh: Value) -> Vec<Value> {
         let rig = self.binding.rig();
-        let global = self.skin.source().global_to_skin.map(|column| column.map(f64::from));
+        let global = self
+            .skin
+            .source()
+            .global_to_skin
+            .map(|column| column.map(f64::from));
         let placement = DMat4::from_cols_array_2d(&global).inverse();
         mesh["matrix"] = json!(placement.to_cols_array());
         let mut nodes = vec![mesh];
@@ -89,14 +100,16 @@ impl<'a> Layout<'a> {
                 children[parent.index()].push(index + 1);
             }
         });
-        children.into_iter().enumerate().filter(|(_, children)| !children.is_empty())
+        children
+            .into_iter()
+            .enumerate()
+            .filter(|(_, children)| !children.is_empty())
             .for_each(|(index, children)| nodes[index + 1]["children"] = json!(children));
         let basis: Vec<_> = self.binding.basis().into_iter().flatten().collect();
         nodes.push(json!({"matrix":basis,"children":rig.roots().iter().map(|root|root.index()+1).collect::<Vec<_>>()}));
         let frame = match rig.frame() {
             RigFrame::SourceZUp => [
-                1.0,0.0,0.0,0.0, 0.0,0.0,-1.0,0.0,
-                0.0,1.0,0.0,0.0, 0.0,0.0,0.0,1.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ],
             RigFrame::YUp => DMat4::IDENTITY.to_cols_array(),
         };
