@@ -167,12 +167,13 @@ pub fn remap_skin<'a>(
         });
     }
     let locked = locked_set(source.rig(), settings)?;
-    let locked_targets: Vec<_> = locked.iter().filter_map(|&joint| {
-        match map.entries()[joint.index()].destination {
+    let locked_targets: Vec<_> = locked
+        .iter()
+        .filter_map(|&joint| match map.entries()[joint.index()].destination {
             Destination::Direct(target) | Destination::Collapsed(target) => Some((joint, target)),
             Destination::Unsupported => None,
-        }
-    }).collect();
+        })
+        .collect();
     let source_skin = select_shape(source.skins(), GraphSide::Source, settings.source_shape)?;
     let target_skin = select_shape(target.skins(), GraphSide::Target, settings.target_shape)?;
 
@@ -211,9 +212,10 @@ pub fn remap_skin<'a>(
                 .push((*joint, *weight));
         }
         for &(locked_joint, destination) in &locked_targets {
-            if contributors.get(&destination).is_some_and(|sources| {
-                sources.iter().any(|(joint, _)| *joint != locked_joint)
-            }) {
+            if contributors
+                .get(&destination)
+                .is_some_and(|sources| sources.iter().any(|(joint, _)| *joint != locked_joint))
+            {
                 return Err(RemapError::LockCollapse {
                     vertex,
                     locked: locked_joint,
@@ -226,12 +228,15 @@ pub fn remap_skin<'a>(
             .filter(|(_, sources)| sources.iter().any(|(joint, _)| locked.contains(joint)))
             .map(|(destination, _)| *destination)
             .collect();
-        for (destination, sources) in contributors
-            .iter()
-            .filter(|(_, sources)| sources.len() >= 2 || sources.iter().any(|(joint, _)| {
-                matches!(map.entries()[joint.index()].destination, Destination::Collapsed(_))
-            }))
-        {
+        for (destination, sources) in contributors.iter().filter(|(_, sources)| {
+            sources.len() >= 2
+                || sources.iter().any(|(joint, _)| {
+                    matches!(
+                        map.entries()[joint.index()].destination,
+                        Destination::Collapsed(_)
+                    )
+                })
+        }) {
             collapses.push(CollapsedWeights {
                 vertex,
                 destination: *destination,

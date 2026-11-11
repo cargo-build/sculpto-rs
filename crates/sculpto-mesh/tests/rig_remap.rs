@@ -121,7 +121,10 @@ fn f64_of(value: [[f32; 4]; 4]) -> DMat4 {
 
 fn assert_close(left: DMat4, right: DMat4, tolerance: f64, context: &str) {
     assert!(
-        (left - right).to_cols_array().into_iter().all(|value| value.abs() < tolerance),
+        (left - right)
+            .to_cols_array()
+            .into_iter()
+            .all(|value| value.abs() < tolerance),
         "{context}: {left} vs {right}"
     );
 }
@@ -131,7 +134,8 @@ fn binds(rig: &Rig, basis: DMat4, global: DMat4, bones: &[&str]) -> Vec<[[f32; 4
         .iter()
         .map(|name| {
             let joint = rig.joint_by_name(name).expect("fixture joint");
-            let world = DMat4::from_cols_array_2d(&rig.rest_world(joint).expect("fixture rest world"));
+            let world =
+                DMat4::from_cols_array_2d(&rig.rest_world(joint).expect("fixture rest world"));
             f32_of((basis * world).inverse() * global.inverse())
         })
         .collect()
@@ -267,13 +271,7 @@ fn a_checked_document_remaps_across_nonidentity_rest_graphs() {
             &source_rig,
             frame,
             &[
-                bound(
-                    &source_rig,
-                    BODY_SHAPE,
-                    &body_positions,
-                    &body_skin,
-                    gs,
-                ),
+                bound(&source_rig, BODY_SHAPE, &body_positions, &body_skin, gs),
                 bound(
                     &source_rig,
                     GARMENT_SHAPE,
@@ -394,7 +392,10 @@ fn a_checked_document_remaps_across_nonidentity_rest_graphs() {
         let discarded_collapse = &remapped.report.collapses[2];
         assert_eq!(discarded_collapse.vertex, 3);
         assert_eq!(discarded_collapse.destination, HIP);
-        assert_eq!(discarded_collapse.sources, [(source_rig.joint_by_name("cuff").expect("source cuff"), 0.1)]);
+        assert_eq!(
+            discarded_collapse.sources,
+            [(source_rig.joint_by_name("cuff").expect("source cuff"), 0.1)]
+        );
         assert!(remapped.report.measurement.max_vertex < 1.0e-4);
 
         // The garment shape transfers with its own smaller palette.
@@ -470,13 +471,7 @@ fn locked_weights_transfer_bit_exactly_and_impossible_locks_refuse() {
     let source_binding = RestBinding::prove(
         &source_rig,
         frame,
-        &[bound(
-            &source_rig,
-            BODY_SHAPE,
-            &positions,
-            &locked_skin,
-            gs,
-        )],
+        &[bound(&source_rig, BODY_SHAPE, &positions, &locked_skin, gs)],
     )
     .expect("checked source document");
     let map = BoneMap::build(
@@ -509,13 +504,7 @@ fn locked_weights_transfer_bit_exactly_and_impossible_locks_refuse() {
     let overweight_binding = RestBinding::prove(
         &source_rig,
         frame,
-        &[bound(
-            &source_rig,
-            BODY_SHAPE,
-            &positions,
-            &overweight,
-            gs,
-        )],
+        &[bound(&source_rig, BODY_SHAPE, &positions, &overweight, gs)],
     )
     .expect("checked source document");
     let overweight_map = BoneMap::build(
@@ -551,13 +540,7 @@ fn locked_weights_transfer_bit_exactly_and_impossible_locks_refuse() {
     let five_binding = RestBinding::prove(
         &source_rig,
         frame,
-        &[bound(
-            &source_rig,
-            BODY_SHAPE,
-            &positions,
-            &five_locked,
-            gs,
-        )],
+        &[bound(&source_rig, BODY_SHAPE, &positions, &five_locked, gs)],
     )
     .expect("checked source document");
     let five_map = BoneMap::build(
@@ -603,13 +586,7 @@ fn locked_weights_transfer_bit_exactly_and_impossible_locks_refuse() {
     let collision_binding = RestBinding::prove(
         &source_rig,
         frame,
-        &[bound(
-            &source_rig,
-            BODY_SHAPE,
-            &positions,
-            &collision,
-            gs,
-        )],
+        &[bound(&source_rig, BODY_SHAPE, &positions, &collision, gs)],
     )
     .expect("checked source document");
     let collision_map = BoneMap::build(
@@ -650,18 +627,34 @@ fn locked_weights_transfer_bit_exactly_and_impossible_locks_refuse() {
     let zero_binding = RestBinding::prove(
         &source_rig,
         frame,
-        &[bound(&source_rig, BODY_SHAPE, &positions, &zero_collision, gs)],
+        &[bound(
+            &source_rig,
+            BODY_SHAPE,
+            &positions,
+            &zero_collision,
+            gs,
+        )],
     )
     .expect("source with a locked zero");
     let zero_map = BoneMap::build(
-        BodyFamily::Himbo, &zero_binding, BodyFamily::Cbbe,
-        &target_rig, &collapse_declarations(),
+        BodyFamily::Himbo,
+        &zero_binding,
+        BodyFamily::Cbbe,
+        &target_rig,
+        &collapse_declarations(),
     )
     .expect("declared collapse into the locked destination");
     assert_eq!(
-        remap_skin(&zero_binding, &zero_map, &target_binding, &collision_settings),
+        remap_skin(
+            &zero_binding,
+            &zero_map,
+            &target_binding,
+            &collision_settings
+        ),
         Err(RemapError::LockCollapse {
-            vertex: 0, locked: SKIRT, destination: ANCHOR,
+            vertex: 0,
+            locked: SKIRT,
+            destination: ANCHOR,
         }),
         "a zero lock cannot acquire another source's weight"
     );
@@ -806,13 +799,7 @@ fn mismatched_owners_and_ambiguous_shape_selections_are_refused() {
     let source_binding = RestBinding::prove(
         &source_rig,
         frame,
-        &[bound(
-            &source_rig,
-            BODY_SHAPE,
-            &positions,
-            &body_skin,
-            gs,
-        )],
+        &[bound(&source_rig, BODY_SHAPE, &positions, &body_skin, gs)],
     )
     .expect("checked source document");
     let target_binding = RestBinding::prove(
@@ -847,13 +834,7 @@ fn mismatched_owners_and_ambiguous_shape_selections_are_refused() {
     let clone_binding = RestBinding::prove(
         &source_clone,
         frame,
-        &[bound(
-            &source_clone,
-            BODY_SHAPE,
-            &positions,
-            &body_skin,
-            gs,
-        )],
+        &[bound(&source_clone, BODY_SHAPE, &positions, &body_skin, gs)],
     )
     .expect("checked clone document");
     assert_eq!(
@@ -907,8 +888,8 @@ fn mismatched_owners_and_ambiguous_shape_selections_are_refused() {
             shape: 7
         })
     );
-    let duplicate_source = [BODY_SHAPE, BODY_SHAPE]
-        .map(|shape| bound(&source_rig, shape, &positions, &body_skin, gs));
+    let duplicate_source =
+        [BODY_SHAPE, BODY_SHAPE].map(|shape| bound(&source_rig, shape, &positions, &body_skin, gs));
     let duplicate_binding =
         RestBinding::prove(&source_rig, frame, &duplicate_source).expect("equal shapes still bind");
     assert_eq!(
@@ -1008,13 +989,7 @@ fn a_remapped_skin_exports_and_poses_through_the_existing_actor() {
         let source_binding = RestBinding::prove(
             &source_rig,
             frame,
-            &[bound(
-                &source_rig,
-                BODY_SHAPE,
-                &positions,
-                &pose_skin,
-                gs,
-            )],
+            &[bound(&source_rig, BODY_SHAPE, &positions, &pose_skin, gs)],
         )
         .expect("checked source document");
         let target_binding = RestBinding::prove(
