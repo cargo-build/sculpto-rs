@@ -211,9 +211,7 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
     let target = set.target_for_shape(&shape.name).unwrap_or(&shape.name);
-    let baked = plan
-        .apply(target, &shape.positions)
-        .map_err(errors::bake)?;
+    let baked = plan.apply(target, &shape.positions).map_err(errors::bake)?;
     write_obj(&params.out, &baked, &shape.triangles)
         .map_err(|error| errors::io(&params.out, error))?;
     Ok(BakeOutcome {
@@ -470,7 +468,10 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
     let target = nif_target(document.bsver, document.header.user_version)?;
     let index = pick_shape_index(&document.shapes, params.shape.as_deref())?;
     let shape = &document.shapes[index];
-    let set = project.sets.iter().find(|set| set.name == params.set)
+    let set = project
+        .sets
+        .iter()
+        .find(|set| set.name == params.set)
         .ok_or_else(|| errors::not_found("set", &params.set))?;
     let morph_target = set.target_for_shape(&shape.name).unwrap_or(&shape.name);
     let rig = export_rig(&document, index, params.rig_template.as_deref())?;

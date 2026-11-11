@@ -132,13 +132,20 @@ impl Fixture {
             .iter()
             .map(|&[x, y, z]| [x, y, z + percent as f32 / 100.0])
             .collect::<Vec<_>>();
-        dispatch("bake", &json!({
-            "project": root.join("project.osp"), "presets": root.join("presets.xml"),
-            "set": "Body Set", "preset": "Neutral", "endpoint": "big",
-            "home": root, "source": root.join("body.nif"), "shape": "Body",
-            "sliders": { "Lift": percent }, "out": body,
-        })).expect("bake body through its target alias");
-        assert_eq!(obj::read_obj_positions(&body).expect("body endpoint OBJ"), positions);
+        dispatch(
+            "bake",
+            &json!({
+                "project": root.join("project.osp"), "presets": root.join("presets.xml"),
+                "set": "Body Set", "preset": "Neutral", "endpoint": "big",
+                "home": root, "source": root.join("body.nif"), "shape": "Body",
+                "sliders": { "Lift": percent }, "out": body,
+            }),
+        )
+        .expect("bake body through its target alias");
+        assert_eq!(
+            obj::read_obj_positions(&body).expect("body endpoint OBJ"),
+            positions
+        );
         let out = root.join(format!("garment-{percent}.obj"));
         let result = dispatch(
             "outfit.fit",

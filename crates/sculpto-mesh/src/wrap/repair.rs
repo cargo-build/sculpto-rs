@@ -6,7 +6,8 @@ use crate::mask::VertexMask;
 
 use super::{
     BodySurface, FitOptions, Mesh, ON_SURFACE, REPORT_STRAIN_THRESHOLD, Welded, add, count_flipped,
-    first_non_finite, fit_to_body, scale, strain_stats, sub, validate_geometry, validate_lengths, weld,
+    first_non_finite, fit_to_body, scale, strain_stats, sub, validate_geometry, validate_lengths,
+    weld,
 };
 
 /// Measurements on the geometry actually returned by the repair.
@@ -40,7 +41,8 @@ pub fn fit_and_repair(
     if before.inside_after == 0 && before.intersection_pairs == 0 {
         return Ok((preview, before));
     }
-    let (positions, fit) = fit_to_body(garment, body, lock, options).map_err(ClipFixError::FitOptions)?;
+    let (positions, fit) =
+        fit_to_body(garment, body, lock, options).map_err(ClipFixError::FitOptions)?;
     if fit.flipped != 0 {
         return Ok((preview, before));
     }

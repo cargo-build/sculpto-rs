@@ -306,7 +306,10 @@ pub(super) fn preview(params: &FitParams) -> Result<FitOutcome, CommandError> {
         (&target, &body.shape.triangles),
         None,
         &options,
-    ).map_err(|error| CommandError::new(ErrorKind::Refused, "conform_fit_repair", error.to_string()))?;
+    )
+    .map_err(|error| {
+        CommandError::new(ErrorKind::Refused, "conform_fit_repair", error.to_string())
+    })?;
     let reference = Conform::bind(&garment.source_positions(), &body.source_positions())
         .map_err(errors::conform)?;
     let output: Vec<_> = fitted

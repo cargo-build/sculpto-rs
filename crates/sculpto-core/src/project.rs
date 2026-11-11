@@ -268,7 +268,9 @@ impl Project {
 impl SliderSet {
     /// Morph target used by the authored records for a source shape.
     pub fn target_for_shape(&self, name: &str) -> Option<&str> {
-        self.shapes.iter().find(|shape| shape.name == name)
+        self.shapes
+            .iter()
+            .find(|shape| shape.name == name)
             .map(|shape| shape.target.as_str())
     }
 
