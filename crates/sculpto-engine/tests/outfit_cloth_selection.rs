@@ -12,10 +12,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str, shape_name: &str) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "sculpto-outfit-{}-{label}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("sculpto-outfit-{}-{label}", std::process::id()));
         std::fs::create_dir(&directory).expect("test directory");
         let nif = directory.join("outfit.nif");
         let shape = MeshAsset {
@@ -144,7 +142,10 @@ fn an_authored_garment_role_can_override_a_body_name() {
     let overridden = dispatch("outfit.inspect", &request(&fixture.nif, Some(&manifest)))
         .expect("manifest role overrides the name");
     assert_eq!(overridden["shapes"][0]["role"], "garment");
-    assert_eq!(overridden["shapes"][0]["cloth"][0]["path"], "ordinary_rigged");
+    assert_eq!(
+        overridden["shapes"][0]["cloth"][0]["path"],
+        "ordinary_rigged"
+    );
 }
 
 #[test]
@@ -157,7 +158,12 @@ fn real_outfit_census() {
     for (file, expected) in [
         (
             "apachii-divine-elegance/unpacked-bsa/meshes/divineelegance/female/robes/nightshade/robef_1.nif",
-            &[("pants", 392, 632), ("belt", 403, 427), ("sleeves", 556, 886), ("robe", 3808, 6410)][..],
+            &[
+                ("pants", 392, 632),
+                ("belt", 403, 427),
+                ("sleeves", 556, 886),
+                ("robe", 3808, 6410),
+            ][..],
         ),
         (
             "sentinel-himbo-refit/CalienteTools/BodySlide/ShapeData/HIMBO Sentinel - Body - Common Padded Tunic/Common Padded Tunic - Body.nif",

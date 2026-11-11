@@ -148,7 +148,11 @@ pub enum ClothDefect {
     /// Whole-shape selection overlaps a second region.
     WholeWithRegions,
     /// One face is outside the source triangle range.
-    TriangleOutOfRange { region: String, triangle: usize, triangles: usize },
+    TriangleOutOfRange {
+        region: String,
+        triangle: usize,
+        triangles: usize,
+    },
     /// A face belongs to more than one declaration.
     RepeatedTriangle { triangle: usize },
 }
@@ -158,9 +162,15 @@ impl fmt::Display for OutfitError {
         match self {
             Self::BlankOutfit => write!(formatter, "manifest outfit name is blank"),
             Self::UnknownShape(name) => write!(formatter, "source has no shape `{name}`"),
-            Self::AmbiguousShape(name) => write!(formatter, "source has multiple shapes named `{name}`"),
-            Self::DuplicateShape(name) => write!(formatter, "manifest declares shape `{name}` more than once"),
-            Self::InvalidCloth { shape, defect } => write!(formatter, "shape `{shape}` cloth selection: {defect}"),
+            Self::AmbiguousShape(name) => {
+                write!(formatter, "source has multiple shapes named `{name}`")
+            }
+            Self::DuplicateShape(name) => {
+                write!(formatter, "manifest declares shape `{name}` more than once")
+            }
+            Self::InvalidCloth { shape, defect } => {
+                write!(formatter, "shape `{shape}` cloth selection: {defect}")
+            }
         }
     }
 }
@@ -173,11 +183,20 @@ impl fmt::Display for ClothDefect {
             Self::BlankRegion => write!(formatter, "region name is blank"),
             Self::DuplicateRegion(name) => write!(formatter, "region `{name}` is declared twice"),
             Self::EmptyRegion(name) => write!(formatter, "region `{name}` has no source triangles"),
-            Self::WholeWithRegions => write!(formatter, "whole-shape selection overlaps another region"),
-            Self::TriangleOutOfRange { region, triangle, triangles } => write!(
-                formatter, "region `{region}` names triangle {triangle} outside the {triangles} source triangles"
+            Self::WholeWithRegions => {
+                write!(formatter, "whole-shape selection overlaps another region")
+            }
+            Self::TriangleOutOfRange {
+                region,
+                triangle,
+                triangles,
+            } => write!(
+                formatter,
+                "region `{region}` names triangle {triangle} outside the {triangles} source triangles"
             ),
-            Self::RepeatedTriangle { triangle } => write!(formatter, "source triangle {triangle} is selected twice"),
+            Self::RepeatedTriangle { triangle } => {
+                write!(formatter, "source triangle {triangle} is selected twice")
+            }
         }
     }
 }
@@ -203,10 +222,18 @@ pub fn census(
             bind_role(shapes, &mut assigned, name, ManifestRole::Body)?;
         }
         for slot in &manifest.garment_shapes {
-            bind_role(shapes, &mut assigned, &slot.name, ManifestRole::Garment(slot))?;
+            bind_role(
+                shapes,
+                &mut assigned,
+                &slot.name,
+                ManifestRole::Garment(slot),
+            )?;
         }
     }
-    shapes.iter().zip(assigned).enumerate()
+    shapes
+        .iter()
+        .zip(assigned)
+        .enumerate()
         .map(|(index, (shape, assigned))| shape_report(index, shape, assigned))
         .collect()
 }
@@ -217,8 +244,13 @@ fn bind_role<'a>(
     name: &str,
     role: ManifestRole<'a>,
 ) -> Result<(), OutfitError> {
-    let mut matches = shapes.iter().enumerate().filter(|(_, shape)| shape.name == name);
-    let (index, _) = matches.next().ok_or_else(|| OutfitError::UnknownShape(name.into()))?;
+    let mut matches = shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, shape)| shape.name == name);
+    let (index, _) = matches
+        .next()
+        .ok_or_else(|| OutfitError::UnknownShape(name.into()))?;
     if matches.next().is_some() {
         return Err(OutfitError::AmbiguousShape(name.into()));
     }
@@ -261,9 +293,18 @@ fn shape_report(
 }
 
 fn is_body(name: &str) -> bool {
-    ["BaseShape", "CBBE", "CBBE Body", "HIMBO", "HIMBO - Body", "3BA", "3BA_Vagina", "3BA_Anus"]
-        .iter()
-        .any(|body| name.eq_ignore_ascii_case(body))
+    [
+        "BaseShape",
+        "CBBE",
+        "CBBE Body",
+        "HIMBO",
+        "HIMBO - Body",
+        "3BA",
+        "3BA_Vagina",
+        "3BA_Anus",
+    ]
+    .iter()
+    .any(|body| name.eq_ignore_ascii_case(body))
 }
 
 fn select_cloth(triangles: usize, regions: &[ClothRegion]) -> Result<Vec<ClothPart>, ClothDefect> {
@@ -299,7 +340,9 @@ fn select_cloth(triangles: usize, regions: &[ClothRegion]) -> Result<Vec<ClothPa
             return Ok(parts);
         }
     }
-    let remainder: Vec<_> = covered.iter().enumerate()
+    let remainder: Vec<_> = covered
+        .iter()
+        .enumerate()
         .filter_map(|(triangle, &selected)| (!selected).then_some(triangle))
         .collect();
     if !remainder.is_empty() {
@@ -315,11 +358,13 @@ fn claim_faces(
 ) -> Result<Vec<usize>, ClothDefect> {
     let triangles = covered.len();
     for &triangle in indices {
-        let slot = covered.get_mut(triangle).ok_or_else(|| ClothDefect::TriangleOutOfRange {
-            region: region.name.clone(),
-            triangle,
-            triangles,
-        })?;
+        let slot = covered
+            .get_mut(triangle)
+            .ok_or_else(|| ClothDefect::TriangleOutOfRange {
+                region: region.name.clone(),
+                triangle,
+                triangles,
+            })?;
         if std::mem::replace(slot, true) {
             return Err(ClothDefect::RepeatedTriangle { triangle });
         }

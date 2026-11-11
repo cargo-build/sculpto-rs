@@ -384,7 +384,10 @@ fn required<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a s
 
 fn outfit_inspect(args: &[String]) -> ExitCode {
     let input = parse_flags(args).and_then(|flags| {
-        if let Some(key) = flags.keys().find(|key| !matches!(key.as_str(), "nif" | "manifest")) {
+        if let Some(key) = flags
+            .keys()
+            .find(|key| !matches!(key.as_str(), "nif" | "manifest"))
+        {
             return Err(format!("unknown option `--{key}`"));
         }
         Ok(serde_json::json!({

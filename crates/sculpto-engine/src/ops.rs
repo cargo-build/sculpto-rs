@@ -49,13 +49,18 @@ pub struct OutfitInspectOutcome {
 
 /// Read an outfit without changing its geometry or rig.
 pub fn inspect_outfit(params: &OutfitInspectParams) -> Result<OutfitInspectOutcome, CommandError> {
-    let source = std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
-    let manifest = params.manifest.as_deref()
+    let source =
+        std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let manifest = params
+        .manifest
+        .as_deref()
         .map(|path| read_outfit_manifest(path, &source))
         .transpose()?;
     let bytes = std::fs::read(&source).map_err(|error| errors::io(&source, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
-    let shapes: Vec<_> = document.shapes.iter()
+    let shapes: Vec<_> = document
+        .shapes
+        .iter()
         .map(|shape| ShapeInfo {
             name: &shape.name,
             vertices: shape.positions.len(),
@@ -83,12 +88,18 @@ fn read_outfit_manifest(path: &Path, nif: &Path) -> Result<OutfitManifest, Comma
         return Err(errors::invalid("manifest.nif", "source path is required"));
     }
     let declared = path.parent().unwrap_or(Path::new(".")).join(&manifest.nif);
-    let expected = std::fs::canonicalize(&declared).map_err(|error| errors::io(&declared, error))?;
+    let expected =
+        std::fs::canonicalize(&declared).map_err(|error| errors::io(&declared, error))?;
     if expected.as_path() != nif {
         return Err(CommandError::new(
             ErrorKind::Refused,
             "outfit_source_mismatch",
-            format!("{} declares {}, but the request names {}", path.display(), declared.display(), nif.display()),
+            format!(
+                "{} declares {}, but the request names {}",
+                path.display(),
+                declared.display(),
+                nif.display()
+            ),
         ));
     }
     Ok(manifest)
