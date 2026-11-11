@@ -1,6 +1,8 @@
 use glam::{DMat4, DQuat, DVec3};
 use sculpto_core::mesh::Skin;
-use sculpto_core::rig::rest::{RestBindError, RestBinding, SkinRestDefect, SkinRestSource};
+use sculpto_core::rig::rest::{
+    BasisDefect, RestBindError, RestBinding, SkinRestDefect, SkinRestSource,
+};
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigFrame};
 use sculpto_core::skin::SkinWeights;
 
@@ -177,6 +179,99 @@ fn opposing_bad_binds_cannot_cancel_each_other_at_rest() {
             },
         },
     );
+}
+
+#[test]
+fn an_explicit_basis_is_measured_exactly_without_fallback() {
+    let rig =
+        Rig::new(vec![named("root", None, LocalTransform::default())], FRAME).expect("valid root");
+    let skin = skin(&["root"], &[DMat4::IDENTITY], 0);
+    let point = [[2.0, 1.0, 1.0]];
+    let global = DMat4::from_translation(DVec3::NEG_Z);
+    let explicit = global.inverse();
+    let binding = RestBinding::prove_with_basis(
+        &rig,
+        FRAME,
+        &[source(0, &point, &skin, global)],
+        explicit.to_cols_array_2d(),
+    )
+    .expect("the explicit basis reconstructs the shape");
+    assert_eq!(binding.basis(), explicit.to_cols_array_2d());
+    assert!(binding.skins()[0].measurement().max_vertex < 1.0e-6);
+
+    // A different valid basis is refused at the measured vertex; the proof
+    // never falls back to the automatic candidate that would accept the data.
+    let wrong = DMat4::from_translation(DVec3::X);
+    assert!(matches!(
+        RestBinding::prove_with_basis(
+            &rig,
+            FRAME,
+            &[source(0, &point, &skin, global)],
+            wrong.to_cols_array_2d(),
+        ),
+        Err(RestBindError::Shape {
+            shape: 0,
+            defect: SkinRestDefect::VertexRest { vertex: 0, error },
+        }) if (error - 2.0_f64.sqrt()).abs() < 1.0e-9
+    ));
+}
+
+#[test]
+fn the_automatic_proof_still_finds_its_candidate() {
+    let rig =
+        Rig::new(vec![named("root", None, LocalTransform::default())], FRAME).expect("valid root");
+    let skin = skin(&["root"], &[DMat4::IDENTITY], 0);
+    let point = [[2.0, 1.0, 1.0]];
+    let global = DMat4::from_translation(DVec3::NEG_Z);
+    let binding = RestBinding::prove(&rig, FRAME, &[source(0, &point, &skin, global)])
+        .expect("the automatic candidate still serves the same data");
+    assert_eq!(binding.basis(), global.inverse().to_cols_array_2d());
+
+    // The same data refuses an explicit identity basis: only the automatic
+    // proof searches for candidates.
+    assert!(matches!(
+        RestBinding::prove_with_basis(
+            &rig,
+            FRAME,
+            &[source(0, &point, &skin, global)],
+            DMat4::IDENTITY.to_cols_array_2d(),
+        ),
+        Err(RestBindError::Shape {
+            defect: SkinRestDefect::VertexRest { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn invalid_explicit_bases_are_named_before_any_shape() {
+    let rig =
+        Rig::new(vec![named("root", None, LocalTransform::default())], FRAME).expect("valid root");
+    let skin = skin(&["root"], &[DMat4::IDENTITY], 0);
+    let point = [[1.0, 0.0, 0.0]];
+    let non_affine = DMat4::from_cols_array_2d(&[
+        [1.0, 0.0, 0.0, 0.1],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]);
+    for (basis, expected) in [
+        (
+            DMat4::from_translation(DVec3::new(f64::NAN, 0.0, 0.0)),
+            BasisDefect::NonFinite,
+        ),
+        (non_affine, BasisDefect::NonAffine),
+        (DMat4::from_scale(DVec3::ZERO), BasisDefect::Singular),
+    ] {
+        let error = RestBinding::prove_with_basis(
+            &rig,
+            FRAME,
+            &[source(0, &point, &skin, DMat4::IDENTITY)],
+            basis.to_cols_array_2d(),
+        )
+        .expect_err("an invalid basis is refused before any shape");
+        assert_eq!(error, RestBindError::Basis(expected));
+    }
 }
 
 #[test]

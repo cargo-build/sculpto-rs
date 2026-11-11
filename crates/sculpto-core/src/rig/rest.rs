@@ -82,22 +82,7 @@ impl<'a> RestBinding<'a> {
         frame: RigFrame,
         sources: &[SkinRestSource<'a>],
     ) -> Result<Self, RestBindError> {
-        if rig.frame() != frame {
-            return Err(RestBindError::Frame {
-                rig: rig.frame(),
-                skin: frame,
-            });
-        }
-        let resolved = sources
-            .iter()
-            .copied()
-            .map(|source| {
-                ResolvedSkin::new(rig, source).map_err(|defect| RestBindError::Shape {
-                    shape: source.shape,
-                    defect,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let resolved = resolve_sources(rig, frame, sources)?;
         let first = resolved.first().ok_or(RestBindError::NoSkins)?;
         let measure = |basis| {
             resolved
@@ -132,6 +117,69 @@ impl<'a> RestBinding<'a> {
         })
     }
 
+    /// Resolve the inputs and prove one explicitly selected basis. @req DECL0008
+    ///
+    /// Derived skins carry an exact intended basis: it is validated as finite,
+    /// affine and invertible, then measured without any automatic candidate
+    /// fallback, so a wrong basis is refused instead of silently replaced.
+    /// The resolution and measurement owners are the automatic proof's.
+    ///
+    /// # Errors
+    /// A frame mismatch, an unusable basis, no skinned shape, or any per-shape
+    /// resolution or tolerance defect measured at `basis`.
+    pub fn prove_with_basis<'b>(
+        rig: &'a Rig,
+        frame: RigFrame,
+        sources: &[SkinRestSource<'b>],
+        basis: [[f64; 4]; 4],
+    ) -> Result<RestBinding<'b>, RestBindError>
+    where
+        'a: 'b,
+    {
+        if rig.frame() != frame {
+            return Err(RestBindError::Frame {
+                rig: rig.frame(),
+                skin: frame,
+            });
+        }
+        let basis = DMat4::from_cols_array_2d(&basis);
+        if !basis.is_finite() {
+            return Err(RestBindError::Basis(BasisDefect::NonFinite));
+        }
+        if basis.row(3).to_array() != [0.0, 0.0, 0.0, 1.0] {
+            return Err(RestBindError::Basis(BasisDefect::NonAffine));
+        }
+        if !invertible(basis) {
+            return Err(RestBindError::Basis(BasisDefect::Singular));
+        }
+        let resolved = resolve_sources(rig, frame, sources)?;
+        if resolved.is_empty() {
+            return Err(RestBindError::NoSkins);
+        }
+        let measurements = resolved
+            .iter()
+            .map(|shape| {
+                shape.measure(basis).map_err(|defect| RestBindError::Shape {
+                    shape: shape.source.shape,
+                    defect,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RestBinding {
+            rig,
+            basis: basis.to_cols_array_2d(),
+            skins: resolved
+                .into_iter()
+                .zip(measurements)
+                .map(|(shape, measurement)| BoundRestSkin {
+                    source: shape.source,
+                    palette: shape.palette,
+                    measurement,
+                })
+                .collect(),
+        })
+    }
+
     /// The authored hierarchy and rest transforms.
     pub fn rig(&self) -> &'a Rig {
         self.rig
@@ -146,6 +194,32 @@ impl<'a> RestBinding<'a> {
     pub fn skins(&self) -> &[BoundRestSkin<'a>] {
         &self.skins
     }
+}
+
+/// Resolve every source against one rig, frame-checked.
+///
+/// The shared owner of the automatic and explicit proofs' source resolution.
+fn resolve_sources<'a>(
+    rig: &Rig,
+    frame: RigFrame,
+    sources: &[SkinRestSource<'a>],
+) -> Result<Vec<ResolvedSkin<'a>>, RestBindError> {
+    if rig.frame() != frame {
+        return Err(RestBindError::Frame {
+            rig: rig.frame(),
+            skin: frame,
+        });
+    }
+    sources
+        .iter()
+        .copied()
+        .map(|source| {
+            ResolvedSkin::new(rig, source).map_err(|defect| RestBindError::Shape {
+                shape: source.shape,
+                defect,
+            })
+        })
+        .collect()
 }
 
 struct ResolvedSkin<'a> {
@@ -315,12 +389,37 @@ pub enum RestBindError {
     NoSkins,
     /// The caller declared a different frame for the skin.
     Frame { rig: RigFrame, skin: RigFrame },
+    /// The explicitly selected proof basis is unusable.
+    Basis(BasisDefect),
     /// One shape or palette entry is inconsistent.
     Shape {
         shape: usize,
         defect: SkinRestDefect,
     },
 }
+
+/// The failed requirement for an explicitly selected proof basis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasisDefect {
+    /// A basis cell is not finite.
+    NonFinite,
+    /// The basis moves the homogeneous lane, so it is not affine.
+    NonAffine,
+    /// The basis is singular, so its inverse does not exist.
+    Singular,
+}
+
+impl fmt::Display for BasisDefect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFinite => write!(formatter, "proof basis is not finite"),
+            Self::NonAffine => write!(formatter, "proof basis is not affine"),
+            Self::Singular => write!(formatter, "proof basis is singular"),
+        }
+    }
+}
+
+impl std::error::Error for BasisDefect {}
 
 /// The failed requirement for one shape.
 #[derive(Debug, Clone, PartialEq)]
@@ -363,6 +462,7 @@ impl fmt::Display for RestBindError {
                 formatter,
                 "rig frame {rig:?} differs from skin frame {skin:?}"
             ),
+            Self::Basis(defect) => write!(formatter, "{defect}"),
             Self::Shape { shape, defect } => write!(formatter, "shape {shape}: {defect}"),
         }
     }
@@ -379,6 +479,7 @@ impl std::error::Error for RestBindError {
                 defect: SkinRestDefect::Rig(error),
                 ..
             } => Some(error),
+            Self::Basis(defect) => Some(defect),
             _ => None,
         }
     }
