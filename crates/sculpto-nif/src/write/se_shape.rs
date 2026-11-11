@@ -200,7 +200,10 @@ pub(super) fn write(
     let (instance, data, partition, nodes) = match skin_plan.as_ref().zip(skin_nodes) {
         Some((plan, scene)) => (
             skin::instance(2, 3, scene.root, &scene.bones),
-            skin::data(plan, &checked.map_or_else(skin::identity, CheckedScene::global_skin))?,
+            skin::data(
+                plan,
+                &checked.map_or_else(skin::identity, CheckedScene::global_skin),
+            )?,
             skin::partitions(asset, plan, Some(&global))?,
             scene.encode(&root_extra),
         ),

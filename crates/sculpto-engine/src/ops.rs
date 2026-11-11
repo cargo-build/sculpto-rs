@@ -24,11 +24,11 @@ use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
-use sculpto_nif::{NifDocument, NifRigError, NifShape};
 use sculpto_nif::write::header::{NifTarget, NifWriteError};
 use sculpto_nif::write::{
     DroppedInfluence, InfluencePolicy, WrittenNif, write_rigged_shape, write_shape_with_policy,
 };
+use sculpto_nif::{NifDocument, NifRigError, NifShape};
 
 use crate::errors;
 use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, write_obj_uv};
@@ -619,25 +619,42 @@ fn export_rig<'a>(
             None => Ok(None),
         };
     }
-    let authored = document.rig.as_ref().ok_or_else(|| {
-        errors::nif_write(NifWriteError::InvalidRig(NifRigError::MissingRig))
-    })?;
+    let authored = document
+        .rig
+        .as_ref()
+        .ok_or_else(|| errors::nif_write(NifWriteError::InvalidRig(NifRigError::MissingRig)))?;
     let Some(path) = template_path else {
         return Ok(Some(Cow::Borrowed(authored)));
     };
     let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let template = document.rig.as_ref().ok_or_else(|| {
-        errors::invalid("rig_template", format!("{} contains no node graph", path.display()))
+        errors::invalid(
+            "rig_template",
+            format!("{} contains no node graph", path.display()),
+        )
     })?;
     let ([authored_root], [template_root]) = (authored.roots(), template.roots()) else {
-        return Err(errors::invalid("rig_template", "the source and template each need one scene root"));
+        return Err(errors::invalid(
+            "rig_template",
+            "the source and template each need one scene root",
+        ));
     };
-    let completed = complete_family_rig(authored, template, TemplateRoots {
-        authored: *authored_root, template: *template_root,
-    }).map_err(|error| CommandError::new(
-        ErrorKind::Refused, "nif_rig_template_incompatible", format!("{}: {error}", path.display()),
-    ))?;
+    let completed = complete_family_rig(
+        authored,
+        template,
+        TemplateRoots {
+            authored: *authored_root,
+            template: *template_root,
+        },
+    )
+    .map_err(|error| {
+        CommandError::new(
+            ErrorKind::Refused,
+            "nif_rig_template_incompatible",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
     Ok(Some(Cow::Owned(completed)))
 }
 
@@ -660,9 +677,14 @@ fn encode_nif(
         }
     };
     let output = match source {
-        Some((document, rig, index)) => {
-            write_rigged_shape(&projected, document, rig, index, target, InfluencePolicy::NativeFour)
-        }
+        Some((document, rig, index)) => write_rigged_shape(
+            &projected,
+            document,
+            rig,
+            index,
+            target,
+            InfluencePolicy::NativeFour,
+        ),
         None => write_shape_with_policy(&projected, target, InfluencePolicy::NativeFour),
     };
     output.map_err(errors::nif_write)

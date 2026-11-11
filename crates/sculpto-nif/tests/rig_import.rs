@@ -12,11 +12,13 @@ use sculpto_core::rig::rest::REST_TOLERANCE;
 use sculpto_core::rig::template::{TemplateRoots, complete_family_rig};
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigFrame};
 use sculpto_core::skin::SkinWeights;
+use sculpto_nif::write::header::{NifTarget, NifWriteError};
 use sculpto_nif::write::le_shape::write_le_shape;
 use sculpto_nif::write::se_shape::write_se_shape;
-use sculpto_nif::write::header::{NifTarget, NifWriteError};
 use sculpto_nif::write::{InfluencePolicy, write_rigged_shape};
-use sculpto_nif::{NifDocument, NifRigError, ShapeSource, read, yup_matrix_to_zup, yup_transform_to_zup};
+use sculpto_nif::{
+    NifDocument, NifRigError, ShapeSource, read, yup_matrix_to_zup, yup_transform_to_zup,
+};
 
 fn triangle() -> MeshAsset {
     MeshAsset {
@@ -338,7 +340,11 @@ fn checked_writer_preserves_graph_bind_and_placement() {
     let half = std::f32::consts::FRAC_1_SQRT_2;
     let rig = Rig::new(
         vec![
-            Joint { name: Some("Scene".into()), parent: None, rest: LocalTransform::default() },
+            Joint {
+                name: Some("Scene".into()),
+                parent: None,
+                rest: LocalTransform::default(),
+            },
             Joint {
                 name: Some("Pivot".into()),
                 parent: Some(root),
@@ -348,10 +354,15 @@ fn checked_writer_preserves_graph_bind_and_placement() {
                     scale: 1.0,
                 },
             },
-            Joint { name: Some("Arm".into()), parent: Some(pivot), rest: LocalTransform::default() },
+            Joint {
+                name: Some("Arm".into()),
+                parent: Some(pivot),
+                rest: LocalTransform::default(),
+            },
         ],
         RigFrame::SourceZUp,
-    ).expect("source graph");
+    )
+    .expect("source graph");
     let mut asset = triangle();
     // W = Tx(2) Rz(90), B = Ty(3), G = Tz(-1), K = inv(B W) inv(G).
     let bind = [
@@ -390,14 +401,21 @@ fn checked_writer_preserves_graph_bind_and_placement() {
             .expect("checked native write");
         let back = read(&written.bytes).expect("checked native readback");
         let binding = back.bind_rest().expect("rest reconstruction");
-        assert_eq!(binding.basis(), identity().map(|column| column.map(f64::from)));
+        assert_eq!(
+            binding.basis(),
+            identity().map(|column| column.map(f64::from))
+        );
         let resolved = binding.rig();
         let pivot = resolved.joint_by_name("Pivot").expect("non-palette parent");
         let arm = resolved.joint_by_name("Arm").expect("weighted joint");
         assert_eq!(resolved.joint(arm).expect("joint").parent, Some(pivot));
         let position = resolved.rest_world(arm).expect("world")[3];
-        assert!(position.into_iter().zip([2.0, 3.0, 0.0, 1.0])
-            .all(|(actual, expected)| (actual - expected).abs() < REST_TOLERANCE));
+        assert!(
+            position
+                .into_iter()
+                .zip([2.0, 3.0, 0.0, 1.0])
+                .all(|(actual, expected)| (actual - expected).abs() < REST_TOLERANCE)
+        );
         assert_eq!(back.sources[0].parent, Some(pivot));
         assert_eq!(back.sources[0].local.translation, placement.translation);
         assert_eq!(back.sources[0].local.scale, placement.scale);
@@ -408,7 +426,14 @@ fn checked_writer_preserves_graph_bind_and_placement() {
     }
     asset.triangles[0] = [1, 0, 2];
     assert!(matches!(
-        write_rigged_shape(&asset, &doc, &rig, 0, NifTarget::Se, InfluencePolicy::Preserve),
+        write_rigged_shape(
+            &asset,
+            &doc,
+            &rig,
+            0,
+            NifTarget::Se,
+            InfluencePolicy::Preserve
+        ),
         Err(NifWriteError::RigLayout { shape: 0, .. })
     ));
 }
@@ -519,19 +544,36 @@ fn configured_family_templates_restore_hierarchy_and_preserve_body_rest() {
                     asset.tangents.clear();
                 }
                 let written = write_rigged_shape(
-                    &asset, &body, &completed, source.shape, target, InfluencePolicy::NativeFour,
-                ).expect("write completed rig and authored skin");
+                    &asset,
+                    &body,
+                    &completed,
+                    source.shape,
+                    target,
+                    InfluencePolicy::NativeFour,
+                )
+                .expect("write completed rig and authored skin");
                 let back = read(&written.bytes).expect("read completed native rig");
                 let verified = back.bind_rest().expect("reconstruct exported rest");
                 let rig = verified.rig();
-                let thigh = rig.joint_by_name("NPC L Thigh [LThg]").expect("exported thigh");
-                let foot = rig.joint_by_name("NPC L Foot [Lft ]").expect("exported foot");
+                let thigh = rig
+                    .joint_by_name("NPC L Thigh [LThg]")
+                    .expect("exported thigh");
+                let foot = rig
+                    .joint_by_name("NPC L Foot [Lft ]")
+                    .expect("exported foot");
                 assert!(rig.is_ancestor(thigh, foot).expect("exported limb chain"));
                 assert_eq!(rig.joints().len(), count + usize::from(expects_correction));
-                assert_eq!(verified.basis(), identity().map(|column| column.map(f64::from)));
+                assert_eq!(
+                    verified.basis(),
+                    identity().map(|column| column.map(f64::from))
+                );
                 let rest = verified.skins()[0].measurement();
-                eprintln!("  {target:?}: {} nodes, rest {:.9e}, {} omitted native influences",
-                    rig.joints().len(), rest.max_vertex, written.dropped_influences.len());
+                eprintln!(
+                    "  {target:?}: {} nodes, rest {:.9e}, {} omitted native influences",
+                    rig.joints().len(),
+                    rest.max_vertex,
+                    written.dropped_influences.len()
+                );
             }
         }
     }

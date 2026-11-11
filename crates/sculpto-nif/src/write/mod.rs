@@ -98,7 +98,9 @@ pub fn write_rigged_shape(
             reason: "the export topology or skin differs from its source binding",
         });
     }
-    let binding = document.bind_rest_on(rig).map_err(NifWriteError::InvalidRig)?;
+    let binding = document
+        .bind_rest_on(rig)
+        .map_err(NifWriteError::InvalidRig)?;
     let scene = CheckedScene::new(&binding, &document.sources[shape], shape)?;
     encode(asset, target, policy, Some(&scene))
 }

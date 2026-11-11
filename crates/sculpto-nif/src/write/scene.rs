@@ -35,24 +35,35 @@ impl<'a> CheckedScene<'a> {
             NativeTransform::from_matrix(matrix.map(|col| col.map(f64::from))).is_some()
         };
         if !native(&authored.global_to_skin) {
-            return Err(fail("global-to-skin needs a positive uniform native transform"));
+            return Err(fail(
+                "global-to-skin needs a positive uniform native transform",
+            ));
         }
         if !authored.skin.bind_inverse.iter().all(native) {
-            return Err(fail("a skin-to-bone bind needs a positive uniform native transform"));
+            return Err(fail(
+                "a skin-to-bone bind needs a positive uniform native transform",
+            ));
         }
         let parent = source
             .parent
             .filter(|&parent| rig.joint(parent).is_some())
             .ok_or_else(|| fail("the source shape has no resolved parent"))?;
-        let basis = NativeTransform::from_matrix(binding.basis())
-            .ok_or_else(|| fail("the common rest basis needs a positive uniform native transform"))?;
+        let basis = NativeTransform::from_matrix(binding.basis()).ok_or_else(|| {
+            fail("the common rest basis needs a positive uniform native transform")
+        })?;
         let local = source
             .local
             .matrix()
             .map_err(|_| fail("the source shape placement is invalid"))?;
         let placement = NativeTransform::from_matrix(local)
             .ok_or_else(|| fail("the source shape placement exceeds native precision"))?;
-        Ok(Self { rig, skin, parent, basis, placement })
+        Ok(Self {
+            rig,
+            skin,
+            parent,
+            basis,
+            placement,
+        })
     }
 
     pub(super) fn global_skin(&self) -> [[f32; 4]; 4] {
@@ -94,13 +105,24 @@ impl<'a> CheckedScene<'a> {
                     shape: self.skin.source().shape,
                     reason: "a joint local exceeds native transform precision",
                 })?;
-            let name = joint.name.as_deref().map_or(-1, |name| strings.intern(name) as i32);
-            nodes.push(Node { name, local, children: Vec::new() });
+            let name = joint
+                .name
+                .as_deref()
+                .map_or(-1, |name| strings.intern(name) as i32);
+            nodes.push(Node {
+                name,
+                local,
+                children: Vec::new(),
+            });
             if let Some(parent) = joint.parent {
-                nodes[(block(parent) - start) as usize].children.push(block(id));
+                nodes[(block(parent) - start) as usize]
+                    .children
+                    .push(block(id));
             }
         }
-        nodes[(block(self.parent) - start) as usize].children.push(0);
+        nodes[(block(self.parent) - start) as usize]
+            .children
+            .push(0);
         Ok(SkinNodes {
             root: block(self.skin.source().root),
             bones: self.skin.palette().iter().copied().map(block).collect(),
@@ -137,7 +159,9 @@ impl SkinNodes {
         }));
         Ok(Self {
             root: start + 1,
-            bones: (0..names.len()).map(|index| start + 1 + index as i32).collect(),
+            bones: (0..names.len())
+                .map(|index| start + 1 + index as i32)
+                .collect(),
             nodes,
         })
     }
@@ -179,7 +203,9 @@ impl NativeTransform {
     };
 
     fn from_matrix(matrix: [[f64; 4]; 4]) -> Option<Self> {
-        if matrix.into_iter().zip([0.0, 0.0, 0.0, 1.0])
+        if matrix
+            .into_iter()
+            .zip([0.0, 0.0, 0.0, 1.0])
             .any(|(column, expected)| (column[3] - expected).abs() > 1e-12)
             || !matrix.iter().flatten().all(|value| value.is_finite())
         {
@@ -189,22 +215,43 @@ impl NativeTransform {
         let rotation = [0, 1, 2].map(|row| [0, 1, 2].map(|column| matrix[column][row] / scale));
         let dot = |a: [f64; 3], b: [f64; 3]| a.into_iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
         let [x, y, z] = rotation;
-        let cross = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
-        let residuals = [dot(x, x) - 1.0, dot(y, y) - 1.0, dot(z, z) - 1.0,
-            dot(x, y), dot(x, z), dot(y, z), dot(cross, z) - 1.0];
+        let cross = [
+            x[1] * y[2] - x[2] * y[1],
+            x[2] * y[0] - x[0] * y[2],
+            x[0] * y[1] - x[1] * y[0],
+        ];
+        let residuals = [
+            dot(x, x) - 1.0,
+            dot(y, y) - 1.0,
+            dot(z, z) - 1.0,
+            dot(x, y),
+            dot(x, z),
+            dot(y, z),
+            dot(cross, z) - 1.0,
+        ];
         let translation = [0, 1, 2].map(|axis| matrix[3][axis] as f32);
         let scale = scale as f32;
-        if scale <= 0.0 || !scale.is_finite()
+        if scale <= 0.0
+            || !scale.is_finite()
             || !translation.iter().all(|value| value.is_finite())
             || !residuals.iter().all(|value| value.abs() <= 1e-5)
         {
             return None;
         }
-        Some(Self { translation, rotation: rotation.map(|row| row.map(|value| value as f32)), scale })
+        Some(Self {
+            translation,
+            rotation: rotation.map(|row| row.map(|value| value as f32)),
+            scale,
+        })
     }
 
     pub(super) fn write_av(self, bytes: &mut Vec<u8>) {
-        for value in self.translation.into_iter().chain(self.rotation.into_iter().flatten()).chain([self.scale]) {
+        for value in self
+            .translation
+            .into_iter()
+            .chain(self.rotation.into_iter().flatten())
+            .chain([self.scale])
+        {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
