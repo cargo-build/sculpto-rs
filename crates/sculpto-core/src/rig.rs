@@ -18,6 +18,7 @@ use std::fmt;
 use glam::{DMat4, DQuat, DVec3};
 
 pub mod rest;
+pub mod template;
 
 /// Squared-length tolerance for a unit rotation quaternion.
 ///

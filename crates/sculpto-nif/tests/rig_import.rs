@@ -9,6 +9,7 @@
 
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
 use sculpto_core::rig::rest::REST_TOLERANCE;
+use sculpto_core::rig::template::{TemplateRoots, complete_family_rig};
 use sculpto_core::rig::{JointId, LocalTransform};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::le_shape::write_le_shape;
@@ -326,4 +327,55 @@ fn three_ba_body_rest_reconstructs_in_its_authored_frame() {
     );
     assert_eq!(document.shapes.len(), 3);
     measure_bound_rest(&document, false);
+}
+
+#[test]
+fn configured_family_templates_restore_hierarchy_and_preserve_body_rest() {
+    let Some(root) = std::env::var_os("SCULPTO_RIG_TEMPLATE_FIXTURES") else {
+        eprintln!("SCULPTO_RIG_TEMPLATE_FIXTURES not set; skipping family skeleton completion");
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    for (body_file, template_file, body_root, template_root, count, expects_correction) in [
+        ("himbo.nif", "skeleton_male_sse.nif", "Scene Root", "Scene Root", 514, false),
+        ("bijin.nif", "skeleton_female_sse.nif", "CalienteArmor.00", "skeleton_female.nif", 363, true),
+        ("3ba.nif", "skeleton_female_sse.nif", "Scene Root", "skeleton_female.nif", 363, false),
+    ] {
+        let body = read(&std::fs::read(root.join(body_file)).expect("configured body")).expect("body reads");
+        let template = read(&std::fs::read(root.join(template_file)).expect("configured family template"))
+            .expect("template reads");
+        let source_rig = body.rig.as_ref().expect("authored graph");
+        let template_rig = template.rig.as_ref().expect("family graph");
+        let completed = complete_family_rig(source_rig, template_rig, TemplateRoots {
+            authored: source_rig.joint_by_name(body_root).expect("authored scene root"),
+            template: template_rig.joint_by_name(template_root).expect("family scene root"),
+        }).expect("compatible family graph");
+        assert_eq!(completed.joints().len(), count);
+        assert_eq!(completed.roots(), source_rig.roots());
+        for &id in source_rig.topological_order() {
+            assert_eq!(source_rig.joint(id).expect("source").name, completed.joint(id).expect("completed").name);
+        }
+        let thigh = completed.joint_by_name("NPC L Thigh [LThg]").expect("left thigh");
+        let foot = completed.joint_by_name("NPC L Foot [Lft ]").expect("left foot");
+        assert!(completed.is_ancestor(thigh, foot).expect("valid limb chain"));
+        let binding = body.bind_rest_on(&completed).expect("completed rig keeps the authored rest");
+        assert_eq!(
+            binding.basis() != identity().map(|column| column.map(f64::from)),
+            expects_correction,
+        );
+        for skin in binding.skins() {
+            let source = skin.source();
+            let measured = skin.measurement();
+            assert!(std::ptr::eq(source.skin, body.shapes[source.shape].skin.as_ref().expect("authored skin")));
+            assert!(measured.max_influence <= REST_TOLERANCE && measured.max_vertex <= REST_TOLERANCE);
+            eprintln!(
+                "{body_file}: graph {} -> {}, shape {}, {} vertices, rest error {:.9e}",
+                source_rig.joints().len(),
+                completed.joints().len(),
+                source.shape,
+                source.positions.len(),
+                measured.max_vertex,
+            );
+        }
+    }
 }

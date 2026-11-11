@@ -49,6 +49,15 @@ impl NifDocument {
     /// remains part of the source record. @req DECL0008
     pub fn bind_rest(&self) -> Result<RestBinding<'_>, NifRigError> {
         let rig = self.rig.as_ref().ok_or(NifRigError::MissingRig)?;
+        self.bind_rest_on(rig)
+    }
+
+    /// Prove the authored skins against a supplied completed family rig.
+    ///
+    /// # Errors
+    /// Refuses missing source records, unresolved skeleton roots and any
+    /// frame, palette or rest mismatch reported by the checked binding.
+    pub fn bind_rest_on<'a>(&'a self, rig: &'a Rig) -> Result<RestBinding<'a>, NifRigError> {
         if self.shapes.len() != self.sources.len() {
             return Err(NifRigError::SourceCount {
                 shapes: self.shapes.len(),
