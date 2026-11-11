@@ -66,6 +66,7 @@ fn params(nif: PathBuf, out: PathBuf, target: ExportTarget) -> ExportNifParams {
         out,
         target,
         shape: None,
+        rig_template: None,
     }
 }
 

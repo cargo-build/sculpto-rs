@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::NifHeader;
+use crate::{NifHeader, NifRigError};
 use sculpto_core::mesh::MeshError;
 
 /// Numeric NIF version both Skyrim variants use (`20.2.0.7`).
@@ -54,6 +54,10 @@ pub enum NifWriteError {
     UnsupportedEndian { endian: u8 },
     /// The model failed validation, so no bytes are written.
     InvalidModel(MeshError),
+    /// The source document did not supply a checked rig and skin binding.
+    InvalidRig(NifRigError),
+    /// The selected shape cannot be represented with the supplied native rig.
+    RigLayout { shape: usize, reason: &'static str },
     /// A shape has more vertices than the `u16` count can hold.
     TooManyVertices { vertices: usize },
     /// A shape has more triangles than the `u16` count can hold.
@@ -125,6 +129,8 @@ impl fmt::Display for NifWriteError {
                 write!(formatter, "unsupported endian marker {endian}")
             }
             Self::InvalidModel(error) => write!(formatter, "model is invalid: {error:?}"),
+            Self::InvalidRig(error) => write!(formatter, "invalid rig: {error}"),
+            Self::RigLayout { shape, reason } => write!(formatter, "shape {shape}: {reason}"),
             Self::TooManyVertices { vertices } => {
                 write!(
                     formatter,

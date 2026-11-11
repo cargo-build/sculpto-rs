@@ -17,17 +17,21 @@ use schemars::JsonSchema;
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakePlan;
 use sculpto_core::mesh::MeshAsset;
+use sculpto_core::rig::Rig;
+use sculpto_core::rig::template::{TemplateRoots, complete_family_rig};
 use sculpto_core::{SliderSize, document::Document};
 use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
-use sculpto_nif::NifShape;
-use sculpto_nif::write::header::NifTarget;
-use sculpto_nif::write::{DroppedInfluence, InfluencePolicy, WrittenNif, write_shape_with_policy};
+use sculpto_nif::{NifDocument, NifRigError, NifShape};
+use sculpto_nif::write::header::{NifTarget, NifWriteError};
+use sculpto_nif::write::{
+    DroppedInfluence, InfluencePolicy, WrittenNif, write_rigged_shape, write_shape_with_policy,
+};
 
 use crate::errors;
-use crate::obj::{pick_shape, read_obj_positions, write_obj, write_obj_uv};
+use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, write_obj_uv};
 
 /// A source NIF and its optional authored outfit declaration.
 #[derive(Debug, Clone, JsonSchema)]
@@ -318,6 +322,8 @@ pub struct ExportPairParams {
     pub size: Option<Vec<String>>,
     /// Shape name; the largest shape when absent.
     pub shape: Option<String>,
+    /// Optional family skeleton NIF to complete the source joint hierarchy.
+    pub rig_template: Option<PathBuf>,
     /// BodySlide home; the project's grandparent when absent.
     pub home: Option<PathBuf>,
 }
@@ -458,14 +464,16 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
     let target = nif_target(document.bsver, document.header.user_version)?;
-    let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
+    let index = pick_shape_index(&document.shapes, params.shape.as_deref())?;
+    let shape = &document.shapes[index];
+    let rig = export_rig(&document, index, params.rig_template.as_deref())?;
+    let source = rig.as_deref().map(|rig| (&document, rig, index));
     let mut asset = MeshAsset::from(shape);
     let mut encode = |plan: &BakePlan| {
         asset.positions = plan
             .apply(&shape.name, &shape.positions)
             .map_err(errors::bake)?;
-        write_shape_with_policy(&asset, target, InfluencePolicy::NativeFour)
-            .map_err(errors::nif_write)
+        encode_nif(&asset, target, source)
     };
     let bodies = [encode(&plans[0])?, encode(&plans[1])?];
     let stem = pair_stem(&params.out);
@@ -536,6 +544,8 @@ pub struct ExportNifParams {
     pub target: ExportTarget,
     /// Shape name; the largest shape when absent.
     pub shape: Option<String>,
+    /// Optional family skeleton NIF to complete the source joint hierarchy.
+    pub rig_template: Option<PathBuf>,
 }
 
 /// What `export.nif` produced.
@@ -559,17 +569,19 @@ pub struct ExportNifOutcome {
 pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandError> {
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
-    let shape = match &params.shape {
+    let index = match &params.shape {
         // The caller chose from a list, so the miss names what the file holds.
         Some(name) => document
             .shapes
             .iter()
-            .find(|shape| shape.name == *name)
+            .position(|shape| shape.name == *name)
             .ok_or_else(|| unknown_shape(&document.shapes, name))?,
-        None => pick_shape(&document.shapes, None)?,
+        None => pick_shape_index(&document.shapes, None)?,
     };
-    let asset = MeshAsset::from(shape);
-    let written = write_nif(&asset, params.target)?;
+    let asset = MeshAsset::from(&document.shapes[index]);
+    let rig = export_rig(&document, index, params.rig_template.as_deref())?;
+    let source = rig.as_deref().map(|rig| (&document, rig, index));
+    let written = encode_nif(&asset, params.target.into(), source)?;
     std::fs::write(&params.out, &written.bytes).map_err(|error| errors::io(&params.out, error))?;
     Ok(ExportNifOutcome {
         out: params.out.clone(),
@@ -583,29 +595,77 @@ pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandE
 
 /// Validate one model and encode it for the target.
 ///
-/// `export_nif` is the only product caller; the function is public so the
-/// validation gate and the target projection are testable without a NIF round
-/// trip. A refused model returns before any byte exists.
 pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<WrittenNif, CommandError> {
+    encode_nif(asset, target.into(), None)
+}
+
+impl From<ExportTarget> for NifTarget {
+    fn from(value: ExportTarget) -> Self {
+        match value {
+            ExportTarget::Se => Self::Se,
+            ExportTarget::Le => Self::Le,
+        }
+    }
+}
+
+fn export_rig<'a>(
+    document: &'a NifDocument,
+    index: usize,
+    template_path: Option<&Path>,
+) -> Result<Option<Cow<'a, Rig>>, CommandError> {
+    if document.shapes[index].skin.is_none() {
+        return match template_path {
+            Some(_) => Err(errors::invalid("rig_template", "requires a skinned shape")),
+            None => Ok(None),
+        };
+    }
+    let authored = document.rig.as_ref().ok_or_else(|| {
+        errors::nif_write(NifWriteError::InvalidRig(NifRigError::MissingRig))
+    })?;
+    let Some(path) = template_path else {
+        return Ok(Some(Cow::Borrowed(authored)));
+    };
+    let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let template = document.rig.as_ref().ok_or_else(|| {
+        errors::invalid("rig_template", format!("{} contains no node graph", path.display()))
+    })?;
+    let ([authored_root], [template_root]) = (authored.roots(), template.roots()) else {
+        return Err(errors::invalid("rig_template", "the source and template each need one scene root"));
+    };
+    let completed = complete_family_rig(authored, template, TemplateRoots {
+        authored: *authored_root, template: *template_root,
+    }).map_err(|error| CommandError::new(
+        ErrorKind::Refused, "nif_rig_template_incompatible", format!("{}: {error}", path.display()),
+    ))?;
+    Ok(Some(Cow::Owned(completed)))
+}
+
+fn encode_nif(
+    asset: &MeshAsset,
+    target: NifTarget,
+    source: Option<(&NifDocument, &Rig, usize)>,
+) -> Result<WrittenNif, CommandError> {
     asset.validate().map_err(errors::mesh)?;
     // This LE writer has no NBT layout and refuses authored tangents. A
     // texture-ready model always carries them (the reader synthesizes them from
     // UVs and normals), so the target projection omits them instead of refusing
     // every real shape. SE writes them.
     let projected = match target {
-        ExportTarget::Se => Cow::Borrowed(asset),
-        ExportTarget::Le => {
+        NifTarget::Se => Cow::Borrowed(asset),
+        NifTarget::Le => {
             let mut projection = asset.clone();
             projection.tangents.clear();
             Cow::Owned(projection)
         }
     };
-    let target = match target {
-        ExportTarget::Se => NifTarget::Se,
-        ExportTarget::Le => NifTarget::Le,
+    let output = match source {
+        Some((document, rig, index)) => {
+            write_rigged_shape(&projected, document, rig, index, target, InfluencePolicy::NativeFour)
+        }
+        None => write_shape_with_policy(&projected, target, InfluencePolicy::NativeFour),
     };
-    write_shape_with_policy(&projected, target, InfluencePolicy::NativeFour)
-        .map_err(errors::nif_write)
+    output.map_err(errors::nif_write)
 }
 
 /// Everything `gltf.reset_weights` and `gltf.clamp_texcoord` need.

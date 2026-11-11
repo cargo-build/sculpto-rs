@@ -15,6 +15,7 @@ use sculpto_core::mesh::{MeshAsset, MeshError, PartitionPalette};
 use sculpto_core::skin::FourLane;
 
 use super::header::{NifTarget, NifWriteError};
+use super::scene::NativeTransform;
 use super::{DroppedInfluence, InfluencePolicy};
 
 /// Validated palette, bind matrices and per-bone sparse weights.
@@ -163,9 +164,13 @@ fn project_row(
     Ok(lane)
 }
 
-/// A named `NiNode` body with an identity transform, the given children and
-/// extra-data references.
-pub fn node(name: i32, children: &[i32], extra_data: &[i32]) -> Vec<u8> {
+/// A `NiNode` body with its local transform, children and extra references.
+pub(super) fn node(
+    name: i32,
+    children: &[i32],
+    extra_data: &[i32],
+    local: NativeTransform,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     push_i32(&mut bytes, name);
     push_u32(&mut bytes, extra_data.len() as u32);
@@ -174,15 +179,7 @@ pub fn node(name: i32, children: &[i32], extra_data: &[i32]) -> Vec<u8> {
     }
     push_i32(&mut bytes, -1); // controller
     push_u32(&mut bytes, 0); // flags
-    for value in [0.0f32, 0.0, 0.0] {
-        push_f32(&mut bytes, value);
-    }
-    for row in 0..3 {
-        for column in 0..3 {
-            push_f32(&mut bytes, if row == column { 1.0 } else { 0.0 });
-        }
-    }
-    push_f32(&mut bytes, 1.0);
+    local.write_av(&mut bytes);
     push_i32(&mut bytes, -1); // collision
     push_u32(&mut bytes, children.len() as u32);
     for child in children {
@@ -205,10 +202,10 @@ pub fn instance(data: i32, partition: i32, skeleton_root: i32, bones: &[i32]) ->
     bytes
 }
 
-/// A `NiSkinData` body with an identity global transform and sparse weights.
-pub(crate) fn data(plan: &SkinPlan) -> Result<Vec<u8>, NifWriteError> {
+/// A `NiSkinData` body with the source global-to-skin transform and sparse weights.
+pub(crate) fn data(plan: &SkinPlan, global_skin: &[[f32; 4]; 4]) -> Result<Vec<u8>, NifWriteError> {
     let mut bytes = Vec::new();
-    push_transform(&mut bytes, &identity(), 0)?;
+    push_transform(&mut bytes, global_skin, 0)?;
     push_u32(&mut bytes, plan.names.len() as u32);
     push_u8(&mut bytes, 1); // has vertex weights
     for (bone, entries) in plan.weights.iter().enumerate() {

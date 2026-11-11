@@ -2,12 +2,17 @@
 //! block gates cannot drift apart.
 
 use sculpto_core::mesh::MeshAsset;
+use sculpto_core::rig::Rig;
+
+use crate::NifDocument;
 
 use self::header::{NifTarget, NifWriteError};
+use self::scene::CheckedScene;
 
 pub mod extra;
 pub mod header;
 pub mod le_shape;
+mod scene;
 pub mod se_shape;
 pub mod shader;
 pub mod skin;
@@ -61,8 +66,51 @@ pub fn write_shape_with_policy(
     target: NifTarget,
     policy: InfluencePolicy,
 ) -> Result<WrittenNif, NifWriteError> {
+    encode(asset, target, policy, None)
+}
+
+/// Write one imported skinned shape through a checked source or family rig.
+///
+/// Geometry may carry same-topology slider edits. The source shape's ordered
+/// triangles and skin still identify its binding. @req DECL0008
+///
+/// # Errors
+/// Refuses missing or inconsistent source binding, changes to its topology or
+/// skin, and transforms or weights the selected native target cannot encode.
+pub fn write_rigged_shape(
+    asset: &MeshAsset,
+    document: &NifDocument,
+    rig: &Rig,
+    shape: usize,
+    target: NifTarget,
+    policy: InfluencePolicy,
+) -> Result<WrittenNif, NifWriteError> {
+    let source = document.shapes.get(shape).ok_or(NifWriteError::RigLayout {
+        shape,
+        reason: "shape is outside the source document",
+    })?;
+    if source.skin != asset.skin
+        || source.triangles != asset.triangles
+        || source.positions.len() != asset.positions.len()
+    {
+        return Err(NifWriteError::RigLayout {
+            shape,
+            reason: "the export topology or skin differs from its source binding",
+        });
+    }
+    let binding = document.bind_rest_on(rig).map_err(NifWriteError::InvalidRig)?;
+    let scene = CheckedScene::new(&binding, &document.sources[shape], shape)?;
+    encode(asset, target, policy, Some(&scene))
+}
+
+fn encode(
+    asset: &MeshAsset,
+    target: NifTarget,
+    policy: InfluencePolicy,
+    scene: Option<&CheckedScene<'_>>,
+) -> Result<WrittenNif, NifWriteError> {
     match target {
-        NifTarget::Se => se_shape::write(asset, policy),
-        NifTarget::Le => le_shape::write(asset, policy),
+        NifTarget::Se => se_shape::write(asset, policy, scene),
+        NifTarget::Le => le_shape::write(asset, policy, scene),
     }
 }

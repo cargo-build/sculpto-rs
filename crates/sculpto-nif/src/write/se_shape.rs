@@ -15,6 +15,7 @@ use sculpto_core::skin::FourLane;
 
 use super::extra;
 use super::header::{NifTarget, NifWriteError, write_header};
+use super::scene::{CheckedScene, NativeTransform, SkinNodes};
 use super::shader;
 use super::skin;
 use super::strings::StringTable;
@@ -37,12 +38,13 @@ const BLOCK_TYPE: &str = "BSTriShape";
 /// `NiSkinData`, leaving the shape's own vertex/triangle counts and
 /// `data_size` at zero; morphs are deliberately not written yet (C08 onward).
 pub fn write_se_shape(asset: &MeshAsset) -> Result<Vec<u8>, NifWriteError> {
-    write(asset, InfluencePolicy::Preserve).map(|output| output.bytes)
+    write(asset, InfluencePolicy::Preserve, None).map(|output| output.bytes)
 }
 
 pub(super) fn write(
     asset: &MeshAsset,
     policy: InfluencePolicy,
+    checked: Option<&CheckedScene<'_>>,
 ) -> Result<WrittenNif, NifWriteError> {
     asset.validate().map_err(NifWriteError::InvalidModel)?;
     let vertices =
@@ -86,20 +88,11 @@ pub(super) fn write(
         true => -1,
         false => strings.intern(&asset.name) as i32,
     };
-    let bone_names: Vec<i32> = skin_plan
+    let skin_nodes = skin_plan
         .as_ref()
-        .map(|plan| {
-            plan.names
-                .iter()
-                .map(|name| strings.intern(name) as i32)
-                .collect()
-        })
-        .unwrap_or_default();
-    let bone_count = bone_names.len();
-    // Block 0 is the shape; a skin adds the instance (1), the data (2) and one
-    // node per bone (3..).
-    let bone_refs: Vec<i32> = (0..bone_count).map(|offset| 5 + offset as i32).collect();
-    let skeleton_root = bone_refs.first().copied().unwrap_or(-1);
+        .map(|plan| SkinNodes::plan(checked, &plan.names, 4, &mut strings))
+        .transpose()?;
+    let node_count = skin_nodes.as_ref().map_or(0, SkinNodes::len);
     let skin_ref = skin_plan.as_ref().map_or(-1, |_| 1);
     let material = match asset.materials.len() {
         0 => None,
@@ -112,7 +105,7 @@ pub(super) fn write(
     };
     // Blocks after the geometry/skin group.
     let mut next_block = if skin_plan.is_some() {
-        5 + bone_count as i32
+        4 + node_count as i32
     } else {
         1
     };
@@ -161,15 +154,9 @@ pub(super) fn write(
     push_i32(&mut body, -1);
     // NiAVObject: flags, identity transform, no collision.
     push_u32(&mut body, 0);
-    for value in [0.0f32, 0.0, 0.0] {
-        push_f32(&mut body, value);
-    }
-    for row in 0..3 {
-        for column in 0..3 {
-            push_f32(&mut body, if row == column { 1.0 } else { 0.0 });
-        }
-    }
-    push_f32(&mut body, 1.0);
+    checked
+        .map_or(NativeTransform::IDENTITY, |scene| scene.placement)
+        .write_av(&mut body);
     push_i32(&mut body, -1);
     // BSTriShape: bounding sphere, refs, vertex descriptor.
     for value in [0.0f32, 0.0, 0.0, 0.0] {
@@ -210,19 +197,14 @@ pub(super) fn write(
         vertex_size: vertex_size as u32,
         bytes: &vertex_bytes,
     };
-    let (instance, data, partition, root, nodes) = match &skin_plan {
-        Some(plan) => (
-            skin::instance(2, 3, skeleton_root, &bone_refs),
-            skin::data(plan)?,
+    let (instance, data, partition, nodes) = match skin_plan.as_ref().zip(skin_nodes) {
+        Some((plan, scene)) => (
+            skin::instance(2, 3, scene.root, &scene.bones),
+            skin::data(plan, &checked.map_or_else(skin::identity, CheckedScene::global_skin))?,
             skin::partitions(asset, plan, Some(&global))?,
-            skin::node(-1, &[0], &root_extra),
-            plan.names
-                .iter()
-                .zip(&bone_names)
-                .map(|(_name, index)| skin::node(*index, &[], &[]))
-                .collect::<Vec<_>>(),
+            scene.encode(&root_extra),
         ),
-        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
 
     let mut type_names: Vec<&str> = vec![BLOCK_TYPE];
@@ -230,7 +212,7 @@ pub(super) fn write(
     if skin_plan.is_some() {
         type_names.extend(["NiSkinInstance", "NiSkinData", "NiSkinPartition", "NiNode"]);
         type_indices.extend([1, 2, 3]);
-        type_indices.extend(std::iter::repeat_n(4, bone_count + 1));
+        type_indices.extend(std::iter::repeat_n(4, node_count));
     }
     if material.is_some() {
         type_names.push("BSLightingShaderProperty");
@@ -267,7 +249,6 @@ pub(super) fn write(
         push_u32(&mut file, instance.len() as u32);
         push_u32(&mut file, data.len() as u32);
         push_u32(&mut file, partition.len() as u32);
-        push_u32(&mut file, root.len() as u32);
         for node in &nodes {
             push_u32(&mut file, node.len() as u32);
         }
@@ -295,7 +276,6 @@ pub(super) fn write(
         file.extend_from_slice(&instance);
         file.extend_from_slice(&data);
         file.extend_from_slice(&partition);
-        file.extend_from_slice(&root);
         for node in &nodes {
             file.extend_from_slice(node);
         }

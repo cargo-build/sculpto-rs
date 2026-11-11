@@ -42,14 +42,23 @@ pub fn pick_shape<'a>(
     shapes: &'a [NifShape],
     name: Option<&str>,
 ) -> Result<&'a NifShape, CommandError> {
+    pick_shape_index(shapes, name).map(|index| &shapes[index])
+}
+
+pub(crate) fn pick_shape_index(
+    shapes: &[NifShape],
+    name: Option<&str>,
+) -> Result<usize, CommandError> {
     match name {
         Some(name) => shapes
             .iter()
-            .find(|shape| shape.name == name)
+            .position(|shape| shape.name == name)
             .ok_or_else(|| errors::not_found("shape", name)),
         None => shapes
             .iter()
-            .max_by_key(|shape| shape.positions.len())
+            .enumerate()
+            .max_by_key(|(_, shape)| shape.positions.len())
+            .map(|(index, _)| index)
             .ok_or_else(|| errors::invalid("nif", "the file has no shapes")),
     }
 }

@@ -115,12 +115,16 @@ fn optional_path(input: &Value, field: &str) -> Option<PathBuf> {
     optional_string(input, field).map(PathBuf::from)
 }
 
+fn checked_optional_path(input: &Value, field: &str) -> Result<Option<PathBuf>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(Some(PathBuf::from(path))),
+        Some(_) => Err(errors::invalid(field, "must be a nonempty path")),
+    }
+}
+
 pub fn outfit_inspect(input: &Value) -> Result<Value, CommandError> {
-    let manifest = match input.get("manifest") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
-        Some(_) => return Err(errors::invalid("manifest", "must be a nonempty path")),
-    };
+    let manifest = checked_optional_path(input, "manifest")?;
     let outcome = ops::inspect_outfit(&ops::OutfitInspectParams {
         nif: path(input, "nif")?,
         manifest,
@@ -246,6 +250,7 @@ pub fn export_pair(input: &Value) -> Result<Value, CommandError> {
         out: path(input, "out")?,
         size: string_list(input, "size")?,
         shape: optional_string(input, "shape"),
+        rig_template: checked_optional_path(input, "rig_template")?,
         home: optional_path(input, "home"),
     };
     let outcome = ops::export_pair(&params)?;
@@ -273,6 +278,7 @@ pub fn export_nif(input: &Value) -> Result<Value, CommandError> {
         out: path(input, "out")?,
         target: ops::ExportTarget::parse(&string(input, "target")?)?,
         shape: optional_string(input, "shape"),
+        rig_template: checked_optional_path(input, "rig_template")?,
     };
     let outcome = ops::export_nif(&params)?;
     Ok(json!({

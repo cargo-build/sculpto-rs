@@ -81,6 +81,8 @@ pub fn nif_write(error: NifWriteError) -> CommandError {
             (ErrorKind::Unsupported, "nif_write_unsupported_endian")
         }
         NifWriteError::InvalidModel(_) => (ErrorKind::Refused, "nif_write_invalid_model"),
+        NifWriteError::InvalidRig(_) => (ErrorKind::Refused, "nif_write_invalid_rig"),
+        NifWriteError::RigLayout { .. } => (ErrorKind::Refused, "nif_write_rig_layout"),
         NifWriteError::TooManyVertices { .. } => {
             (ErrorKind::Unsupported, "nif_write_too_many_vertices")
         }
