@@ -378,13 +378,17 @@ fn transferred_garment(case: &Case) {
 
     let body_rows = name_rows(body_skin);
     if let Some(vertex) = case.default_radius_refusal {
-        assert!(matches!(
-            transfer(&body_frame, &body_shape.positions, &body_rows, &TransferOptions::default()),
-            Err(TransferError::Vertex {
-                vertex: failed,
-                error: WeightError::MissingUnlockedMass { remainder: 1.0 },
-            }) if failed == vertex
-        ), "{}: the uncovered default-radius copy must refuse vertex {vertex}", case.label);
+        assert!(
+            matches!(
+                transfer(&body_frame, &body_shape.positions, &body_rows, &TransferOptions::default()),
+                Err(TransferError::Vertex {
+                    vertex: failed,
+                    error: WeightError::MissingUnlockedMass { remainder: 1.0 },
+                }) if failed == vertex
+            ),
+            "{}: the uncovered default-radius copy must refuse vertex {vertex}",
+            case.label
+        );
     }
     let copied = transfer(
         &body_frame,
