@@ -11,8 +11,8 @@ use sculpto_core::document::Document;
 use sculpto_core::shape_data::{MorphBlock, MorphContainer, SUPPORTED_VERSION, VertexOffset};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::delta_conform::{DeltaOptions, ProximityCache, ProximityOptions, generate_delta};
-use sculpto_mesh::outfit::{ClothRegion, ShapeInfo, ShapeRole, census};
 use sculpto_mesh::outfit::rigging::fit_rigged_regions;
+use sculpto_mesh::outfit::{ClothRegion, ShapeInfo, ShapeRole, census};
 use sculpto_mesh::wrap::repair::fit_and_repair;
 use sculpto_mesh::wrap::{FitOptions, GapMode};
 use sculpto_nif::{NifDocument, NifShape, ShapePlacement};
@@ -285,36 +285,79 @@ pub(super) fn fit_regions(params: &FitParams) -> Result<FitOutcome, CommandError
     let garment = PlacedShape::named(&document, &params.shape)?;
     let body = PlacedShape::named(&source, &params.body_shape)?;
     let target = target_positions(params, &body)?;
-    finish_fit(params, &document, &garment, &body, garment.source_positions(), target)
+    finish_fit(
+        params,
+        &document,
+        &garment,
+        &body,
+        garment.source_positions(),
+        target,
+    )
 }
 
-fn target_positions(params: &FitParams, body: &PlacedShape<'_>) -> Result<Vec<[f32; 3]>, CommandError> {
+fn target_positions(
+    params: &FitParams,
+    body: &PlacedShape<'_>,
+) -> Result<Vec<[f32; 3]>, CommandError> {
     let target = read_obj_positions(&params.body)?;
     if target.len() != body.shape.positions.len() {
-        return Err(errors::invalid("body", format!(
-            "{} positions, expected {} in source shape order", target.len(), body.shape.positions.len(),
-        )));
+        return Err(errors::invalid(
+            "body",
+            format!(
+                "{} positions, expected {} in source shape order",
+                target.len(),
+                body.shape.positions.len(),
+            ),
+        ));
     }
-    Ok(target.into_iter().map(|point| body.placement.position_in_source(point)).collect())
+    Ok(target
+        .into_iter()
+        .map(|point| body.placement.position_in_source(point))
+        .collect())
 }
 
-fn cloth_regions(params: &FitParams, document: &NifDocument) -> Result<Vec<ClothRegion>, CommandError> {
-    let path = params.manifest.as_deref().ok_or_else(|| errors::invalid("manifest", "region fit requires a manifest"))?;
-    let source = std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+fn cloth_regions(
+    params: &FitParams,
+    document: &NifDocument,
+) -> Result<Vec<ClothRegion>, CommandError> {
+    let path = params
+        .manifest
+        .as_deref()
+        .ok_or_else(|| errors::invalid("manifest", "region fit requires a manifest"))?;
+    let source =
+        std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let manifest = super::read_outfit_manifest(path, &source)?;
-    let shapes: Vec<_> = document.shapes.iter().map(|shape| ShapeInfo {
-        name: &shape.name, vertices: shape.positions.len(), triangles: shape.triangles.len(),
-    }).collect();
+    let shapes: Vec<_> = document
+        .shapes
+        .iter()
+        .map(|shape| ShapeInfo {
+            name: &shape.name,
+            vertices: shape.positions.len(),
+            triangles: shape.triangles.len(),
+        })
+        .collect();
     let report = census(&shapes, Some(&manifest)).map_err(errors::outfit)?;
-    let garment = report.iter().find(|shape| shape.name == params.shape)
+    let garment = report
+        .iter()
+        .find(|shape| shape.name == params.shape)
         .ok_or_else(|| errors::not_found("shape", &params.shape))?;
     if garment.role != ShapeRole::Garment {
-        return Err(CommandError::new(ErrorKind::Refused, "outfit_fit_role", "region fitting requires a garment shape"));
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "outfit_fit_role",
+            "region fitting requires a garment shape",
+        ));
     }
-    Ok(match manifest.garment_shapes.into_iter().find(|slot| slot.name == params.shape) {
-        Some(slot) => slot.blender_cloth,
-        None => Vec::new(),
-    })
+    Ok(
+        match manifest
+            .garment_shapes
+            .into_iter()
+            .find(|slot| slot.name == params.shape)
+        {
+            Some(slot) => slot.blender_cloth,
+            None => Vec::new(),
+        },
+    )
 }
 
 fn finish_fit(
@@ -326,7 +369,10 @@ fn finish_fit(
     target: Vec<[f32; 3]>,
 ) -> Result<FitOutcome, CommandError> {
     if params.body_after.is_some() || params.out_after.is_some() {
-        return Err(errors::invalid("body_after", "fit one body state per region or slider request"));
+        return Err(errors::invalid(
+            "body_after",
+            "fit one body state per region or slider request",
+        ));
     }
     let options = FitOptions {
         gap_mode: GapMode::Keep,
@@ -340,15 +386,30 @@ fn finish_fit(
     let (fitted, pairs, inside, regions) = match &params.manifest {
         Some(_) => {
             let regions = cloth_regions(params, document)?;
-            let (fitted, report) = fit_rigged_regions(garment_mesh, body_mesh, &regions, None, &options)
-                .map_err(|error| CommandError::new(ErrorKind::Refused, "outfit_region_fit", error.to_string()))?;
+            let (fitted, report) = fit_rigged_regions(
+                garment_mesh,
+                body_mesh,
+                &regions,
+                None,
+                &options,
+            )
+            .map_err(|error| {
+                CommandError::new(ErrorKind::Refused, "outfit_region_fit", error.to_string())
+            })?;
             let pairs = report.intersection_pairs;
             (fitted, pairs, None, Some(report))
         }
         None => {
             let (fitted, report) = fit_and_repair(garment_mesh, body_mesh, None, &options)
-                .map_err(|error| CommandError::new(ErrorKind::Refused, "conform_fit_repair", error.to_string()))?;
-            (fitted, report.intersection_pairs, Some(report.inside_after), None)
+                .map_err(|error| {
+                    CommandError::new(ErrorKind::Refused, "conform_fit_repair", error.to_string())
+                })?;
+            (
+                fitted,
+                report.intersection_pairs,
+                Some(report.inside_after),
+                None,
+            )
         }
     };
     let reference = Conform::bind(&garment.source_positions(), &body.source_positions())
