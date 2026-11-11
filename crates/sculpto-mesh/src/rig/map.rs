@@ -59,12 +59,21 @@ impl<'a> BoneMap<'a> {
         collapses: &[Collapse<'_>],
     ) -> Result<Self, BoneMapError> {
         use BodyFamily::{Cbbe, Himbo, ThreeBa};
-        if !matches!((source_family, target_family), (Himbo, Cbbe | ThreeBa) | (Cbbe | ThreeBa, Himbo)) {
-            return Err(BoneMapError::Families { source: source_family, target: target_family });
+        if !matches!(
+            (source_family, target_family),
+            (Himbo, Cbbe | ThreeBa) | (Cbbe | ThreeBa, Himbo)
+        ) {
+            return Err(BoneMapError::Families {
+                source: source_family,
+                target: target_family,
+            });
         }
         let rig = source.rig();
         if rig.frame() != target.frame() {
-            return Err(BoneMapError::Frame { source: rig.frame(), target: target.frame() });
+            return Err(BoneMapError::Frame {
+                source: rig.frame(),
+                target: target.frame(),
+            });
         }
         let source_names = names(rig, "source")?;
         let target_names = names(target, "target")?;
@@ -73,10 +82,16 @@ impl<'a> BoneMap<'a> {
             let joint = named(&source_names, collapse.source, "source")?;
             let destination = named(&target_names, collapse.target, "target")?;
             if target_names.contains_key(collapse.source) {
-                return Err(BoneMapError::DirectCollapse { joint, name: collapse.source.into() });
+                return Err(BoneMapError::DirectCollapse {
+                    joint,
+                    name: collapse.source.into(),
+                });
             }
             if authored.insert(joint, destination).is_some() {
-                return Err(BoneMapError::DuplicateCollapse { joint, name: collapse.source.into() });
+                return Err(BoneMapError::DuplicateCollapse {
+                    joint,
+                    name: collapse.source.into(),
+                });
             }
         }
         let weighted = weighted_joints(source);
@@ -86,16 +101,27 @@ impl<'a> BoneMap<'a> {
             .enumerate()
             .map(|(index, joint)| {
                 let source = JointId::new(index as u32);
-                let direct = joint.name.as_deref().and_then(|name| target_names.get(name));
+                let direct = joint
+                    .name
+                    .as_deref()
+                    .and_then(|name| target_names.get(name));
                 let destination = match (direct, authored.get(&source)) {
                     (Some(&id), _) => Destination::Direct(id),
                     (None, Some(&id)) => Destination::Collapsed(id),
                     (None, None) => Destination::Unsupported,
                 };
-                JointMapping { source, weighted: weighted[index], destination }
+                JointMapping {
+                    source,
+                    weighted: weighted[index],
+                    destination,
+                }
             })
             .collect();
-        Ok(Self { source: rig, target, entries })
+        Ok(Self {
+            source: rig,
+            target,
+            entries,
+        })
     }
 
     /// Graph that owns the source joint IDs.
@@ -118,7 +144,10 @@ impl<'a> BoneMap<'a> {
     /// # Errors
     /// Refuses an unknown source ID or a source with no destination.
     pub fn resolve(&self, joint: JointId) -> Result<JointId, BoneMapError> {
-        let entry = self.entries.get(joint.index()).ok_or(BoneMapError::UnknownSource(joint))?;
+        let entry = self
+            .entries
+            .get(joint.index())
+            .ok_or(BoneMapError::UnknownSource(joint))?;
         match entry.destination {
             Destination::Direct(id) | Destination::Collapsed(id) => Ok(id),
             Destination::Unsupported => Err(BoneMapError::Unsupported {
@@ -147,10 +176,13 @@ fn named(
     name: &str,
     side: &'static str,
 ) -> Result<JointId, BoneMapError> {
-    names.get(name).copied().ok_or_else(|| BoneMapError::NamedJoint {
-        side,
-        error: RigError::UnknownJointName { name: name.into() },
-    })
+    names
+        .get(name)
+        .copied()
+        .ok_or_else(|| BoneMapError::NamedJoint {
+            side,
+            error: RigError::UnknownJointName { name: name.into() },
+        })
 }
 
 fn weighted_joints(binding: &RestBinding<'_>) -> Vec<bool> {
@@ -172,26 +204,63 @@ fn weighted_joints(binding: &RestBinding<'_>) -> Vec<bool> {
 /// A requested body-family mapping could not resolve its inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoneMapError {
-    Families { source: BodyFamily, target: BodyFamily },
-    Frame { source: RigFrame, target: RigFrame },
-    NamedJoint { side: &'static str, error: RigError },
-    DirectCollapse { joint: JointId, name: String },
-    DuplicateCollapse { joint: JointId, name: String },
+    Families {
+        source: BodyFamily,
+        target: BodyFamily,
+    },
+    Frame {
+        source: RigFrame,
+        target: RigFrame,
+    },
+    NamedJoint {
+        side: &'static str,
+        error: RigError,
+    },
+    DirectCollapse {
+        joint: JointId,
+        name: String,
+    },
+    DuplicateCollapse {
+        joint: JointId,
+        name: String,
+    },
     UnknownSource(JointId),
-    Unsupported { joint: JointId, name: Option<String> },
+    Unsupported {
+        joint: JointId,
+        name: Option<String>,
+    },
 }
 
 impl fmt::Display for BoneMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Families { source, target } => write!(f, "unsupported body family pair {source:?} to {target:?}"),
-            Self::Frame { source, target } => write!(f, "rig frame {source:?} differs from target {target:?}"),
+            Self::Families { source, target } => {
+                write!(f, "unsupported body family pair {source:?} to {target:?}")
+            }
+            Self::Frame { source, target } => {
+                write!(f, "rig frame {source:?} differs from target {target:?}")
+            }
             Self::NamedJoint { side, error } => write!(f, "{side} joint: {error}"),
-            Self::DirectCollapse { joint, name } => write!(f, "source joint {joint} `{name}` already has an exact destination"),
-            Self::DuplicateCollapse { joint, name } => write!(f, "source joint {joint} `{name}` has multiple collapse declarations"),
+            Self::DirectCollapse { joint, name } => write!(
+                f,
+                "source joint {joint} `{name}` already has an exact destination"
+            ),
+            Self::DuplicateCollapse { joint, name } => write!(
+                f,
+                "source joint {joint} `{name}` has multiple collapse declarations"
+            ),
             Self::UnknownSource(joint) => write!(f, "source joint {joint} is outside the mapping"),
-            Self::Unsupported { joint, name: Some(name) } => write!(f, "source joint {joint} `{name}` has no supported destination"),
-            Self::Unsupported { joint, name: None } => write!(f, "unnamed source joint {joint} has no supported destination"),
+            Self::Unsupported {
+                joint,
+                name: Some(name),
+            } => write!(
+                f,
+                "source joint {joint} `{name}` has no supported destination"
+            ),
+            Self::Unsupported { joint, name: None } => write!(
+                f,
+                "unnamed source joint {joint} has no supported destination"
+            ),
         }
     }
 }

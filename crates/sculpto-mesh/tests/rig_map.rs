@@ -19,11 +19,15 @@ const IDENTITY: [[f32; 4]; 4] = [
 ];
 
 fn rig(names: &[&str], frame: RigFrame) -> Rig {
-    let joints = names.iter().enumerate().map(|(index, name)| Joint {
-        name: Some((*name).into()),
-        parent: (index > 0).then_some(ROOT),
-        rest: LocalTransform::default(),
-    }).collect();
+    let joints = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| Joint {
+            name: Some((*name).into()),
+            parent: (index > 0).then_some(ROOT),
+            rest: LocalTransform::default(),
+        })
+        .collect();
     Rig::new(joints, frame).expect("a valid joint graph")
 }
 
@@ -36,9 +40,18 @@ fn with_binding(test: impl FnOnce(&RestBinding<'_>)) {
         influences: SkinWeights::new(vec![0, 3], vec![0, 1, 2], vec![0.7, 0.3, 0.0], 3)
             .expect("one source row"),
     };
-    let binding = RestBinding::prove(&source, RigFrame::SourceZUp, &[SkinRestSource {
-        shape: 0, root: ROOT, positions: &positions, skin: &skin, global_to_skin: IDENTITY,
-    }]).expect("checked source");
+    let binding = RestBinding::prove(
+        &source,
+        RigFrame::SourceZUp,
+        &[SkinRestSource {
+            shape: 0,
+            root: ROOT,
+            positions: &positions,
+            skin: &skin,
+            global_to_skin: IDENTITY,
+        }],
+    )
+    .expect("checked source");
     test(&binding);
 }
 
@@ -51,16 +64,30 @@ fn maps_exact_ids_and_reports_positive_source_coverage() {
         assert!(std::ptr::eq(map.source(), source.rig()));
         assert!(std::ptr::eq(map.target(), &target));
         assert_eq!(map.entries().len(), 4);
-        assert_eq!(map.entries()[ARM.index()].destination, Destination::Direct(AUX));
+        assert_eq!(
+            map.entries()[ARM.index()].destination,
+            Destination::Direct(AUX)
+        );
         assert_eq!(map.resolve(ARM), Ok(AUX));
-        let weighted: Vec<_> = map.entries().iter().filter(|entry| entry.weighted)
-            .map(|entry| entry.source).collect();
+        let weighted: Vec<_> = map
+            .entries()
+            .iter()
+            .filter(|entry| entry.weighted)
+            .map(|entry| entry.source)
+            .collect();
         assert_eq!(weighted, [ARM, AUX]);
-        assert_eq!(map.resolve(AUX), Err(BoneMapError::Unsupported {
-            joint: AUX, name: Some("Aux".into()),
-        }));
+        assert_eq!(
+            map.resolve(AUX),
+            Err(BoneMapError::Unsupported {
+                joint: AUX,
+                name: Some("Aux".into()),
+            })
+        );
         let outside = JointId::new(80);
-        assert_eq!(map.resolve(outside), Err(BoneMapError::UnknownSource(outside)));
+        assert_eq!(
+            map.resolve(outside),
+            Err(BoneMapError::UnknownSource(outside))
+        );
     });
 }
 
@@ -68,18 +95,40 @@ fn maps_exact_ids_and_reports_positive_source_coverage() {
 fn only_an_explicit_collapse_resolves_a_missing_name() {
     with_binding(|source| {
         let target = rig(&["Root", "Arm"], RigFrame::SourceZUp);
-        let declaration = Collapse { source: "Aux", target: "Arm" };
+        let declaration = Collapse {
+            source: "Aux",
+            target: "Arm",
+        };
         let make = |collapses: &[Collapse<'_>]| {
-            BoneMap::build(BodyFamily::ThreeBa, source, BodyFamily::Himbo, &target, collapses)
+            BoneMap::build(
+                BodyFamily::ThreeBa,
+                source,
+                BodyFamily::Himbo,
+                &target,
+                collapses,
+            )
         };
         let map = make(&[declaration]).expect("explicit collapse");
-        assert_eq!(map.entries()[AUX.index()].destination, Destination::Collapsed(ARM));
+        assert_eq!(
+            map.entries()[AUX.index()].destination,
+            Destination::Collapsed(ARM)
+        );
         assert_eq!(map.resolve(AUX), Ok(ARM));
-        assert!(matches!(make(&[declaration, declaration]), Err(BoneMapError::DuplicateCollapse { joint: AUX, .. })));
-        assert!(matches!(make(&[Collapse { source: "Arm", target: "Root" }]),
-            Err(BoneMapError::DirectCollapse { joint: ARM, .. })));
-        assert!(matches!(make(&[Collapse { source: "Aux", target: "Unknown" }]),
-            Err(BoneMapError::NamedJoint { side: "target", error: RigError::UnknownJointName { name } }) if name == "Unknown"));
+        assert!(matches!(
+            make(&[declaration, declaration]),
+            Err(BoneMapError::DuplicateCollapse { joint: AUX, .. })
+        ));
+        assert!(matches!(
+            make(&[Collapse {
+                source: "Arm",
+                target: "Root"
+            }]),
+            Err(BoneMapError::DirectCollapse { joint: ARM, .. })
+        ));
+        assert!(
+            matches!(make(&[Collapse { source: "Aux", target: "Unknown" }]),
+            Err(BoneMapError::NamedJoint { side: "target", error: RigError::UnknownJointName { name } }) if name == "Unknown")
+        );
     });
 }
 
@@ -105,13 +154,19 @@ fn refuses_ambiguous_joints_other_pairs_and_mixed_frames() {
 
 fn complete(root: &Path, body: &str, template: &str) -> (NifDocument, Rig) {
     let body = read(&std::fs::read(root.join(body)).expect("configured body")).expect("body NIF");
-    let template = read(&std::fs::read(root.join(template)).expect("configured template")).expect("template NIF");
+    let template = read(&std::fs::read(root.join(template)).expect("configured template"))
+        .expect("template NIF");
     let authored = body.rig.as_ref().expect("source graph");
     let template = template.rig.as_ref().expect("template graph");
-    let completed = complete_family_rig(authored, template, TemplateRoots {
-        authored: authored.roots()[0],
-        template: template.roots()[0],
-    }).expect("completed family hierarchy");
+    let completed = complete_family_rig(
+        authored,
+        template,
+        TemplateRoots {
+            authored: authored.roots()[0],
+            template: template.roots()[0],
+        },
+    )
+    .expect("completed family hierarchy");
     (body, completed)
 }
 
@@ -138,8 +193,13 @@ fn configured_body_family_maps_measure_every_weighted_joint() {
         let map = BoneMap::build(origin, binding, family, target, &[]).expect("body map");
         let mut coverage = (0, 0);
         for entry in map.entries().iter().filter(|entry| entry.weighted) {
-            let name = map.source().joint(entry.source).expect("source joint")
-                .name.as_deref().expect("weighted joint name");
+            let name = map
+                .source()
+                .joint(entry.source)
+                .expect("source joint")
+                .name
+                .as_deref()
+                .expect("weighted joint name");
             match target.joint_by_name(name) {
                 Ok(id) => {
                     assert_eq!(entry.destination, Destination::Direct(id));
@@ -148,15 +208,22 @@ fn configured_body_family_maps_measure_every_weighted_joint() {
                 }
                 Err(RigError::UnknownJointName { .. }) => {
                     assert_eq!(entry.destination, Destination::Unsupported);
-                    assert_eq!(map.resolve(entry.source), Err(BoneMapError::Unsupported {
-                        joint: entry.source, name: Some(name.into()),
-                    }));
+                    assert_eq!(
+                        map.resolve(entry.source),
+                        Err(BoneMapError::Unsupported {
+                            joint: entry.source,
+                            name: Some(name.into()),
+                        })
+                    );
                     coverage.1 += 1;
                 }
                 Err(error) => panic!("{error}"),
             }
         }
         assert_eq!(coverage, expected);
-        eprintln!("{origin:?} -> {family:?}: {} direct, {} unsupported", coverage.0, coverage.1);
+        eprintln!(
+            "{origin:?} -> {family:?}: {} direct, {} unsupported",
+            coverage.0, coverage.1
+        );
     }
 }
