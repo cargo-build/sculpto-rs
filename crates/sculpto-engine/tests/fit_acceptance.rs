@@ -526,10 +526,15 @@ fn configured_ordinary_outputs_meet_contact_and_construction_bounds() {
         OrthographicFrame::new([[-43.0, 43.0], [-8.0, 126.0]], RasterSettings::default())
             .expect("frozen Apachii frame");
     let feet = document(&mods.join("bijin-warmaidens/Bijin Warmaidens v3.1.3/03 CBBE/meshes/actors/character/Bijin Warmaidens/femalefeet_1.nif"));
-    let male_feet = document(&mods.join("himbo-v5-core/CalienteTools/BodySlide/ShapeData/HIMBO Res/HIMBO Feet.nif"));
+    let male_feet = document(
+        &mods.join("himbo-v5-core/CalienteTools/BodySlide/ShapeData/HIMBO Res/HIMBO Feet.nif"),
+    );
     assert_eq!(male_feet.shapes.len(), 1, "pinned raw HIMBO feet");
     assert_eq!(
-        (male_feet.shapes[0].positions.len(), male_feet.shapes[0].triangles.len()),
+        (
+            male_feet.shapes[0].positions.len(),
+            male_feet.shapes[0].triangles.len()
+        ),
         (1284, 2244),
         "feet reference must match the raw HIMBO family"
     );
