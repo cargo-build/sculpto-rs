@@ -8,6 +8,10 @@ of them. The complete raw-garment-to-finished-outfit workflow is experimental.
 
 ## Build and use
 
+The [agent and engine navigator](AGENTS.md#start-here--engine-help) connects
+commands, owning crates, verification and remaining work. It distinguishes
+argv-only operations from the JSON/MCP registry.
+
 Rust 1.99 or newer, edition 2024:
 
 ```sh
