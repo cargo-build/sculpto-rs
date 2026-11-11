@@ -226,10 +226,10 @@ fn mismatched_or_ambiguous_checked_sources_are_refused() {
 }
 
 #[test]
-fn configured_default_body_rigs_reconstruct_and_pose_through_glb() {
+fn configured_family_body_rigs_reconstruct_and_pose_through_glb() {
     let Some(root) = std::env::var_os("SCULPTO_RIG_TEMPLATE_FIXTURES") else {
         eprintln!(
-            "SKIP configured_default_body_rigs_reconstruct_and_pose_through_glb: SCULPTO_RIG_TEMPLATE_FIXTURES is unset"
+            "SKIP configured_family_body_rigs_reconstruct_and_pose_through_glb: SCULPTO_RIG_TEMPLATE_FIXTURES is unset"
         );
         return;
     };
