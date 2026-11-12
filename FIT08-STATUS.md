@@ -1,4 +1,4 @@
-# FIT-08 progress — 2026-11-11
+# FIT-08 progress — 2026-11-12
 
 **Status: In progress. This branch is a requested progress publication.**
 The production fitting workflow has not passed the complete FIT-08 acceptance.
@@ -79,14 +79,18 @@ output independently of command reports: full solid references, source topology,
 body contacts, inside counts, self contacts, orientation, fixed silhouette,
 weights, locks and posed follow through GLB/Actor. It composes placed body and
 feet through the existing named NIF reference API. The portable transformed
-extra-part regression passes. Male feet are now explicitly included too;
-that expanded configured run is pending at this snapshot.
+extra-part regression passes. The expanded configured run now includes male
+feet too: male reference10630 vertices/20318 faces, female5825/10488.
 
-The latest completed registered-command run, before the male-feet addition,
-still fails Sentinel Armor001 (148 body contacts, 74 inside) and original
-Nightshade pants (574 body + 92 feet contacts, 13 inside). Armor001_1, belt
-and sleeves pass that run's contact checks. Derived weight, mask, lock and
-pose controls pass; this does not certify the failed geometry.
+The latest completed registered-command run fails Sentinel Armor001
+(148 body contacts,74 inside), Armor001_1 (0 body +12 feet contacts,0 inside)
+and original Nightshade pants (574 body +92 feet contacts,13 inside).
+Belt and sleeves pass contact checks. Adding the previously omitted male feet
+exposed the trousers'12 contacts; their earlier body-only result was incomplete.
+Derived weight, mask, lock and pose controls pass on all five pieces.
+Actual result:4 tests pass,1 configured geometry test fails,34.02s test time.
+Build passes. This remains a failing workflow, distinct from the qualified
+prepared-pants static experiment above.
 
 Required next work:
 
