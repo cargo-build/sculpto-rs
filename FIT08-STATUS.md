@@ -7,22 +7,26 @@ does not mark the integrated task Done.
 
 ## Latest Rust pants result
 
-The recovered prepared pants also pass static clearance with **two calls to
-the existing Rust clipping repair**, in 0.482 seconds. Actual body and feet
+The recovered prepared pants now pass the **registered engine fitting command**
+with bounded repetition of the existing Rust clipping repair. Actual body and feet
 contacts, inside groups, new self contacts and flipped faces are all zero.
-Original fixed-frame IoU is **0.9294741133**, above **0.8883417222**. The maximum
-symmetric retained-edge strain is 0.3298687721; all three openings, exact UV
+Original fixed-frame IoU is **0.9275814370**, above **0.8883417222**. The maximum
+symmetric retained-edge strain is 0.344897424; all three openings, exact UV
 corners and prepared topology survive. No native backend is needed for this result.
+The integrated debug fit took **5.444 seconds**. The earlier 0.482-second release
+probe used two external calls; these are different measured executions.
 
 The registered-command acceptance now composes original source selection and
 disk recovery → prepared NIF → fit → weight/mask checks → GLB/Actor pose.
 The [fixture profile and provenance](crates/sculpto-engine/tests/fixtures/fit08/README.md)
 record the explicit preparation inputs and original-source accounting.
-The 370-vertex prepared pants pass that weight/pose handoff: 173 vertices move,
+The 370-vertex prepared pants pass that weight/pose handoff: 174 vertices move,
 none detach, at most three influences, maximum sum error 1.20e-7, and 132
-locked-bone rows remain exact. The current integrated repair still leaves 83
-body triangle contacts after its first pass; bounded repetition is being added
-to the existing repair owner. These results do not yet close FIT-08.
+locked-bone rows remain exact. Each authoring repair branch allows at most
+`max(1, clipping_passes)` stages and stops when clear or when no candidate
+improves contacts while preserving the original orientation and self-contact
+guards. Six new repair controls and 22 existing SurfaceFit tests pass; scoped
+Clippy and formatting pass. These results do not yet close FIT-08.
 
 ## Earlier qualifying native reference
 
@@ -102,20 +106,20 @@ extra-part regression passes. The expanded configured run now includes male
 feet too: male reference10630 vertices/20318 faces, female5825/10488.
 
 The latest completed registered-command run fails Sentinel Armor001
-(148 body contacts,74 inside), Armor001_1 (0 body +12 feet contacts,0 inside)
-and prepared Nightshade pants after one repair pass (83 body,0 feet/inside).
+(148 body contacts,74 inside) and Armor001_1 (0 body +11 feet contacts,0 inside).
+Prepared Nightshade pants now pass, alongside belt and sleeves.
 The original capped pants previously had574 body +92 feet contacts,13 inside.
-Belt and sleeves pass contact checks. Adding the previously omitted male feet
+Adding the previously omitted male feet
 exposed the trousers'12 contacts; their earlier body-only result was incomplete.
 Derived weight, mask, lock and pose controls pass on all five pieces.
-Actual result:4 tests pass,1 configured geometry test fails,33.78s test time.
+Actual result:4 tests pass,1 configured geometry test fails,46.44s test time.
 Build passes. This remains a failing workflow, distinct from the qualified
 prepared-pants static experiment above.
 
 Required next work:
 
-- Integrate bounded Rust clipping repair into the verified pants preparation,
-  lineage and fitted pose path; complete appearance/export qualification.
+- Complete appearance/export qualification beyond the verified pants
+  preparation, clipping, lineage and fitted pose path.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
   diagnostic variants remain unqualified.
 - Complete the robe's ordinary/Blender Cloth boundary acceptance.
@@ -149,7 +153,25 @@ The operator requested UMA intake before considering algorithm reuse.
 [UMA upstream](https://github.com/umasteeringgroup/UMA) is present in the local
 source collection, refreshed to master
 `0d65997d319d8e08f478c540d171f03e5da1979a` and catalogued. Its clothing conformer,
-binding data, mesh utility and tests are being audited by three independent
+binding data, mesh utility and tests were audited by three independent
 DeepSeek workers: binding/topology, collision/seams, and tests/callers. No UMA
 algorithm has been adopted or credited with closing FIT-08. Unreal is outside
 this investigation.
+
+Source-backed conclusions at that pin:
+
+- A changed body or clothing topology requires rebinding. The conformer does
+  not supply correspondence between arbitrary body topologies.
+- Collision correction pushes vertices along their mapped surface normals;
+  it does not prove triangle/edge clearance or preserve a measured contact set.
+- Its dedicated test file contains four mathematical helper cases; those
+  tests do not exercise the complete binding/conforming/export workflow.
+- Useful future audit targets are explicit binding identity, reporting failed
+  correspondence, and negative cases around UV seams and postprocessing.
+  Sculpto already owns triangle-frame offset transport and guarded clipping;
+  replacing those implementations wholesale is not justified by this audit.
+
+Primary sources: [conformer](https://github.com/umasteeringgroup/UMA/blob/0d65997d319d8e08f478c540d171f03e5da1979a/UMAProject/Assets/UMA/Core/Scripts/ClothingConformer/UMAClothingConformer.cs#L349),
+[collision correction](https://github.com/umasteeringgroup/UMA/blob/0d65997d319d8e08f478c540d171f03e5da1979a/UMAProject/Assets/UMA/Core/Scripts/ClothingConformer/UMAClothingConformer.cs#L957),
+[tests](https://github.com/umasteeringgroup/UMA/blob/0d65997d319d8e08f478c540d171f03e5da1979a/UMAProject/Assets/UMA/Core/Editor/Tests/UMAClothingConformerTests.cs).
+This was a source audit; Unity tests were not run.

@@ -30,6 +30,9 @@ pub struct FitRepairReport {
 /// Keep the repaired preview unless the full fit improves at least one
 /// contact measure, preserves both bounds and retains original orientation.
 /// New self contacts are checked against the original garment. @req DECL0013
+/// Each repair branch allows `clipping_passes` stages, stopping at clearance or
+/// no guarded improvement. Zero retains one mandatory poke-only stage; it disables
+/// retries and the stage's inside projection, not the authoring repair itself.
 ///
 /// # Errors
 /// Refuses invalid fit or repair inputs and non-finite results.
@@ -39,11 +42,13 @@ pub fn fit_and_repair(
     lock: Option<&VertexMask>,
     options: &FitOptions,
 ) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
-    let repair = |mesh: Mesh<'_>| repair_after_fit(mesh, body, lock, options);
-    let (mut preview, mut before) = repair(garment)?;
+    validate_repair_input(garment, body, lock, options)?;
     let original_contacts: HashSet<_> = self_intersection_witnesses(garment.0, garment.1)
         .into_iter()
         .collect();
+    let repair =
+        |mesh: Mesh<'_>| bounded_repair(mesh, body, lock, options, garment, &original_contacts);
+    let (mut preview, mut before) = repair(garment)?;
     if !preserves_self_contacts(&original_contacts, (&preview, garment.1)) {
         preview = garment.0.to_vec();
         before = measure_contacts(garment, body, &BodySurface::build(body.0, body.1), options);
@@ -57,10 +62,7 @@ pub fn fit_and_repair(
         return Ok((preview, before));
     }
     let (candidate, after) = repair((&positions, garment.1))?;
-    if after.inside_after <= before.inside_after
-        && after.intersection_pairs <= before.intersection_pairs
-        && (after.inside_after < before.inside_after
-            || after.intersection_pairs < before.intersection_pairs)
+    if improves_contacts(&after, &before)
         && count_flipped(garment.0, &candidate, garment.1) == 0
         && preserves_self_contacts(&original_contacts, (&candidate, garment.1))
     {
@@ -68,6 +70,58 @@ pub fn fit_and_repair(
     } else {
         Ok((preview, before))
     }
+}
+
+/// Retry only accepted repairs; the authoring source remains the guard baseline.
+/// @req DECL0013
+fn bounded_repair(
+    garment: Mesh<'_>,
+    body: Mesh<'_>,
+    lock: Option<&VertexMask>,
+    options: &FitOptions,
+    original: Mesh<'_>,
+    original_contacts: &HashSet<Witness>,
+) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
+    let surface = BodySurface::build(body.0, body.1);
+    let mut positions = garment.0.to_vec();
+    let mut report = measure_contacts(garment, body, &surface, options);
+    for _ in 0..options.clipping_passes.max(1) {
+        if report.inside_after == 0 && report.intersection_pairs == 0 {
+            break;
+        }
+        let (candidate, after) = repair_after_fit((&positions, garment.1), body, lock, options)?;
+        if !improves_contacts(&after, &report)
+            || count_flipped(original.0, &candidate, original.1) != 0
+            || !preserves_self_contacts(original_contacts, (&candidate, garment.1))
+        {
+            break;
+        }
+        positions = candidate;
+        report = FitRepairReport {
+            poke_repair_applied: report.poke_repair_applied || after.poke_repair_applied,
+            projection_applied: report.projection_applied || after.projection_applied,
+            ..after
+        };
+    }
+    Ok((positions, report))
+}
+
+fn improves_contacts(candidate: &FitRepairReport, before: &FitRepairReport) -> bool {
+    candidate.inside_after <= before.inside_after
+        && candidate.intersection_pairs <= before.intersection_pairs
+        && (candidate.inside_after < before.inside_after
+            || candidate.intersection_pairs < before.intersection_pairs)
+}
+
+fn validate_repair_input(
+    garment: Mesh<'_>,
+    body: Mesh<'_>,
+    lock: Option<&VertexMask>,
+    options: &FitOptions,
+) -> Result<(), ClipFixError> {
+    options.validate().map_err(ClipFixError::FitOptions)?;
+    validate_lengths(garment.0.len(), lock, options, false).map_err(ClipFixError::FitOptions)?;
+    validate_geometry(garment, body).map_err(ClipFixError::Geometry)
 }
 
 /// Repair a fitted garment, measuring and retaining the better geometry.
@@ -84,9 +138,7 @@ pub fn repair_after_fit(
     lock: Option<&VertexMask>,
     options: &FitOptions,
 ) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
-    options.validate().map_err(ClipFixError::FitOptions)?;
-    validate_lengths(garment.0.len(), lock, options, false).map_err(ClipFixError::FitOptions)?;
-    validate_geometry(garment, body).map_err(ClipFixError::Geometry)?;
+    validate_repair_input(garment, body, lock, options)?;
 
     let surface = BodySurface::build(body.0, body.1);
     let contacts =
