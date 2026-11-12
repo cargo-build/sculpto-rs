@@ -55,6 +55,19 @@ are fractional on this open body, so they do not justify replacing the inside
 test. These diagnostics changed no production geometry, thresholds or acceptance
 criteria. The ordinary-case result remains **four of five**.
 
+A bounded source-layer coupling experiment was also rejected. It added 1,397
+source normal-ray displacement links to the existing SurfaceFit solver and
+produced 254 full-reference pairs, 24 inside groups, 99 new self contacts and
+11 face flips. IoU 0.98722 alone did not qualify it. The experimental changes
+were removed; the production tree and four-of-five result are unchanged.
+
+The November 8 dress lab is retained as experience, not a golden recipe.
+Its useful lessons concern cloth versus leg skinning, measured pins, scene
+scale, modifier order and animation continuity. Its final gown still reported
+body contacts. Neither its parameters nor its remaining defects replace the
+current acceptance criteria. Sculpto selects regions; Blender owns simulation
+and garment-specific cloth settings.
+
 ## Latest Rust pants result
 
 The recovered prepared pants now pass the **registered engine fitting command**
