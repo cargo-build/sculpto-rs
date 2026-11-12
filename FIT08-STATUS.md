@@ -5,7 +5,7 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
-## Paused checkpoint — opening repair integrated
+## Current verified checkpoint — opening repair integrated
 
 Reusable opening repair is implemented and the placed-source engine path opts
 into positive Z. Five portable controls and 29 configured mesh integration/
@@ -16,7 +16,24 @@ Armor001_1:0 body/feet/inside/newself/flips,IoU0.9496206587,354moving vertices,
 takes17.10s. Main-coat contacts and the robe boundary remain unresolved.
 
 This is a pushed work-in-progress checkpoint, not a main landing or FIT-08 Done.
-The goal is paused at the operator’s request.
+The goal has resumed from this checkpoint.
+
+The count refers to static fit, masks, weights and posed-follow checks on
+five ordinary garment cases. It does **not** mean that FIT-08, all animation
+clearance, appearance/export, the full gate or main landing is complete.
+Recorded configured run: engine checkpoint `26a2f403`, log `0210`.
+
+| Garment case | Body pairs | Foot pairs | Inside groups | Scoped result |
+|---|---:|---:|---:|---|
+| Sentinel Armor001 | 148 | 0 | 74 | Fail |
+| Sentinel Armor001_1 | 0 | 0 | 0 | Pass |
+| Nightshade prepared pants | 0 | 0 | 0 | Pass |
+| Nightshade belt | 0 | 0 | 0 | Pass |
+| Nightshade sleeves | 0 | 0 | 0 | Pass |
+
+All five outputs also passed the recorded weight/mask/lock/posed-follow controls;
+the main coat fails the geometric criterion. The enclosing configured test
+therefore fails, as it must until every required case qualifies.
 
 ## Latest Rust pants result
 
@@ -125,35 +142,33 @@ follow. Complete male and female reference parts remain included.
 Actual suite result:4 tests pass,1 configured geometry test fails,45.31s total.
 Build and scoped Clippy pass. No complete gate or main landing is claimed.
 
-Required next work:
+### Earlier auxiliary experiments — historical
 
-Sentinel auxiliary diagnosis localized all11 remaining foot contacts to three
+Before the integrated opening repair, Sentinel auxiliary diagnosis localized11 foot contacts to three
 retained ankle faces (1151,1182,1183). Its source already has a waist and two open
 cuffs. Existing guide-facing selection retains those faces while removing40
 others and creating an unwanted fourth opening; that preparation is rejected.
-The next correction must keep the original construction and address the actual
-ankle-face geometry. No contact-driven trimming was applied.
+That diagnosis required preserving construction while addressing the ankle faces. No contact-driven trimming was applied.
 
 A whole-face plane diagnostic clears the11 contacts with0inside/new self/flips,
 but is rejected for deformation: one cuff edge contracts from1.75 to0.58 source
 units. The source-direct variant also stretches a thigh edge from1.64 to4.71.
-The production path retains its honest residuals. A coherent patch correction
-is the next candidate; zero contacts alone is insufficient.
+That rejected candidate retained honest residuals; zero contacts alone was insufficient.
 
 Connected contact-patch translation with displacement propagation also clears
 the auxiliary piece in two stages, with no inside/new self/flips and original
 IoU0.96282. It preserves the contacted faces' internal shape, but a neighboring
 edge still stretches0.60→1.05 units (source strain0.748). That exceeds the enabled
-local deformation bound; the diagnostic is not adopted. Three of five ordinary
-pieces remain verified in the registered workflow.
+local deformation bound; that diagnostic was rejected. It is not the later
+whole-opening implementation used by the current checkpoint.
 
 A later auxiliary candidate passes static checks: move the complete cuff openings
 upward by1.72/1.77 source units with a bounded geodesic transition. This slightly
 shortens fitted legs while retaining opening XY shape,702vertices/1200faces and
 exact welded seams. Full body+feet contacts,inside,new self and flips are0;
 original IoU0.94962≥0.90407; additional symmetric edge strain0.13039≤0.3.
-Worst source strain stays at the existing fit's0.40414. It remains a diagnostic
-pending reusable implementation, matched review and registered weight/pose checks.
+Worst source strain stays at the existing fit's0.40414. This diagnostic became
+the reusable opening repair; its command/weight/pose verification is recorded above.
 
 Matched geometric review now confirms the cuff contour is retained with a raised
 hem. The crops include the actual full-reference feet in blue; cameras and scale
@@ -165,9 +180,11 @@ are shared. These are diagnostic REST views, not textured or animation acceptanc
 | ![Original left cuff](assets/fit08/sentinel-opening-left-side-source.png) | ![Candidate left cuff](assets/fit08/sentinel-opening-left-side-candidate.png) |
 | ![Original right cuff](assets/fit08/sentinel-opening-right-side-source.png) | ![Candidate right cuff](assets/fit08/sentinel-opening-right-side-candidate.png) |
 
-Reusable opt-in repair is being implemented with an explicit caller direction,
+Reusable opt-in repair is implemented with an explicit caller direction,
 boundary-contact admission, masks/rigid parts, bounded work and measured quality
 guards. Interior contacts cannot choose a distant opening for this repair.
+
+### Remaining acceptance
 
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
@@ -179,8 +196,8 @@ guards. Interior contacts cannot choose a distant opening for this repair.
 
 Blender owns cloth simulation. Sculpto selects which parts/regions use Blender
 Cloth and which use ordinary rigging; HDT/Bullet runtime work is outside this
-scope. The latest operator request is a graceful sleep checkpoint. The goal is paused
-with FIT-08 unfinished; resume from this saved state.
+scope. Work has resumed from the published graceful sleep checkpoint; FIT-08
+remains unfinished.
 
 ## Negative evidence retained
 
