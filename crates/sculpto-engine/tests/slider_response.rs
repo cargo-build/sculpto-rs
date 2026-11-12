@@ -234,6 +234,50 @@ fn a_missing_selected_body_diff_leaves_no_output() {
 }
 
 #[test]
+fn registered_conform_resolves_external_body_data_and_refuses_a_missing_file() {
+    let external_project = PROJECT
+        .replace(
+            r#"<Shape target="BodyData">Body</Shape>"#,
+            r#"<Shape target="BodyData" DataFolder="Shared\Body">Body</Shape>"#,
+        )
+        .replace(r#"local="true""#, r#"local="false""#);
+    let fixture = Fixture::new("external-body-data");
+    let root = fixture.scratch.path();
+    std::fs::write(root.join("project.osp"), &external_project).expect("external project");
+    std::fs::create_dir_all(root.join("ShapeData/Shared/Body")).expect("external folder");
+    std::fs::rename(
+        root.join("ShapeData/Test/source.osd"),
+        root.join("ShapeData/Shared/Body/source.osd"),
+    )
+    .expect("authored external morphs");
+    let result = fixture.conform();
+    assert_eq!(result["sliders"], json!(["Lift", "Reverse"]));
+    let output = MorphContainer::parse_file(root.join("conformed.osd")).expect("conformed OSD");
+    let lift = output
+        .blocks
+        .iter()
+        .find(|block| block.name == "GarmentLift")
+        .expect("Lift block");
+    assert_eq!(lift.offsets.len(), 4);
+    assert!(
+        lift.offsets
+            .iter()
+            .all(|offset| (offset.delta[2] - 1.0).abs() < 1e-6)
+    );
+
+    let missing = Fixture::new("external-body-data-missing");
+    let root = missing.scratch.path();
+    std::fs::write(root.join("project.osp"), external_project).expect("external project");
+    let error = dispatch("outfit.conform", &missing.conform_request())
+        .expect_err("local data cannot replace a missing external reference");
+    assert_eq!(error.code(), "conform_unresolved_reference");
+    assert!(error.message().contains("Lift"));
+    assert!(error.message().contains("BodyData"));
+    assert!(error.message().contains("Shared/Body/source.osd"));
+    assert!(!root.join("conformed.osd").exists());
+}
+
+#[test]
 fn configured_sentinel_slider_endpoints_are_clear() {
     let (Some(home), Some(fixture)) = (
         std::env::var_os("SCULPTO_BODYSLIDE_HOME"),

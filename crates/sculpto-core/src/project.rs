@@ -63,7 +63,8 @@ pub struct ShapeRef {
     pub name: String,
     /// Target shape name used by slider records.
     pub target: String,
-    /// Optional per-shape data folder override.
+    /// Ordered semicolon-separated folders for non-local morph references.
+    /// Empty lists fall back to the set folder; empty components name ShapeData itself.
     pub data_folder: Option<String>,
     /// Smooth seams when generating normals.
     pub smooth_seam_normals: bool,

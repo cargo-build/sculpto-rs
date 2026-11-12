@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use sculpto_core::shape_data::MorphData;
-use sculpto_core::{Preset, Project, SliderSize, VertexOffset};
+use sculpto_core::{Preset, Project, SliderDataRef, SliderSet, SliderSize, VertexOffset};
 
 /// One resolved block and the shape it deforms.
 #[derive(Debug, Clone, PartialEq)]
@@ -250,8 +250,8 @@ impl BakePlan {
 
     /// Resolve with both overrides and a caller-supplied morph data loader.
     ///
-    /// `home` is the BodySlide directory: local references resolve under
-    /// `ShapeData/<data folder>/`, non-local ones under `Data/`.
+    /// Containers live under `home/ShapeData`: local records use the set folder;
+    /// external records select the first existing file in their target's folders.
     pub fn resolve_with_overrides<F, T>(
         project: &Project,
         preset: &Preset,
@@ -328,7 +328,7 @@ impl BakePlan {
                     });
                     continue;
                 };
-                let path = container_path(home, set, data.local, file);
+                let path = container_path(home, set, data, file);
                 if !cache.contains_key(&path) {
                     if !path.is_file() {
                         unresolved.push(UnresolvedRef {
@@ -427,15 +427,32 @@ impl BakePlan {
     }
 }
 
-fn container_path(home: &Path, set: &sculpto_core::SliderSet, local: bool, file: &str) -> PathBuf {
-    // Authored folders use Windows separators (`HIMBO Body\Vanilla`); on Linux
-    // they must become real path components.
-    let folder = set.data_folder.replace('\\', "/");
+/// Keep file selection independent of block lookup, matching native builds. @req BLD-05
+fn container_path(home: &Path, set: &SliderSet, data: &SliderDataRef, file: &str) -> PathBuf {
+    let root = home.join("ShapeData");
     let file = file.replace('\\', "/");
-    if local {
-        home.join("ShapeData").join(folder).join(file)
-    } else {
-        home.join("Data").join(file)
+    let path = |folder: &str| root.join(folder.replace('\\', "/")).join(&file);
+    let folders = match data.local {
+        true => None,
+        false => set
+            .shapes
+            .iter()
+            .find(|shape| shape.target == data.target)
+            .and_then(|shape| shape.data_folder.as_deref()),
+    };
+    let mut candidates = folders
+        .into_iter()
+        .flat_map(|list| list.split_terminator(';'))
+        .map(path);
+    let first = match candidates.next() {
+        Some(first) => first,
+        None => return path(&set.data_folder),
+    };
+    match first.is_file() {
+        true => first,
+        false => candidates
+            .find(|candidate| candidate.is_file())
+            .unwrap_or(first),
     }
 }
 

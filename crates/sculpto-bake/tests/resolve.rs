@@ -312,3 +312,269 @@ fn nonlocal_reference_uses_target_shape_folder() {
     assert!(plan.unresolved.is_empty(), "{:?}", plan.unresolved);
     assert_eq!(output, [[3.0, 0.0, 0.0]], "authored target folder must win");
 }
+
+struct FolderFixture(PathBuf);
+
+impl FolderFixture {
+    fn new(tag: &str) -> Self {
+        Self(home(tag))
+    }
+
+    fn write_osd(&self, relative: &str, blocks: &[(&str, Vec<VertexOffset>)]) -> PathBuf {
+        let path = self.0.join(relative);
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture folder");
+        std::fs::write(&path, container(blocks).to_osd_bytes().expect("OSD bytes"))
+            .expect("fixture OSD");
+        path
+    }
+
+    fn resolve(&self, project: &Project) -> BakePlan {
+        BakePlan::resolve(project, &preset(""), "Body", SliderSize::Big, &self.0)
+            .expect("production morph loader")
+    }
+}
+
+impl Drop for FolderFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn folder_project(folders: Option<&str>, local: bool) -> Project {
+    let mut project = project();
+    let set = &mut project.sets[0];
+    set.shapes[0].name = "RenderBody".into();
+    set.shapes[0].data_folder = folders.map(str::to_owned);
+    set.sliders[0].data[0].local = local;
+    project
+}
+
+#[test]
+fn local_records_ignore_external_shape_folders() {
+    let fixture = FolderFixture::new("local-override");
+    fixture.write_osd(
+        "ShapeData/HIMBO/body.osd",
+        &[("BodyLean", vec![offset(0, [2.0, 0.0, 0.0])])],
+    );
+    fixture.write_osd(
+        "ShapeData/Shared/Body/body.osd",
+        &[("BodyLean", vec![offset(0, [9.0, 0.0, 0.0])])],
+    );
+    let plan = fixture.resolve(&folder_project(Some(r"Shared\Body"), true));
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(
+        plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+        [[2.0, 0.0, 0.0]]
+    );
+}
+
+#[test]
+fn external_candidates_select_the_first_existing_file() {
+    let fixture = FolderFixture::new("ordered-folders");
+    std::fs::create_dir_all(fixture.0.join("ShapeData/Directory/nested/body.osd"))
+        .expect("a directory is not a container file");
+    fixture.write_osd(
+        "ShapeData/First/nested/body.osd",
+        &[("BodyLean", vec![offset(0, [3.0, 0.0, 0.0])])],
+    );
+    fixture.write_osd(
+        "ShapeData/Second/nested/body.osd",
+        &[("BodyLean", vec![offset(0, [9.0, 0.0, 0.0])])],
+    );
+    let mut project = folder_project(Some("Missing;Directory;First;Second;"), false);
+    project.sets[0].sliders[0].data[0].file = Some(r"nested\body.osd".into());
+    let plan = fixture.resolve(&project);
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(
+        plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+        [[3.0, 0.0, 0.0]]
+    );
+}
+
+#[test]
+fn a_missing_block_does_not_select_a_later_container() {
+    let fixture = FolderFixture::new("no-block-fallback");
+    fixture.write_osd("ShapeData/First/body.osd", &[]);
+    fixture.write_osd(
+        "ShapeData/Second/body.osd",
+        &[("BodyLean", vec![offset(0, [9.0, 0.0, 0.0])])],
+    );
+    let plan = fixture.resolve(&folder_project(Some("First;Second"), false));
+    assert_eq!(plan.block_count(), 0);
+    assert_eq!(plan.unresolved.len(), 1);
+    assert_eq!(plan.unresolved[0].target, "Body");
+    assert_eq!(
+        plan.unresolved[0].reason,
+        UnresolvedReason::MissingBlock("BodyLean".into())
+    );
+    assert_eq!(
+        plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+        [[0.0; 3]]
+    );
+}
+
+#[test]
+fn external_references_without_an_effective_override_use_the_set_folder() {
+    let fixture = FolderFixture::new("external-default-folder");
+    fixture.write_osd(
+        "ShapeData/HIMBO/body.osd",
+        &[("BodyLean", vec![offset(0, [2.0, 0.0, 0.0])])],
+    );
+    [None, Some("")].into_iter().for_each(|folders| {
+        let plan = fixture.resolve(&folder_project(folders, false));
+        assert!(plan.unresolved.is_empty(), "{folders:?}");
+        assert_eq!(
+            plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+            [[2.0, 0.0, 0.0]]
+        );
+    });
+    let mut project = folder_project(Some("Missing"), false);
+    project.sets[0].shapes[0].target = "AnotherTarget".into();
+    let plan = fixture.resolve(&project);
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(
+        plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+        [[2.0, 0.0, 0.0]]
+    );
+}
+
+#[test]
+fn missing_external_files_report_the_first_candidate_without_using_the_set_folder() {
+    let fixture = FolderFixture::new("external-missing-file");
+    fixture.write_osd(
+        "ShapeData/HIMBO/body.osd",
+        &[("BodyLean", vec![offset(0, [2.0, 0.0, 0.0])])],
+    );
+    let plan = fixture.resolve(&folder_project(
+        Some(r"Missing\First;Missing\Second"),
+        false,
+    ));
+    assert_eq!(plan.block_count(), 0);
+    assert_eq!(plan.unresolved.len(), 1);
+    assert_eq!(plan.unresolved[0].slider, "Lean");
+    assert_eq!(
+        plan.unresolved[0].reason,
+        UnresolvedReason::MissingFile(fixture.0.join("ShapeData/Missing/First/body.osd"))
+    );
+}
+
+#[test]
+fn folder_lists_preserve_native_empty_components_and_whitespace() {
+    let fixture = FolderFixture::new("native-folder-components");
+    fixture.write_osd(
+        "ShapeData/body.osd",
+        &[("BodyLean", vec![offset(0, [3.0, 0.0, 0.0])])],
+    );
+    fixture.write_osd(
+        "ShapeData/ Later/body.osd",
+        &[("BodyLean", vec![offset(0, [7.0, 0.0, 0.0])])],
+    );
+    fixture.write_osd(
+        "ShapeData/Later/body.osd",
+        &[("BodyLean", vec![offset(0, [9.0, 0.0, 0.0])])],
+    );
+    [
+        (";", 3.0),
+        (";Later", 3.0),
+        ("Missing;;Later", 3.0),
+        (" Later", 7.0),
+        ("Missing; Later", 7.0),
+    ]
+    .into_iter()
+    .for_each(|(folders, expected)| {
+        let plan = fixture.resolve(&folder_project(Some(folders), false));
+        assert!(plan.unresolved.is_empty(), "{folders:?}");
+        assert_eq!(
+            plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+            [[expected, 0.0, 0.0]],
+            "{folders:?}"
+        );
+    });
+    let trailing = fixture.resolve(&folder_project(Some("Missing;"), false));
+    assert_eq!(
+        trailing.unresolved[0].reason,
+        UnresolvedReason::MissingFile(fixture.0.join("ShapeData/Missing/body.osd"))
+    );
+}
+
+#[test]
+fn cache_identity_uses_the_selected_path_and_reuses_blocks_from_one_file() {
+    let fixture = FolderFixture::new("external-cache");
+    let body = fixture.write_osd(
+        "ShapeData/Body/body.osd",
+        &[
+            ("First", vec![offset(0, [1.0, 0.0, 0.0])]),
+            ("Second", vec![offset(0, [2.0, 0.0, 0.0])]),
+        ],
+    );
+    let boots = fixture.write_osd(
+        "ShapeData/Boots/body.osd",
+        &[("First", vec![offset(0, [9.0, 0.0, 0.0])])],
+    );
+    let mut project = folder_project(Some("Body"), false);
+    let set = &mut project.sets[0];
+    let mut shape = set.shapes[0].clone();
+    shape.name = "RenderBoots".into();
+    shape.target = "Boots".into();
+    shape.data_folder = Some("Boots".into());
+    set.shapes.push(shape);
+    let mut reference = set.sliders[0].data[0].clone();
+    reference.record = Some("First".into());
+    set.sliders[0].data = vec![reference.clone()];
+    reference.target = "Boots".into();
+    set.sliders[0].data.push(reference.clone());
+    reference.target = "Body".into();
+    reference.record = Some("Second".into());
+    set.sliders[0].data.push(reference);
+    let mut loaded = Vec::new();
+    let plan = BakePlan::resolve_with(
+        &project,
+        &preset(""),
+        "Body",
+        SliderSize::Big,
+        &fixture.0,
+        |path| {
+            loaded.push(path.to_path_buf());
+            sculpto_core::shape_data::MorphData::from_file(path).map_err(|source| {
+                BakeError::Container {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })
+        },
+    )
+    .expect("production morph loader");
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(loaded, [body, boots]);
+    assert_eq!(
+        plan.apply("Body", &[[0.0; 3]]).expect("body"),
+        [[3.0, 0.0, 0.0]]
+    );
+    assert_eq!(
+        plan.apply("Boots", &[[0.0; 3]]).expect("boots"),
+        [[9.0, 0.0, 0.0]]
+    );
+}
+
+#[test]
+fn external_bare_bsd_uses_the_selected_shape_folder() {
+    let fixture = FolderFixture::new("external-bsd");
+    let directory = fixture.0.join("ShapeData/Shared/Body/nested");
+    std::fs::create_dir_all(&directory).expect("BSD folder");
+    std::fs::write(
+        directory.join("body.bsd"),
+        sculpto_core::shape_data::to_bsd_bytes(&[offset(0, [4.0, 0.0, 0.0])]).expect("BSD bytes"),
+    )
+    .expect("BSD file");
+    let mut project = folder_project(Some(r"Shared\Body"), false);
+    let data = &mut project.sets[0].sliders[0].data[0];
+    data.file = Some(r"nested\body.bsd".into());
+    data.record = None;
+    let plan = fixture.resolve(&project);
+    assert!(plan.unresolved.is_empty());
+    assert_eq!(plan.sliders[0].shapes[0].block, "BodyLean");
+    assert_eq!(
+        plan.apply("Body", &[[0.0; 3]]).expect("applies"),
+        [[4.0, 0.0, 0.0]]
+    );
+}
