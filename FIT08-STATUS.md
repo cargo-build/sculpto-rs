@@ -74,7 +74,7 @@ fresh Blender reopen and actual posed garment deformation remain separate
 proofs. Qualification/integration is in progress; no complete pack or Mike
 workflow has been established by the measurements below.
 
-## Current verified checkpoint — opening repair integrated
+## Historical fit checkpoint — opening repair integrated
 
 Reusable opening repair is implemented and the placed-source engine path opts
 into positive Z. Five portable controls and 29 configured mesh integration/
@@ -84,8 +84,8 @@ Armor001_1:0 body/feet/inside/newself/flips,IoU0.9496206587,354moving vertices,
 0detached,≤4influences,sum error1.20e-7,and exact locked weights. Its debug fit
 takes17.10s. Main-coat contacts and the robe boundary remain unresolved.
 
-This is a pushed work-in-progress checkpoint, not a main landing or FIT-08 Done.
-The goal has resumed from this checkpoint.
+Opening repair was first published as a work-in-progress checkpoint and later
+landed as a verified foundation. FIT-08 acceptance remains incomplete.
 
 The count refers to static fit, masks, weights and posed-follow checks on
 five ordinary garment cases. It does **not** mean that FIT-08, all animation
