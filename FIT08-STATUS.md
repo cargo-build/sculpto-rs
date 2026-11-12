@@ -146,6 +146,20 @@ original IoU0.94962≥0.90407; additional symmetric edge strain0.13039≤0.3.
 Worst source strain stays at the existing fit's0.40414. It remains a diagnostic
 pending reusable implementation, matched review and registered weight/pose checks.
 
+Matched geometric review now confirms the cuff contour is retained with a raised
+hem. The crops include the actual full-reference feet in blue; cameras and scale
+are shared. These are diagnostic REST views, not textured or animation acceptance.
+
+| Original | Opening-lift candidate |
+|---|---|
+| ![Original Sentinel auxiliary](assets/fit08/sentinel-opening-whole-front-source.png) | ![Opening-lift auxiliary](assets/fit08/sentinel-opening-whole-front-control.png) |
+| ![Original left cuff](assets/fit08/sentinel-opening-left-side-source.png) | ![Candidate left cuff](assets/fit08/sentinel-opening-left-side-candidate.png) |
+| ![Original right cuff](assets/fit08/sentinel-opening-right-side-source.png) | ![Candidate right cuff](assets/fit08/sentinel-opening-right-side-candidate.png) |
+
+Reusable opt-in repair is being implemented with an explicit caller direction,
+boundary-contact admission, masks/rigid parts, bounded work and measured quality
+guards. Interior contacts cannot choose a distant opening for this repair.
+
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
