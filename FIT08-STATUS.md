@@ -1,11 +1,35 @@
-# FIT-08 progress — 2026-11-12
+# FIT-08 progress — 2026-11-13
 
 **Status: In progress. This branch is a requested progress publication.**
 The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
-## Latest checkpoint — exact Bijin native pair and textured handoff
+## Latest checkpoint — repeatable native extraction, fit still rejected
+
+The private host wrapper now has a parameterized native-reference extraction
+command. An explicit recipe pins the selected native project/preset, exact body
+and parts, skeleton, default Bijin skin, tools and maps. The adapter composes the
+existing native build, common-frame assembly and Blender importer; it adds no
+fitting algorithm or cloth solver. Seven portable controls cover refusals,
+failed receipts, input drift and child-process cleanup. Independent advisory
+review findings were reproduced and repaired.
+
+Fresh `_0` and `_1` runs each preserve57 declared input pins. Their native NIFs
+are byte-identical to the earlier replay; geometry, triangles, UVs, bones,
+weights and materials match on all eight assembled meshes. Fresh Blender opens
+pass source/rest/image checks and controlled body/hands/robe pose smoke tests.
+`Produced` describes transport through these stages, not an accepted fit.
+
+Moving seam-driver probes reveal an additional input defect: the fixed Lydia
+head's neck misses exact Bijin `_0` by up to10.109mm, including sampled poses.
+The worst measured component gap on `_1` is0.174mm. The provisional head needs
+lower-endpoint adaptation with the accepted body protected. Nonmoving child-bone
+probes were rejected before checking the actual Forearm/Calf/Spine2 drivers.
+The rejected torso fit below also remains open. One robe does not establish
+the required broad Bijin/Mike clothing-cohort acceptance.
+
+## Exact Bijin native pair and textured handoff
 
 A native custom-reference pilot now produces distinct Apprentice robe endpoints
 against the exact Bijin Warmaidens option03 CBBE pair. This is a measured native

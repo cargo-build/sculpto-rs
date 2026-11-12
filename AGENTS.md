@@ -33,9 +33,10 @@ In the managed `sculpto-rs-wrapper/repos/sculpto-rs` checkout, the wrapper's
 AGENTS.md, issue journal, rules and source map govern coordinated work. Keep
 their affected bindings/metrics current and run the wrapper's full `just gate`
 before integration. Each independent source writer uses the wrapper's ignored
-`repos/jj-workspaces/sculpto-rs-<task>` container; wrapper writers use
-`repos/jj-workspaces/wrapper-<task>`. The workspace name equals its directory
-basename. Standalone build/test does not require the wrapper.
+`repos/jj-workspaces/sculpto-rs-<task>` container; the private management wrapper
+uses its primary copy and main, with serialized writes and no wrapper task
+workspaces. A source workspace name equals its directory basename. Standalone
+build/test does not require the wrapper.
 
 ## Start here — engine help
 
