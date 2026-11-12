@@ -6,7 +6,9 @@ Keep remaining command/workflow gaps explicit; direction is not acceptance.
 
 This independent repository contains the GPL-3.0-only implementation. Use
 Rust 2024 and the declared toolchain; keep core behavior in Rust and optional
-host adapters thin. Private asset payloads and renders never belong in VCS.
+host adapters thin. Private mod/model payloads stay outside VCS. Generated PNG
+geometry review renders may be published as explicitly labelled review evidence
+(operator,2026-11-08).
 
 Use jj for mutations and readable git diff. Confirm the task feature before
 editing/building; after jj describe immediately jj new. This implementation

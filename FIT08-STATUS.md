@@ -61,6 +61,17 @@ The frozen native executable is identified by SHA-256
 `7031a255961465bf824804b66bb2ba13ff9ce1549004d03e6c4b3d2edbe51d71`.
 This branch does not claim a portable native-backend installation.
 
+### Matched geometry review
+
+These are generated neutral review renders, with shared cameras and scale.
+They show the complete original pants and the prepared/fitted result. They
+do not replace the contact measurements or establish textured/posed acceptance.
+
+| Original | Prepared and fitted |
+|---|---|
+| ![Original pants, front](assets/fit08/fitted612-front-source.png) | ![Fitted pants, front](assets/fit08/fitted612-front-control.png) |
+| ![Original pants, side](assets/fit08/fitted612-side-source.png) | ![Fitted pants, side](assets/fit08/fitted612-side-control.png) |
+
 ## Integrated workflow and remaining work
 
 [fit_acceptance.rs](crates/sculpto-engine/tests/fit_acceptance.rs) checks written
@@ -111,8 +122,9 @@ above is a distinct, fully recorded source-construction route.
 ## UMA reference
 
 The operator requested UMA intake before considering algorithm reuse.
-[UMA upstream](https://github.com/umasteeringgroup/UMA) is already present in
-the local source collection and is being refreshed. Its clothing conformer,
+[UMA upstream](https://github.com/umasteeringgroup/UMA) is present in the local
+source collection, refreshed to master
+`0d65997d319d8e08f478c540d171f03e5da1979a` and catalogued. Its clothing conformer,
 binding data, mesh utility and tests are the bounded audit targets. No UMA
 algorithm has been adopted or credited with closing FIT-08. Unreal is outside
 this investigation.
