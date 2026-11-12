@@ -5,7 +5,62 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
-## Latest audit checkpoint — native BodySlide and morph lookup
+## Latest checkpoint — exact Bijin native pair and textured handoff
+
+A native custom-reference pilot now produces distinct Apprentice robe endpoints
+against the exact Bijin Warmaidens option03 CBBE pair. This is a measured native
+preparation/extraction reference, **not an accepted fit or a completed Sculpto
+pipeline**. Each assembly retains the original full body, matching hands/feet,
+a verified human Nord Lydia head with eyes/brows/mouth, and the native-built robe:
+eight meshes, 12,184 vertices, 19,746 triangles and one 89-node rig. The dense 3BA
+conversion reference is excluded from the accepted-body assembly.
+
+The target body endpoints differ by up to 1.6232 coordinate units; each remains
+unchanged within 7.56e-6 units in the declared common frame. Native preset routing
+selects the independent Bijin0 morph at `_0` and Bijin1 at `_1`. The paired `_1`
+garment reproduces the earlier pilot exactly. A +0.125X control is consumed within
+1.91e-6 units on all 18,436 auxiliary-reference vertices and 3,152/3,164 robe
+vertices. The 12 unmapped vertices are six duplicated lower-skirt positions;
+they remain disclosed. Native garment topology, UVs, weights, binds, bone names
+and texture references match the original authored garment. Three auxiliary-body
+weight rows change by at most 1.91e-6 during native saving; that auxiliary body
+never replaces Bijin.
+
+Both textured endpoints survive fresh Blender 5.2.3 reopen with source geometry,
+UVs, weights and three controlled skin poses on every mesh. Maximum measured
+skin prediction error is 1.67e-5 source units. Twenty-five named texture paths
+resolve explicitly; all 16 diffuse/normal images used by the material graphs
+decode from packed bytes matching their pinned sources. Skin comes from the
+supplied Bijin Skin CBBE defaults, rather than an unverified game Data alias.
+Measured XZY model-space normal decoding gives body mean agreement 0.974 versus
+0.428 for XYZ. This does not establish full Skyrim shader or animation parity.
+The chosen default skin replaces Lydia's NPC FaceTint appearance deliberately;
+her geometry is a replaceable human head. Hair is outside this pilot.
+
+**The fit fails visibly and numerically.** With the full exact body and feet
+retained, `_0` has 1,667 intersecting triangle pairs and `_1` has 1,849. Their
+self-contact counts are 1,329 and 1,357; the earlier neutral baseline has 1,322,
+including 387 exact duplicate face pairs. These totals do not identify new
+contacts or prove penetration depth. The original high-endpoint project's only
+nonzero default is BodyZap, which removes reference-body vertices, not robe
+geometry; an omitted hidden chest-correction explanation was falsified.
+No body hiding, contact-driven trimming or blanket garment inflation was used
+to turn these failures into passes.
+
+| Rejected fit candidate, front | Rejected fit candidate, side |
+|---|---|
+| ![Exact Bijin1 native pilot: visible torso clipping](assets/fit08/bijin-apprentice-native-pilot-front.png) | ![Same candidate: torso clipping from the side](assets/fit08/bijin-apprentice-native-pilot-side.png) |
+
+These generated rest views show the actual textured candidate at a shared
+scale; they are negative review evidence. Ordinary-region clearance and
+construction preservation remain unfinished. Blender owns cloth simulation;
+the loose robe panels must not be treated as a static shirt fitted to legs.
+The earlier foot-isolation smoke also remains failed: a source cross-side toe
+weight moves one right-foot vertex during a left-foot twist. Independent skin
+evaluation reproduces it; source-weight fidelity is not source-weight quality.
+Private source meshes, maps, native projects and blends are not distributed.
+
+## Earlier audit checkpoint — native BodySlide and morph lookup
 
 Native qualification attempted a frozen cohort of **865 BodySlide sets**:
 Sentinel HIMBO: 283; Daring Ranger: 2; 3BA: 114; CBBE Outfits: 466. These include
