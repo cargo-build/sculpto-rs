@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use sculpto_core::mesh::{MeshAsset, PartitionId};
 use sculpto_engine::{dispatch, obj};
 use sculpto_mesh::check::{intersection_pairs, self_intersection_witnesses};
+use sculpto_mesh::control::measure::ControlDiagnostics;
+use sculpto_mesh::control::{ControlProfile, SourceSurface, compact, source_selection};
 use sculpto_mesh::mask::VertexMask;
 use sculpto_mesh::outfit::ClothRegion;
 use sculpto_mesh::outfit::rigging::fit_rigged_regions;
@@ -24,6 +26,7 @@ struct Case {
     shape: &'static str,
     counts: (usize, usize),
     silhouette_baseline: f64,
+    preparation: Option<&'static str>,
 }
 
 struct Reference<'a> {
@@ -183,6 +186,153 @@ fn inside(garment: Mesh<'_>, body: Mesh<'_>) -> usize {
 }
 
 fn ordinary_case(
+    fixture: &Fixture,
+    garment_path: &Path,
+    reference: &Reference<'_>,
+    case: &Case,
+) -> (Value, Vec<String>) {
+    let Some(profile_path) = case.preparation else {
+        return fitted_case(fixture, garment_path, reference, case);
+    };
+    let original = document(garment_path);
+    let index = original
+        .shapes
+        .iter()
+        .position(|s| s.name == case.shape)
+        .expect("original shape");
+    let shape = &original.shapes[index];
+    assert_eq!((shape.positions.len(), shape.triangles.len()), case.counts);
+    let source = placed(&original, index);
+    let profile = ControlProfile::from_json(
+        &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(profile_path))
+            .expect("declared source profile"),
+    )
+    .expect("valid source preparation");
+    assert!(
+        profile.source_cuts.is_empty(),
+        "this source-face route does not execute native cuts"
+    );
+    let selection =
+        source_selection(&source, &shape.triangles, &profile).expect("qualified source selection");
+    let selected: Vec<_> = selection
+        .selected_faces
+        .iter()
+        .map(|&id| shape.triangles[id as usize])
+        .collect();
+    let (positions, triangles, origins) = compact(&source, &selected);
+    let physical = SourceSurface::identify(&positions, &triangles).expect("physical seam identity");
+    let diagnostics = ControlDiagnostics::measure(physical.positions(), physical.triangles())
+        .expect("prepared physical topology");
+    diagnostics
+        .qualify(&profile)
+        .expect("all intended openings, genus and no incidental defects");
+    let before = compare(
+        (&source, &shape.triangles),
+        (&positions, &triangles),
+        reference.frame,
+    )
+    .expect("original/prepared fixed frame");
+    assert_eq!(
+        before.iou, 1.0,
+        "preparation retains the original silhouette"
+    );
+    triangles
+        .iter()
+        .zip(&selection.selected_faces)
+        .for_each(|(face, &id)| {
+            assert_eq!(
+                face.map(|v| origins[v as usize]),
+                shape.triangles[id as usize],
+                "complete source corner lineage"
+            )
+        });
+    let source_asset = MeshAsset::from(shape);
+    let prepared = MeshAsset {
+        name: shape.name.clone(),
+        positions,
+        triangles,
+        uvs: origins.iter().map(|&v| shape.uvs[v as usize]).collect(),
+        triangle_partitions: selection
+            .selected_faces
+            .iter()
+            .map(|&id| source_asset.triangle_partitions[id as usize])
+            .collect(),
+        materials: source_asset.materials,
+        ..MeshAsset::default()
+    };
+    let prepared_path = fixture.root.join(format!("{}-prepared.nif", case.shape));
+    std::fs::write(
+        &prepared_path,
+        write_shape(&prepared, NifTarget::Se).expect("prepared source NIF"),
+    )
+    .expect("derived source file");
+    let readback = document(&prepared_path);
+    assert_eq!(
+        placed(&readback, 0),
+        prepared.positions,
+        "source scene placement preserved"
+    );
+    assert_eq!(readback.shapes[0].triangles, prepared.triangles);
+    assert_eq!(
+        readback.shapes[0].uvs, prepared.uvs,
+        "UV seams and corners survive the handoff"
+    );
+    let prepared_case = Case {
+        shape: case.shape,
+        counts: (prepared.positions.len(), prepared.triangles.len()),
+        silhouette_baseline: case.silhouette_baseline,
+        preparation: None,
+    };
+    let (mut measured, mut failures) =
+        fitted_case(fixture, &prepared_path, reference, &prepared_case);
+    // The acceptance collision assembly is source-world identity; fitted_case checks read-back.
+    let output = obj::read_obj_positions(&fixture.root.join(format!("{}.obj", case.shape)))
+        .expect("written prepared fit");
+    let final_overlap = compare(
+        (&source, &shape.triangles),
+        (&output, &prepared.triangles),
+        reference.frame,
+    )
+    .expect("complete original silhouette frame");
+    let physical =
+        SourceSurface::identify(&output, &prepared.triangles).expect("fitted physical identity");
+    ControlDiagnostics::measure(physical.positions(), physical.triangles())
+        .expect("fitted physical topology")
+        .qualify(&profile)
+        .expect("fitted openings and construction");
+    assert!(
+        self_intersection_witnesses(&source, &shape.triangles).is_empty(),
+        "this preparation fixture has no original self contacts"
+    );
+    if final_overlap.iou < case.silhouette_baseline {
+        failures.push(format!(
+            "{}: original silhouette {} < {}",
+            case.shape, final_overlap.iou, case.silhouette_baseline
+        ));
+    }
+    let kept: HashSet<_> = selection.selected_faces.iter().copied().collect();
+    let area = |face: [u32; 3]| {
+        normal(&source, face)
+            .iter()
+            .map(|n| n * n)
+            .sum::<f64>()
+            .sqrt()
+            * 0.5
+    };
+    let original_area = shape.triangles.iter().map(|&f| area(f)).sum::<f64>();
+    let omitted_area = shape
+        .triangles
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| !kept.contains(&(*id as u32)))
+        .map(|(_, &f)| area(f))
+        .sum::<f64>();
+    measured["preparation"] = json!({"profile":profile_path,"original_vertices":source.len(),"original_triangles":shape.triangles.len(),"source_vertices":origins,"source_faces":selection.selected_faces,
+        "recovered_source_faces":selection.recovery.disks.iter().flat_map(|d|d.faces.iter().copied()).collect::<Vec<_>>(),"original_area":original_area,"omitted_original_area":omitted_area,"omitted_original_area_share":omitted_area/original_area,"prepared_source_iou":before.iou,"original_fitted_iou":final_overlap.iou,"exact_uv_corners":true});
+    (measured, failures)
+}
+
+fn fitted_case(
     fixture: &Fixture,
     garment_path: &Path,
     reference: &Reference<'_>,
@@ -543,11 +693,13 @@ fn configured_ordinary_outputs_meet_contact_and_construction_bounds() {
             shape: "Armor001",
             counts: (2737, 4040),
             silhouette_baseline: 0.9372047546854745,
+            preparation: None,
         },
         Case {
             shape: "Armor001_1",
             counts: (702, 1200),
             silhouette_baseline: 0.9040660175646305,
+            preparation: None,
         },
     ];
     let apachii = [
@@ -555,16 +707,19 @@ fn configured_ordinary_outputs_meet_contact_and_construction_bounds() {
             shape: "pants",
             counts: (392, 632),
             silhouette_baseline: 0.8883417222146647,
+            preparation: Some("tests/fixtures/fit08/nightshade-pants-profile.json"),
         },
         Case {
             shape: "belt",
             counts: (403, 427),
             silhouette_baseline: 0.6361788617886179,
+            preparation: None,
         },
         Case {
             shape: "sleeves",
             counts: (556, 886),
             silhouette_baseline: 0.8338973076357217,
+            preparation: None,
         },
     ];
     let sentinel_body = fit.join("body.nif");

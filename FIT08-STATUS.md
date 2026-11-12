@@ -5,7 +5,24 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
-## First qualifying static pants result
+## Latest Rust pants result
+
+The recovered prepared pants also pass static clearance with **two calls to
+the existing Rust clipping repair**, in 0.482 seconds. Actual body and feet
+contacts, inside groups, new self contacts and flipped faces are all zero.
+Original fixed-frame IoU is **0.9294741133**, above **0.8883417222**. The maximum
+symmetric retained-edge strain is 0.3298687721; all three openings, exact UV
+corners and prepared topology survive. No native backend is needed for this result.
+
+The registered-command acceptance now composes original source selection and
+disk recovery → prepared NIF → fit → weight/mask checks → GLB/Actor pose.
+The 370-vertex prepared pants pass that weight/pose handoff: 173 vertices move,
+none detach, at most three influences, maximum sum error 1.20e-7, and 132
+locked-bone rows remain exact. The current integrated repair still leaves 83
+body triangle contacts after its first pass; bounded repetition is being added
+to the existing repair owner. These results do not yet close FIT-08.
+
+## Earlier qualifying native reference
 
 The pinned Apachii Nightshade pants now pass the measured static bounds through
 an explicit source-preparation stage followed by the existing native static
@@ -84,18 +101,19 @@ feet too: male reference10630 vertices/20318 faces, female5825/10488.
 
 The latest completed registered-command run fails Sentinel Armor001
 (148 body contacts,74 inside), Armor001_1 (0 body +12 feet contacts,0 inside)
-and original Nightshade pants (574 body +92 feet contacts,13 inside).
+and prepared Nightshade pants after one repair pass (83 body,0 feet/inside).
+The original capped pants previously had574 body +92 feet contacts,13 inside.
 Belt and sleeves pass contact checks. Adding the previously omitted male feet
 exposed the trousers'12 contacts; their earlier body-only result was incomplete.
 Derived weight, mask, lock and pose controls pass on all five pieces.
-Actual result:4 tests pass,1 configured geometry test fails,34.02s test time.
+Actual result:4 tests pass,1 configured geometry test fails,33.78s test time.
 Build passes. This remains a failing workflow, distinct from the qualified
 prepared-pants static experiment above.
 
 Required next work:
 
-- Integrate the qualified pants preparation/fitting route with explicit
-  original/prepared/output identity, appearance and fitted pose verification.
+- Integrate bounded Rust clipping repair into the verified pants preparation,
+  lineage and fitted pose path; complete appearance/export qualification.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
   diagnostic variants remain unqualified.
 - Complete the robe's ordinary/Blender Cloth boundary acceptance.
@@ -129,6 +147,7 @@ The operator requested UMA intake before considering algorithm reuse.
 [UMA upstream](https://github.com/umasteeringgroup/UMA) is present in the local
 source collection, refreshed to master
 `0d65997d319d8e08f478c540d171f03e5da1979a` and catalogued. Its clothing conformer,
-binding data, mesh utility and tests are the bounded audit targets. No UMA
+binding data, mesh utility and tests are being audited by three independent
+DeepSeek workers: binding/topology, collision/seams, and tests/callers. No UMA
 algorithm has been adopted or credited with closing FIT-08. Unreal is outside
 this investigation.
