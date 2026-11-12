@@ -35,6 +35,26 @@ All five outputs also passed the recorded weight/mask/lock/posed-follow controls
 the main coat fails the geometric criterion. The enclosing configured test
 therefore fails, as it must until every required case qualifies.
 
+### Main-coat diagnosis — 2026-11-12
+
+The current source has 951 self-contact witnesses. Their vertices form ten
+coherent groups, covering 564 physical vertices; none touches a source
+body-contact face. The earlier localized-fit experiment already locked every
+render alias of these vertices and still introduced 24 new crossings, or 47
+after repair. Locking existing folds alone is therefore insufficient.
+
+The source is manifold and consistently oriented, with 26 closed boundary
+loops across 26 components. Of its 148 body-contact pairs, 36 touch one actual
+boundary and 112 touch none. The existing complete-opening repair cannot solve
+all these interior contacts. Of the 74 reported inside vertices, 55 lie on a
+boundary; 11 are at the neck and the remaining 63 span the waist and cuffs.
+
+A suspected open-neck sign error was not established: no source point beyond
+the complete body's bounds is reported inside. Independent solid-angle values
+are fractional on this open body, so they do not justify replacing the inside
+test. These diagnostics changed no production geometry, thresholds or acceptance
+criteria. The ordinary-case result remains **four of five**.
+
 ## Latest Rust pants result
 
 The recovered prepared pants now pass the **registered engine fitting command**
