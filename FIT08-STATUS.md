@@ -138,6 +138,14 @@ edge still stretches0.60→1.05 units (source strain0.748). That exceeds the ena
 local deformation bound; the diagnostic is not adopted. Three of five ordinary
 pieces remain verified in the registered workflow.
 
+A later auxiliary candidate passes static checks: move the complete cuff openings
+upward by1.72/1.77 source units with a bounded geodesic transition. This slightly
+shortens fitted legs while retaining opening XY shape,702vertices/1200faces and
+exact welded seams. Full body+feet contacts,inside,new self and flips are0;
+original IoU0.94962≥0.90407; additional symmetric edge strain0.13039≤0.3.
+Worst source strain stays at the existing fit's0.40414. It remains a diagnostic
+pending reusable implementation, matched review and registered weight/pose checks.
+
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
