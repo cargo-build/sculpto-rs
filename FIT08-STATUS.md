@@ -125,6 +125,12 @@ others and creating an unwanted fourth opening; that preparation is rejected.
 The next correction must keep the original construction and address the actual
 ankle-face geometry. No contact-driven trimming was applied.
 
+A whole-face plane diagnostic clears the11 contacts with0inside/new self/flips,
+but is rejected for deformation: one cuff edge contracts from1.75 to0.58 source
+units. The source-direct variant also stretches a thigh edge from1.64 to4.71.
+The production path retains its honest residuals. A coherent patch correction
+is the next candidate; zero contacts alone is insufficient.
+
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
