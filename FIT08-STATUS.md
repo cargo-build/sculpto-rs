@@ -5,6 +5,56 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
+## Latest audit checkpoint — native BodySlide and morph lookup
+
+Native qualification attempted a frozen cohort of **865 BodySlide sets**:
+Sentinel HIMBO: 283; Daring Ranger: 2; 3BA: 114; CBBE Outfits: 466. These include
+pieces, alternatives and first-person projects, not 865 complete outfits.
+Initial strict native success was 809/865. Documented serial diagnosis and one
+private filename-case repair produced all expected geometry, while preserving
+the original failures. **Three sets still have missing authored morph resources.**
+Eight other supplied garment-pack groups need conversion projects. Native
+geometry output does not establish complete builds or broad fitting.
+
+Every male native build used HIMBO Mike. Its six body/hands/feet endpoint files
+match the accepted outputs byte for byte. Female native builds used CBBE Curvy
+solely as a compatibility control; the accepted Bijin body stayed separate and
+unchanged. Curvy has 13,554 vertices / 26,286 triangles; Bijin has 3,471 / 6,516.
+Complete male/female Blender assemblies with 14/7 meshes pass rest, skin-weight
+and nine finite native motion samples each. Continuous clearance, seams, full
+shader fidelity, cloth settings and exact Bijin clothing fit remain unqualified.
+One female texture reference is still missing. Private asset inputs are not
+distributed with this repository.
+
+The native investigation exposed a Rust resolver defect:
+[`container_path`](crates/sculpto-bake/src/lib.rs) sent non-local morphs to
+`home/Data`, ignoring the target shape's authored folder. It now selects the
+first existing file under `ShapeData` from the ordered per-target folder list.
+Local references retain the set folder. Missing files and missing blocks remain
+distinct; a missing block does not trigger a later-file substitution.
+
+The reproduction used real OSD data: the authored folder supplied +3X while a
+legacy Data decoy supplied −10X. Before repair Rust applied −10X; after repair
+it applies +3X. Nineteen resolver tests, the registered conform success/refusal
+test, configured bake tests and six existing native parity cells pass. The
+parity cells cover Mike/Chonky and a Curvy comparison, not exact Bijin fitting.
+The composed destination gate passes: **810 tests passed, one ignored**, with
+formatting, Clippy, source maps and wrapper checks green. Configured fitting
+acceptance remains separate and incomplete.
+
+A separate [mixed-robe regression](https://github.com/cargo-build/sculpto-rs/commit/b020a96967ae85a8d3688683f64154d7d9862eaa)
+is pushed for review and remains pending integration. It preserves 1,889 cloth
+and coincident positions exactly, while ordinary regions still fail with
+440 body contacts and 70 inside groups. This does not turn a robe into a static
+shirt or treat cloth preservation as ordinary-region clearance.
+
+Remaining pipeline work includes exact Bijin garment conversion, whole-cohort
+contact/construction/silhouette/posed acceptance, complete native build semantics,
+and batch reporting/application issues found by source inspection. The current
+CLI batch can count unresolved or partly written sets as built and passes mesh
+names without mapping authored morph-target aliases. Those consumer repairs
+remain pending. The historical 4/5 fixture result below remains diagnostic.
+
 ## Acceptance correction — Bijin/Mike and clothing packs
 
 The primary characters remain the exact Bijin Warmaidens option03 CBBE body

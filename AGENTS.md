@@ -10,6 +10,15 @@ host adapters thin. Private mod/model payloads stay outside VCS. Generated PNG
 geometry review renders may be published as explicitly labelled review evidence
 (operator,2026-11-08).
 
+## Supplied assets — required first stop
+
+For any asset task, especially clothing, start at **`~/src/oss/gamedev/assets/`**.
+This is the canonical supplied-asset root (operator, 2026-11-12). Read its
+applicable instructions plus `from-skyrim-community/README.md` before
+downloads or absence claims. Pass resolved pack paths to every asset delegate.
+These are private optional host fixtures, never build/runtime dependencies of
+the standalone engine. Bijin and HIMBO Mike remain the primary fitting targets.
+
 Use jj for mutations and readable git diff. Confirm the task feature before
 editing/building; after jj describe immediately jj new. This implementation
 is published publicly; its managed wrapper stays private. Land on main and
