@@ -16,6 +16,8 @@ corners and prepared topology survive. No native backend is needed for this resu
 
 The registered-command acceptance now composes original source selection and
 disk recovery → prepared NIF → fit → weight/mask checks → GLB/Actor pose.
+The [fixture profile and provenance](crates/sculpto-engine/tests/fixtures/fit08/README.md)
+record the explicit preparation inputs and original-source accounting.
 The 370-vertex prepared pants pass that weight/pose handoff: 173 vertices move,
 none detach, at most three influences, maximum sum error 1.20e-7, and 132
 locked-bone rows remain exact. The current integrated repair still leaves 83
