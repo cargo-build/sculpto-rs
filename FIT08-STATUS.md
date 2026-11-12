@@ -5,6 +5,19 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
+## Paused checkpoint — opening repair integrated
+
+Reusable opening repair is implemented and the placed-source engine path opts
+into positive Z. Five portable controls and 29 configured mesh integration/
+regression tests pass. Scoped mesh and engine Clippy pass. The registered
+workflow now qualifies **four of five ordinary pieces**, including Sentinel
+Armor001_1:0 body/feet/inside/newself/flips,IoU0.9496206587,354moving vertices,
+0detached,≤4influences,sum error1.20e-7,and exact locked weights. Its debug fit
+takes17.10s. Main-coat contacts and the robe boundary remain unresolved.
+
+This is a pushed work-in-progress checkpoint, not a main landing or FIT-08 Done.
+The goal is paused at the operator’s request.
+
 ## Latest Rust pants result
 
 The recovered prepared pants now pass the **registered engine fitting command**
@@ -105,16 +118,12 @@ feet through the existing named NIF reference API. The portable transformed
 extra-part regression passes. The expanded configured run now includes male
 feet too: male reference10630 vertices/20318 faces, female5825/10488.
 
-The latest completed registered-command run fails Sentinel Armor001
-(148 body contacts,74 inside) and Armor001_1 (0 body +11 feet contacts,0 inside).
-Prepared Nightshade pants now pass, alongside belt and sleeves.
-The original capped pants previously had574 body +92 feet contacts,13 inside.
-Adding the previously omitted male feet
-exposed the trousers'12 contacts; their earlier body-only result was incomplete.
-Derived weight, mask, lock and pose controls pass on all five pieces.
-Actual result:4 tests pass,1 configured geometry test fails,46.44s test time.
-Build passes. This remains a failing workflow, distinct from the qualified
-prepared-pants static experiment above.
+The latest registered-command run fails only Sentinel Armor001 among the five
+ordinary cases:148 body contacts/74 inside groups. Auxiliary Armor001_1, prepared
+Nightshade pants, belt and sleeves pass geometry, weights, masks, locks and posed
+follow. Complete male and female reference parts remain included.
+Actual suite result:4 tests pass,1 configured geometry test fails,45.31s total.
+Build and scoped Clippy pass. No complete gate or main landing is claimed.
 
 Required next work:
 
@@ -162,7 +171,7 @@ guards. Interior contacts cannot choose a distant opening for this repair.
 
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
-- Resolve Sentinel without new folds or lost silhouette. Native and Rust
+- Resolve Sentinel main coat without new folds or lost silhouette. Native and Rust
   diagnostic variants remain unqualified.
 - Complete the robe's ordinary/Blender Cloth boundary acceptance.
 - Run the complete configured acceptance and destination gates, then land
@@ -170,8 +179,8 @@ guards. Interior contacts cannot choose a distant opening for this repair.
 
 Blender owns cloth simulation. Sculpto selects which parts/regions use Blender
 Cloth and which use ordinary rigging; HDT/Bullet runtime work is outside this
-scope. The operator requested the active goal be paused after FIT-08 is fully
-verified, landed and marked Done.
+scope. The latest operator request is a graceful sleep checkpoint. The goal is paused
+with FIT-08 unfinished; resume from this saved state.
 
 ## Negative evidence retained
 

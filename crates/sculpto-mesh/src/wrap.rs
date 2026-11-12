@@ -150,6 +150,9 @@ pub struct FitOptions {
     /// Where the fit would stretch or squash edges by more than this ratio,
     /// the pull gives way and the garment keeps its form. `0` for no limit.
     pub max_strain: f32,
+    /// Explicit source-frame direction for authoring-only whole-opening repair.
+    /// Requires positive `max_strain`; `None` or zero clipping passes skips it.
+    pub opening_direction: Option<[f32; 3]>,
     /// Rings of neighbours around flipped triangles that may be damped by
     /// this port's inline flip repair; `0` disables it.
     pub flip_rings: u32,
@@ -178,6 +181,7 @@ impl Default for FitOptions {
             clipping_passes: 4,
             poke_depth: 1.5,
             max_strain: 0.3,
+            opening_direction: None,
             flip_rings: 4,
             flip_strength: 0.5,
         }
@@ -298,6 +302,10 @@ pub enum FitError {
     PokeDepth(f32),
     /// `max_strain` is negative or not finite.
     MaxStrain(f32),
+    /// The optional opening direction is non-finite or zero.
+    OpeningDirection([f32; 3]),
+    /// Opening repair requires an enabled positive additional strain bound.
+    OpeningStrainRequired,
     /// `flip_rings` is above this port's bound of 20.
     FlipRings(u32),
     /// `flip_strength` is outside `0..=1` or not finite.
@@ -437,6 +445,14 @@ impl fmt::Display for FitError {
                     "the strain cap {value} is negative or not finite"
                 )
             }
+            Self::OpeningDirection(direction) => write!(
+                formatter,
+                "the opening direction {direction:?} must be finite and nonzero"
+            ),
+            Self::OpeningStrainRequired => write!(
+                formatter,
+                "opening repair requires a positive enabled max_strain"
+            ),
             Self::FlipRings(value) => {
                 write!(
                     formatter,
@@ -504,6 +520,16 @@ impl FitOptions {
         }
         if !self.max_strain.is_finite() || self.max_strain < 0.0 {
             return Err(FitError::MaxStrain(self.max_strain));
+        }
+        if let Some(direction) = self.opening_direction {
+            if !direction.iter().all(|value| value.is_finite())
+                || direction.iter().all(|&value| value == 0.0)
+            {
+                return Err(FitError::OpeningDirection(direction));
+            }
+            if self.max_strain == 0.0 {
+                return Err(FitError::OpeningStrainRequired);
+            }
         }
         if self.flip_rings > MAX_FLIP_RINGS {
             return Err(FitError::FlipRings(self.flip_rings));

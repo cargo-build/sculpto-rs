@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use glam::DVec3;
+
 use crate::check::{Witness, intersection_pairs, self_intersection_witnesses};
 use crate::clip_fix::{ClipFixError, ClipFixOptions, fix_clipping};
 use crate::mask::VertexMask;
@@ -11,6 +13,8 @@ use super::{
     first_non_finite, fit_to_body, scale, strain_stats, sub, validate_geometry, validate_lengths,
     weld,
 };
+
+mod openings;
 
 /// Measurements on the geometry actually returned by the repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -33,6 +37,8 @@ pub struct FitRepairReport {
 /// Each repair branch allows `clipping_passes` stages, stopping at clearance or
 /// no guarded improvement. Zero retains one mandatory poke-only stage; it disables
 /// retries and the stage's inside projection, not the authoring repair itself.
+/// An explicit opening direction permits a bounded whole-loop candidate after
+/// ordinary repair stalls; unsupported boundaries retain their residual geometry.
 ///
 /// # Errors
 /// Refuses invalid fit or repair inputs and non-finite results.
@@ -58,18 +64,77 @@ pub fn fit_and_repair(
     }
     let (positions, fit) =
         fit_to_body(garment, body, lock, options).map_err(ClipFixError::FitOptions)?;
-    if fit.flipped != 0 {
-        return Ok((preview, before));
+    if fit.flipped == 0 {
+        let (candidate, after) = repair((&positions, garment.1))?;
+        if improves_contacts(&after, &before)
+            && count_flipped(garment.0, &candidate, garment.1) == 0
+            && preserves_self_contacts(&original_contacts, (&candidate, garment.1))
+        {
+            preview = candidate;
+            before = after;
+        }
     }
-    let (candidate, after) = repair((&positions, garment.1))?;
-    if improves_contacts(&after, &before)
-        && count_flipped(garment.0, &candidate, garment.1) == 0
-        && preserves_self_contacts(&original_contacts, (&candidate, garment.1))
-    {
-        Ok((candidate, after))
-    } else {
-        Ok((preview, before))
+    repair_openings(
+        garment,
+        body,
+        lock,
+        options,
+        &original_contacts,
+        preview,
+        before,
+    )
+}
+
+/// Additional strain stays relative to the incoming repaired surface across every attempt.
+/// @req DECL0013
+fn repair_openings(
+    original: Mesh<'_>,
+    body: Mesh<'_>,
+    lock: Option<&VertexMask>,
+    options: &FitOptions,
+    original_contacts: &HashSet<Witness>,
+    mut positions: Vec<[f32; 3]>,
+    mut report: FitRepairReport,
+) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
+    let Some(direction) = options.opening_direction else {
+        return Ok((positions, report));
+    };
+    if options.clipping_passes == 0 || report.intersection_pairs == 0 {
+        return Ok((positions, report));
     }
+    let Some(openings) = openings::OpeningSurface::build(original) else {
+        return Ok((positions, report));
+    };
+    let direction = DVec3::from(direction.map(f64::from)).normalize();
+    let incoming = positions.clone();
+    let surface = BodySurface::build(body.0, body.1);
+    for _ in 0..options.clipping_passes {
+        let Some(candidate) =
+            openings.candidate((&positions, original.1), body, lock, options, direction)?
+        else {
+            break;
+        };
+        if !openings::within_strain((&incoming, original.1), &candidate, options.max_strain)
+            || count_flipped(original.0, &candidate, original.1) != 0
+            || !preserves_self_contacts(original_contacts, (&candidate, original.1))
+        {
+            break;
+        }
+        let after = measure_contacts((&candidate, original.1), body, &surface, options);
+        if !improves_contacts(&after, &report) {
+            break;
+        }
+        positions = candidate;
+        report = FitRepairReport {
+            poke_repair_applied: report.poke_repair_applied,
+            projection_applied: report.projection_applied,
+            ..after
+        };
+        if report.intersection_pairs == 0 {
+            break;
+        }
+    }
+    Ok((positions, report))
 }
 
 /// Retry only accepted repairs; the authoring source remains the guard baseline.
