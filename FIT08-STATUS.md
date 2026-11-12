@@ -5,12 +5,31 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
+## Acceptance correction — Bijin/Mike and clothing packs
+
+The primary characters remain the exact Bijin Warmaidens option03 CBBE body
+and HIMBO Mike on HIMBO Body - Vanilla Nevernude. The historical five-case
+ledger below uses Bijin for female geometry, but its male reference is raw
+Vanilla9346, not Mike. Earlier native CBBE Curvy clothing builds are compatibility
+evidence, not exact Bijin fitting. **Four of five diagnostic pieces is not a
+production coverage percentage.**
+
+Acceptance requires a predeclared male/female clothing-pack cohort, authored
+native BodySlide preparation or explicit conversion/custom-reference handling,
+exact-target fitting and a complete rigged body/feet/head character handoff to
+Blender. Report all pack outcomes and conversion-needed assets; demonstrate most
+clothing works elegantly for each selected character. Preserve ordinary-region
+quality bounds and authored Blender Cloth regions. Native loading, materials,
+fresh Blender reopen and actual posed garment deformation remain separate
+proofs. Qualification/integration is in progress; no complete pack or Mike
+workflow has been established by the measurements below.
+
 ## Current verified checkpoint — opening repair integrated
 
 Reusable opening repair is implemented and the placed-source engine path opts
 into positive Z. Five portable controls and 29 configured mesh integration/
 regression tests pass. Scoped mesh and engine Clippy pass. The registered
-workflow now qualifies **four of five ordinary pieces**, including Sentinel
+workflow qualifies **four of five diagnostic ordinary pieces**, including Sentinel
 Armor001_1:0 body/feet/inside/newself/flips,IoU0.9496206587,354moving vertices,
 0detached,≤4influences,sum error1.20e-7,and exact locked weights. Its debug fit
 takes17.10s. Main-coat contacts and the robe boundary remain unresolved.
