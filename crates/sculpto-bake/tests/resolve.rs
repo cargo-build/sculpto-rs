@@ -274,3 +274,41 @@ fn override_replaces_the_preset_value() {
     let out = plan.apply("Body", &[[0.0; 3]]).expect("applies");
     assert_eq!(out[0], [0.25, 0.0, 0.0]);
 }
+
+#[test]
+fn nonlocal_reference_uses_target_shape_folder() {
+    let root = home("nonlocal-target-folder");
+    [
+        ("ShapeData/HIMBO", -20.0),
+        ("Data", -10.0),
+        ("ShapeData/Shared/Body", 3.0),
+    ]
+    .into_iter()
+    .for_each(|(folder, delta)| {
+        let folder = root.join(folder);
+        std::fs::create_dir_all(&folder).expect("fixture folder");
+        let data = container(&[("BodyLean", vec![offset(0, [delta, 0.0, 0.0])])]);
+        std::fs::write(
+            folder.join("body.osd"),
+            data.to_osd_bytes().expect("OSD bytes"),
+        )
+        .expect("fixture container");
+    });
+    let xml = PROJECT
+        .replace(
+            r#"<Shape target="Body">Body</Shape>"#,
+            r#"<Shape target="Body" DataFolder="Shared\Body">RenderBody</Shape>"#,
+        )
+        .replace(r#"local="true""#, r#"local="false""#);
+    let project = match Document::parse_str(&xml, "nonlocal.osp") {
+        Ok(Document::Project(project)) => project,
+        other => panic!("expected a project: {other:?}"),
+    };
+    let plan = BakePlan::resolve(&project, &preset(""), "Body", SliderSize::Big, &root)
+        .expect("production morph loader");
+    let output = plan.apply("Body", &[[0.0; 3]]).expect("applies offsets");
+    std::fs::remove_dir_all(&root).expect("remove fixture");
+
+    assert!(plan.unresolved.is_empty(), "{:?}", plan.unresolved);
+    assert_eq!(output, [[3.0, 0.0, 0.0]], "authored target folder must win");
+}
