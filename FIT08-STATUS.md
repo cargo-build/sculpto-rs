@@ -118,6 +118,13 @@ prepared-pants static experiment above.
 
 Required next work:
 
+Sentinel auxiliary diagnosis localized all11 remaining foot contacts to three
+retained ankle faces (1151,1182,1183). Its source already has a waist and two open
+cuffs. Existing guide-facing selection retains those faces while removing40
+others and creating an unwanted fourth opening; that preparation is rejected.
+The next correction must keep the original construction and address the actual
+ankle-face geometry. No contact-driven trimming was applied.
+
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
