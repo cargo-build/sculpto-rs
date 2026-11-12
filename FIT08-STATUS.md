@@ -131,6 +131,13 @@ units. The source-direct variant also stretches a thigh edge from1.64 to4.71.
 The production path retains its honest residuals. A coherent patch correction
 is the next candidate; zero contacts alone is insufficient.
 
+Connected contact-patch translation with displacement propagation also clears
+the auxiliary piece in two stages, with no inside/new self/flips and original
+IoU0.96282. It preserves the contacted faces' internal shape, but a neighboring
+edge still stretches0.60→1.05 units (source strain0.748). That exceeds the enabled
+local deformation bound; the diagnostic is not adopted. Three of five ordinary
+pieces remain verified in the registered workflow.
+
 - Complete appearance/export qualification beyond the verified pants
   preparation, clipping, lineage and fitted pose path.
 - Resolve Sentinel without new folds or lost silhouette. Native and Rust
