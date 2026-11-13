@@ -596,3 +596,6 @@ impl<'a> PlacedShape<'a> {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

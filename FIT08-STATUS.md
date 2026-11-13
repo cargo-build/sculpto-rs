@@ -5,6 +5,36 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
+## Dressed-character and full-scope fit checkpoint
+
+Native BodySlide batch qualification covered 865 authored sets/parts, not 865
+complete outfits. The primary targets remain the exact Bijin CBBE `_0`/`_1`
+body with default Bijin Skin and HIMBO Mike. Current characters use human
+faces; outfit names do not determine the character's race. Generic CBBE Curvy
+builds are compatibility controls, not substitutes for the Bijin target.
+
+Two additional Mike scenes (Vigil Robes and Pilgrim) and a paired Bijin
+Leather/Studded scene were produced from the host's supplied assets. They are
+rigged, textured and reopen in Blender; finite native-motion samples exercise
+their weights. Their ordinary garments still intersect the body, and neither
+silhouette nor posed fitting is qualified. They are provisional, not accepted
+outfits. The host-specific mod assets and resulting meshes are not in this repo.
+
+The Mike leg garment demonstrates a partial-reference error: a body-only fit
+reported zero triangle pairs, while 111 contacts remained against the assembled
+body, hands and feet. A declared combined obstacle exposes the missing contacts;
+one subsequent full-scope diagnostic returned 96 pairs and two inside groups.
+In that diagnostic a leg vertex moved up to 5.972 source units (about 83.6 mm)
+and the largest relative edge change was 1.763. These are reasons to keep the
+result provisional, not evidence of satisfactory clothing. Whole-character
+coverage, source frame, garment construction, deformation and pose all need
+independent verification.
+
+The guarded fitting work is separating the authored body used for correspondence
+from the caller-declared collision surface, while retaining selected Blender
+Cloth regions. It also reports returned-geometry deformation; fewer contacts
+alone do not establish a good fit. Blender remains the cloth-simulation owner.
+
 ## Latest checkpoint — ordinary robe fit rejection isolated
 
 Read-only probes on engine `2d99f2a5` now separate the mixed-region guard from
