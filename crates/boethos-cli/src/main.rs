@@ -299,12 +299,26 @@ fn values<'a>(arguments: &'a [String], name: &str) -> Vec<&'a str> {
     values
 }
 
+const VALUE_FLAGS: [&str; 7] = [
+    "--db",
+    "--category",
+    "--sex",
+    "--family",
+    "--limit",
+    "--root",
+    "--source",
+];
+
 fn positional(arguments: &[String]) -> Option<&str> {
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].as_str();
-        if argument.starts_with("--") {
+        if VALUE_FLAGS.contains(&argument) {
             index += 2;
+            continue;
+        }
+        if argument.starts_with("--") {
+            index += 1;
             continue;
         }
         return Some(argument);

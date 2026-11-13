@@ -96,3 +96,31 @@ fn content_identity_is_stable_across_paths() {
     let _ = fs::remove_dir_all(first);
     let _ = fs::remove_dir_all(second);
 }
+
+#[test]
+fn family_tokens_do_not_match_substrings() {
+    let root = temp_dir("family");
+    fs::create_dir_all(root.join("PAN_NPCs")).expect("dirs");
+    fs::write(root.join("PAN_NPCs/face.dds"), b"pan").expect("write");
+    fs::create_dir_all(root.join("pants")).expect("dirs");
+    fs::write(root.join("pants/leg.dds"), b"pants").expect("write");
+    let store = Store::open(root.with_extension("redb")).expect("store");
+    index_root(
+        &store,
+        &root,
+        "fixture",
+        &IndexOptions {
+            archive_entries: false,
+        },
+    );
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    let family = |name: &str| {
+        rows.iter()
+            .find(|(_, asset)| asset.name == name)
+            .and_then(|(_, asset)| asset.family.clone())
+    };
+    assert_eq!(family("face.dds").as_deref(), Some("pan"));
+    assert_eq!(family("leg.dds"), None);
+    let _ = fs::remove_file(root.with_extension("redb"));
+    let _ = fs::remove_dir_all(root);
+}

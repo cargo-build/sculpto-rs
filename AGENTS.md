@@ -47,6 +47,8 @@ cargo build -p sculpto-cli -j 2
 target/debug/sculpto --help
 target/debug/sculpto commands --json
 target/debug/sculpto run --cmd version
+cargo build -p boethos-cli -j 2
+target/debug/boethos --help
 ```
 
 `--help` covers argv families. `commands --json` covers the closed engine
@@ -56,6 +58,8 @@ and UV commands also exist on argv and are not all registered for JSON/MCP.
 Inspect the actual [argv dispatcher](crates/sculpto-cli/src/main.rs) and
 [registry](crates/sculpto-engine/src/lib.rs) before claiming transport parity.
 Subcommand help is uneven; missing subcommand help does not prove absence.
+`boethos` is a separate binary for the supplied-asset catalogue; the `sculpto`
+registry does not expose it. Query the catalogue before walking asset roots.
 
 | Goal | Existing entry / source | Boundary |
 |---|---|---|
@@ -70,6 +74,7 @@ Subcommand help is uneven; missing subcommand help does not prove absence.
 | Sample actor geometry/rig/motion | `actor sample`, `actor rig`; [actor CLI](crates/sculpto-cli/src/actor.rs), [actor reader](crates/sculpto-mesh/src/actor/mod.rs) | Explicit parts and REST or clip/time; finite samples do not prove continuous clearance |
 | Export a dressed animation | `actor pack-cloth`; [packing](crates/sculpto-gltf/src/pack.rs) | Preserves the actor; does not qualify cloth motion, collisions or loop closure |
 | Choose ordinary rigging / Blender Cloth | `outfit inspect --nif FILE --manifest FILE`; [outfit](crates/sculpto-mesh/src/outfit.rs) | Named parts/regions; selection is distinct from simulation |
+| Index supplied assets and archive members | `boethos index`, `list`, `get`, `stats`, `export`; [catalogue](crates/boethos-catalogue/src/lib.rs), [CLI](crates/boethos-cli/src/main.rs) | Host `7z` listing; RAR unsupported; database and export stay outside VCS |
 
 `garment trim` / `strip` are destructive geometry operations on derived output;
 triangle deletion is not successful construction-preserving fitting.

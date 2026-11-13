@@ -307,11 +307,18 @@ fn sex_from_context(text: &str) -> Option<Sex> {
 fn family_from_path(text: &str) -> Option<String> {
     let lower = text.to_lowercase();
     for family in [
-        "bijin", "himbo", "3ba", "cbbe", "pride", "sentinel", "apachii", "rustic", "pan",
+        "bijin", "himbo", "3ba", "cbbe", "pride", "sentinel", "apachii", "rustic",
     ] {
         if lower.contains(family) {
             return Some(family.to_string());
         }
+    }
+    // `pan` is a whole token: a path such as `pants/` must not become PAN_NPCs.
+    if lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token == "pan")
+    {
+        return Some("pan".to_string());
     }
     None
 }

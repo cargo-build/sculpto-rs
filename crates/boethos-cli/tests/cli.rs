@@ -60,7 +60,7 @@ fn index_list_get_stats_export() {
     assert_eq!(rows.as_array().expect("array").len(), 1);
 
     let id = rows[0]["id"].as_str().expect("id");
-    let (code, stdout, stderr) = run(&db, &["get", id, "--json"]);
+    let (code, stdout, stderr) = run(&db, &["get", "--json", id]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let asset: serde_json::Value = serde_json::from_str(&stdout).expect("json");
     assert_eq!(asset["category"], "preset");
