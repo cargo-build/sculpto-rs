@@ -8,8 +8,13 @@
 //! references more than 65 535 vertices cannot be one shape. [`MeshAsset::split_for_limit`]
 //! is the pure projection that splits such a part into deterministic sub-shapes
 //! while preserving partition ids and morph deltas.
+//!
+//! [`validate_bundle`] gates a multi-shape set (body, hands, feet) before a
+//! writer projects it: unique names, sound partition palettes and one shared
+//! bone list across the skinned shapes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use crate::skin::{SkinWeightError, SkinWeights};
 
@@ -173,6 +178,30 @@ pub enum PhysicsDefect {
     EmptyInline,
 }
 
+/// One shape's local placement inside a multi-shape bundle.
+///
+/// The identity default leaves the shape in the bundle frame. The rotation
+/// is column-major, the same convention as [`Skin::bind_inverse`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    /// Translation in the bundle frame.
+    pub translation: [f32; 3],
+    /// Rotation matrix, column-major; identity by default.
+    pub rotation: [[f32; 3]; 3],
+    /// Uniform scale.
+    pub scale: f32,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            translation: [0.0; 3],
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            scale: 1.0,
+        }
+    }
+}
+
 /// One export mesh: flat arena, per-triangle partitions, sparse morphs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeshAsset {
@@ -198,6 +227,8 @@ pub struct MeshAsset {
     pub materials: Vec<MaterialSlot>,
     /// Physics sidecar reference, when the asset carries one.
     pub physics: Option<PhysicsRef>,
+    /// Local placement inside a multi-shape bundle; `None` is the identity.
+    pub transform: Option<Transform>,
 }
 
 /// One sparse offset in the `.tri` projection: a `u16` vertex index.
@@ -418,6 +449,106 @@ pub enum SplitError {
     /// A morph delta points at a vertex no triangle references; the split
     /// cannot attach it to any output shape.
     UnreferencedMorphVertex { target: usize, vertex: u32 },
+}
+
+/// Why a set of shapes cannot travel as one multi-shape bundle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BundleError {
+    /// The bundle carries no shapes.
+    Empty,
+    /// Two shapes use the same name.
+    DuplicateName {
+        /// The later shape's position in the bundle.
+        shape: usize,
+        /// The repeated name.
+        name: String,
+    },
+    /// A shape's partition palettes fail the palette gate.
+    Palettes {
+        /// The failing shape's position in the bundle.
+        shape: usize,
+        /// The palette defect.
+        error: MeshError,
+    },
+    /// A skinned shape's bone list differs from the first skinned shape's.
+    BoneListMismatch {
+        /// The failing shape's position in the bundle.
+        shape: usize,
+    },
+}
+
+impl fmt::Display for BundleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "bundle has no shapes"),
+            Self::DuplicateName { shape, name } => {
+                write!(formatter, "shape {shape} repeats the bundle name {name:?}")
+            }
+            Self::Palettes { shape, error } => write!(
+                formatter,
+                "shape {shape} has invalid partition palettes: {error:?}"
+            ),
+            Self::BoneListMismatch { shape } => write!(
+                formatter,
+                "shape {shape} bone list differs from the first skinned shape"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BundleError {}
+
+/// Gate a multi-shape bundle before a writer projects it.
+///
+/// The bundle must carry at least one shape, every shape name must be unique,
+/// each shape's derived partition palettes must pass
+/// [`MeshAsset::validate_partition_palettes`], and every skinned shape must
+/// repeat the first skinned shape's bone list exactly — same names, same
+/// order — because the bundled shapes share one skeleton's bone indices.
+/// Unskinned shapes carry no bone constraint.
+///
+/// # Errors
+/// [`BundleError`] names the first defect in check order: an empty bundle, a
+/// repeated name, a palette failure, then a bone-list mismatch.
+pub fn validate_bundle(shapes: &[MeshAsset]) -> Result<(), BundleError> {
+    if shapes.is_empty() {
+        return Err(BundleError::Empty);
+    }
+    let mut names = BTreeSet::new();
+    for (index, shape) in shapes.iter().enumerate() {
+        if !names.insert(shape.name.as_str()) {
+            return Err(BundleError::DuplicateName {
+                shape: index,
+                name: shape.name.clone(),
+            });
+        }
+    }
+    for (index, shape) in shapes.iter().enumerate() {
+        let palettes = shape
+            .partition_palettes()
+            .map_err(|error| BundleError::Palettes {
+                shape: index,
+                error,
+            })?;
+        shape
+            .validate_partition_palettes(&palettes)
+            .map_err(|error| BundleError::Palettes {
+                shape: index,
+                error,
+            })?;
+    }
+    let Some(reference) = shapes.iter().find_map(|shape| shape.skin.as_ref()) else {
+        return Ok(());
+    };
+    if let Some((index, _)) = shapes.iter().enumerate().find(|(_, shape)| {
+        shape
+            .skin
+            .as_ref()
+            .is_some_and(|skin| skin.bones != reference.bones)
+    }) {
+        return Err(BundleError::BoneListMismatch { shape: index });
+    }
+    Ok(())
 }
 
 impl MeshAsset {
@@ -853,6 +984,7 @@ impl MeshAsset {
             morphs,
             materials: self.materials.clone(),
             physics: self.physics.clone(),
+            transform: self.transform,
         })
     }
 
@@ -1286,6 +1418,24 @@ mod tests {
             Err(MeshError::Physics {
                 defect: PhysicsDefect::EmptyInline
             })
+        );
+    }
+
+    #[test]
+    fn split_copies_the_local_transform() {
+        let mut mesh = two_partitions();
+        let transform = Transform {
+            translation: [1.0, 2.0, 3.0],
+            scale: 2.0,
+            ..Transform::default()
+        };
+        mesh.transform = Some(transform);
+        let shapes = mesh.split_for_limit(3).expect("splits");
+        assert_eq!(shapes.len(), 2);
+        assert!(
+            shapes
+                .iter()
+                .all(|shape| shape.transform == Some(transform))
         );
     }
 
