@@ -561,7 +561,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 }
 
 fn garment(args: &[String]) -> ExitCode {
-    let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj>\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+    let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj> [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
@@ -645,6 +645,8 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         percent,
         body_nif: flags.get("body-nif").map(PathBuf::from),
         manifest: flags.get("manifest").map(PathBuf::from),
+        collision: flags.get("collision").map(PathBuf::from),
+        collision_frame: flags.get("collision-frame").cloned(),
     };
     let outcome = ops::garment_fit(&params).map_err(|error| error.to_string())?;
     println!(
@@ -680,6 +682,12 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     }
     if let (Some(pairs), Some(inside)) = (outcome.intersection_pairs, outcome.inside_after) {
         println!("body contacts {pairs}, inside groups {inside}");
+    }
+    if let Some(collision) = &outcome.collision {
+        println!(
+            "collision: `{}` ({}), {} vertices / {} triangles; unspecified parts are not implied",
+            collision.frame, collision.scope, collision.vertices, collision.triangles
+        );
     }
     Ok(())
 }
@@ -1249,68 +1257,10 @@ fn flag_usize(
     }
 }
 
-/// Read an OBJ as positions plus triangles; polygons are fan-triangulated.
+/// Read an OBJ as display-frame positions plus triangles; polygons are
+/// fan-triangulated by the engine parser both surfaces share.
 fn read_obj(path: &Path) -> Result<Mesh, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut positions = Vec::new();
-    let mut triangles = Vec::new();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("v ") {
-            let mut parts = rest.split_whitespace();
-            let mut coordinate = || -> Result<f32, String> {
-                parts
-                    .next()
-                    .ok_or_else(|| format!("{}: incomplete vertex line `{line}`", path.display()))?
-                    .parse::<f32>()
-                    .map_err(|e| format!("{}: {e}", path.display()))
-            };
-            positions.push([coordinate()?, coordinate()?, coordinate()?]);
-        } else if let Some(rest) = line.strip_prefix("f ") {
-            let mut corners = Vec::new();
-            for corner in rest.split_whitespace() {
-                let index = corner
-                    .split('/')
-                    .next()
-                    .ok_or_else(|| format!("{}: empty face corner", path.display()))?;
-                let one_based = index.parse::<u32>().map_err(|_| {
-                    format!(
-                        "{}: face corner `{index}` is not a vertex index",
-                        path.display()
-                    )
-                })?;
-                corners.push(one_based.checked_sub(1).ok_or_else(|| {
-                    format!("{}: face corner `{index}` is not 1-based", path.display())
-                })?);
-            }
-            if corners.len() < 3 {
-                return Err(format!(
-                    "{}: face has fewer than three corners",
-                    path.display()
-                ));
-            }
-            triangles.extend(
-                corners[1..]
-                    .windows(2)
-                    .map(|edge| [corners[0], edge[0], edge[1]]),
-            );
-        }
-    }
-    if positions.is_empty() {
-        return Err(format!("{}: no vertex lines", path.display()));
-    }
-    if let Some(vertex) = triangles
-        .iter()
-        .flatten()
-        .find(|&&index| index as usize >= positions.len())
-    {
-        return Err(format!(
-            "{}: face references vertex {}, but only {} vertices exist",
-            path.display(),
-            u64::from(*vertex) + 1,
-            positions.len()
-        ));
-    }
-    Ok((positions, triangles))
+    sculpto_engine::obj::read_obj_mesh(path).map_err(|error| error.to_string())
 }
 
 fn sliders(args: &[String]) -> ExitCode {

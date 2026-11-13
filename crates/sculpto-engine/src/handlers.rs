@@ -194,6 +194,16 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         Some(Value::String(name)) if !name.trim().is_empty() => Some(name.clone()),
         Some(_) => return Err(errors::invalid("slider", "must be a nonempty name")),
     };
+    let collision_frame = match input.get("collision_frame") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(frame)) if !frame.trim().is_empty() => Some(frame.clone()),
+        Some(_) => {
+            return Err(errors::invalid(
+                "collision_frame",
+                "must be a nonempty frame name",
+            ));
+        }
+    };
     let params = ops::FitParams {
         nif: path(input, "nif")?,
         shape: string(input, "shape")?,
@@ -207,6 +217,8 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         percent,
         body_nif: checked_optional_path(input, "body_nif")?,
         manifest: checked_optional_path(input, "manifest")?,
+        collision: checked_optional_path(input, "collision")?,
+        collision_frame,
     };
     let outcome = ops::garment_fit(&params)?;
     let follow = outcome.follow.map(|(body, garment, difference)| {
@@ -229,6 +241,9 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
     }
     if let Some(regions) = outcome.regions {
         result["regions"] = json!(regions);
+    }
+    if let Some(collision) = outcome.collision {
+        result["collision"] = json!(collision);
     }
     Ok(result)
 }

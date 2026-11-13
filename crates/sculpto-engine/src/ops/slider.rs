@@ -17,10 +17,15 @@ use sculpto_mesh::wrap::repair::fit_and_repair;
 use sculpto_mesh::wrap::{FitOptions, GapMode};
 use sculpto_nif::{NifDocument, NifShape, ShapePlacement};
 
-use crate::obj::{read_obj_positions, write_obj};
+use crate::obj::{read_obj_positions, read_obj_surface, write_obj};
 use crate::{CommandError, ErrorKind, errors};
 
-use super::{FitOutcome, FitParams};
+use super::{CollisionScope, FitOutcome, FitParams};
+
+/// The one declared collision frame this build can place: coordinates already
+/// in the body shape's NIF source scene, written in the shared OBJ display
+/// frame (`(x, z, -y)` of that scene). No global transform is inferred.
+const COLLISION_FRAME_SOURCE_SCENE: &str = "source-scene";
 
 /// A garment and the BodySlide project that defines its reference motion.
 #[derive(Debug, Clone, JsonSchema)]
@@ -360,6 +365,88 @@ fn cloth_regions(
     )
 }
 
+/// A caller-declared complete collision surface, read and validated before any
+/// fit output exists. @req DECL0013
+struct CollisionSurface {
+    positions: Vec<[f32; 3]>,
+    triangles: Vec<[u32; 3]>,
+}
+
+impl CollisionSurface {
+    /// Read the declared collision OBJ, or report why it cannot be used.
+    ///
+    /// Alignment is not inferable from coordinates: a surface declared in the
+    /// supported frame but assembled somewhere else still passes. This checks
+    /// the declaration, finiteness, faces and index ranges only.
+    fn declared(params: &FitParams) -> Result<Option<Self>, CommandError> {
+        let Some(path) = &params.collision else {
+            return match &params.collision_frame {
+                None => Ok(None),
+                Some(_) => Err(CommandError::new(
+                    ErrorKind::Refused,
+                    "outfit_fit_collision_frame",
+                    "`collision_frame` declares a frame but `collision` names no surface",
+                )),
+            };
+        };
+        let frame = params.collision_frame.as_deref().ok_or_else(|| {
+            CommandError::new(
+                ErrorKind::Refused,
+                "outfit_fit_collision_frame",
+                format!(
+                    "a collision surface requires a declared frame; supported: `{COLLISION_FRAME_SOURCE_SCENE}`"
+                ),
+            )
+        })?;
+        if frame != COLLISION_FRAME_SOURCE_SCENE {
+            return Err(CommandError::new(
+                ErrorKind::Refused,
+                "outfit_fit_collision_frame",
+                format!(
+                    "unsupported collision frame `{frame}`; supported: `{COLLISION_FRAME_SOURCE_SCENE}`"
+                ),
+            ));
+        }
+        let (positions, triangles) = read_obj_surface(path)?;
+        if triangles.is_empty() {
+            return Err(CommandError::new(
+                ErrorKind::Refused,
+                "outfit_fit_collision_surface",
+                format!(
+                    "{}: collision surface has no faces; declare the assembled parts as triangles",
+                    path.display()
+                ),
+            ));
+        }
+        if let Some(vertex) = positions
+            .iter()
+            .position(|point| point.iter().any(|value| !value.is_finite()))
+        {
+            return Err(CommandError::new(
+                ErrorKind::Refused,
+                "outfit_fit_collision_surface",
+                format!(
+                    "{}: collision vertex {vertex} is not finite",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(Some(Self {
+            positions,
+            triangles,
+        }))
+    }
+
+    fn scope(&self) -> CollisionScope {
+        CollisionScope {
+            frame: COLLISION_FRAME_SOURCE_SCENE.to_owned(),
+            vertices: self.positions.len(),
+            triangles: self.triangles.len(),
+            scope: "caller-declared",
+        }
+    }
+}
+
 fn finish_fit(
     params: &FitParams,
     document: &NifDocument,
@@ -374,6 +461,7 @@ fn finish_fit(
             "fit one body state per region or slider request",
         ));
     }
+    let collision = CollisionSurface::declared(params)?;
     let options = FitOptions {
         gap_mode: GapMode::Keep,
         min_gap: 0.05,
@@ -383,7 +471,12 @@ fn finish_fit(
         ..FitOptions::default()
     };
     let garment_mesh = (fitted.as_slice(), garment.shape.triangles.as_slice());
-    let body_mesh = (target.as_slice(), body.shape.triangles.as_slice());
+    // The declared surface replaces the single body shape as the obstacle only;
+    // correspondence and the output frame stay on the authored body.
+    let body_mesh = match &collision {
+        Some(surface) => (surface.positions.as_slice(), surface.triangles.as_slice()),
+        None => (target.as_slice(), body.shape.triangles.as_slice()),
+    };
     let (fitted, pairs, inside, regions) = match &params.manifest {
         Some(_) => {
             let regions = cloth_regions(params, document)?;
@@ -439,6 +532,7 @@ fn finish_fit(
         intersection_pairs: Some(pairs),
         inside_after: inside,
         regions,
+        collision: collision.as_ref().map(CollisionSurface::scope),
     })
 }
 

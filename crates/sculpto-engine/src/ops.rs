@@ -791,6 +791,12 @@ pub struct FitParams {
     pub body_nif: Option<PathBuf>,
     /// Source-bound region manifest. All declared shapes belong to the garment NIF.
     pub manifest: Option<PathBuf>,
+    /// Optional combined collision OBJ: body and every separate part a garment
+    /// can reach (hands, feet), triangulated in one declared frame.
+    pub collision: Option<PathBuf>,
+    /// Declared frame of `collision`. The only supported value is
+    /// `source-scene`: NIF source-scene coordinates in the OBJ display frame.
+    pub collision_frame: Option<String>,
 }
 
 /// What `outfit.fit` produced.
@@ -816,6 +822,24 @@ pub struct FitOutcome {
     pub inside_after: Option<usize>,
     /// Explicit ordinary and cloth measurements when a manifest was supplied.
     pub regions: Option<sculpto_mesh::outfit::rigging::RegionFitReport>,
+    /// The caller-declared collision scope that was measured, when one was given.
+    pub collision: Option<CollisionScope>,
+}
+
+/// The collision surface a fit actually measured against.
+///
+/// The scope is what the caller declared. The tool cannot prove that it covers
+/// a whole character, so this is not whole-actor clearance by itself. @req DECL0013
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollisionScope {
+    /// Declared input frame.
+    pub frame: String,
+    /// Surface vertices measured as obstacles.
+    pub vertices: usize,
+    /// Surface triangles measured as obstacles.
+    pub triangles: usize,
+    /// Always `caller-declared`: the tool does not verify scope completeness.
+    pub scope: &'static str,
 }
 
 /// Bind a garment to its authored body and apply the bind to a morphed body.
@@ -829,6 +853,13 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
     }
     if params.manifest.is_some() {
         return slider::fit_regions(params);
+    }
+    if params.collision.is_some() || params.collision_frame.is_some() {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "outfit_fit_collision_scope",
+            "a collision surface needs a guarded fit: supply `manifest`, or a `conform`, `slider` and `percent` preview; this path measures no contact",
+        ));
     }
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
@@ -864,6 +895,7 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         intersection_pairs: None,
         inside_after: None,
         regions: None,
+        collision: None,
     })
 }
 
