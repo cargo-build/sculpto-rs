@@ -36,6 +36,7 @@ pub mod mask;
 pub mod outfit;
 mod point_query;
 pub mod rig;
+pub mod seam;
 pub mod silhouette;
 pub mod surface;
 mod surface_util;

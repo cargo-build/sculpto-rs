@@ -63,6 +63,7 @@ Subcommand help is uneven; missing subcommand help does not prove absence.
 | Bake shapes | `bake`, `batch`; [bake](crates/sculpto-bake/src/lib.rs) | Explicit set, preset and weight endpoint; a body bake is not a finished outfit |
 | Import/export assets | `export-obj`, registry `export.nif` / `export.pair`; [NIF](crates/sculpto-nif/src/lib.rs), [GLB writer](crates/sculpto-gltf/src/lib.rs) | Supported subsets; do not infer every native format feature |
 | Fit and classify garments | `garment fit`, `follow`, `aura`, `classify`, `intake`; [mesh](crates/sculpto-mesh/src/lib.rs) | Authored topology/rest frame and declared preparation route |
+| Fit a component seam | registry `component.seam_fit`; [mesh seam](crates/sculpto-mesh/src/seam.rs) | Explicit original vertex targets and same-frame lengths; preserves render order, not automatic anatomy or skin transfer |
 | Measure geometric defects | `garment check`, `cover`, `proxies`; [checks](crates/sculpto-mesh/src/check.rs) | Intersection counts and sampled coverage have different meanings |
 | Construct a control | `garment control-exterior`, `control-repair`, `control-cuts`, `control-separate`, `control-check`; [control](crates/sculpto-mesh/src/control.rs) | Strict profile, source lineage, explicit bounded repairs; refusal retains diagnostics |
 | Qualify UVs and retain appearance | `garment uv-check`; [UV](crates/sculpto-mesh/src/uv.rs), [native baking guide](README.md#bake-original-garment-materials-onto-a-control) | A valid atlas does not establish source-ray coverage or appearance |

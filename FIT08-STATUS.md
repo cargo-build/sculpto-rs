@@ -11,7 +11,7 @@ The private host wrapper now has a parameterized native-reference extraction
 command. An explicit recipe pins the selected native project/preset, exact body
 and parts, skeleton, default Bijin skin, tools and maps. The adapter composes the
 existing native build, common-frame assembly and Blender importer; it adds no
-fitting algorithm or cloth solver. Seven portable controls cover refusals,
+fitting algorithm or cloth solver. Eleven portable controls cover refusals,
 failed receipts, input drift and child-process cleanup. Independent advisory
 review findings were reproduced and repaired.
 
@@ -21,11 +21,32 @@ weights and materials match on all eight assembled meshes. Fresh Blender opens
 pass source/rest/image checks and controlled body/hands/robe pose smoke tests.
 `Produced` describes transport through these stages, not an accepted fit.
 
-Moving seam-driver probes reveal an additional input defect: the fixed Lydia
-head's neck misses exact Bijin `_0` by up to10.109mm, including sampled poses.
-The worst measured component gap on `_1` is0.174mm. The provisional head needs
-lower-endpoint adaptation with the accepted body protected. Nonmoving child-bone
-probes were rejected before checking the actual Forearm/Calf/Spine2 drivers.
+The fixed Lydia head initially misses exact Bijin `_0` by up to10.109mm.
+Registry `component.seam_fit` now fits explicit original-vertex targets and
+fades displacement over shortest mesh-edge distance. It preserves render order;
+exact coincident aliases share only the distance graph. Source frame/lengths
+are explicit, contradictory targets and excessive shifts refuse, and all
+outside-support positions remain unchanged. No cloth solver or automatic anatomy
+recognition is added. The optional extraction stage retains the raw assembly.
+
+Fresh real head repairs change55vertices at `_0` and54 at `_1`, leaving941/942
+facial vertices unchanged. Seven other meshes, head topology/UV/weights/materials
+and the rig remain unchanged. Measured neck pairs now coincide at rest and in
+five actual Forearm/Calf/Spine2-driver poses on both endpoints. Worst remaining
+hand/foot gaps are0.0557mm (`_0`) and0.1742mm (`_1`). Nonmoving child-bone probes
+were rejected before selecting these actual seam drivers. The head inherits112
+self-contact witnesses; exact witness comparison finds none added by this repair.
+No triangle orientation reversal was introduced. Inherited head contacts remain
+disclosed; this is bounded collar repair, not a fully validated appearance asset.
+
+| Bijin0 original neck | Same frame after bounded collar repair |
+|---|---|
+| ![Original neck, front](assets/fit08/bijin0-neck-before-front.png) | ![Repaired neck, front](assets/fit08/bijin0-neck-after-front.png) |
+| ![Original neck, side](assets/fit08/bijin0-neck-before-side.png) | ![Repaired neck, side](assets/fit08/bijin0-neck-after-side.png) |
+
+These matched rest crops retain all geometry. The front shows the closed lower
+neck gap; the robe obscures much of the join in the side crop. They do not prove
+full animation, material fidelity or garment clearance.
 The rejected torso fit below also remains open. One robe does not establish
 the required broad Bijin/Mike clothing-cohort acceptance.
 

@@ -13,6 +13,7 @@
 
 use serde_json::{Value, json};
 
+mod component;
 pub mod errors;
 mod handlers;
 pub mod obj;
@@ -25,6 +26,8 @@ pub mod rules;
 /// not be renamed without a migration entry in the issuing epic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
+    /// Fit explicit component seam targets without changing render topology.
+    ComponentSeamFit,
     /// Report the engine build version.
     Version,
     /// List the catalogue.
@@ -65,6 +68,7 @@ impl CommandId {
     /// Wire name, for example `commands.list`.
     pub fn as_str(self) -> &'static str {
         match self {
+            CommandId::ComponentSeamFit => "component.seam_fit",
             CommandId::Version => "version",
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
@@ -226,6 +230,14 @@ impl Spec {
 }
 
 const COMMANDS: &[Spec] = &[
+    Spec {
+        id: CommandId::ComponentSeamFit,
+        summary: "Fit explicit component seam targets with bounded mesh-edge support.",
+        mutates: false,
+        stub: false,
+        schema: component::schema,
+        handler: component::fit,
+    },
     Spec {
         id: CommandId::Version,
         summary: "Report the engine build version.",

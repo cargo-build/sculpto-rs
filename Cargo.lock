@@ -532,6 +532,7 @@ dependencies = [
  "sculpto-gltf",
  "sculpto-mesh",
  "sculpto-nif",
+ "serde",
  "serde_json",
 ]
 
