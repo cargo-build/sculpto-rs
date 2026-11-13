@@ -6,14 +6,30 @@
 //! path has no confirmed slot in this layout, so it is refused instead of being
 //! written into the glow slot and misread by every consumer.
 
-use sculpto_core::mesh::{MaterialSlot, TextureSlot};
+use sculpto_core::mesh::{MaterialSlot, MeshAsset, TextureSlot};
 
 use super::header::NifWriteError;
 
+/// Block type table name for the lighting shader property.
+pub(super) const SHADER_TYPE: &str = "BSLightingShaderProperty";
+/// Block type table name for the texture set.
+pub(super) const TEXTURE_TYPE: &str = "BSShaderTextureSet";
 /// Skyrim `BSLightingShaderProperty` shader type used for a neutral surface.
 const SHADER_TYPE_DEFAULT: u32 = 0;
 /// `SLSF2` bit 4: back-face rendering enabled.
 const DOUBLE_SIDED: u32 = 0x0000_0010;
+
+/// The single material slot a shape may carry, or `None`.
+///
+/// Two slots need per-triangle material authoring, which neither Skyrim target
+/// writes yet, so they are refused by name instead of collapsing to one.
+pub(super) fn single_slot(asset: &MeshAsset) -> Result<Option<&MaterialSlot>, NifWriteError> {
+    match asset.materials.len() {
+        0 => Ok(None),
+        1 => Ok(Some(&asset.materials[0])),
+        count => Err(NifWriteError::MultipleMaterialSlots { count }),
+    }
+}
 
 /// Write a `BSShaderTextureSet` body for a material slot.
 ///

@@ -11,7 +11,7 @@
 use std::fmt;
 
 use crate::{NifHeader, NifRigError};
-use sculpto_core::mesh::MeshError;
+use sculpto_core::mesh::{BundleError, MeshError};
 
 /// Numeric NIF version both Skyrim variants use (`20.2.0.7`).
 pub const VERSION: u32 = 0x1402_0007;
@@ -54,6 +54,10 @@ pub enum NifWriteError {
     UnsupportedEndian { endian: u8 },
     /// The model failed validation, so no bytes are written.
     InvalidModel(MeshError),
+    /// The shape set failed its multi-shape bundle contract.
+    InvalidBundle(BundleError),
+    /// A bundle shape carries a local placement this writer cannot serialize.
+    TransformUnsupported { shape: usize },
     /// The source document did not supply a checked rig and skin binding.
     InvalidRig(NifRigError),
     /// The selected shape cannot be represented with the supplied native rig.
@@ -112,6 +116,8 @@ pub enum NifWriteError {
         /// Actual packed bytes.
         bytes: usize,
     },
+    /// Bundle shapes name different physics files, so one root link cannot carry them.
+    MultiplePhysicsLinks { links: usize },
 }
 
 impl fmt::Display for NifWriteError {
@@ -129,6 +135,11 @@ impl fmt::Display for NifWriteError {
                 write!(formatter, "unsupported endian marker {endian}")
             }
             Self::InvalidModel(error) => write!(formatter, "model is invalid: {error:?}"),
+            Self::InvalidBundle(error) => write!(formatter, "shape bundle is invalid: {error}"),
+            Self::TransformUnsupported { shape } => write!(
+                formatter,
+                "shape {shape} has a local placement the bundle writer does not serialize"
+            ),
             Self::InvalidRig(error) => write!(formatter, "invalid rig: {error}"),
             Self::RigLayout { shape, reason } => write!(formatter, "shape {shape}: {reason}"),
             Self::TooManyVertices { vertices } => {
@@ -204,6 +215,10 @@ impl fmt::Display for NifWriteError {
             } => write!(
                 formatter,
                 "{bytes} global vertex bytes do not pack {vertices} vertices at {vertex_size} bytes"
+            ),
+            Self::MultiplePhysicsLinks { links } => write!(
+                formatter,
+                "the bundle names {links} different physics files; one root link cannot carry them"
             ),
         }
     }

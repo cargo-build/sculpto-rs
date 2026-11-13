@@ -1,4 +1,5 @@
-//! Skyrim SE `BSTriShape` writer for one shape.
+//! Skyrim SE `BSTriShape` writer: one shape's blocks, and the per-shape parts a
+//! bundle reuses.
 //!
 //! C03 wrote positions and triangles, C05 added UVs, C06 byte normals and SE
 //! tangents, C07 added the skin: one `NiSkinInstance` + `NiSkinData`, one named
@@ -9,13 +10,20 @@
 //! where nifly reads and writes it for `IsSkinned()` SSE shapes. Morph blocks
 //! arrive later (C12+). `sculpto_nif::read` undoes the reader's frame
 //! conversion, so every written attribute round-trips.
+//!
+//! [`PreparedShape`] holds everything one shape contributes before a block index
+//! is known (geometry, skin plan, material and physics facts), and [`body`]
+//! encodes the `BSTriShape` block from a prepared shape plus its references.
+//! [`super::se_bundle`] reuses both for a multi-shape file, so the two writers
+//! cannot disagree about a shape's bytes.
 
-use sculpto_core::mesh::MeshAsset;
+use sculpto_core::mesh::{MaterialSlot, MeshAsset};
 use sculpto_core::skin::FourLane;
 
 use super::extra;
-use super::header::{NifTarget, NifWriteError, write_header};
+use super::header::{NifTarget, NifWriteError};
 use super::scene::{CheckedScene, NativeTransform, SkinNodes};
+use super::se_bundle::{Block, write_file};
 use super::shader;
 use super::skin;
 use super::strings::StringTable;
@@ -26,7 +34,8 @@ const VF_UVS: u64 = 0x002;
 const VF_NORMALS: u64 = 0x008;
 const VF_TANGENTS: u64 = 0x010;
 const VF_SKINNED: u64 = 0x040;
-const BLOCK_TYPE: &str = "BSTriShape";
+/// Block type table name for a `BSTriShape`.
+pub(super) const BLOCK_TYPE: &str = "BSTriShape";
 
 /// Write a complete SE NIF containing one `BSTriShape`.
 ///
@@ -46,140 +55,320 @@ pub(super) fn write(
     policy: InfluencePolicy,
     checked: Option<&CheckedScene<'_>>,
 ) -> Result<WrittenNif, NifWriteError> {
-    asset.validate().map_err(NifWriteError::InvalidModel)?;
-    let vertices =
-        u16::try_from(asset.positions.len()).map_err(|_| NifWriteError::TooManyVertices {
-            vertices: asset.positions.len(),
-        })?;
-    let triangles =
-        u16::try_from(asset.triangles.len()).map_err(|_| NifWriteError::TooManyTriangles {
-            triangles: asset.triangles.len(),
-        })?;
-
-    let has_uvs = !asset.uvs.is_empty();
-    let has_normals = !asset.normals.is_empty();
-    let has_tangents = !asset.tangents.is_empty();
-    if has_tangents && !has_normals {
-        return Err(NifWriteError::TangentsWithoutNormals);
-    }
-    let mut flags = VF_VERTEX;
-    let mut vertex_size = 16;
-    if has_uvs {
-        flags |= VF_UVS;
-        vertex_size += 4;
-    }
-    if has_normals {
-        flags |= VF_NORMALS;
-        vertex_size += 4;
-    }
-    if has_tangents {
-        flags |= VF_TANGENTS;
-        vertex_size += 4;
-    }
-    let skin_plan = skin::plan(asset, NifTarget::Se, policy)?;
-    if skin_plan.is_some() {
-        flags |= VF_SKINNED;
-        vertex_size += 12;
-    }
-    let vertex_desc = (flags << 44) | (vertex_size / 4);
+    let prepared = PreparedShape::new(asset, policy)?;
+    let skinned = prepared.skinned();
 
     let mut strings = StringTable::new();
     let name_index = match asset.name.is_empty() {
         true => -1,
         false => strings.intern(&asset.name) as i32,
     };
-    let skin_nodes = skin_plan
+    let skin_nodes = prepared
+        .skin
         .as_ref()
         .map(|plan| SkinNodes::plan(checked, &plan.names, 4, &mut strings))
         .transpose()?;
     let node_count = skin_nodes.as_ref().map_or(0, SkinNodes::len);
-    let skin_ref = skin_plan.as_ref().map_or(-1, |_| 1);
-    let material = match asset.materials.len() {
-        0 => None,
-        1 => Some(&asset.materials[0]),
-        count => return Err(NifWriteError::MultipleMaterialSlots { count }),
+    // Without a skin this file has no root node: the shape is the file root, so
+    // it is the only block before the optional shader pair and physics link.
+    let mut next_block = match skinned {
+        true => 4 + node_count as i32,
+        false => 1,
     };
-    let texture_body = match material {
-        Some(slot) => shader::texture_set(slot)?,
-        None => Vec::new(),
-    };
-    // Blocks after the geometry/skin group.
-    let mut next_block = if skin_plan.is_some() {
-        4 + node_count as i32
-    } else {
-        1
-    };
-    let shader_index = material.map_or(-1, |_| {
-        let index = next_block;
-        next_block += 1;
-        index
-    });
-    let texture_index = match material.is_some() && !texture_body.is_empty() {
-        true => {
-            let index = next_block;
-            next_block += 1;
-            index
-        }
+    let shader_index = match prepared.has_material() {
+        true => take(&mut next_block),
         false => -1,
     };
-    let physics = extra::physics_link(asset)?;
-    let extra_index = physics.as_ref().map_or(-1, |_| {
-        let index = next_block;
-        next_block += 1;
-        index
-    });
-    let shader_body = material.map_or_else(Vec::new, |slot| {
-        shader::shader(slot, texture_index, name_index)
-    });
-    let extra_body = physics
-        .as_ref()
-        .map_or_else(Vec::new, |link| extra::body(link, &mut strings));
-    let data_size = asset.positions.len() as u64 * vertex_size + asset.triangles.len() as u64 * 6;
-    let lanes = skin_plan.as_ref().map(|plan| plan.lanes.as_slice());
-    let vertex_bytes = packed_vertices(asset, lanes, has_uvs, has_normals, has_tangents)?;
+    let texture_index = match shader_index >= 0 && !prepared.texture.is_empty() {
+        true => take(&mut next_block),
+        false => -1,
+    };
+    // Nothing follows the physics link, so its index is the last block.
+    let extra_index = match prepared.physics.is_some() {
+        true => next_block,
+        false => -1,
+    };
 
-    let mut body = Vec::new();
+    let transform = checked.map_or(NativeTransform::IDENTITY, |scene| scene.placement);
     // NiObjectNET: name, extra data, no controller. With a skin the file has a
     // root `NiNode`, and the game only reads the physics link from there
     // (`OutfitProject.cpp:250-252`); without one the shape is the root.
-    let shape_extra = match skin_plan.is_some() {
+    let shape_extra = match skinned {
         true => -1,
         false => extra_index,
     };
-    push_i32(&mut body, name_index);
-    push_u32(&mut body, u32::from(shape_extra >= 0));
-    if shape_extra >= 0 {
-        push_i32(&mut body, shape_extra);
+    let mut blocks = vec![Block {
+        type_name: BLOCK_TYPE,
+        body: body(
+            asset,
+            &prepared,
+            ShapeRefs {
+                name: name_index,
+                extra: shape_extra,
+                skin: if skinned { 1 } else { -1 },
+                shader: shader_index,
+            },
+            transform,
+        ),
+    }];
+    let root_extra: Vec<i32> = match extra_index {
+        -1 => Vec::new(),
+        index => vec![index],
+    };
+    if let Some((plan, nodes)) = prepared.skin.as_ref().zip(skin_nodes) {
+        blocks.push(Block {
+            type_name: skin::INSTANCE_TYPE,
+            body: skin::instance(2, 3, nodes.root, &nodes.bones),
+        });
+        blocks.push(Block {
+            type_name: skin::DATA_TYPE,
+            body: skin::data(
+                plan,
+                &checked.map_or_else(skin::identity, CheckedScene::global_skin),
+            )?,
+        });
+        blocks.push(Block {
+            type_name: skin::PARTITION_TYPE,
+            body: skin::partitions(asset, plan, Some(&prepared.global()))?,
+        });
+        for node in nodes.encode(&root_extra) {
+            blocks.push(Block {
+                type_name: skin::NODE_TYPE,
+                body: node,
+            });
+        }
+    }
+    if shader_index >= 0 {
+        blocks.push(Block {
+            type_name: shader::SHADER_TYPE,
+            body: prepared.shader_body(name_index, texture_index),
+        });
+        if texture_index >= 0 {
+            blocks.push(Block {
+                type_name: shader::TEXTURE_TYPE,
+                body: prepared.texture.clone(),
+            });
+        }
+    }
+    if let Some(link) = prepared.physics.as_ref() {
+        blocks.push(Block {
+            type_name: extra::BLOCK_TYPE,
+            body: extra::body(link, &mut strings),
+        });
+    }
+    Ok(WrittenNif {
+        bytes: write_file(&blocks, &strings),
+        dropped_influences: prepared
+            .skin
+            .map_or_else(Vec::new, |plan| plan.dropped_influences),
+    })
+}
+
+/// Assign the next block index and advance the cursor.
+fn take(next: &mut i32) -> i32 {
+    let index = *next;
+    *next += 1;
+    index
+}
+
+/// One shape's block references inside its file.
+pub(super) struct ShapeRefs {
+    /// String-table index of the shape name, or `-1`.
+    pub(super) name: i32,
+    /// Block index of this shape's extra data, or `-1`.
+    pub(super) extra: i32,
+    /// Block index of `NiSkinInstance`, or `-1` for an unskinned shape.
+    pub(super) skin: i32,
+    /// Block index of `BSLightingShaderProperty`, or `-1`.
+    pub(super) shader: i32,
+}
+
+/// Everything one shape contributes before a block index is known.
+pub(super) struct PreparedShape {
+    /// Vertex count narrowed to the block's `u16` field.
+    vertices: u16,
+    /// Triangle count narrowed to the block's `u16` field.
+    triangles: u16,
+    /// Attribute flags and packed stride.
+    attributes: Attributes,
+    /// Packed `BSVertexDataSSE` stream in mesh order.
+    vertex_bytes: Vec<u8>,
+    /// The validated skin plan, when the shape is skinned.
+    pub(super) skin: Option<skin::SkinPlan>,
+    /// The single material slot, when the shape carries one.
+    material: Option<MaterialSlot>,
+    /// `BSShaderTextureSet` body, empty when the slot declares no texture.
+    pub(super) texture: Vec<u8>,
+    /// The HDT-SMP physics link this shape names.
+    pub(super) physics: Option<extra::PhysicsLink>,
+}
+
+impl PreparedShape {
+    /// Validate the model and plan every per-shape fact that no block index
+    /// affects: counts, packed geometry, skin, material and physics.
+    pub(super) fn new(asset: &MeshAsset, policy: InfluencePolicy) -> Result<Self, NifWriteError> {
+        asset.validate().map_err(NifWriteError::InvalidModel)?;
+        let vertices =
+            u16::try_from(asset.positions.len()).map_err(|_| NifWriteError::TooManyVertices {
+                vertices: asset.positions.len(),
+            })?;
+        let triangles =
+            u16::try_from(asset.triangles.len()).map_err(|_| NifWriteError::TooManyTriangles {
+                triangles: asset.triangles.len(),
+            })?;
+        let base = Attributes::of(asset)?;
+        let skin = skin::plan(asset, NifTarget::Se, policy)?;
+        let attributes = match skin.is_some() {
+            true => base.skinned(),
+            false => base,
+        };
+        let lanes = skin.as_ref().map(|plan| plan.lanes.as_slice());
+        let vertex_bytes = packed_vertices(
+            asset,
+            lanes,
+            base.has(VF_UVS),
+            base.has(VF_NORMALS),
+            base.has(VF_TANGENTS),
+        )?;
+        let material = shader::single_slot(asset)?.cloned();
+        let texture = match &material {
+            Some(slot) => shader::texture_set(slot)?,
+            None => Vec::new(),
+        };
+        let physics = extra::physics_link(asset)?;
+        Ok(Self {
+            vertices,
+            triangles,
+            attributes,
+            vertex_bytes,
+            skin,
+            material,
+            texture,
+            physics,
+        })
+    }
+
+    /// Whether the shape writes a skin group instead of inline geometry.
+    pub(super) fn skinned(&self) -> bool {
+        self.skin.is_some()
+    }
+
+    /// Whether the shape writes a shader property.
+    pub(super) fn has_material(&self) -> bool {
+        self.material.is_some()
+    }
+
+    /// This shape's SSE packed-vertex view, for its own partition block.
+    pub(super) fn global(&self) -> skin::GlobalVertices<'_> {
+        skin::GlobalVertices {
+            vertex_desc: self.attributes.descriptor(),
+            vertex_size: self.attributes.size,
+            bytes: &self.vertex_bytes,
+        }
+    }
+
+    /// `BSLightingShaderProperty` body for the assigned blocks.
+    pub(super) fn shader_body(&self, name: i32, texture_set: i32) -> Vec<u8> {
+        match &self.material {
+            Some(slot) => shader::shader(slot, texture_set, name),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// SE vertex attribute flags and packed stride, before the skin lane.
+#[derive(Clone, Copy)]
+struct Attributes {
+    flags: u64,
+    size: u32,
+}
+
+impl Attributes {
+    /// Attribute flags for the model's authored attributes.
+    ///
+    /// Tangents need normals because the packed frame derives the bitangent from
+    /// them, so that pair is refused rather than written inconsistently.
+    fn of(asset: &MeshAsset) -> Result<Self, NifWriteError> {
+        let mut attributes = Self {
+            flags: VF_VERTEX,
+            size: 16,
+        };
+        for (present, flag, bytes) in [
+            (!asset.uvs.is_empty(), VF_UVS, 4),
+            (!asset.normals.is_empty(), VF_NORMALS, 4),
+            (!asset.tangents.is_empty(), VF_TANGENTS, 4),
+        ] {
+            if present {
+                attributes.flags |= flag;
+                attributes.size += bytes;
+            }
+        }
+        if attributes.has(VF_TANGENTS) && !attributes.has(VF_NORMALS) {
+            return Err(NifWriteError::TangentsWithoutNormals);
+        }
+        Ok(attributes)
+    }
+
+    /// Record the packed skin lane the shape writes after its attributes.
+    fn skinned(mut self) -> Self {
+        self.flags |= VF_SKINNED;
+        self.size += 12;
+        self
+    }
+
+    /// Whether the packed stream carries `flag`'s attribute.
+    fn has(self, flag: u64) -> bool {
+        self.flags & flag != 0
+    }
+
+    /// The `BSVertexDesc` word: flags in the high 44 bits, stride in words.
+    fn descriptor(self) -> u64 {
+        (self.flags << 44) | u64::from(self.size / 4)
+    }
+}
+
+/// Encode one `BSTriShape` block body.
+///
+/// A skinned shape leaves `vertices`, `triangles` and `data_size` at zero: its
+/// packed stream lives in the linked `NiSkinPartition` and the reader
+/// reconstructs from there, exactly as nifly writes and reads `IsSkinned()`
+/// shapes. An unskinned shape keeps the inline stream.
+pub(super) fn body(
+    asset: &MeshAsset,
+    prepared: &PreparedShape,
+    refs: ShapeRefs,
+    transform: NativeTransform,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    push_i32(&mut body, refs.name);
+    push_u32(&mut body, u32::from(refs.extra >= 0));
+    if refs.extra >= 0 {
+        push_i32(&mut body, refs.extra);
     }
     push_i32(&mut body, -1);
-    // NiAVObject: flags, identity transform, no collision.
+    // NiAVObject: flags, transform, no collision.
     push_u32(&mut body, 0);
-    checked
-        .map_or(NativeTransform::IDENTITY, |scene| scene.placement)
-        .write_av(&mut body);
+    transform.write_av(&mut body);
     push_i32(&mut body, -1);
     // BSTriShape: bounding sphere, refs, vertex descriptor.
     for value in [0.0f32, 0.0, 0.0, 0.0] {
         push_f32(&mut body, value);
     }
-    push_i32(&mut body, skin_ref);
-    push_i32(&mut body, shader_index);
+    push_i32(&mut body, refs.skin);
+    push_i32(&mut body, refs.shader);
     push_i32(&mut body, -1); // alpha
-    push_u64(&mut body, vertex_desc);
-    // A skinned SE shape carries no inline geometry: nifly writes 0/0/0 here
-    // and keeps the packed vertices in `NiSkinPartition`
-    // (`Geometry.cpp`, `BSTriShape::Sync` write branch, `IsSkinned()`), and its
-    // reader reconstructs from the same place. An unskinned shape keeps the
-    // inline stream.
-    let (shape_triangles, shape_vertices, shape_data_size) = match skin_plan.is_some() {
+    push_u64(&mut body, prepared.attributes.descriptor());
+    let data_size = asset.positions.len() as u64 * u64::from(prepared.attributes.size)
+        + asset.triangles.len() as u64 * 6;
+    let (triangles, vertices, data_size) = match prepared.skinned() {
         true => (0, 0, 0),
-        false => (triangles, vertices, data_size as u32),
+        false => (prepared.triangles, prepared.vertices, data_size as u32),
     };
-    push_u16(&mut body, shape_triangles);
-    push_u16(&mut body, shape_vertices);
-    push_u32(&mut body, shape_data_size);
-    if skin_plan.is_none() {
-        body.extend_from_slice(&vertex_bytes);
+    push_u16(&mut body, triangles);
+    push_u16(&mut body, vertices);
+    push_u32(&mut body, data_size);
+    if !prepared.skinned() {
+        body.extend_from_slice(&prepared.vertex_bytes);
         for triangle in &asset.triangles {
             push_u16(&mut body, triangle[0] as u16);
             push_u16(&mut body, triangle[1] as u16);
@@ -187,115 +376,7 @@ pub(super) fn write(
         }
     }
     push_u32(&mut body, 0); // SSE particle_data_size
-
-    let root_extra: Vec<i32> = match extra_index {
-        -1 => Vec::new(),
-        index => vec![index],
-    };
-    let global = skin::GlobalVertices {
-        vertex_desc,
-        vertex_size: vertex_size as u32,
-        bytes: &vertex_bytes,
-    };
-    let (instance, data, partition, nodes) = match skin_plan.as_ref().zip(skin_nodes) {
-        Some((plan, scene)) => (
-            skin::instance(2, 3, scene.root, &scene.bones),
-            skin::data(
-                plan,
-                &checked.map_or_else(skin::identity, CheckedScene::global_skin),
-            )?,
-            skin::partitions(asset, plan, Some(&global))?,
-            scene.encode(&root_extra),
-        ),
-        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-    };
-
-    let mut type_names: Vec<&str> = vec![BLOCK_TYPE];
-    let mut type_indices: Vec<u16> = vec![0];
-    if skin_plan.is_some() {
-        type_names.extend(["NiSkinInstance", "NiSkinData", "NiSkinPartition", "NiNode"]);
-        type_indices.extend([1, 2, 3]);
-        type_indices.extend(std::iter::repeat_n(4, node_count));
-    }
-    if material.is_some() {
-        type_names.push("BSLightingShaderProperty");
-        type_indices.push(type_names.len() as u16 - 1);
-        if texture_index >= 0 {
-            type_names.push("BSShaderTextureSet");
-            type_indices.push(type_names.len() as u16 - 1);
-        }
-    }
-    if physics.is_some() {
-        type_names.push(extra::BLOCK_TYPE);
-        type_indices.push(type_names.len() as u16 - 1);
-    }
-
-    let mut file = write_header(NifTarget::Se);
-    // Block count precedes BSStreamHeader in the parsed layout.
-    push_u32(&mut file, type_indices.len() as u32);
-    // BSStreamHeader: SE bsver, empty author/process/export strings.
-    push_u32(&mut file, 100);
-    file.push(0); // author
-    file.push(0); // process script
-    file.push(0); // export script
-    // Block type table.
-    push_u16(&mut file, type_names.len() as u16);
-    for name in &type_names {
-        push_u32(&mut file, name.len() as u32);
-        file.extend_from_slice(name.as_bytes());
-    }
-    for index in &type_indices {
-        push_u16(&mut file, *index);
-    }
-    push_u32(&mut file, body.len() as u32);
-    if skin_plan.is_some() {
-        push_u32(&mut file, instance.len() as u32);
-        push_u32(&mut file, data.len() as u32);
-        push_u32(&mut file, partition.len() as u32);
-        for node in &nodes {
-            push_u32(&mut file, node.len() as u32);
-        }
-    }
-    if material.is_some() {
-        push_u32(&mut file, shader_body.len() as u32);
-        if texture_index >= 0 {
-            push_u32(&mut file, texture_body.len() as u32);
-        }
-    }
-    if physics.is_some() {
-        push_u32(&mut file, extra_body.len() as u32);
-    }
-    // String table: index 0 is empty, then the shape and bone names.
-    let max_length = strings.iter().map(str::len).max().unwrap_or(0);
-    push_u32(&mut file, strings.len() as u32);
-    push_u32(&mut file, max_length as u32);
-    for value in strings.iter() {
-        push_u32(&mut file, value.len() as u32);
-        file.extend_from_slice(value.as_bytes());
-    }
-    push_u32(&mut file, 0); // num_groups
-    file.extend_from_slice(&body);
-    if skin_plan.is_some() {
-        file.extend_from_slice(&instance);
-        file.extend_from_slice(&data);
-        file.extend_from_slice(&partition);
-        for node in &nodes {
-            file.extend_from_slice(node);
-        }
-    }
-    if material.is_some() {
-        file.extend_from_slice(&shader_body);
-        if texture_index >= 0 {
-            file.extend_from_slice(&texture_body);
-        }
-    }
-    if physics.is_some() {
-        file.extend_from_slice(&extra_body);
-    }
-    Ok(WrittenNif {
-        bytes: file,
-        dropped_influences: skin_plan.map_or_else(Vec::new, |plan| plan.dropped_influences),
-    })
+    body
 }
 
 /// Pack every mesh vertex into the `BSVertexDataSSE` stream the shape's

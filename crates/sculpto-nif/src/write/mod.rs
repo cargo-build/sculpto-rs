@@ -13,6 +13,7 @@ pub mod extra;
 pub mod header;
 pub mod le_shape;
 mod scene;
+pub mod se_bundle;
 pub mod se_shape;
 pub mod shader;
 pub mod skin;

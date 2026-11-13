@@ -18,6 +18,15 @@ use super::header::{NifTarget, NifWriteError};
 use super::scene::NativeTransform;
 use super::{DroppedInfluence, InfluencePolicy};
 
+/// Block type table name for the skin instance.
+pub(super) const INSTANCE_TYPE: &str = "NiSkinInstance";
+/// Block type table name for the skin data.
+pub(super) const DATA_TYPE: &str = "NiSkinData";
+/// Block type table name for the skin partition.
+pub(super) const PARTITION_TYPE: &str = "NiSkinPartition";
+/// Block type table name for a scene or bone node.
+pub(super) const NODE_TYPE: &str = "NiNode";
+
 /// Validated palette, bind matrices and per-bone sparse weights.
 pub(crate) struct SkinPlan {
     /// Bone names in palette order.

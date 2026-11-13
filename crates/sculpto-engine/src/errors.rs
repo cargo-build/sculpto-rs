@@ -100,6 +100,10 @@ pub fn nif_write(error: NifWriteError) -> CommandError {
             (ErrorKind::Unsupported, "nif_write_unsupported_endian")
         }
         NifWriteError::InvalidModel(_) => (ErrorKind::Refused, "nif_write_invalid_model"),
+        NifWriteError::InvalidBundle(_) => (ErrorKind::Refused, "nif_write_invalid_bundle"),
+        NifWriteError::TransformUnsupported { .. } => {
+            (ErrorKind::Refused, "nif_write_transform_unsupported")
+        }
         NifWriteError::InvalidRig(_) => (ErrorKind::Refused, "nif_write_invalid_rig"),
         NifWriteError::RigLayout { .. } => (ErrorKind::Refused, "nif_write_rig_layout"),
         NifWriteError::TooManyVertices { .. } => {
@@ -137,6 +141,9 @@ pub fn nif_write(error: NifWriteError) -> CommandError {
         }
         NifWriteError::GlobalVertexMismatch { .. } => {
             (ErrorKind::Refused, "nif_write_global_vertex_mismatch")
+        }
+        NifWriteError::MultiplePhysicsLinks { .. } => {
+            (ErrorKind::Refused, "nif_write_multiple_physics_links")
         }
     };
     CommandError::new(kind, code, error.to_string())
