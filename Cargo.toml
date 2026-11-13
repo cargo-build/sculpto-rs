@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "crates/boethos", "crates/sculpto-engine", "crates/sculpto-gltf", "tools/span-manifest"]
+members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "crates/boethos", "crates/boethos-catalogue", "crates/boethos-cli", "crates/sculpto-engine", "crates/sculpto-gltf", "tools/span-manifest"]
 exclude = ["vendor/byroredux", "tools/bevy-viewer"]
 resolver = "3"
 

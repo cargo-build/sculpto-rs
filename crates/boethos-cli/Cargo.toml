@@ -1,0 +1,16 @@
+[package]
+name = "boethos-cli"
+description = "Agent-first CLI for the boethos asset catalogue."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "boethos"
+path = "src/main.rs"
+
+[dependencies]
+boethos = { path = "../boethos" }
+boethos-catalogue = { path = "../boethos-catalogue" }
+serde_json = "1"
