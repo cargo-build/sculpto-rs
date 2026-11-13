@@ -5,7 +5,51 @@ The production fitting workflow has not passed the complete FIT-08 acceptance.
 The engine-parity epic remains open. A successful reference experiment below
 does not mark the integrated task Done.
 
-## Latest checkpoint — repeatable native extraction, fit still rejected
+## Latest checkpoint — ordinary robe fit rejection isolated
+
+Read-only probes on engine `2d99f2a5` now separate the mixed-region guard from
+the compact ordinary fitter. Inputs are the two native Apprentice robe builds
+assembled with the exact Bijin endpoints after the collar repair below. Positions
+are already in their common Z-up rest frame, at 0.014 metres/source unit.
+
+One **proposed diagnostic profile**, selected before measuring contacts, keeps
+faces below the actual pelvis landmark or influenced by authored Skirt bones
+for Blender Cloth. It is not a universal robe classifier. Those 122 authored
+faces are already included by the height selection. Cloth/ordinary face counts
+are 1011/3081 (`_0`) and 1008/3084 (`_1`); shared/coincident positions are locked.
+None of the four/five fully fixed ordinary faces intersects the body. This
+does not establish feasibility of every other locked-vertex constraint.
+
+The registered-options region fit returns unchanged geometry: 1320/1432 ordinary
+body triangle pairs remain, with 41/47 inside groups. Cloth positions are exact.
+Stage isolation shows rollback already occurs inside compact `fit_and_repair`,
+before the outer whole-garment ordinary/cloth guard.
+
+| Raw ordinary SurfaceFit | Bijin `_0` | Bijin `_1` |
+|---|---:|---:|
+| Body pairs with default internal clipping | 671 | 763 |
+| Face flips with default clipping | 90 | 126 |
+| New full-garment self-witnesses with default clipping | 701 | 829 |
+| Body pairs with internal clipping disabled | 1339 | 1409 |
+| Face flips with clipping disabled | 0 | 0 |
+| New full-garment self-witnesses with clipping disabled | 8 | 8 |
+
+Only `clipping_passes` changes from 4 to 0 in the raw comparison. Internal clipping
+amplifies the damage, but disabling it alone still violates the self-contact
+guard and worsens body pairs at `_0`. Each of the eight/eight witnesses is a
+new Crossing pair, not a changed classification of an inherited pair. All
+involve ordinary faces; only one `_0` pair touches a locked vertex. Cloth-boundary
+contacts alone therefore do not explain the rejection.
+**Neither raw candidate is accepted.**
+The returned guarded region output remains unchanged. No production algorithm
+or quality guard changed; the next investigation concerns the eight remaining
+new witnesses and their source construction/locked boundaries. Separate ordinary
+head contacts 0/11 and hand contacts 94/80 also remain; feet contacts are 0/0.
+Counts are triangle/witness measurements, not penetration depths or motion proof.
+Blender still owns cloth simulation. One profile/outfit does not qualify the
+required exact Bijin/Mike clothing cohorts.
+
+## Repeatable native extraction and bounded collar repair
 
 The private host wrapper now has a parameterized native-reference extraction
 command. An explicit recipe pins the selected native project/preset, exact body
