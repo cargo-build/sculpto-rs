@@ -61,7 +61,7 @@ Subcommand help is uneven; missing subcommand help does not prove absence.
 |---|---|---|
 | Inspect BodySlide data | `inspect PATH`, `presets`, `sliders`; [core](crates/sculpto-core/src/lib.rs) | OSP, presets, OSD/BSD; family and ordered vertex identity matter |
 | Bake shapes | `bake`, `batch`; [bake](crates/sculpto-bake/src/lib.rs) | Explicit set, preset and weight endpoint; a body bake is not a finished outfit |
-| Import/export assets | `export-obj`, registry `export.nif` / `export.pair`; [NIF](crates/sculpto-nif/src/lib.rs), [GLB writer](crates/sculpto-gltf/src/lib.rs) | Supported subsets; do not infer every native format feature |
+| Import/export assets | `export-obj`, `export-nif`, registry `export.nif` / `export.bundle` / `export.pair`; [NIF](crates/sculpto-nif/src/lib.rs), [GLB writer](crates/sculpto-gltf/src/lib.rs) | Supported subsets; do not infer every native format feature |
 | Fit and classify garments | `garment fit`, `follow`, `aura`, `classify`, `intake`; [mesh](crates/sculpto-mesh/src/lib.rs) | Authored topology/rest frame and declared preparation route |
 | Fit a component seam | registry `component.seam_fit`; [mesh seam](crates/sculpto-mesh/src/seam.rs) | Explicit original vertex targets and same-frame lengths; preserves render order, not automatic anatomy or skin transfer |
 | Measure geometric defects | `garment check`, `depth`, `cover`, `proxies`; [checks](crates/sculpto-mesh/src/check.rs) | Intersection counts, depth, and sampled coverage mean different things; depth is a local normal-side approximation split by garment facing, not containment or occlusion |
@@ -127,8 +127,8 @@ this summary when those contracts materially change:
   partitions/material/morph fidelity and the `export.tri` command surface.
 - RIG-04/05: complete posed NIF/GLB round trips and supported-family binding
   acceptance. Existing rig/remap code is a foundation, not that acceptance.
-- SHP-01–06: multi-shape NIF writers, export surface and native acceptance;
-  `export.nif` currently exports one shape.
+- SHP-06: native Outfit Studio multi-shape acceptance; the bundle writers and
+  the `export.bundle` / `export-nif --all-shapes` surface have landed.
 - MOD-02–04/06: material/texture completeness and native end-to-end outfit load.
 - ARC-01/02/04–06: archetypes, attachments and qualified one-button adaptation.
 - Authoring surfaces, engine session/undo/invalidation and hairstyle workflow

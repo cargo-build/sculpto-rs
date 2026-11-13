@@ -25,6 +25,8 @@ use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
 use sculpto_nif::write::header::{NifTarget, NifWriteError};
+use sculpto_nif::write::le_bundle::write_le_bundle;
+use sculpto_nif::write::se_bundle::write_se_bundle;
 use sculpto_nif::write::{
     DroppedInfluence, InfluencePolicy, WrittenNif, write_rigged_shape, write_shape_with_policy,
 };
@@ -611,6 +613,114 @@ pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandE
 ///
 pub fn write_nif(asset: &MeshAsset, target: ExportTarget) -> Result<WrittenNif, CommandError> {
     encode_nif(asset, target.into(), None)
+}
+
+/// Everything `export.bundle` needs.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct ExportBundleParams {
+    /// Input NIF.
+    pub nif: PathBuf,
+    /// Output NIF.
+    pub out: PathBuf,
+    /// Target game version.
+    pub target: ExportTarget,
+    /// Shape names in export order; every document shape in scene order when absent.
+    pub shapes: Option<Vec<String>>,
+}
+
+/// One shape's written counts, in bundle order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeCount {
+    /// Shape name, as authored.
+    pub name: String,
+    /// Vertices written for this shape.
+    pub vertices: usize,
+    /// Triangles written for this shape.
+    pub triangles: usize,
+}
+
+/// What `export.bundle` produced.
+#[derive(Debug, Clone)]
+pub struct ExportBundleOutcome {
+    /// Output path.
+    pub out: PathBuf,
+    /// Target written.
+    pub target: ExportTarget,
+    /// Per-shape counts in write order.
+    pub shapes: Vec<ShapeCount>,
+    /// Total vertices written.
+    pub vertices: usize,
+    /// Total triangles written.
+    pub triangles: usize,
+    /// Bytes written.
+    pub bytes: usize,
+}
+
+/// Re-encode all or selected shapes of a source NIF into one multi-shape NIF.
+///
+/// Names, geometry and skins travel through [`MeshAsset`] unchanged, so the
+/// name-based role attribution and each shape's binding survive the re-encode.
+/// The landed bundle writers own the encoding with `InfluencePolicy::Preserve`:
+/// an unrepresentable weight row is refused, never silently dropped.
+///
+/// # Errors
+/// An unknown shape name is `shape_not_found`; bundle defects (no shapes,
+/// repeated names, differing bone lists) and per-shape writer refusals map
+/// through [`errors::nif_write`]. No output file is written on any failure.
+pub fn export_nif_bundle(params: &ExportBundleParams) -> Result<ExportBundleOutcome, CommandError> {
+    let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let selected = match &params.shapes {
+        // The caller chose from a list, so a miss names what the file holds.
+        Some(names) => names
+            .iter()
+            .map(|name| {
+                document
+                    .shapes
+                    .iter()
+                    .find(|shape| shape.name == *name)
+                    .ok_or_else(|| unknown_shape(&document.shapes, name))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => document.shapes.iter().collect(),
+    };
+    let mut assets = selected
+        .iter()
+        .map(|shape| MeshAsset::from(*shape))
+        .collect::<Vec<_>>();
+    for asset in &assets {
+        asset.validate().map_err(errors::mesh)?;
+    }
+    // Same LE projection as `encode_nif`: the LE writer refuses authored
+    // tangents, so the target projection omits them instead of refusing every
+    // real shape. SE writes them.
+    if params.target == ExportTarget::Le {
+        for asset in &mut assets {
+            asset.tangents.clear();
+        }
+    }
+    let bytes = match params.target {
+        ExportTarget::Se => write_se_bundle(&assets),
+        ExportTarget::Le => write_le_bundle(&assets),
+    }
+    .map_err(errors::nif_write)?;
+    std::fs::write(&params.out, &bytes).map_err(|error| errors::io(&params.out, error))?;
+    let shapes = assets
+        .iter()
+        .map(|asset| ShapeCount {
+            name: asset.name.clone(),
+            vertices: asset.positions.len(),
+            triangles: asset.triangles.len(),
+        })
+        .collect::<Vec<_>>();
+    Ok(ExportBundleOutcome {
+        out: params.out.clone(),
+        target: params.target,
+        vertices: shapes.iter().map(|shape| shape.vertices).sum(),
+        triangles: shapes.iter().map(|shape| shape.triangles).sum(),
+        shapes,
+        bytes: bytes.len(),
+    })
 }
 
 impl From<ExportTarget> for NifTarget {

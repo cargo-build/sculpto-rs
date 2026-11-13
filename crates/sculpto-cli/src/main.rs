@@ -38,6 +38,7 @@ commands:
   sliders [options]     print each slider's effective percentage
   presets [options]     list presets in a SliderPresets collection
   export-obj [options]  read a NIF and write one shape as an OBJ
+  export-nif [options]  re-encode NIF shapes for a Skyrim target (one shape or a bundle)
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
   outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
                  --presets <xml> --preset <name> --set <name> --out <osd>
@@ -90,6 +91,15 @@ export-obj options:
   --shape <name>     shape to export (defaults to the largest)
   --out <obj>        output path
   --list <1>         print every shape and its counts, then stop (no OBJ)
+
+export-nif options:
+  --nif <path>       NIF to read
+  --out <path>       output NIF
+  --target <se|le>   target game version
+  --shape <name>     single shape to export (defaults to the largest)
+  --shapes <name>    explicit shape list, repeatable (bundle mode)
+  --all-shapes       export every document shape (bundle mode)
+  --rig-template <path>  family skeleton NIF (single-shape mode only)
 
 garment fit options:
   --nif <path>         garment NIF
@@ -186,6 +196,7 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "batch" => batch(rest),
         [command, rest @ ..] if command == "presets" => presets(rest),
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
+        [command, rest @ ..] if command == "export-nif" => export_nif(rest),
         [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
             outfit_inspect(rest)
         }
@@ -551,6 +562,76 @@ fn export_obj_inner(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn export_nif(args: &[String]) -> ExitCode {
+    match export_nif_input(args) {
+        Ok((command, input)) => run::dispatch_payload(command, &input),
+        Err(error) => {
+            eprintln!("export-nif: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Translate argv flags into a registry input: bundle mode dispatches
+/// `export.bundle`, the default single-shape mode keeps `export.nif`.
+fn export_nif_input(args: &[String]) -> Result<(&'static str, serde_json::Value), String> {
+    let mut flags: BTreeMap<String, String> = BTreeMap::new();
+    let mut shapes: Vec<String> = Vec::new();
+    let mut all_shapes = false;
+    let mut iter = args.iter();
+    while let Some(key) = iter.next() {
+        let name = key
+            .strip_prefix("--")
+            .ok_or_else(|| format!("unexpected argument `{key}`"))?;
+        if name == "all-shapes" {
+            all_shapes = true;
+            continue;
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| format!("`--{name}` needs a value"))?;
+        match name {
+            "shapes" => shapes.push(value.clone()),
+            "nif" | "out" | "target" | "shape" | "rig-template" => {
+                flags.insert(name.to_string(), value.clone());
+            }
+            other => return Err(format!("unknown option `--{other}`")),
+        }
+    }
+    let bundle = all_shapes || !shapes.is_empty();
+    if all_shapes && (!shapes.is_empty() || flags.contains_key("shape")) {
+        return Err("`--all-shapes` cannot combine with `--shape` or `--shapes`".to_string());
+    }
+    if bundle && flags.contains_key("shape") {
+        return Err("`--shapes` cannot combine with `--shape`".to_string());
+    }
+    if bundle && flags.contains_key("rig-template") {
+        return Err("`--rig-template` applies to single-shape export only".to_string());
+    }
+    let mut input = serde_json::json!({
+        "nif": required(&flags, "nif")?,
+        "out": required(&flags, "out")?,
+        "target": required(&flags, "target")?,
+    });
+    match bundle {
+        true => {
+            if !shapes.is_empty() {
+                input["shapes"] = serde_json::json!(shapes);
+            }
+            Ok(("export.bundle", input))
+        }
+        false => {
+            if let Some(shape) = flags.get("shape") {
+                input["shape"] = serde_json::json!(shape);
+            }
+            if let Some(rig) = flags.get("rig-template") {
+                input["rig_template"] = serde_json::json!(rig);
+            }
+            Ok(("export.nif", input))
+        }
+    }
 }
 
 /// Positions plus triangles, the shape an OBJ carries in the display frame.

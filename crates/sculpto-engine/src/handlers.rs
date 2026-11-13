@@ -61,6 +61,11 @@ pub fn export_nif_schema() -> Value {
     schema_for::<ops::ExportNifParams>()
 }
 
+/// Schema derived from the typed `export.bundle` parameters.
+pub fn export_bundle_schema() -> Value {
+    schema_for::<ops::ExportBundleParams>()
+}
+
 /// Schema derived from the typed GLB repair parameters.
 pub fn glb_file_schema() -> Value {
     schema_for::<ops::GlbFileParams>()
@@ -374,6 +379,35 @@ pub fn export_nif(input: &Value) -> Result<Value, CommandError> {
         "triangles": outcome.triangles,
         "bytes": outcome.bytes,
         "dropped_influences": dropped_influences(&outcome.dropped_influences),
+    }))
+}
+
+pub fn export_bundle(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::ExportBundleParams {
+        nif: path(input, "nif")?,
+        out: path(input, "out")?,
+        target: ops::ExportTarget::parse(&string(input, "target")?)?,
+        shapes: string_list(input, "shapes")?,
+    };
+    let outcome = ops::export_nif_bundle(&params)?;
+    let shapes: Vec<Value> = outcome
+        .shapes
+        .iter()
+        .map(|shape| {
+            json!({
+                "name": shape.name,
+                "vertices": shape.vertices,
+                "triangles": shape.triangles,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "out": outcome.out.display().to_string(),
+        "target": outcome.target.as_str(),
+        "shapes": shapes,
+        "vertices": outcome.vertices,
+        "triangles": outcome.triangles,
+        "bytes": outcome.bytes,
     }))
 }
 

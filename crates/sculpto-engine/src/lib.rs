@@ -58,6 +58,8 @@ pub enum CommandId {
     IntakeCheck,
     /// Export an asset as a NIF.
     ExportNif,
+    /// Re-encode all or selected NIF shapes into one multi-shape bundle.
+    ExportBundle,
     /// Zero a GLB's default morph weights.
     GltfResetWeights,
     /// Clamp a GLB's negative `texCoord` indices to UV set 0.
@@ -84,6 +86,7 @@ impl CommandId {
             CommandId::ExportPair => "export.pair",
             CommandId::IntakeCheck => "intake.check",
             CommandId::ExportNif => "export.nif",
+            CommandId::ExportBundle => "export.bundle",
             CommandId::GltfResetWeights => "gltf.reset_weights",
             CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
         }
@@ -359,6 +362,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::export_nif,
     },
     Spec {
+        id: CommandId::ExportBundle,
+        summary: "Re-encode all or selected shapes of a NIF into one multi-shape Skyrim NIF.",
+        mutates: true,
+        stub: false,
+        schema: handlers::export_bundle_schema,
+        handler: handlers::export_bundle,
+    },
+    Spec {
         id: CommandId::GltfResetWeights,
         summary: "Zero every mesh's default morph weights in a written GLB.",
         mutates: true,
@@ -468,6 +479,7 @@ mod tests {
             "export.obj",
             "export.pair",
             "export.nif",
+            "export.bundle",
             "intake.check",
             "gltf.reset_weights",
             "gltf.clamp_texcoord",
