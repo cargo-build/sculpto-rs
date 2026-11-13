@@ -35,13 +35,24 @@ pub struct PlannedSlider {
     pub name: String,
     /// Authored percentage after endpoint selection.
     pub percent: f32,
-    /// Reverse the morph direction.
+    /// Complement the value instead of reversing the diff: native replaces the
+    /// normalized value with `1 - value`, so 0 percent is full motion and 100
+    /// percent is none.
     pub invert: bool,
     /// Resolved blocks in document order.
     pub shapes: Vec<PlannedShape>,
 }
 
 impl PlannedSlider {
+    /// The normalized value native BodySlide feeds to its diff application.
+    ///
+    /// Authored percentages are 0..100; native stores the same value divided by
+    /// 100 and, for an inverted slider, applies the complement before the diff,
+    /// so this is the multiplier, not a negated percentage.
+    pub fn value(&self) -> f32 {
+        native_value(self.percent, self.invert)
+    }
+
     /// Apply this slider to a copy of the target's positions.
     ///
     /// # Errors
@@ -53,7 +64,7 @@ impl PlannedSlider {
     }
 
     fn apply_to(&self, target: &str, positions: &mut [[f32; 3]]) -> Result<(), BakeError> {
-        let scale = self.percent / 100.0 * if self.invert { -1.0 } else { 1.0 };
+        let scale = self.value();
         let vertices = positions.len();
         for shape in self.shapes.iter().filter(|shape| shape.target == target) {
             for offset in &shape.offsets {
@@ -293,7 +304,9 @@ impl BakePlan {
                     SliderSize::Small => slider.small,
                     SliderSize::Big => slider.big,
                 });
-            if percent == 0.0 {
+            // Native applies a slider whenever the post-inversion value is
+            // non-zero, so inversion makes 0 percent active and 100 percent inert.
+            if native_value(percent, slider.invert) == 0.0 {
                 continue;
             }
             if slider.uv {
@@ -424,6 +437,20 @@ impl BakePlan {
             slider.apply_to(target, &mut out)?;
         }
         Ok(out)
+    }
+}
+
+/// Normalized value native BodySlide applies for one slider. @req DECL0007
+///
+/// Native keeps slider values in `0..=1` and replaces an inverted one with
+/// `1.0f - value` right before `ApplyDiff`, which multiplies the authored diff
+/// by that value. Negating the percentage instead is a different curve and a
+/// different zero point.
+fn native_value(percent: f32, invert: bool) -> f32 {
+    let authored = percent / 100.0;
+    match invert {
+        true => 1.0 - authored,
+        false => authored,
     }
 }
 

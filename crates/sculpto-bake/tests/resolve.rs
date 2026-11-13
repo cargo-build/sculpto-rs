@@ -103,27 +103,81 @@ fn omitted_preset_value_uses_the_endpoint_default() {
     assert_eq!(out[0], [1.0, 0.0, 0.0]);
 }
 
-#[test]
-fn invert_flips_the_direction() {
+/// The same project with `Lean` inverted. Native replaces its normalized value
+/// with `1 - value` before the diff is applied, so 0 percent is full motion.
+fn inverted_project() -> Project {
     let xml = PROJECT.replace(
         r#"<Slider name="Lean""#,
         r#"<Slider name="Lean" invert="true""#,
     );
-    let project = match Document::parse_str(&xml, "inline.osp") {
+    match Document::parse_str(&xml, "inline.osp") {
         Ok(Document::Project(project)) => project,
         other => panic!("expected a project: {other:?}"),
-    };
-    let plan = BakePlan::resolve_with(
-        &project,
-        &preset(r#"<SetSlider name="Lean" size="big" value="50"/>"#),
+    }
+}
+
+/// One slider whose authored diff is `+1` on x, baked at an explicit percent.
+fn bake(project: &Project, percent: f32, tag: &str) -> BakePlan {
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert("Lean".to_string(), percent);
+    BakePlan::resolve_with_overrides(
+        project,
+        &preset(""),
         "Body",
         SliderSize::Big,
-        &home("invert"),
+        &home(tag),
+        &overrides,
         |_path| Ok(container(&[("BodyLean", vec![offset(0, [1.0, 0.0, 0.0])])])),
     )
-    .expect("plan resolves");
-    let out = plan.apply("Body", &[[0.0; 3]]).expect("applies");
-    assert_eq!(out[0], [-0.5, 0.0, 0.0]);
+    .expect("plan resolves")
+}
+
+fn applied(plan: &BakePlan, start: [f32; 3]) -> Vec<[f32; 3]> {
+    plan.apply("Body", &[start]).expect("applies")
+}
+
+#[test]
+fn inverted_zero_matches_non_inverted_full() {
+    let inverted = bake(&inverted_project(), 0.0, "invert-zero");
+    let plain = bake(&project(), 100.0, "invert-zero-plain");
+    assert_eq!(
+        inverted.sliders.len(),
+        1,
+        "0 percent is active when inverted"
+    );
+    assert_eq!(inverted.sliders[0].value(), 1.0);
+    assert_eq!(applied(&inverted, [0.0; 3]), applied(&plain, [0.0; 3]));
+    assert_eq!(applied(&inverted, [0.0; 3]), [[1.0, 0.0, 0.0]]);
+}
+
+#[test]
+fn inverted_half_matches_non_inverted_half() {
+    let inverted = bake(&inverted_project(), 50.0, "invert-half");
+    let plain = bake(&project(), 50.0, "invert-half-plain");
+    assert_eq!(inverted.sliders[0].value(), 0.5);
+    assert_eq!(applied(&inverted, [0.0; 3]), applied(&plain, [0.0; 3]));
+    assert_eq!(applied(&inverted, [0.0; 3]), [[0.5, 0.0, 0.0]]);
+}
+
+#[test]
+fn inverted_full_matches_non_inverted_zero() {
+    let inverted = bake(&inverted_project(), 100.0, "invert-full");
+    let plain = bake(&project(), 0.0, "invert-full-plain");
+    assert_eq!(
+        inverted.sliders.len(),
+        0,
+        "100 percent is inert when inverted"
+    );
+    assert_eq!(plain.sliders.len(), 0);
+    assert_eq!(applied(&inverted, [2.0; 3]), applied(&plain, [2.0; 3]));
+    assert_eq!(applied(&inverted, [2.0; 3]), [[2.0; 3]]);
+}
+
+#[test]
+fn non_inverted_bake_is_unchanged() {
+    let plan = bake(&project(), 50.0, "invert-baseline");
+    assert_eq!(plan.sliders[0].value(), 0.5);
+    assert_eq!(applied(&plan, [0.0; 3]), [[0.5, 0.0, 0.0]]);
 }
 
 #[test]

@@ -30,7 +30,10 @@ const PROJECT: &str = r#"<SliderSetInfo version="1">
     <Slider name="Hide" small="0" big="0" zap="true"/>
   </SliderSet>
 </SliderSetInfo>"#;
-const PRESETS: &str = r#"<SliderPresets><Preset name="Neutral" set="Body Set"/></SliderPresets>"#;
+// Native replaces an inverted slider's value with `1 - value`, so the 0 default
+// of `Reverse` would apply its whole diff in every bake. The preset declares it
+// inert at 100 to keep the fixture about `Lift`.
+const PRESETS: &str = r#"<SliderPresets><Preset name="Neutral" set="Body Set"><SetSlider name="Reverse" size="big" value="100"/></Preset></SliderPresets>"#;
 
 struct Scratch(PathBuf);
 
@@ -198,10 +201,8 @@ fn conformed_slider_follows_the_body_at_zero_and_one_hundred() {
     assert_eq!(file.blocks[0].offsets.len(), 4);
     assert_eq!(file.blocks[1].name, "GarmentReverse");
     assert!(
-        file.blocks[1]
-            .offsets
-            .iter()
-            .all(|offset| (offset.delta[2] + 1.0).abs() < 1e-6)
+        file.blocks[1].offsets.is_empty(),
+        "an inverted slider at 100 percent applies no diff, so its conformed block is empty"
     );
     let (zero, zero_report) = fixture.preview(0);
     let (hundred, hundred_report) = fixture.preview(100);
