@@ -1,11 +1,12 @@
-//! Multi-shape SE bundles: round trip, block layout and one shared skeleton.
+//! Multi-shape Skyrim bundles: round trip, block layout and one shared skeleton.
 //!
 //! The synthetic tier is procedural: three skinned shapes in one body palette,
 //! a different influence pair per shape, distinct vertex counts and only some of
 //! them textured. It pins the two things a bundle can get wrong without a
 //! reader error — that every shape's geometry, weights and material survive, and
 //! that the file has one root, one bone node per bone name, and one partition
-//! per shape.
+//! per shape. Each target runs it: SE writes `BSTriShape` groups, LE writes
+//! `NiTriShape` + `NiTriShapeData` pairs.
 //!
 //! The private-host tier writes a real body from `SCULPTO_BIJIN_NIF` next to two
 //! synthetic shapes in its own palette and compares every emitted shape's
@@ -17,11 +18,12 @@ use std::collections::BTreeSet;
 use byroredux_nif::blocks::node::NiNode;
 use byroredux_nif::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet};
 use byroredux_nif::blocks::skin::{NiSkinInstance, NiSkinPartition};
-use byroredux_nif::blocks::tri_shape::BsTriShape;
+use byroredux_nif::blocks::tri_shape::{BsTriShape, NiTriShape, NiTriShapeData};
 use byroredux_nif::parse_nif;
 use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderKind, Skin};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::read;
+use sculpto_nif::write::le_bundle::write_le_bundle;
 use sculpto_nif::write::se_bundle::write_se_bundle;
 use sculpto_nif::write::skin::identity;
 
@@ -322,6 +324,253 @@ fn se_shape_count() {
     }
 }
 
+/// LE keeps geometry on a separate data block, so a bundle is a list of
+/// `NiTriShape` + `NiTriShapeData` pairs, one shared skeleton and the same
+/// per-shape skin/shader groups the single-shape writer emits.
+#[test]
+fn le_multi_shape() {
+    let shapes = bundle();
+    for asset in &shapes {
+        asset.validate().expect("the fixture is a valid model");
+    }
+    let bytes = write_le_bundle(&shapes).expect("a three-shape LE bundle writes");
+    let document = read(&bytes).expect("our LE reader opens the bundle");
+    assert_eq!(document.bsver, 83, "the bundle is a Skyrim LE stream");
+    assert_eq!(document.header.user_version, 12);
+    assert_eq!(document.shapes.len(), shapes.len(), "one shape per shape");
+
+    for (index, source) in shapes.iter().enumerate() {
+        let shape = &document.shapes[index];
+        assert_eq!(shape.name, source.name, "shape {index} keeps its name");
+        assert_eq!(
+            shape.positions.len(),
+            source.positions.len(),
+            "shape {index} keeps its vertex count"
+        );
+        assert_eq!(
+            shape.triangles.len(),
+            source.triangles.len(),
+            "shape {index} keeps its triangle count"
+        );
+        assert_eq!(shape.triangles, source.triangles);
+        assert_eq!(shape.uvs.len(), source.uvs.len());
+        assert_eq!(shape.normals.len(), source.normals.len());
+        for (vertex, (actual, expected)) in
+            shape.positions.iter().zip(&source.positions).enumerate()
+        {
+            for (left, right) in actual.iter().zip(expected) {
+                assert!(
+                    (left - right).abs() <= 1e-6,
+                    "shape {index} vertex {vertex} drifted"
+                );
+            }
+        }
+        let authored = source.skin.as_ref().expect("authored skin");
+        let read_skin = shape.skin.as_ref().expect("each shape keeps its skin");
+        assert_eq!(
+            read_skin.bones, authored.bones,
+            "shape {index} keeps the shared palette order"
+        );
+        assert_eq!(read_skin.influences.rows(), authored.influences.rows());
+        for vertex in 0..authored.influences.rows() {
+            let read_row = read_skin.influences.row(vertex).expect("read row");
+            let authored_row = authored.influences.row(vertex).expect("authored row");
+            assert_eq!(
+                read_row.joints, authored_row.joints,
+                "shape {index} vertex {vertex} bone lanes"
+            );
+            for (left, right) in read_row.weights.iter().zip(authored_row.weights) {
+                assert!(
+                    (left - right).abs() <= 1e-5,
+                    "shape {index} vertex {vertex} weight drifted (LE sparse)"
+                );
+            }
+        }
+    }
+
+    // Distinct counts prove no shape consumed another shape's data block.
+    assert_eq!(
+        document
+            .shapes
+            .iter()
+            .map(|shape| (shape.positions.len(), shape.triangles.len()))
+            .collect::<Vec<_>>(),
+        vec![(3, 1), (4, 2), (3, 1)]
+    );
+}
+
+#[test]
+fn le_shape_count() {
+    let bytes = write_le_bundle(&bundle()).expect("writes");
+    let scene = parse_nif(&bytes).expect("parses");
+    let (header, _) = byroredux_nif::header::NifHeader::parse(&bytes).expect("header");
+    assert_eq!(
+        header.block_sizes.len(),
+        scene.len(),
+        "one recorded size per block"
+    );
+
+    // Block order: shape/data pairs with their skin and shader groups, then the
+    // root, then the bone union.
+    let types: Vec<&str> = (0..scene.len())
+        .map(|index| scene.get(index).expect("block").block_type_name())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "NiTriShape",
+            "NiTriShapeData",
+            "NiSkinInstance",
+            "NiSkinData",
+            "NiSkinPartition",
+            "BSLightingShaderProperty",
+            "BSShaderTextureSet",
+            "NiTriShape",
+            "NiTriShapeData",
+            "NiSkinInstance",
+            "NiSkinData",
+            "NiSkinPartition",
+            "BSLightingShaderProperty",
+            "BSShaderTextureSet",
+            "NiTriShape",
+            "NiTriShapeData",
+            "NiSkinInstance",
+            "NiSkinData",
+            "NiSkinPartition",
+            "NiNode",
+            "NiNode",
+            "NiNode",
+            "NiNode",
+        ]
+    );
+
+    // Every shape points at the data block written immediately after it, and
+    // that block carries the shape's own geometry.
+    for (shape_index, data_index, vertices, triangles) in [
+        (0usize, 1usize, 3usize, 1usize),
+        (7, 8, 4, 2),
+        (14, 15, 3, 1),
+    ] {
+        let shape = scene
+            .get_as::<NiTriShape>(shape_index)
+            .expect("shape block");
+        assert_eq!(
+            shape.data_ref.index(),
+            Some(data_index),
+            "shape {shape_index} pairs with its own data block"
+        );
+        let data = scene
+            .get_as::<NiTriShapeData>(data_index)
+            .expect("data block");
+        assert_eq!(data.vertices.len(), vertices, "data block {data_index}");
+        assert_eq!(data.triangles.len(), triangles, "data block {data_index}");
+    }
+
+    let root = scene.root_index.expect("one scene root");
+    assert_eq!(root, 19, "the root follows the shape groups");
+    let root_node = scene.get_as::<NiNode>(root).expect("root NiNode");
+    let children: Vec<usize> = root_node
+        .children
+        .iter()
+        .filter_map(|child| child.index())
+        .collect();
+    assert_eq!(children, vec![0, 7, 14], "one root references every shape");
+    assert!(
+        root_node.av.net.extra_data_refs.is_empty(),
+        "no physics link without a sidecar"
+    );
+
+    let bone_nodes: Vec<usize> = (root + 1..scene.len())
+        .filter(|index| scene.get_as::<NiNode>(*index).is_some())
+        .collect();
+    assert_eq!(bone_nodes.len(), BONES.len(), "one NiNode per bone name");
+    let names: Vec<&str> = bone_nodes
+        .iter()
+        .map(|index| {
+            scene
+                .get_as::<NiNode>(*index)
+                .and_then(|node| node.av.net.name.as_deref())
+                .expect("every bone node is named")
+        })
+        .collect();
+    assert_eq!(names, BONES);
+
+    let mut referenced = BTreeSet::new();
+    for instance_index in [2usize, 9, 16] {
+        let instance = scene
+            .get_as::<NiSkinInstance>(instance_index)
+            .expect("instance");
+        let bones: Vec<usize> = instance
+            .bone_refs
+            .iter()
+            .filter_map(|bone| bone.index())
+            .collect();
+        assert_eq!(
+            bones, bone_nodes,
+            "shape at {instance_index} points at the shared bone nodes"
+        );
+        assert_eq!(
+            instance.skeleton_root_ref.index(),
+            Some(root),
+            "every instance shares the one root"
+        );
+        referenced.extend(bones);
+    }
+    assert_eq!(
+        referenced.len(),
+        BONES.len(),
+        "the union has no duplicated bone node"
+    );
+
+    // Per shape: its own LE partition, its own bone pair, no SSE global buffer.
+    for (partition_index, bones, vertices) in [
+        (4usize, vec![0u16, 1], 3usize),
+        (11, vec![1, 2], 4),
+        (18, vec![0, 2], 3),
+    ] {
+        let partition = scene
+            .get_as::<NiSkinPartition>(partition_index)
+            .expect("partition");
+        assert_eq!(partition.partitions.len(), 1);
+        assert_eq!(
+            partition.partitions[0].bones, bones,
+            "partition {partition_index} follows its own shape's lanes"
+        );
+        assert_eq!(
+            partition.partitions[0].vertex_map.len(),
+            vertices,
+            "partition {partition_index} maps only its own shape"
+        );
+        assert!(
+            partition.global_vertex_data.is_none(),
+            "partition {partition_index} is the LE layout, not the SSE buffer"
+        );
+    }
+
+    // One shader per textured shape, in shape order.
+    for (shader_index, textures_index, expected) in [
+        (
+            5usize,
+            6usize,
+            vec!["textures/body_d.dds", "textures/body_n.dds"],
+        ),
+        (12, 13, vec!["textures/hands_d.dds"]),
+    ] {
+        let shader = scene
+            .get_as::<BSLightingShaderProperty>(shader_index)
+            .expect("shader");
+        let textures = scene
+            .get_as::<BSShaderTextureSet>(textures_index)
+            .expect("texture set");
+        assert_eq!(
+            shader.texture_set_ref.index(),
+            Some(textures_index),
+            "shader {shader_index} names its own texture set"
+        );
+        assert_eq!(textures.textures, expected);
+    }
+}
+
 /// Copy a skin with every row reduced to the four strongest influences.
 ///
 /// The real Bijin body authors five influences on five vertices, which the
@@ -409,6 +658,67 @@ fn se_bundle_with_the_real_bijin_body() {
     assert_eq!(document.shapes.len(), shapes.len());
     eprintln!(
         "real bundle: {} shapes, body {} vertices / {} triangles, {} bone names, {} bytes",
+        shapes.len(),
+        expected[0].0,
+        expected[0].1,
+        palette.len(),
+        written.len()
+    );
+    for (index, source) in shapes.iter().enumerate() {
+        let shape = &document.shapes[index];
+        assert_eq!(
+            (shape.positions.len(), shape.triangles.len()),
+            expected[index],
+            "shape {index} keeps its emitted counts"
+        );
+        assert_eq!(
+            shape.skin.as_ref().expect("skin").bones,
+            source.skin.as_ref().expect("authored skin").bones,
+            "shape {index} keeps its bone names"
+        );
+    }
+}
+
+#[test]
+fn le_bundle_with_the_real_bijin_body() {
+    let Ok(path) = std::env::var("SCULPTO_BIJIN_NIF") else {
+        eprintln!("SCULPTO_BIJIN_NIF not set; skipping the real-body LE bundle control");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("the fixture NIF is readable");
+    let source = read(&bytes).expect("the Bijin body parses");
+    assert_eq!(
+        source.bsver, 83,
+        "the LE control needs the LE fixture, not an SE stream"
+    );
+    assert!(!source.shapes.is_empty(), "the fixture carries a body");
+
+    let body = &source.shapes[0];
+    let palette = body
+        .skin
+        .as_ref()
+        .expect("the body is skinned")
+        .bones
+        .clone();
+    let mut real = MeshAsset::from(body);
+    real.name = "Body".into();
+    // The LE layout has no tangent channel, and the reader synthesizes tangents
+    // for any UV shape, so this writer's input cannot carry them.
+    real.tangents = Vec::new();
+    real.skin = real.skin.as_ref().map(four_lane_skin);
+    let expected = [(real.positions.len(), real.triangles.len()), (3, 1), (3, 1)];
+    let shapes = vec![
+        real,
+        companion("Hands", &palette, 5000.0),
+        companion("Feet", &palette, 5003.0),
+    ];
+
+    let written = write_le_bundle(&shapes).expect("the real body joins the LE bundle");
+    let document = read(&written).expect("the engine reader opens the LE bundle");
+    assert_eq!(document.bsver, 83);
+    assert_eq!(document.shapes.len(), shapes.len());
+    eprintln!(
+        "real LE bundle: {} shapes, body {} vertices / {} triangles, {} bone names, {} bytes",
         shapes.len(),
         expected[0].0,
         expected[0].1,

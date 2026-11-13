@@ -37,6 +37,17 @@ impl NifTarget {
             NifTarget::Le => 12,
         }
     }
+
+    /// BS stream version the target writes.
+    ///
+    /// This is the only header field that separates the two Skyrim games, and
+    /// the container encoder reads it from here rather than from a literal.
+    pub fn bs_version(self) -> u32 {
+        match self {
+            NifTarget::Se => 100,
+            NifTarget::Le => 83,
+        }
+    }
 }
 
 /// Why a header cannot be written or read.

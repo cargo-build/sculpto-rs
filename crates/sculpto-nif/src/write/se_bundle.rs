@@ -15,29 +15,26 @@
 //! `skin_ref`, the partition triangle space and every size stay exactly what
 //! [`super::se_shape`] already emits for one shape.
 //!
+//! The per-shape facts come from [`PreparedShape`] and the container tail from
+//! [`super::layout`], both shared with the LE bundle writer.
+//!
 //! `MeshAsset::transform` is a bundle-local placement this writer does not
 //! serialize yet: a skinned shape's node placement and its skinning frame have
 //! to be decided together, so a non-identity placement is refused by name
 //! instead of being dropped or written inconsistently.
 
-use sculpto_core::mesh::{MeshAsset, Transform, validate_bundle};
+use sculpto_core::mesh::{MeshAsset, validate_bundle};
 
 use super::extra;
-use super::header::{NifTarget, NifWriteError, write_header};
+use super::header::{NifTarget, NifWriteError};
+use super::layout::{Block, BoneUnion, write_file};
+use super::prepared::{PreparedShape, refuse_placements, single_physics_link};
 use super::scene::NativeTransform;
-use super::se_shape::{self, PreparedShape};
+use super::se_shape::{self, ShapeRefs};
 use super::shader;
 use super::skin;
 use super::strings::StringTable;
 use super::{InfluencePolicy, WrittenNif};
-
-/// One ordered block body with its type name.
-pub(super) struct Block {
-    /// Block type table name, e.g. `BSTriShape`.
-    pub(super) type_name: &'static str,
-    /// Serialized block body.
-    pub(super) body: Vec<u8>,
-}
 
 /// Write one SE NIF carrying every shape of a bundle.
 ///
@@ -58,17 +55,10 @@ pub fn write_se_bundle(shapes: &[MeshAsset]) -> Result<Vec<u8>, NifWriteError> {
 
 fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, NifWriteError> {
     validate_bundle(shapes).map_err(NifWriteError::InvalidBundle)?;
-    for (index, shape) in shapes.iter().enumerate() {
-        if shape
-            .transform
-            .is_some_and(|transform| transform != Transform::default())
-        {
-            return Err(NifWriteError::TransformUnsupported { shape: index });
-        }
-    }
+    refuse_placements(shapes)?;
     let prepared = shapes
         .iter()
-        .map(|shape| PreparedShape::new(shape, policy))
+        .map(|shape| PreparedShape::new(shape, policy, NifTarget::Se))
         .collect::<Result<Vec<_>, _>>()?;
     let physics = single_physics_link(&prepared)?;
 
@@ -122,24 +112,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
             false => strings.intern(&shape.name) as i32,
         })
         .collect();
-    let mut bones: Vec<BoneNode> = Vec::new();
-    for shape in &prepared {
-        let Some(plan) = shape.skin.as_ref() else {
-            continue;
-        };
-        for name in &plan.names {
-            if bones.iter().any(|bone| &bone.name == name) {
-                continue;
-            }
-            let block = next;
-            next += 1;
-            bones.push(BoneNode {
-                name: name.clone(),
-                name_index: strings.intern(name) as i32,
-                block,
-            });
-        }
-    }
+    let bones = BoneUnion::plan(&prepared, &mut next, &mut strings);
     let extra_block = match physics.is_some() {
         true => next,
         false => -1,
@@ -163,7 +136,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
             body: se_shape::body(
                 shape,
                 prepared,
-                se_shape::ShapeRefs {
+                ShapeRefs {
                     name: *name,
                     // The physics link belongs to the file root: the game reads
                     // it only from there (`OutfitProject.cpp:250-252`).
@@ -175,11 +148,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
             ),
         });
         if let (Some(plan), Some((_, data, partition))) = (prepared.skin.as_ref(), index.skin) {
-            let palette: Vec<i32> = plan
-                .names
-                .iter()
-                .map(|bone| bone_block(&bones, bone))
-                .collect();
+            let palette: Vec<i32> = plan.names.iter().map(|bone| bones.block(bone)).collect();
             blocks.push(Block {
                 type_name: skin::INSTANCE_TYPE,
                 body: skin::instance(data, partition, root, &palette),
@@ -210,7 +179,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
         type_name: skin::NODE_TYPE,
         body: skin::node(-1, &root_children, &root_extra, NativeTransform::IDENTITY),
     });
-    for bone in &bones {
+    for bone in bones.bones() {
         blocks.push(Block {
             type_name: skin::NODE_TYPE,
             body: skin::node(bone.name_index, &[], &[], NativeTransform::IDENTITY),
@@ -223,76 +192,13 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
         });
     }
     Ok(WrittenNif {
-        bytes: write_file(&blocks, &strings),
+        bytes: write_file(NifTarget::Se, &blocks, &strings),
         dropped_influences: prepared
             .iter()
             .filter_map(|shape| shape.skin.as_ref())
             .flat_map(|plan| plan.dropped_influences.iter().cloned())
             .collect(),
     })
-}
-
-/// Encode the SE container: header, block type table, block sizes, strings.
-///
-/// Both SE writers end here, so a file cannot disagree with itself about the
-/// block count, the type table order or the string table it describes.
-pub(super) fn write_file(blocks: &[Block], strings: &StringTable) -> Vec<u8> {
-    let mut type_names: Vec<&'static str> = Vec::new();
-    let mut type_indices: Vec<u16> = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let type_index = match type_names.iter().position(|name| *name == block.type_name) {
-            Some(index) => index,
-            None => {
-                type_names.push(block.type_name);
-                type_names.len() - 1
-            }
-        };
-        type_indices.push(type_index as u16);
-    }
-
-    let mut file = write_header(NifTarget::Se);
-    // Block count precedes BSStreamHeader in the parsed layout.
-    push_u32(&mut file, blocks.len() as u32);
-    // BSStreamHeader: SE bsver, empty author/process/export strings.
-    push_u32(&mut file, 100);
-    file.push(0); // author
-    file.push(0); // process script
-    file.push(0); // export script
-    // Block type table.
-    push_u16(&mut file, type_names.len() as u16);
-    for name in &type_names {
-        push_u32(&mut file, name.len() as u32);
-        file.extend_from_slice(name.as_bytes());
-    }
-    for index in &type_indices {
-        push_u16(&mut file, *index);
-    }
-    for block in blocks {
-        push_u32(&mut file, block.body.len() as u32);
-    }
-    // String table: index 0 is empty, then the shape, bone and physics names.
-    let max_length = strings.iter().map(str::len).max().unwrap_or(0);
-    push_u32(&mut file, strings.len() as u32);
-    push_u32(&mut file, max_length as u32);
-    for value in strings.iter() {
-        push_u32(&mut file, value.len() as u32);
-        file.extend_from_slice(value.as_bytes());
-    }
-    push_u32(&mut file, 0); // num_groups
-    for block in blocks {
-        file.extend_from_slice(&block.body);
-    }
-    file
-}
-
-/// One bone `NiNode` in the file's shared union.
-struct BoneNode {
-    /// Bone name as authored.
-    name: String,
-    /// String-table index of that name.
-    name_index: i32,
-    /// Block index of the bone node.
-    block: i32,
 }
 
 /// Block indices of one shape's blocks, in write order.
@@ -305,41 +211,4 @@ struct ShapeBlocks {
     shader: i32,
     /// `BSShaderTextureSet`, or `-1`.
     texture: i32,
-}
-
-/// The block of one union bone by name.
-fn bone_block(bones: &[BoneNode], name: &str) -> i32 {
-    bones
-        .iter()
-        .find(|bone| bone.name == name)
-        .map_or(-1, |bone| bone.block)
-}
-
-/// The one root physics link a bundle may carry.
-///
-/// HDT-SMP scans the model root and the reference keeps one link per model
-/// (`extra.rs`), so shapes naming different files cannot share this file; the
-/// count is reported instead of picking one at random.
-fn single_physics_link(
-    prepared: &[PreparedShape],
-) -> Result<Option<&extra::PhysicsLink>, NifWriteError> {
-    let mut links: Vec<&extra::PhysicsLink> = Vec::new();
-    for link in prepared.iter().filter_map(|shape| shape.physics.as_ref()) {
-        if !links.iter().any(|known| known.path == link.path) {
-            links.push(link);
-        }
-    }
-    match links.as_slice() {
-        [] => Ok(None),
-        [link] => Ok(Some(*link)),
-        many => Err(NifWriteError::MultiplePhysicsLinks { links: many.len() }),
-    }
-}
-
-fn push_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
 }

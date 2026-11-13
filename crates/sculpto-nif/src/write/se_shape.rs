@@ -1,5 +1,4 @@
-//! Skyrim SE `BSTriShape` writer: one shape's blocks, and the per-shape parts a
-//! bundle reuses.
+//! Skyrim SE `BSTriShape` writer: one shape's block and its block layout.
 //!
 //! C03 wrote positions and triangles, C05 added UVs, C06 byte normals and SE
 //! tangents, C07 added the skin: one `NiSkinInstance` + `NiSkinData`, one named
@@ -11,29 +10,24 @@
 //! arrive later (C12+). `sculpto_nif::read` undoes the reader's frame
 //! conversion, so every written attribute round-trips.
 //!
-//! [`PreparedShape`] holds everything one shape contributes before a block index
-//! is known (geometry, skin plan, material and physics facts), and [`body`]
-//! encodes the `BSTriShape` block from a prepared shape plus its references.
-//! [`super::se_bundle`] reuses both for a multi-shape file, so the two writers
-//! cannot disagree about a shape's bytes.
+//! The per-shape facts live in [`super::prepared::PreparedShape`] and the
+//! container tail in [`super::layout`], both shared with the LE writer; [`body`]
+//! is the only SE-specific encoder here. [`super::se_bundle`] reuses the same
+//! owners for a multi-shape file, so the two entry points cannot disagree about
+//! a shape's bytes.
 
-use sculpto_core::mesh::{MaterialSlot, MeshAsset};
-use sculpto_core::skin::FourLane;
+use sculpto_core::mesh::MeshAsset;
 
 use super::extra;
 use super::header::{NifTarget, NifWriteError};
+use super::layout::{Block, write_file};
+use super::prepared::PreparedShape;
 use super::scene::{CheckedScene, NativeTransform, SkinNodes};
-use super::se_bundle::{Block, write_file};
 use super::shader;
 use super::skin;
 use super::strings::StringTable;
 use super::{InfluencePolicy, WrittenNif};
 
-const VF_VERTEX: u64 = 0x001;
-const VF_UVS: u64 = 0x002;
-const VF_NORMALS: u64 = 0x008;
-const VF_TANGENTS: u64 = 0x010;
-const VF_SKINNED: u64 = 0x040;
 /// Block type table name for a `BSTriShape`.
 pub(super) const BLOCK_TYPE: &str = "BSTriShape";
 
@@ -55,7 +49,7 @@ pub(super) fn write(
     policy: InfluencePolicy,
     checked: Option<&CheckedScene<'_>>,
 ) -> Result<WrittenNif, NifWriteError> {
-    let prepared = PreparedShape::new(asset, policy)?;
+    let prepared = PreparedShape::new(asset, policy, NifTarget::Se)?;
     let skinned = prepared.skinned();
 
     let mut strings = StringTable::new();
@@ -157,7 +151,7 @@ pub(super) fn write(
         });
     }
     Ok(WrittenNif {
-        bytes: write_file(&blocks, &strings),
+        bytes: write_file(NifTarget::Se, &blocks, &strings),
         dropped_influences: prepared
             .skin
             .map_or_else(Vec::new, |plan| plan.dropped_influences),
@@ -181,150 +175,6 @@ pub(super) struct ShapeRefs {
     pub(super) skin: i32,
     /// Block index of `BSLightingShaderProperty`, or `-1`.
     pub(super) shader: i32,
-}
-
-/// Everything one shape contributes before a block index is known.
-pub(super) struct PreparedShape {
-    /// Vertex count narrowed to the block's `u16` field.
-    vertices: u16,
-    /// Triangle count narrowed to the block's `u16` field.
-    triangles: u16,
-    /// Attribute flags and packed stride.
-    attributes: Attributes,
-    /// Packed `BSVertexDataSSE` stream in mesh order.
-    vertex_bytes: Vec<u8>,
-    /// The validated skin plan, when the shape is skinned.
-    pub(super) skin: Option<skin::SkinPlan>,
-    /// The single material slot, when the shape carries one.
-    material: Option<MaterialSlot>,
-    /// `BSShaderTextureSet` body, empty when the slot declares no texture.
-    pub(super) texture: Vec<u8>,
-    /// The HDT-SMP physics link this shape names.
-    pub(super) physics: Option<extra::PhysicsLink>,
-}
-
-impl PreparedShape {
-    /// Validate the model and plan every per-shape fact that no block index
-    /// affects: counts, packed geometry, skin, material and physics.
-    pub(super) fn new(asset: &MeshAsset, policy: InfluencePolicy) -> Result<Self, NifWriteError> {
-        asset.validate().map_err(NifWriteError::InvalidModel)?;
-        let vertices =
-            u16::try_from(asset.positions.len()).map_err(|_| NifWriteError::TooManyVertices {
-                vertices: asset.positions.len(),
-            })?;
-        let triangles =
-            u16::try_from(asset.triangles.len()).map_err(|_| NifWriteError::TooManyTriangles {
-                triangles: asset.triangles.len(),
-            })?;
-        let base = Attributes::of(asset)?;
-        let skin = skin::plan(asset, NifTarget::Se, policy)?;
-        let attributes = match skin.is_some() {
-            true => base.skinned(),
-            false => base,
-        };
-        let lanes = skin.as_ref().map(|plan| plan.lanes.as_slice());
-        let vertex_bytes = packed_vertices(
-            asset,
-            lanes,
-            base.has(VF_UVS),
-            base.has(VF_NORMALS),
-            base.has(VF_TANGENTS),
-        )?;
-        let material = shader::single_slot(asset)?.cloned();
-        let texture = match &material {
-            Some(slot) => shader::texture_set(slot)?,
-            None => Vec::new(),
-        };
-        let physics = extra::physics_link(asset)?;
-        Ok(Self {
-            vertices,
-            triangles,
-            attributes,
-            vertex_bytes,
-            skin,
-            material,
-            texture,
-            physics,
-        })
-    }
-
-    /// Whether the shape writes a skin group instead of inline geometry.
-    pub(super) fn skinned(&self) -> bool {
-        self.skin.is_some()
-    }
-
-    /// Whether the shape writes a shader property.
-    pub(super) fn has_material(&self) -> bool {
-        self.material.is_some()
-    }
-
-    /// This shape's SSE packed-vertex view, for its own partition block.
-    pub(super) fn global(&self) -> skin::GlobalVertices<'_> {
-        skin::GlobalVertices {
-            vertex_desc: self.attributes.descriptor(),
-            vertex_size: self.attributes.size,
-            bytes: &self.vertex_bytes,
-        }
-    }
-
-    /// `BSLightingShaderProperty` body for the assigned blocks.
-    pub(super) fn shader_body(&self, name: i32, texture_set: i32) -> Vec<u8> {
-        match &self.material {
-            Some(slot) => shader::shader(slot, texture_set, name),
-            None => Vec::new(),
-        }
-    }
-}
-
-/// SE vertex attribute flags and packed stride, before the skin lane.
-#[derive(Clone, Copy)]
-struct Attributes {
-    flags: u64,
-    size: u32,
-}
-
-impl Attributes {
-    /// Attribute flags for the model's authored attributes.
-    ///
-    /// Tangents need normals because the packed frame derives the bitangent from
-    /// them, so that pair is refused rather than written inconsistently.
-    fn of(asset: &MeshAsset) -> Result<Self, NifWriteError> {
-        let mut attributes = Self {
-            flags: VF_VERTEX,
-            size: 16,
-        };
-        for (present, flag, bytes) in [
-            (!asset.uvs.is_empty(), VF_UVS, 4),
-            (!asset.normals.is_empty(), VF_NORMALS, 4),
-            (!asset.tangents.is_empty(), VF_TANGENTS, 4),
-        ] {
-            if present {
-                attributes.flags |= flag;
-                attributes.size += bytes;
-            }
-        }
-        if attributes.has(VF_TANGENTS) && !attributes.has(VF_NORMALS) {
-            return Err(NifWriteError::TangentsWithoutNormals);
-        }
-        Ok(attributes)
-    }
-
-    /// Record the packed skin lane the shape writes after its attributes.
-    fn skinned(mut self) -> Self {
-        self.flags |= VF_SKINNED;
-        self.size += 12;
-        self
-    }
-
-    /// Whether the packed stream carries `flag`'s attribute.
-    fn has(self, flag: u64) -> bool {
-        self.flags & flag != 0
-    }
-
-    /// The `BSVertexDesc` word: flags in the high 44 bits, stride in words.
-    fn descriptor(self) -> u64 {
-        (self.flags << 44) | u64::from(self.size / 4)
-    }
 }
 
 /// Encode one `BSTriShape` block body.
@@ -357,18 +207,18 @@ pub(super) fn body(
     push_i32(&mut body, refs.skin);
     push_i32(&mut body, refs.shader);
     push_i32(&mut body, -1); // alpha
-    push_u64(&mut body, prepared.attributes.descriptor());
-    let data_size = asset.positions.len() as u64 * u64::from(prepared.attributes.size)
+    push_u64(&mut body, prepared.descriptor());
+    let data_size = asset.positions.len() as u64 * u64::from(prepared.packed_size())
         + asset.triangles.len() as u64 * 6;
     let (triangles, vertices, data_size) = match prepared.skinned() {
         true => (0, 0, 0),
-        false => (prepared.triangles, prepared.vertices, data_size as u32),
+        false => (prepared.triangles(), prepared.vertices(), data_size as u32),
     };
     push_u16(&mut body, triangles);
     push_u16(&mut body, vertices);
     push_u32(&mut body, data_size);
     if !prepared.skinned() {
-        body.extend_from_slice(&prepared.vertex_bytes);
+        body.extend_from_slice(prepared.vertex_bytes());
         for triangle in &asset.triangles {
             push_u16(&mut body, triangle[0] as u16);
             push_u16(&mut body, triangle[1] as u16);
@@ -377,120 +227,6 @@ pub(super) fn body(
     }
     push_u32(&mut body, 0); // SSE particle_data_size
     body
-}
-
-/// Pack every mesh vertex into the `BSVertexDataSSE` stream the shape's
-/// `vertex_desc` describes.
-///
-/// The same bytes serve both layouts: inline on an unskinned `BSTriShape`, and
-/// as the `NiSkinPartition` global buffer for a skinned one. Field order and
-/// gates match nifly's decoder (`Skin.cpp`, `NiSkinPartition::Sync`):
-/// position + W, UV, normal + bitangent Y, tangent + bitangent Z, four half
-/// weights, four bone bytes.
-fn packed_vertices(
-    asset: &MeshAsset,
-    skin: Option<&[FourLane]>,
-    has_uvs: bool,
-    has_normals: bool,
-    has_tangents: bool,
-) -> Result<Vec<u8>, NifWriteError> {
-    let mut bytes = Vec::new();
-    for (index, position) in asset.positions.iter().enumerate() {
-        let normal = match has_normals {
-            true => Some(unit(asset.normals[index], "normal", index)?),
-            false => None,
-        };
-        let tangent = match has_tangents {
-            true => {
-                let raw = asset.tangents[index];
-                let direction = unit([raw[0], raw[1], raw[2]], "tangent", index)?;
-                let sign = if raw[3].is_sign_negative() { -1.0 } else { 1.0 };
-                Some((direction, sign))
-            }
-            false => None,
-        };
-
-        push_f32(&mut bytes, position[0]);
-        push_f32(&mut bytes, position[1]);
-        push_f32(&mut bytes, position[2]);
-        // Position W carries Bitangent X when VF_TANGENTS is set.
-        push_f32(&mut bytes, tangent.map_or(0.0, |(b, _)| b[0]));
-        if has_uvs {
-            let uv = asset.uvs[index];
-            push_u16(&mut bytes, half::f16::from_f32(uv[0]).to_bits());
-            push_u16(&mut bytes, half::f16::from_f32(uv[1]).to_bits());
-        }
-        if let Some(normal) = normal {
-            push_u8(&mut bytes, encode_normal(normal[0]));
-            push_u8(&mut bytes, encode_normal(normal[1]));
-            push_u8(&mut bytes, encode_normal(normal[2]));
-            // Normal W carries Bitangent Y when VF_TANGENTS is set.
-            push_u8(
-                &mut bytes,
-                encode_normal(tangent.map_or(0.0, |(b, _)| b[1])),
-            );
-        }
-        if let Some((bitangent, sign)) = tangent {
-            // On-disk Tangent is Bethesda's dP/dV; the reader keeps it only to
-            // derive the sign of `dot(B, cross(N, T))`. `sign * cross(B, N)`
-            // reproduces the requested sign exactly.
-            let normal = normal.expect("tangents require normals");
-            let on_disk = normalize(cross(normal, bitangent), "tangent", index)?;
-            push_u8(&mut bytes, encode_normal(sign * on_disk[0]));
-            push_u8(&mut bytes, encode_normal(sign * on_disk[1]));
-            push_u8(&mut bytes, encode_normal(sign * on_disk[2]));
-            // Tangent W carries Bitangent Z.
-            push_u8(&mut bytes, encode_normal(bitangent[2]));
-        }
-        if let Some(skin) = skin {
-            let lanes = skin[index];
-            for weight in lanes.weights {
-                push_u16(&mut bytes, half::f16::from_f32(weight).to_bits());
-            }
-            for bone in lanes.joints {
-                push_u8(&mut bytes, bone as u8);
-            }
-        }
-    }
-    Ok(bytes)
-}
-
-fn unit(
-    vector: [f32; 3],
-    attribute: &'static str,
-    vertex: usize,
-) -> Result<[f32; 3], NifWriteError> {
-    normalize(vector, attribute, vertex)
-}
-
-fn normalize(
-    vector: [f32; 3],
-    attribute: &'static str,
-    vertex: usize,
-) -> Result<[f32; 3], NifWriteError> {
-    let length = (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
-    if length == 0.0 || !length.is_finite() {
-        return Err(NifWriteError::ZeroVector { attribute, vertex });
-    }
-    Ok([vector[0] / length, vector[1] / length, vector[2] / length])
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn encode_normal(value: f32) -> u8 {
-    ((value.clamp(-1.0, 1.0) + 1.0) * 127.5)
-        .round()
-        .clamp(0.0, 255.0) as u8
-}
-
-fn push_u8(bytes: &mut Vec<u8>, value: u8) {
-    bytes.push(value);
 }
 
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {

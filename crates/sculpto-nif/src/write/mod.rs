@@ -11,7 +11,10 @@ use self::scene::CheckedScene;
 
 pub mod extra;
 pub mod header;
+mod layout;
+pub mod le_bundle;
 pub mod le_shape;
+mod prepared;
 mod scene;
 pub mod se_bundle;
 pub mod se_shape;
