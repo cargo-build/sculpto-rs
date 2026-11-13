@@ -35,6 +35,22 @@ from the caller-declared collision surface, while retaining selected Blender
 Cloth regions. It also reports returned-geometry deformation; fewer contacts
 alone do not establish a good fit. Blender remains the cloth-simulation owner.
 
+The composed registered path, using a caller-supplied body/hands/feet obstacle,
+returns 100 pairs and two inside groups on the same Mike leg shape, with maximum
+displacement 2.840 source units, eligible-edge strain 0.755 and no newly
+collapsed edges. These counts and deformation do not meet the complete-outfit
+acceptance. A body-only diagnostic of the Mike Vigil top accepts the bounded
+fallback and reduces 235 to 221 pairs, with 14 inside groups still remaining.
+
+For the exact Bijin `_0` Leather/Studded assembly, a source-scene obstacle was
+constructed from body, hands, feet and the human Lydia head by applying the
+body's nonidentity placement to the assembled body-frame geometry once. Separate
+registered fits leave 777 and 570 pairs on the two main parts; the fur part
+improves from 12 to zero pairs. These are per-part rest measurements, without
+cross-garment, posed or silhouette acceptance. An earlier run mistakenly
+declared the body-frame obstacle as source-scene and is invalid; its results are
+retained in the private diagnostic evidence, not compared as fit outcomes.
+
 ## Latest checkpoint — ordinary robe fit rejection isolated
 
 Read-only probes on engine `2d99f2a5` now separate the mixed-region guard from

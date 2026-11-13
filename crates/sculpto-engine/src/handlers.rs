@@ -242,6 +242,9 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
     if let Some(regions) = outcome.regions {
         result["regions"] = json!(regions);
     }
+    if let Some(repair) = outcome.repair {
+        result["repair"] = json!(repair);
+    }
     if let Some(collision) = outcome.collision {
         result["collision"] = json!(collision);
     }

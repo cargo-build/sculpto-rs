@@ -782,7 +782,7 @@ fn fit_with_targets(
         .map(|(after, before)| length(sub(*after, *before)))
         .fold(0.0f32, f32::max);
     let flipped = count_flipped(garment.0, &positions, garment.1);
-    let (_, strained_edges, max_strain, mean_strain) =
+    let (_, strained_edges, max_strain, mean_strain, _) =
         strain_stats(garment.0, &positions, garment.1, REPORT_STRAIN_THRESHOLD);
 
     Ok((
@@ -2141,14 +2141,14 @@ fn count_flipped(before: &[[f32; 3]], after: &[[f32; 3]], faces: &[[u32; 3]]) ->
 }
 
 /// Edge strain between two position sets: unique-edge count, edges over the
-/// threshold, largest and mean strain (`AnalyzeStrain`,
-/// `MeshAnalysis.cpp:711-747`).
+/// threshold, largest and mean strain, plus newly collapsed edge count.
+/// Strain follows `AnalyzeStrain` (`MeshAnalysis.cpp:711-747`).
 fn strain_stats(
     before: &[[f32; 3]],
     after: &[[f32; 3]],
     faces: &[[u32; 3]],
     threshold: f32,
-) -> (usize, usize, f32, f32) {
+) -> (usize, usize, f32, f32, usize) {
     let mut edges = BTreeSet::new();
     for face in faces {
         for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
@@ -2161,11 +2161,16 @@ fn strain_stats(
     let mut stretched = 0usize;
     let mut sum = 0.0f64;
     let mut max_strain = 0.0f32;
+    let mut collapsed = 0usize;
     for (a, b) in edges {
         let (a, b) = (a as usize, b as usize);
         let before_length = length(sub(before[a], before[b]));
         let after_length = length(sub(after[a], after[b]));
-        if before_length < 1e-5 || after_length < 1e-5 {
+        if before_length < 1e-5 {
+            continue;
+        }
+        if after_length < 1e-5 {
+            collapsed += 1;
             continue;
         }
         let strain = (after_length / before_length).max(before_length / after_length) - 1.0;
@@ -2181,7 +2186,7 @@ fn strain_stats(
     } else {
         0.0
     };
-    (total, stretched, max_strain, mean)
+    (total, stretched, max_strain, mean, collapsed)
 }
 
 /// Outfit Studio's `CleanPull`: a pull must run roughly along the normal

@@ -822,6 +822,8 @@ pub struct FitOutcome {
     pub inside_after: Option<usize>,
     /// Explicit ordinary and cloth measurements when a manifest was supplied.
     pub regions: Option<sculpto_mesh::outfit::rigging::RegionFitReport>,
+    /// Guarded preview measurements when no region manifest was supplied.
+    pub repair: Option<sculpto_mesh::wrap::repair::FitRepairReport>,
     /// The caller-declared collision scope that was measured, when one was given.
     pub collision: Option<CollisionScope>,
 }
@@ -895,6 +897,7 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         intersection_pairs: None,
         inside_after: None,
         regions: None,
+        repair: None,
         collision: None,
     })
 }

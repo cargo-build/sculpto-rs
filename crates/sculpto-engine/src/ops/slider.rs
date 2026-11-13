@@ -11,9 +11,9 @@ use sculpto_core::document::Document;
 use sculpto_core::shape_data::{MorphBlock, MorphContainer, SUPPORTED_VERSION, VertexOffset};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::delta_conform::{DeltaOptions, ProximityCache, ProximityOptions, generate_delta};
-use sculpto_mesh::outfit::rigging::fit_rigged_regions;
+use sculpto_mesh::outfit::rigging::fit_rigged_regions_with_collision;
 use sculpto_mesh::outfit::{ClothRegion, ShapeInfo, ShapeRole, census};
-use sculpto_mesh::wrap::repair::fit_and_repair;
+use sculpto_mesh::wrap::repair::fit_and_repair_with_collision;
 use sculpto_mesh::wrap::{FitOptions, GapMode};
 use sculpto_nif::{NifDocument, NifShape, ShapePlacement};
 
@@ -471,18 +471,18 @@ fn finish_fit(
         ..FitOptions::default()
     };
     let garment_mesh = (fitted.as_slice(), garment.shape.triangles.as_slice());
-    // The declared surface replaces the single body shape as the obstacle only;
-    // correspondence and the output frame stay on the authored body.
-    let body_mesh = match &collision {
+    let body_mesh = (target.as_slice(), body.shape.triangles.as_slice());
+    let collision_mesh = match &collision {
         Some(surface) => (surface.positions.as_slice(), surface.triangles.as_slice()),
-        None => (target.as_slice(), body.shape.triangles.as_slice()),
+        None => body_mesh,
     };
-    let (fitted, pairs, inside, regions) = match &params.manifest {
+    let (fitted, pairs, inside, regions, repair) = match &params.manifest {
         Some(_) => {
             let regions = cloth_regions(params, document)?;
-            let (fitted, report) = fit_rigged_regions(
+            let (fitted, report) = fit_rigged_regions_with_collision(
                 garment_mesh,
                 body_mesh,
+                collision_mesh,
                 &regions,
                 None,
                 &options,
@@ -491,18 +491,25 @@ fn finish_fit(
                 CommandError::new(ErrorKind::Refused, "outfit_region_fit", error.to_string())
             })?;
             let pairs = report.intersection_pairs;
-            (fitted, pairs, None, Some(report))
+            (fitted, pairs, None, Some(report), None)
         }
         None => {
-            let (fitted, report) = fit_and_repair(garment_mesh, body_mesh, None, &options)
-                .map_err(|error| {
-                    CommandError::new(ErrorKind::Refused, "conform_fit_repair", error.to_string())
-                })?;
+            let (fitted, report) = fit_and_repair_with_collision(
+                garment_mesh,
+                body_mesh,
+                collision_mesh,
+                None,
+                &options,
+            )
+            .map_err(|error| {
+                CommandError::new(ErrorKind::Refused, "conform_fit_repair", error.to_string())
+            })?;
             (
                 fitted,
                 report.intersection_pairs,
                 Some(report.inside_after),
                 None,
+                Some(report),
             )
         }
     };
@@ -532,6 +539,7 @@ fn finish_fit(
         intersection_pairs: Some(pairs),
         inside_after: inside,
         regions,
+        repair,
         collision: collision.as_ref().map(CollisionSurface::scope),
     })
 }

@@ -41,6 +41,20 @@ fn body_part() -> Part {
     (BODY.to_vec(), BODY_FACES.to_vec())
 }
 
+fn max_move(before: &[[f32; 3]], after: &[[f32; 3]]) -> f64 {
+    before
+        .iter()
+        .zip(after)
+        .map(|(a, b)| {
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        })
+        .fold(0.0, f64::max)
+}
+
 /// Combined surfaces keep every part in one index space, as an assembled
 /// character export does.
 fn write_parts(path: &Path, parts: &[Part]) {
@@ -173,6 +187,16 @@ fn slider_preview_measures_against_the_declared_surface() {
     assert!(single.get("collision").is_none());
     let single_out =
         obj::read_obj_positions(&fixture.out("single.obj")).expect("body-only preview output");
+    let reported_move = single["repair"]["max_displacement"]
+        .as_f64()
+        .expect("returned-geometry displacement");
+    assert!((reported_move - max_move(&fixture.garment.positions, &single_out)).abs() < 1e-5);
+    assert_eq!(
+        single["repair"]["intersection_pairs"],
+        single["intersection_pairs"]
+    );
+    assert!(single["repair"]["max_strain"].as_f64().is_some());
+    assert_eq!(single["repair"]["collapsed_edges"], 0);
     assert!(
         single_out[0][2] > 0.0,
         "the authored body lifts the ordinary faces in the single-shape path"
@@ -294,6 +318,12 @@ fn separate_part_contact_is_not_reported_clear() {
     // The ordinary region is still fitted off the body, and the retained cloth
     // panel keeps its incoming positions: the scope only adds obstacles.
     let output = obj::read_obj_positions(&fixture.root.join("fitted.obj")).expect("fit output");
+    let reported_move = scoped["regions"]["max_displacement"]
+        .as_f64()
+        .expect("whole-garment displacement");
+    assert!((reported_move - max_move(&fixture.garment.positions, &output)).abs() < 1e-5);
+    assert!(scoped["regions"]["max_strain"].as_f64().is_some());
+    assert_eq!(scoped["regions"]["collapsed_edges"], 0);
     assert!(
         output[..3].iter().all(|point| point[2] > 0.0),
         "ordinary faces must leave the body and the separate part"

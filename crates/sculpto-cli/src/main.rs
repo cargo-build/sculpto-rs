@@ -679,9 +679,22 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
                 regions.cloth_triangles, regions.cloth_intersection_pairs,
             ),
         }
+        println!(
+            "deformation: max displacement {:.6}, max edge strain {:.6}, collapsed edges {}",
+            regions.max_displacement, regions.max_strain, regions.collapsed_edges,
+        );
     }
     if let (Some(pairs), Some(inside)) = (outcome.intersection_pairs, outcome.inside_after) {
         println!("body contacts {pairs}, inside groups {inside}");
+    }
+    if let Some(repair) = &outcome.repair {
+        println!(
+            "deformation: max displacement {:.6}, max edge strain {:.6}, collapsed edges {}; no-clipping fallback {}",
+            repair.max_displacement,
+            repair.max_strain,
+            repair.collapsed_edges,
+            repair.no_clipping_fallback_applied,
+        );
     }
     if let Some(collision) = &outcome.collision {
         println!(

@@ -1,6 +1,18 @@
 use super::*;
 use crate::surface_util::outward_vertex_normals;
 
+#[test]
+fn deformation_reports_collapsed_edges_excluded_from_strain() {
+    let before = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let after = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let (movement, strain, collapsed) =
+        repair::deformation(&before, &after, &[[0, 1, 2], [1, 0, 2]]);
+    assert_eq!(movement, 1.0);
+    assert!((strain - (2.0_f32.sqrt() - 1.0)).abs() < 1e-6);
+    assert_eq!(collapsed, 1, "the shared collapsed edge is counted once");
+    assert_eq!(repair::deformation(&before, &before, &[[0, 1, 2]]).2, 0);
+}
+
 /// A seam's own face normal finds the cover; its welded diagonal misses it.
 /// @req DECL0013
 #[test]

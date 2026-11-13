@@ -39,6 +39,9 @@ pub struct FitRepairReport {
     /// (`AnalyzeStrain`, `MeshAnalysis.cpp:711-747`); `0` when none qualify.
     /// Reported for quality judgment, not an acceptance threshold.
     pub max_strain: f32,
+    /// Unique edges at least `1e-5` long before fitting but shorter afterward.
+    /// These edges are excluded from `max_strain` and need separate review.
+    pub collapsed_edges: usize,
 }
 
 /// Repair a preview and try the configured SurfaceFit mode if contacts remain.
@@ -357,7 +360,7 @@ pub fn repair_after_fit(
     let projected = project_inside(&positions, &mesh, &surface, &locked, options)?;
     let inside = inside_count((&projected, garment.1), &surface, options);
     let pairs = contacts(&projected);
-    let (_, _, strain, _) =
+    let (_, _, strain, _, _) =
         strain_stats(&positions, &projected, garment.1, REPORT_STRAIN_THRESHOLD);
     if inside < report.inside_after
         && pairs <= report.intersection_pairs
@@ -386,7 +389,8 @@ pub(crate) fn measure_contacts(
     options: &FitOptions,
     incoming: &[[f32; 3]],
 ) -> FitRepairReport {
-    let (max_displacement, max_strain) = deformation(incoming, garment.0, garment.1);
+    let (max_displacement, max_strain, collapsed_edges) =
+        deformation(incoming, garment.0, garment.1);
     FitRepairReport {
         inside_after: inside_count(garment, surface, options),
         intersection_pairs: intersection_pairs(garment.0, garment.1, body.0, body.1),
@@ -395,6 +399,7 @@ pub(crate) fn measure_contacts(
         no_clipping_fallback_applied: false,
         max_displacement,
         max_strain,
+        collapsed_edges,
     }
 }
 
@@ -405,7 +410,11 @@ fn attach_deformation(
     positions: Vec<[f32; 3]>,
     mut report: FitRepairReport,
 ) -> (Vec<[f32; 3]>, FitRepairReport) {
-    (report.max_displacement, report.max_strain) = deformation(incoming, &positions, faces);
+    (
+        report.max_displacement,
+        report.max_strain,
+        report.collapsed_edges,
+    ) = deformation(incoming, &positions, faces);
     (positions, report)
 }
 
@@ -415,14 +424,15 @@ pub(crate) fn deformation(
     incoming: &[[f32; 3]],
     returned: &[[f32; 3]],
     faces: &[[u32; 3]],
-) -> (f32, f32) {
+) -> (f32, f32, usize) {
     let max_displacement = incoming
         .iter()
         .zip(returned)
         .map(|(before, after)| length(sub(*after, *before)))
         .fold(0.0f32, f32::max);
-    let max_strain = strain_stats(incoming, returned, faces, REPORT_STRAIN_THRESHOLD).2;
-    (max_displacement, max_strain)
+    let (_, _, max_strain, _, collapsed_edges) =
+        strain_stats(incoming, returned, faces, REPORT_STRAIN_THRESHOLD);
+    (max_displacement, max_strain, collapsed_edges)
 }
 
 fn coherent_positions(

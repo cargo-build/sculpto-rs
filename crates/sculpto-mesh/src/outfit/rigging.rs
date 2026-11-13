@@ -39,6 +39,8 @@ pub struct RegionFitReport {
     /// incoming garment, using the fit's symmetric unique-edge definition
     /// (see [`FitRepairReport::max_strain`]); zero after a self-contact rollback.
     pub max_strain: f32,
+    /// Newly collapsed edges excluded from the whole-garment strain metric.
+    pub collapsed_edges: usize,
 }
 
 /// A failed cloth selection or fit, retaining its original cause.
@@ -201,7 +203,8 @@ pub fn fit_rigged_regions_with_collision(
             &positions,
         ));
     }
-    let (max_displacement, max_strain) = deformation(garment.0, &output, garment.1);
+    let (max_displacement, max_strain, collapsed_edges) =
+        deformation(garment.0, &output, garment.1);
     let report = RegionFitReport {
         selection,
         ordinary_triangles: ordinary_faces.len(),
@@ -216,6 +219,7 @@ pub fn fit_rigged_regions_with_collision(
         intersection_pairs: intersection_pairs(&output, garment.1, collision.0, collision.1),
         max_displacement,
         max_strain,
+        collapsed_edges,
     };
     Ok((output, report))
 }
