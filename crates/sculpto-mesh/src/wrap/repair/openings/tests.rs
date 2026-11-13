@@ -244,6 +244,7 @@ fn source_self_and_additional_strain_guards_reject_an_unsafe_opening_candidate()
         (&body.0, &body.1),
         &BodySurface::build(&body.0, &body.1),
         &options(),
+        &source.0,
     );
     let (output, after) = repair_openings(
         (&source.0, &source.1),
@@ -294,6 +295,7 @@ fn invalid_configuration_and_zero_budget_are_explicit() {
         (&body.0, &body.1),
         &BodySurface::build(&body.0, &body.1),
         &options(),
+        &source.0,
     );
     let (output, after) = repair_openings(
         (&source.0, &source.1),

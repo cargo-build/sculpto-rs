@@ -12,7 +12,8 @@ use crate::control::compact;
 use crate::mask::VertexMask;
 use crate::topology::key;
 use crate::wrap::repair::{
-    FitRepairReport, fit_and_repair, measure_contacts, preserves_self_contacts,
+    FitRepairReport, deformation, fit_and_repair_with_collision, measure_contacts,
+    preserves_self_contacts,
 };
 use crate::wrap::{BodySurface, FitOptions, Mesh, validate_geometry, validate_lengths};
 
@@ -31,6 +32,13 @@ pub struct RegionFitReport {
     pub cloth_intersection_pairs: usize,
     /// Body contacts on the complete garment.
     pub intersection_pairs: usize,
+    /// Largest vertex displacement of the complete returned garment against
+    /// the incoming garment, in mesh units; zero after a self-contact rollback.
+    pub max_displacement: f32,
+    /// Largest edge strain of the complete returned garment against the
+    /// incoming garment, using the fit's symmetric unique-edge definition
+    /// (see [`FitRepairReport::max_strain`]); zero after a self-contact rollback.
+    pub max_strain: f32,
 }
 
 /// A failed cloth selection or fit, retaining its original cause.
@@ -72,11 +80,37 @@ pub fn fit_rigged_regions(
     lock: Option<&VertexMask>,
     options: &FitOptions,
 ) -> Result<(Vec<[f32; 3]>, RegionFitReport), RegionFitError> {
+    fit_rigged_regions_with_collision(garment, body, body, regions, lock, options)
+}
+
+/// Region fit with separate correspondence and collision surfaces. @req DECL0013
+///
+/// `body` supplies the SurfaceFit pull correspondences for the ordinary arena;
+/// contacts, repair candidates, acceptance and the reported measurements use
+/// the declared `collision` obstacle. The extra parts never become pull
+/// targets, and selected cloth geometry stays fixed bit-exactly. Passing one
+/// mesh for both surfaces reproduces [`fit_rigged_regions`]. The deformation
+/// fields describe the complete returned garment, including after the outer
+/// self-contact rollback restores the incoming positions.
+///
+/// # Errors
+/// Refuses invalid geometry, fit settings, mask lengths and cloth selections.
+pub fn fit_rigged_regions_with_collision(
+    garment: Mesh<'_>,
+    body: Mesh<'_>,
+    collision: Mesh<'_>,
+    regions: &[ClothRegion],
+    lock: Option<&VertexMask>,
+    options: &FitOptions,
+) -> Result<(Vec<[f32; 3]>, RegionFitReport), RegionFitError> {
     options
         .validate()
         .map_err(ClipFixError::FitOptions)
         .map_err(RegionFitError::Fit)?;
     validate_geometry(garment, body)
+        .map_err(ClipFixError::Geometry)
+        .map_err(RegionFitError::Fit)?;
+    validate_geometry(garment, collision)
         .map_err(ClipFixError::Geometry)
         .map_err(RegionFitError::Fit)?;
     validate_lengths(garment.0.len(), lock, options, false)
@@ -138,9 +172,10 @@ pub fn fit_rigged_regions(
     let (fitted, mut ordinary) = match triangles.is_empty() {
         true => (Vec::new(), None),
         false => {
-            let (positions, report) = fit_and_repair(
+            let (positions, report) = fit_and_repair_with_collision(
                 (&positions, &triangles),
                 body,
+                collision,
                 Some(&locks),
                 &compact_options,
             )
@@ -160,18 +195,27 @@ pub fn fit_rigged_regions(
         output.copy_from_slice(garment.0);
         ordinary = Some(measure_contacts(
             (&positions, &triangles),
-            body,
-            &BodySurface::build(body.0, body.1),
+            collision,
+            &BodySurface::build(collision.0, collision.1),
             &compact_options,
+            &positions,
         ));
     }
+    let (max_displacement, max_strain) = deformation(garment.0, &output, garment.1);
     let report = RegionFitReport {
         selection,
         ordinary_triangles: ordinary_faces.len(),
         cloth_triangles: cloth_faces.len(),
         ordinary,
-        cloth_intersection_pairs: intersection_pairs(&output, &cloth_faces, body.0, body.1),
-        intersection_pairs: intersection_pairs(&output, garment.1, body.0, body.1),
+        cloth_intersection_pairs: intersection_pairs(
+            &output,
+            &cloth_faces,
+            collision.0,
+            collision.1,
+        ),
+        intersection_pairs: intersection_pairs(&output, garment.1, collision.0, collision.1),
+        max_displacement,
+        max_strain,
     };
     Ok((output, report))
 }
