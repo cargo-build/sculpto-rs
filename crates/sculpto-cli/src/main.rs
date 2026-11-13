@@ -1374,7 +1374,7 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
             "garment": garment_path.display().to_string(),
             "units": "source",
             "semantics": "max(0, -dot(point - closest_body_point, body_triangle_normal))",
-            "layers_semantics": "visible when dot(garment_vertex_normal, nearest_body_triangle_normal) >= 0, inner when < 0",
+            "layers_semantics": "visible when dot(garment_vertex_normal, nearest_body_triangle_normal) >= 0, inner when < 0; hidden when the garment's own surface is first along the nearest body point's outward normal and the hit is not the penetrating vertex's own triangle; visible_occluded = visible and not hidden, the layered graded set",
             "garment_vertices": report.vertices,
             "garment_triangles": garment_triangles.len(),
             "body_triangles": body_triangles.len(),
@@ -1393,6 +1393,8 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
             "layers": {
                 "visible": depth_layer_json(&report.visible),
                 "inner": depth_layer_json(&report.inner),
+                "hidden": depth_layer_json(&report.hidden),
+                "visible_occluded": depth_layer_json(&report.visible_occluded),
             },
             "above": above,
             "worst": worst,
@@ -1411,7 +1413,7 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
             payload["verdict"] = serde_json::json!({
                 "result": if verdict.passed { "pass" } else { "fail" },
                 "tolerance": depth_number(verdict.tolerance),
-                "visible_max": depth_number(report.visible.max),
+                "visible_max": depth_number(report.visible_occluded.max),
                 "violations": violations,
             });
         }
@@ -1445,6 +1447,17 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
         report.inner.mean,
         report.inner.p90
     );
+    println!(
+        "occlusion: hidden {} (max {:.6}, mean {:.6}, p90 {:.6}), visible_occluded {} (max {:.6}, mean {:.6}, p90 {:.6})",
+        report.hidden.count,
+        report.hidden.max,
+        report.hidden.mean,
+        report.hidden.p90,
+        report.visible_occluded.count,
+        report.visible_occluded.max,
+        report.visible_occluded.mean,
+        report.visible_occluded.p90
+    );
     let bands: Vec<String> = check::DEPTH_THRESHOLDS
         .iter()
         .zip(&report.above)
@@ -1465,13 +1478,13 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
         if verdict.passed {
             println!(
                 "verdict: pass (tolerance {:.6}, visible max {:.6})",
-                verdict.tolerance, report.visible.max
+                verdict.tolerance, report.visible_occluded.max
             );
         } else {
             println!(
                 "verdict: fail (tolerance {:.6}, visible max {:.6}, {} above)",
                 verdict.tolerance,
-                report.visible.max,
+                report.visible_occluded.max,
                 verdict.violations.len()
             );
             let violating: Vec<String> = verdict
@@ -1486,7 +1499,7 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
         }
     }
     println!(
-        "note: inside = behind the nearest body triangle's normal; visible/inner split by the cosine of the garment vertex normal there (>= 0 visible); local one-sided facing, not occlusion or containment"
+        "note: inside = behind the nearest body triangle's normal; visible/inner split by the cosine of the garment vertex normal there (>= 0 visible); hidden = the garment's own surface is first along that body point's outward normal and it is not the vertex's own triangle (DECL0015 contact point); visible_occluded = visible and not hidden, the graded set; body winding supplies outward and one-sided depth is not containment"
     );
     Ok(())
 }

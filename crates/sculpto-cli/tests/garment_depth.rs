@@ -274,6 +274,70 @@ fn a_clear_garment_passes_with_zero_visible_depth() {
     );
 }
 
+/// A garment `0.2` behind the cube's `+x` face, optionally under a shell `1.0`
+/// further out that covers the contact point's outward normal.
+fn covered_garment_obj(shell: bool) -> String {
+    let mut text = String::from("v 0.8 0 0\nv 0.8 0.1 0\nv 0.8 0 0.1\nf 1 2 3\n");
+    if shell {
+        text.push_str("v 2 -0.5 -0.5\nv 2 0.5 -0.5\nv 2 0 0.5\nf 4 5 6\n");
+    }
+    text
+}
+
+#[test]
+fn occlusion_moves_a_covered_vertex_out_of_the_verdict() {
+    let directory = fixture_directory("occlusion");
+    let body = directory.join("body.obj");
+    let exposed = directory.join("exposed.obj");
+    let covered = directory.join("covered.obj");
+    fs::write(&body, cube_obj()).unwrap();
+    fs::write(&exposed, covered_garment_obj(false)).unwrap();
+    fs::write(&covered, covered_garment_obj(true)).unwrap();
+
+    let exposed_json = depth_with(&body, &exposed, true, Some(0.1));
+    let covered_json = depth_with(&body, &covered, true, Some(0.1));
+    let covered_text = depth_with(&body, &covered, false, Some(0.1));
+    fs::remove_dir_all(&directory).unwrap();
+
+    let value = json_of(&exposed_json);
+    assert_eq!(value["inside_vertices"], 3);
+    assert_eq!(value["layers"]["hidden"]["count"], 0);
+    assert_eq!(value["layers"]["visible_occluded"]["count"], 3);
+    assert_eq!(value["verdict"]["result"], "fail");
+    assert_eq!(value["verdict"]["violations"].as_array().unwrap().len(), 3);
+
+    let value = json_of(&covered_json);
+    // The facing split is untouched: the diagnosis still reports an outer layer.
+    assert_eq!(value["layers"]["visible"]["count"], 3);
+    assert_eq!(value["layers"]["inner"]["count"], 0);
+    assert_eq!(value["layers"]["hidden"]["count"], 3);
+    assert_eq!(value["layers"]["visible_occluded"]["count"], 0);
+    assert_eq!(value["depth"]["max"], value["layers"]["visible"]["max"]);
+    assert_eq!(value["verdict"]["result"], "pass");
+    assert_eq!(value["verdict"]["visible_max"], 0.0);
+    assert_eq!(value["verdict"]["tolerance"], 0.1);
+    assert!(
+        value["verdict"]["violations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let summary = String::from_utf8(covered_text.stdout).unwrap();
+    assert!(
+        summary.contains("occlusion: hidden 3 (max 0.200000"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("visible_occluded 0 (max 0.000000"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("verdict: pass (tolerance 0.100000, visible max 0.000000)"),
+        "{summary}"
+    );
+}
+
 #[test]
 fn a_malformed_tolerance_is_refused_by_name() {
     let directory = fixture_directory("tolerance");

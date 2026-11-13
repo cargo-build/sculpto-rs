@@ -38,6 +38,32 @@ const PLANE_POSITIONS: [[f32; 3]; 4] = [
 ];
 const PLANE_FACES: [[u32; 3]; 2] = [[0, 2, 1], [0, 3, 2]];
 
+/// The same `y = 0` square shrunk to one unit, so a nearest body point can fall
+/// on its edge and leave the penetrating vertex off the outward normal.
+const SMALL_PLANE_POSITIONS: [[f32; 3]; 4] = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0],
+];
+const SMALL_PLANE_FACES: [[u32; 3]; 2] = [[0, 2, 1], [0, 3, 2]];
+
+/// A garment triangle `0.1` behind the `y = 0` plane body, wound outwards.
+const PENETRATING_PLANE: [[f32; 3]; 3] = [[2.0, -0.1, 2.0], [2.1, -0.1, 2.0], [2.0, -0.1, 2.1]];
+const PENETRATING_FACE: [[u32; 3]; 1] = [[0, 2, 1]];
+
+/// The same triangle plus a shell `0.5` above the body over all three contact
+/// points: the garment's own surface stands between them and the outside.
+const SHELLED_PLANE: [[f32; 3]; 6] = [
+    [2.0, -0.1, 2.0],
+    [2.1, -0.1, 2.0],
+    [2.0, -0.1, 2.1],
+    [0.0, 0.5, 0.0],
+    [5.0, 0.5, 0.0],
+    [0.0, 0.5, 5.0],
+];
+const SHELLED_FACES: [[u32; 3]; 2] = [[0, 2, 1], [3, 4, 5]];
+
 fn depth_report(
     garment_positions: &[[f32; 3]],
     garment_faces: &[[u32; 3]],
@@ -227,6 +253,180 @@ fn a_vertex_without_a_face_counts_as_visible() {
     assert_eq!(report.visible.count, 3);
     assert_eq!(report.inner.count, 0);
     assert!(!report.visible_verdict(0.05).passed);
+}
+
+#[test]
+fn a_contact_shell_hides_the_penetrating_plane() {
+    // Without the shell the same plane is exposed: nothing is between the body
+    // contact point and the outside, so it stays graded.
+    let exposed = depth_report(
+        &PENETRATING_PLANE,
+        &PENETRATING_FACE,
+        &PLANE_POSITIONS,
+        &PLANE_FACES,
+    );
+    assert_eq!(exposed.inside, 3);
+    assert_eq!(exposed.visible.count, 3);
+    assert_eq!(exposed.inner.count, 0);
+    assert_eq!(exposed.hidden.count, 0);
+    assert_eq!(exposed.visible_occluded.count, 3);
+    close(exposed.visible_occluded.max, 0.1);
+    let failing = exposed.visible_verdict(0.05);
+    assert!(!failing.passed);
+    assert_eq!(failing.violations.len(), 3);
+
+    let covered = depth_report(
+        &SHELLED_PLANE,
+        &SHELLED_FACES,
+        &PLANE_POSITIONS,
+        &PLANE_FACES,
+    );
+    assert_eq!(covered.inside, 3);
+    // The facing split is unchanged: the diagnosis still says outer layer.
+    assert_eq!(covered.visible.count, 3);
+    assert_eq!(covered.inner.count, 0);
+    close(covered.visible.max, 0.1);
+    assert_eq!(covered.hidden.count, 3);
+    close(covered.hidden.max, 0.1);
+    assert_eq!(covered.visible_occluded.count, 0);
+    assert_eq!(covered.visible_occluded.max, 0.0);
+    // The depth measurement is unchanged; only the graded set moves.
+    close(covered.max, 0.1);
+    let passing = covered.visible_verdict(0.0);
+    assert!(passing.passed);
+    assert!(passing.violations.is_empty());
+}
+
+#[test]
+fn an_occluded_inner_layer_stays_out_of_the_graded_set() {
+    // The same shell over a reversed (inward-facing) plane: the facing test and
+    // the occlusion test both withhold it, and neither substitutes for the other.
+    let reversed_faces = [[0, 1, 2], [3, 4, 5]];
+    let report = depth_report(
+        &SHELLED_PLANE,
+        &reversed_faces,
+        &PLANE_POSITIONS,
+        &PLANE_FACES,
+    );
+    assert_eq!(report.inside, 3);
+    assert_eq!(report.visible.count, 0);
+    assert_eq!(report.inner.count, 3);
+    assert_eq!(report.hidden.count, 3);
+    assert_eq!(report.visible_occluded.count, 0);
+    assert!(report.visible_verdict(0.0).passed);
+}
+
+#[test]
+fn the_contact_points_own_surface_never_occludes() {
+    // The triangle passes through the body contact point itself: that hit is the
+    // contact, inside `OCCLUSION_EPSILON`, not a surface above it.
+    let garment = [[2.0, -0.1, 2.0], [2.0, 0.0, 2.0], [2.5, 0.2, 2.5]];
+    let report = depth_report(&garment, &[[0, 1, 2]], &PLANE_POSITIONS, &PLANE_FACES);
+    assert_eq!(report.inside, 1);
+    assert_eq!(report.contacts, 2);
+    assert_eq!(report.visible.count, 1);
+    assert_eq!(report.hidden.count, 0);
+    assert_eq!(report.visible_occluded.count, 1);
+    close(report.visible_occluded.max, 0.1);
+    assert_eq!(report.visible_verdict(0.05).violations.len(), 1);
+}
+
+#[test]
+fn a_shared_edge_tie_between_foreign_surfaces_is_hidden_and_repeats() {
+    // Two foreign triangles share the edge the ray crosses, so both hits land in
+    // the tie band; neither is the vertex's own, so the vertex stays hidden.
+    let garment = [
+        [5.0, -0.1, 5.0], // 0: inside by 0.1
+        [5.0, -0.1, 5.2], // 1
+        [5.0, -0.2, 5.1], // 2: inside by 0.2
+        [4.5, 0.3, 5.0],  // 3: shared edge of the covering pair
+        [5.5, 0.3, 5.0],  // 4: crosses the vertex-0 ray at its midpoint
+        [5.0, 0.9, 6.0],  // 5
+        [5.0, 0.9, 4.0],  // 6
+    ];
+    let faces = [[0, 2, 1], [3, 4, 5], [3, 4, 6]];
+    let report = depth_report(&garment, &faces, &PLANE_POSITIONS, &PLANE_FACES);
+    assert_eq!(report.inside, 3);
+    assert_eq!(report.visible.count, 3);
+    assert_eq!(report.hidden.count, 3);
+    assert_eq!(report.visible_occluded.count, 0);
+    assert!(
+        report
+            .hidden
+            .depths
+            .iter()
+            .any(|&(vertex, depth)| vertex == 0 && (depth - 0.1).abs() < 1e-6)
+    );
+    assert!(report.visible_verdict(0.0).passed);
+    assert_eq!(
+        report,
+        depth_report(&garment, &faces, &PLANE_POSITIONS, &PLANE_FACES)
+    );
+}
+
+#[test]
+fn a_surface_within_the_occlusion_epsilon_is_the_contact_itself() {
+    // The same cover 5e-5 above the body is the contact, not a layer; at 2e-4 it
+    // is a surface above it. `OCCLUSION_EPSILON` is the declared boundary.
+    let garment = |cover_height: f32| {
+        [
+            [2.0, -0.1, 2.0],
+            [2.1, -0.1, 2.0],
+            [2.0, -0.1, 2.1],
+            [0.0, cover_height, 0.0],
+            [5.0, cover_height, 0.0],
+            [0.0, cover_height, 5.0],
+        ]
+    };
+    let faces = [[0, 2, 1], [3, 4, 5]];
+    let at_contact = depth_report(&garment(5e-5), &faces, &PLANE_POSITIONS, &PLANE_FACES);
+    assert_eq!(at_contact.hidden.count, 0);
+    assert_eq!(at_contact.visible_occluded.count, 3);
+
+    let above = depth_report(&garment(2e-4), &faces, &PLANE_POSITIONS, &PLANE_FACES);
+    assert_eq!(above.hidden.count, 3);
+    assert_eq!(above.visible_occluded.count, 0);
+}
+
+#[test]
+fn a_foreign_surface_hides_only_when_it_is_nearer_than_the_own_surface() {
+    // A one-unit body puts the contact point on its edge, so the penetrating
+    // vertex is off the ray and its own triangle can be met above the contact.
+    // The ray meets the own triangle at 0.2: a foreign surface at 0.15 is in
+    // front of it and hides the vertex, the same surface at 0.25 is behind it.
+    let garment = |cover_height: f32| {
+        [
+            [2.0, -0.1, 0.5],         // 0: inside by 0.1, lateral offset from the contact
+            [1.0, 0.2, 0.5],          // 1: own triangle, crossed by the ray at 0.2
+            [1.0, 0.2, 1.5],          // 2
+            [0.5, cover_height, 0.0], // 3: foreign cover
+            [1.5, cover_height, 0.0], // 4
+            [1.0, cover_height, 1.0], // 5
+        ]
+    };
+    let faces = [[0, 1, 2], [3, 4, 5]];
+    let nearer = depth_report(
+        &garment(0.15),
+        &faces,
+        &SMALL_PLANE_POSITIONS,
+        &SMALL_PLANE_FACES,
+    );
+    assert_eq!(nearer.inside, 1);
+    assert_eq!(nearer.visible.count, 1);
+    assert_eq!(nearer.hidden.count, 1);
+    assert_eq!(nearer.visible_occluded.count, 0);
+    close(nearer.hidden.max, 0.1);
+
+    let behind = depth_report(
+        &garment(0.25),
+        &faces,
+        &SMALL_PLANE_POSITIONS,
+        &SMALL_PLANE_FACES,
+    );
+    assert_eq!(behind.inside, 1);
+    assert_eq!(behind.hidden.count, 0);
+    assert_eq!(behind.visible_occluded.count, 1);
+    close(behind.visible_occluded.max, 0.1);
 }
 
 #[test]

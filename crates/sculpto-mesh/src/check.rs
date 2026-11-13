@@ -726,6 +726,53 @@ impl Bvh {
         }
         hit
     }
+
+    /// Every triangle the unit ray meets within `band` of the nearest hit in
+    /// `(minimum, ...]`, nearest first and tie-broken by triangle index.
+    ///
+    /// A shared-edge crossing hits two triangles at the same distance; keeping
+    /// the whole band lets the caller resolve that tie by meaning instead of by
+    /// traversal order. @req DECL0015
+    fn hits_along(
+        &self,
+        origin: [f32; 3],
+        ray: [f64; 3],
+        minimum: f64,
+        band: f64,
+    ) -> Vec<(usize, f64)> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+        let origin = origin.map(f64::from);
+        let mut nearest = f64::INFINITY;
+        let mut hits = Vec::new();
+        let mut stack = vec![0usize];
+        while let Some(node) = stack.pop() {
+            let entry = &self.nodes[node];
+            if !ray_box(origin, ray, entry.min, entry.max, nearest + band) {
+                continue;
+            }
+            if entry.count > 0 {
+                for &triangle in
+                    &self.order[entry.start as usize..(entry.start + entry.count) as usize]
+                {
+                    if let Some((distance, _)) =
+                        ray_triangle(origin, ray, &self.tries[triangle].corners)
+                        && distance > minimum
+                    {
+                        nearest = nearest.min(distance);
+                        hits.push((triangle, distance));
+                    }
+                }
+            } else {
+                stack.push(entry.left as usize);
+                stack.push(entry.right as usize);
+            }
+        }
+        hits.retain(|&(_, distance)| distance <= nearest + band);
+        hits.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        hits
+    }
 }
 
 /// Whether the ray reaches the box before `limit`.
@@ -1008,6 +1055,16 @@ pub const CONTACT_DISTANCE: f32 = DEPTH_THRESHOLDS[0];
 /// How many worst vertices a [`DepthReport`] lists.
 pub const WORST_VERTICES: usize = 10;
 
+/// Distance below which a garment hit is the contact itself, and within which
+/// two hits cannot be told apart, in source units.
+///
+/// `1e-4` source units is about `1.4 µm` (a source unit is a Skyrim unit,
+/// `1.4285 cm`): one five-hundredth of the shallowest [`DEPTH_THRESHOLDS`] band
+/// and roughly a hundred times the f32 noise floor at ten-unit coordinates. It
+/// discounts the surface that passes through the body contact point, and it
+/// makes a shared-edge crossing read as one tie instead of two orderings.
+pub const OCCLUSION_EPSILON: f32 = 1e-4;
+
 /// Penetration depths of one layer, split by the facing of each inside vertex.
 ///
 /// `depths` keeps every vertex of the layer as `(index, depth)`, deepest
@@ -1047,6 +1104,9 @@ pub struct DepthVerdict {
 /// [`DEPTH_THRESHOLDS`] entry. `visible` and `inner` split the same inside
 /// vertices by whether the garment's own normal agrees with the body triangle
 /// at the nearest point; every inside vertex is in exactly one of them.
+/// `hidden` and `visible_occluded` split the same inside vertices by the
+/// DECL0015 contact-point occlusion test instead; the two splits are
+/// independent, so `visible.count` includes vertices `hidden` also holds.
 /// Depths are in the input frame's units. `body_pairs` and `self_pairs` come
 /// from the same witness lists as [`intersection_pairs`] and
 /// [`self_intersection_pairs`].
@@ -1077,6 +1137,12 @@ pub struct DepthReport {
     /// Inside vertices facing away from that body triangle (cosine `< 0`): an
     /// inner layer, hidden while it stays inside.
     pub inner: DepthLayer,
+    /// Inside vertices the garment's own surface covers at the body contact
+    /// point ([`OCCLUSION_EPSILON`]): the DECL0015 hidden region.
+    pub hidden: DepthLayer,
+    /// Inside vertices that are `visible` and not `hidden`: the occlusion-aware
+    /// visible set, and the only layer [`Self::visible_verdict`] grades.
+    pub visible_occluded: DepthLayer,
     /// Deepest penetrating vertices as `(index, depth)`, deepest first.
     pub worst: Vec<(usize, f32)>,
     /// Garment/body triangle contact pairs ([`intersection_pairs`]).
@@ -1086,16 +1152,19 @@ pub struct DepthReport {
 }
 
 impl DepthReport {
-    /// Acceptance verdict for the visible layer at `tolerance` source units.
+    /// Acceptance verdict for the occlusion-aware visible layer at `tolerance`
+    /// source units.
     ///
-    /// A visible vertex at exactly the tolerance passes and anything deeper
-    /// fails, so `--tolerance` means one thing in the CLI, the tests and any
-    /// downstream ledger. The layer split is a facing test, not a visibility
-    /// proof: see [`garment_depth_report`]. Callers validate the tolerance; a
-    /// negative or non-finite one has no accepted reading.
+    /// "Visible" here is [`Self::visible_occluded`], not the facing-only
+    /// [`Self::visible`]: a vertex the garment's own surface covers between the
+    /// body contact point and the outside is not graded. A visible vertex at
+    /// exactly the tolerance passes and anything deeper fails, so `--tolerance`
+    /// means one thing in the CLI, the tests and any downstream ledger. Callers
+    /// validate the tolerance; a negative or non-finite one has no accepted
+    /// reading.
     pub fn visible_verdict(&self, tolerance: f32) -> DepthVerdict {
         let violations: Vec<(usize, f32)> = self
-            .visible
+            .visible_occluded
             .depths
             .iter()
             .copied()
@@ -1114,19 +1183,25 @@ impl DepthReport {
 /// The sign comes from the nearest body triangle's normal: a point behind that
 /// triangle is inside and contributes `max(0, -signed_distance)`. Closest
 /// points reuse [`SurfaceIndex`], the same BVH as [`nearest_distances`], so
-/// this adds no second geometry kernel. This is a local, winding-dependent
-/// approximation, not containment or visibility: it ignores a body wall
-/// between the point and its nearest triangle, and a degenerate nearest face
-/// reads as outside. Contacts reuse the [`intersection_pairs`] and
-/// [`self_intersection_pairs`] witnesses.
+/// this adds no second geometry kernel. This depth is a local, winding-dependent
+/// approximation, not containment: it ignores a body wall between the point and
+/// its nearest triangle, and a degenerate nearest face reads as outside. Contacts
+/// reuse the [`intersection_pairs`] and [`self_intersection_pairs`] witnesses.
 ///
-/// Each inside vertex is then classified by the cosine between its own
-/// area-weighted normal (the crate's `vertex_normals` owner) and that body
-/// triangle's normal: `>= 0` is the `visible` layer facing outwards like the
-/// skin, `< 0` is the `inner` layer facing into the body. A vertex without an
-/// incidence face has no normal and counts as `visible`, so an unreadable
-/// facing never hides depth from the verdict. This is a facing comparison, not
-/// a visibility, occlusion or containment result.
+/// Each inside vertex is then classified twice, by two independent splits.
+///
+/// Facing (diagnostic): the cosine between its own area-weighted normal (the
+/// crate's `vertex_normals` owner) and that body triangle's normal: `>= 0` is
+/// the `visible` layer facing outwards like the skin, `< 0` is the `inner` layer
+/// facing into the body. A vertex without an incidence face has no normal and
+/// counts as `visible`.
+///
+/// Occlusion ([`occlusion_hides_vertex`], DECL0015 contact-point grading): the
+/// ray from the nearest body point along that triangle's outward normal either
+/// meets the garment's own surface before the penetrating vertex's own triangle
+/// (`hidden`) or does not (`visible_occluded`, when the facing test also admits
+/// it). The body winding supplies "outward", so an inward-wound body inverts the
+/// ray direction exactly as it inverts the depth sign.
 ///
 /// # Errors
 ///
@@ -1136,6 +1211,7 @@ impl DepthReport {
 pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthReport, FitError> {
     validate_geometry(garment, body)?;
     let index = SurfaceIndex::build(body.0, body.1);
+    let surface = SurfaceIndex::build(garment.0, garment.1);
     let normals = vertex_normals(garment.0, garment.1);
     let mut contacts = 0usize;
     let mut inside = 0usize;
@@ -1143,6 +1219,8 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
     let mut penetrating = Vec::new();
     let mut visible = Vec::new();
     let mut inner = Vec::new();
+    let mut hidden = Vec::new();
+    let mut visible_occluded = Vec::new();
     for (vertex, &point) in garment.0.iter().enumerate() {
         let Some(closest) = index.closest(point) else {
             return Err(FitError::EmptyBodyFaces);
@@ -1169,10 +1247,19 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
             penetrating.push((vertex, depth));
             let facing =
                 body_normal.map_or(0.0, |normal| dot64(normals[vertex].map(f64::from), normal));
+            let occluded = body_normal.is_some_and(|normal| {
+                occlusion_hides_vertex(&surface, garment.1, closest.point, normal, vertex)
+            });
+            if occluded {
+                hidden.push((vertex, depth));
+            }
             if facing < 0.0 {
                 inner.push((vertex, depth));
             } else {
                 visible.push((vertex, depth));
+                if !occluded {
+                    visible_occluded.push((vertex, depth));
+                }
             }
             depth
         } else {
@@ -1202,9 +1289,56 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
         above,
         visible: depth_layer(visible),
         inner: depth_layer(inner),
+        hidden: depth_layer(hidden),
+        visible_occluded: depth_layer(visible_occluded),
         worst: penetrating,
         body_pairs: intersection_pairs(garment.0, garment.1, body.0, body.1),
         self_pairs: self_intersection_pairs(garment.0, garment.1),
+    })
+}
+
+/// Whether the garment's own surface covers an inside vertex at its body contact
+/// point (DECL0015 contact-point rule).
+///
+/// The ray starts at `contact`, the nearest body point, and follows `normal`,
+/// the outward body triangle normal. The vertex is hidden when the first garment
+/// surface the ray meets is not one of that vertex's own triangles: the garment
+/// then lies between the body contact point and the outside, so the penetrating
+/// geometry sits behind its own shell. A ray that meets nothing, or only the
+/// vertex's own triangles, leaves the vertex visible. Hits at or below
+/// [`OCCLUSION_EPSILON`] are the contact itself, not a surface in between.
+///
+/// Hits within `OCCLUSION_EPSILON` of the nearest one are one tie at a shared
+/// edge, resolved by DECL0015's "never excuse a contact it cannot resolve": if
+/// any tied triangle is the vertex's own, the vertex stays visible. The result
+/// therefore does not depend on BVH traversal order. Winding is ignored — a
+/// surface occludes from either side — so this stays a geometric cover test, not
+/// a facing test.
+///
+/// An interior closest body point puts the ray through the vertex itself, so the
+/// vertex's own triangles sit behind the contact; the own-triangle exception
+/// matters when the contact point falls on a body edge or vertex and the vertex
+/// is laterally offset.
+fn occlusion_hides_vertex(
+    surface: &SurfaceIndex,
+    garment_faces: &[[u32; 3]],
+    contact: [f32; 3],
+    normal: [f64; 3],
+    vertex: usize,
+) -> bool {
+    let hits = surface.bvh.hits_along(
+        contact,
+        normal,
+        f64::from(OCCLUSION_EPSILON),
+        f64::from(OCCLUSION_EPSILON),
+    );
+    if hits.is_empty() {
+        return false;
+    }
+    !hits.iter().any(|&(triangle, _)| {
+        garment_faces[triangle]
+            .iter()
+            .any(|&corner| corner as usize == vertex)
     })
 }
 
