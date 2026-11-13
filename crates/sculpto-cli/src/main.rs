@@ -48,6 +48,7 @@ commands:
   garment classify [options] measure a garment into its GarmentKind and profile
   garment proxies [options] export the body's per-contour collision proxies
   garment check [options] count garment/body triangle intersections (measured gate)
+  garment depth [options] penetration depth of garment vertices inside a body
   garment trim [options]  cut away garment triangles that intersect the body
   garment cover [options] body coverage per height band (<=2/<=8/<=20 units)
   garment control-exterior [options] keep the outward control surface of a thick shell
@@ -562,6 +563,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 
 fn garment(args: &[String]) -> ExitCode {
     let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj> [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+       sculpto garment depth --body <obj> --garment <obj> [--json]
        sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
@@ -578,6 +580,7 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "strip" => garment_strip_inner(rest),
         [action, rest @ ..] if action == "proxies" => garment_proxies_inner(rest),
         [action, rest @ ..] if action == "check" => garment_check_inner(rest),
+        [action, rest @ ..] if action == "depth" => garment_depth_inner(rest),
         [action, rest @ ..] if action == "trim" => garment_trim_inner(rest),
         [action, rest @ ..] if action == "cover" => garment_cover_inner(rest),
         [action, rest @ ..] if action == "control-exterior" => {
@@ -1238,6 +1241,121 @@ fn garment_check_inner(args: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn garment_depth_inner(args: &[String]) -> Result<(), String> {
+    let mut json = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let flags = parse_flags(&rest)?;
+    let body_path = PathBuf::from(required(&flags, "body")?);
+    let garment_path = PathBuf::from(required(&flags, "garment")?);
+    let (body_positions, body_triangles) = read_obj(&body_path)?;
+    let (garment_positions, garment_triangles) = read_obj(&garment_path)?;
+    // Both inputs share the OBJ display frame, so pure geometric queries need
+    // no conversion.
+    let report = check::garment_depth_report(
+        (&garment_positions, &garment_triangles),
+        (&body_positions, &body_triangles),
+    )
+    .map_err(|error| error.to_string())?;
+    if json {
+        let above: Vec<serde_json::Value> = check::DEPTH_THRESHOLDS
+            .iter()
+            .zip(&report.above)
+            .map(|(&threshold, &count)| {
+                serde_json::json!({
+                    "threshold": depth_number(threshold),
+                    "count": count,
+                })
+            })
+            .collect();
+        let worst: Vec<serde_json::Value> = report
+            .worst
+            .iter()
+            .map(|&(vertex, depth)| {
+                serde_json::json!({
+                    "vertex": vertex,
+                    "depth": depth_number(depth),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "body": body_path.display().to_string(),
+                "garment": garment_path.display().to_string(),
+                "units": "source",
+                "semantics": "max(0, -dot(point - closest_body_point, body_triangle_normal))",
+                "garment_vertices": report.vertices,
+                "garment_triangles": garment_triangles.len(),
+                "body_triangles": body_triangles.len(),
+                "body_pairs": report.body_pairs,
+                "self_pairs": report.self_pairs,
+                "contact_vertices": report.contacts,
+                "inside_vertices": report.inside,
+                "depth": {
+                    "vertices": report.inside,
+                    "mean": depth_number(report.mean),
+                    "median": depth_number(report.median),
+                    "p90": depth_number(report.p90),
+                    "p99": depth_number(report.p99),
+                    "max": depth_number(report.max),
+                },
+                "above": above,
+                "worst": worst,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "{}: {} garment vertices vs {} body triangles; body pairs {}, self pairs {}",
+        garment_path.display(),
+        report.vertices,
+        body_triangles.len(),
+        report.body_pairs,
+        report.self_pairs
+    );
+    println!(
+        "contact vertices {} (inside {}); depth units: source",
+        report.contacts, report.inside
+    );
+    println!(
+        "depth mean {:.6}, median {:.6}, p90 {:.6}, p99 {:.6}, max {:.6}",
+        report.mean, report.median, report.p90, report.p99, report.max
+    );
+    let bands: Vec<String> = check::DEPTH_THRESHOLDS
+        .iter()
+        .zip(&report.above)
+        .map(|(threshold, count)| format!("{threshold}: {count}"))
+        .collect();
+    println!("above depth: {}", bands.join(", "));
+    if report.worst.is_empty() {
+        println!("worst (index, depth): none");
+    } else {
+        let worst: Vec<String> = report
+            .worst
+            .iter()
+            .map(|(vertex, depth)| format!("({vertex}, {depth:.6})"))
+            .collect();
+        println!("worst (index, depth): {}", worst.join(", "));
+    }
+    println!(
+        "note: inside = behind the nearest body triangle's normal; local one-sided approximation, not visibility or containment"
+    );
+    Ok(())
+}
+
+/// JSON depths are rounded to 1e-6 source units: f32's binary expansion adds
+/// noise far below the measurement's precision.
+fn depth_number(value: f32) -> f64 {
+    (f64::from(value) * 1e6).round() / 1e6
 }
 
 fn mode_label(mode: AuraMode) -> &'static str {

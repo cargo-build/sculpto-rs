@@ -1,12 +1,16 @@
-//! Triangle-pair intersection counting for fit gates.
+//! Garment contact and penetration measurement for fit gates.
 //!
 //! Vertex-inside tests miss folds and cut-ins: a triangle can pass through a
 //! surface between its vertices. This module measures triangle pairs that
 //! actually intersect, with a bounding-volume hierarchy over one side so the
 //! scan stays near-linear. Coplanar contacts use projected edge crossings and
 //! barycentric containment, including boundary touches and coincident faces.
+//! [`garment_depth_report`] adds how deep the vertices are, not only whether
+//! triangles touch.
 
 use std::cmp::Ordering;
+
+use crate::wrap::{FitError, Mesh, validate_geometry};
 
 type Vec3 = [f32; 3];
 
@@ -991,6 +995,161 @@ pub fn self_intersection_witnesses(positions: &[[f32; 3]], tris: &[[u32; 3]]) ->
 /// Count physical self contacts; UV seams are adjacent, duplicate faces are not.
 pub fn self_intersection_pairs(positions: &[[f32; 3]], tris: &[[u32; 3]]) -> usize {
     self_intersection_witnesses(positions, tris).len()
+}
+
+/// Depth bands a [`DepthReport`] counts, in source units.
+pub const DEPTH_THRESHOLDS: [f32; 5] = [0.05, 0.1, 0.15, 0.3, 0.5];
+
+/// A vertex is in contact when its nearest body point is this close (the
+/// shallowest depth band) or lies behind it.
+pub const CONTACT_DISTANCE: f32 = DEPTH_THRESHOLDS[0];
+
+/// How many worst vertices a [`DepthReport`] lists.
+pub const WORST_VERTICES: usize = 10;
+
+/// Garment penetration into a body, measured at the nearest body triangle.
+///
+/// `mean` through `max` summarise penetrating vertices only (`depth > 0`) and
+/// are zero when nothing penetrates; percentages use linear interpolation
+/// between order statistics, so an even sample's median is the mean of the two
+/// middle depths. `above` counts every vertex deeper than each
+/// [`DEPTH_THRESHOLDS`] entry. Depths are in the input frame's units.
+/// `body_pairs` and `self_pairs` come from the same witness lists as
+/// [`intersection_pairs`] and [`self_intersection_pairs`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepthReport {
+    /// Garment vertices queried.
+    pub vertices: usize,
+    /// Vertices touching the body: inside, or outside by at most
+    /// [`CONTACT_DISTANCE`].
+    pub contacts: usize,
+    /// Vertices behind the nearest body triangle.
+    pub inside: usize,
+    /// Mean depth over penetrating vertices.
+    pub mean: f32,
+    /// Median depth over penetrating vertices.
+    pub median: f32,
+    /// 90th percentile depth over penetrating vertices.
+    pub p90: f32,
+    /// 99th percentile depth over penetrating vertices.
+    pub p99: f32,
+    /// Deepest vertex depth, zero when nothing penetrates.
+    pub max: f32,
+    /// Vertices deeper than each [`DEPTH_THRESHOLDS`] entry.
+    pub above: [usize; DEPTH_THRESHOLDS.len()],
+    /// Deepest penetrating vertices as `(index, depth)`, deepest first.
+    pub worst: Vec<(usize, f32)>,
+    /// Garment/body triangle contact pairs ([`intersection_pairs`]).
+    pub body_pairs: usize,
+    /// Garment self contact pairs ([`self_intersection_pairs`]).
+    pub self_pairs: usize,
+}
+
+/// Measure how far garment vertices lie inside a body.
+///
+/// The sign comes from the nearest body triangle's normal: a point behind that
+/// triangle is inside and contributes `max(0, -signed_distance)`. Closest
+/// points reuse [`SurfaceIndex`], the same BVH as [`nearest_distances`], so
+/// this adds no second geometry kernel. This is a local, winding-dependent
+/// approximation, not containment or visibility: it ignores a body wall
+/// between the point and its nearest triangle, and a degenerate nearest face
+/// reads as outside. Contacts reuse the [`intersection_pairs`] and
+/// [`self_intersection_pairs`] witnesses.
+///
+/// # Errors
+///
+/// Refuses the shared fit-input defects ([`FitError`]): empty garment or body,
+/// a body without faces, non-finite positions, out-of-range face ids and a
+/// non-finite computed depth.
+pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthReport, FitError> {
+    validate_geometry(garment, body)?;
+    let index = SurfaceIndex::build(body.0, body.1);
+    let mut contacts = 0usize;
+    let mut inside = 0usize;
+    let mut above = [0usize; DEPTH_THRESHOLDS.len()];
+    let mut penetrating = Vec::new();
+    for (vertex, &point) in garment.0.iter().enumerate() {
+        let Some(closest) = index.closest(point) else {
+            return Err(FitError::EmptyBodyFaces);
+        };
+        let face = body.1[closest.triangle];
+        let corners = [
+            body.0[face[0] as usize],
+            body.0[face[1] as usize],
+            body.0[face[2] as usize],
+        ];
+        let offset = sub64(point.map(f64::from), closest.point.map(f64::from));
+        let signed = unit_triangle_normal(corners).map_or(0.0, |normal| dot64(offset, normal));
+        let is_inside = signed < 0.0;
+        if is_inside || closest.distance <= CONTACT_DISTANCE {
+            contacts += 1;
+        }
+        let depth = if is_inside {
+            let depth = (-signed) as f32;
+            if !depth.is_finite() {
+                return Err(FitError::NonFiniteResult { vertex });
+            }
+            inside += 1;
+            penetrating.push((vertex, depth));
+            depth
+        } else {
+            0.0
+        };
+        for (band, threshold) in DEPTH_THRESHOLDS.iter().enumerate() {
+            if depth > *threshold {
+                above[band] += 1;
+            }
+        }
+    }
+
+    let mut depths: Vec<f32> = penetrating.iter().map(|&(_, depth)| depth).collect();
+    depths.sort_by(f32::total_cmp);
+    let mean = if depths.is_empty() {
+        0.0
+    } else {
+        (depths.iter().map(|&depth| f64::from(depth)).sum::<f64>() / depths.len() as f64) as f32
+    };
+    penetrating.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    penetrating.truncate(WORST_VERTICES);
+    Ok(DepthReport {
+        vertices: garment.0.len(),
+        contacts,
+        inside,
+        mean,
+        median: percentile(&depths, 0.5),
+        p90: percentile(&depths, 0.9),
+        p99: percentile(&depths, 0.99),
+        max: depths.last().copied().unwrap_or(0.0),
+        above,
+        worst: penetrating,
+        body_pairs: intersection_pairs(garment.0, garment.1, body.0, body.1),
+        self_pairs: self_intersection_pairs(garment.0, garment.1),
+    })
+}
+
+/// Unit face normal, or `None` for a degenerate triangle that cannot name a
+/// side.
+fn unit_triangle_normal(corners: [[f32; 3]; 3]) -> Option<[f64; 3]> {
+    let a = corners[0].map(f64::from);
+    let normal = cross64(
+        sub64(corners[1].map(f64::from), a),
+        sub64(corners[2].map(f64::from), a),
+    );
+    let length = dot64(normal, normal).sqrt();
+    (length > 0.0 && length.is_finite()).then(|| normal.map(|value| value / length))
+}
+
+/// Percentile by linear interpolation between order statistics, like NumPy's
+/// default.
+fn percentile(sorted: &[f32], fraction: f64) -> f32 {
+    let Some(last) = sorted.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let position = fraction * last as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let weight = (position - lower as f64) as f32;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * weight
 }
 
 #[cfg(test)]
