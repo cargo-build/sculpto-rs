@@ -563,7 +563,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 
 fn garment(args: &[String]) -> ExitCode {
     let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj> [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
-       sculpto garment depth --body <obj> --garment <obj> [--json]
+       sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
        sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
@@ -1256,6 +1256,7 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(&rest)?;
     let body_path = PathBuf::from(required(&flags, "body")?);
     let garment_path = PathBuf::from(required(&flags, "garment")?);
+    let tolerance = flag_tolerance(&flags)?;
     let (body_positions, body_triangles) = read_obj(&body_path)?;
     let (garment_positions, garment_triangles) = read_obj(&garment_path)?;
     // Both inputs share the OBJ display frame, so pure geometric queries need
@@ -1265,6 +1266,7 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
         (&body_positions, &body_triangles),
     )
     .map_err(|error| error.to_string())?;
+    let verdict = tolerance.map(|tolerance| report.visible_verdict(tolerance));
     if json {
         let above: Vec<serde_json::Value> = check::DEPTH_THRESHOLDS
             .iter()
@@ -1286,32 +1288,53 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::json!({
-                "body": body_path.display().to_string(),
-                "garment": garment_path.display().to_string(),
-                "units": "source",
-                "semantics": "max(0, -dot(point - closest_body_point, body_triangle_normal))",
-                "garment_vertices": report.vertices,
-                "garment_triangles": garment_triangles.len(),
-                "body_triangles": body_triangles.len(),
-                "body_pairs": report.body_pairs,
-                "self_pairs": report.self_pairs,
-                "contact_vertices": report.contacts,
-                "inside_vertices": report.inside,
-                "depth": {
-                    "vertices": report.inside,
-                    "mean": depth_number(report.mean),
-                    "median": depth_number(report.median),
-                    "p90": depth_number(report.p90),
-                    "p99": depth_number(report.p99),
-                    "max": depth_number(report.max),
-                },
-                "above": above,
-                "worst": worst,
-            })
-        );
+        let mut payload = serde_json::json!({
+            "body": body_path.display().to_string(),
+            "garment": garment_path.display().to_string(),
+            "units": "source",
+            "semantics": "max(0, -dot(point - closest_body_point, body_triangle_normal))",
+            "layers_semantics": "visible when dot(garment_vertex_normal, nearest_body_triangle_normal) >= 0, inner when < 0",
+            "garment_vertices": report.vertices,
+            "garment_triangles": garment_triangles.len(),
+            "body_triangles": body_triangles.len(),
+            "body_pairs": report.body_pairs,
+            "self_pairs": report.self_pairs,
+            "contact_vertices": report.contacts,
+            "inside_vertices": report.inside,
+            "depth": {
+                "vertices": report.inside,
+                "mean": depth_number(report.mean),
+                "median": depth_number(report.median),
+                "p90": depth_number(report.p90),
+                "p99": depth_number(report.p99),
+                "max": depth_number(report.max),
+            },
+            "layers": {
+                "visible": depth_layer_json(&report.visible),
+                "inner": depth_layer_json(&report.inner),
+            },
+            "above": above,
+            "worst": worst,
+        });
+        if let Some(verdict) = &verdict {
+            let violations: Vec<serde_json::Value> = verdict
+                .violations
+                .iter()
+                .map(|&(vertex, depth)| {
+                    serde_json::json!({
+                        "vertex": vertex,
+                        "depth": depth_number(depth),
+                    })
+                })
+                .collect();
+            payload["verdict"] = serde_json::json!({
+                "result": if verdict.passed { "pass" } else { "fail" },
+                "tolerance": depth_number(verdict.tolerance),
+                "visible_max": depth_number(report.visible.max),
+                "violations": violations,
+            });
+        }
+        println!("{payload}");
         return Ok(());
     }
     println!(
@@ -1330,6 +1353,17 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
         "depth mean {:.6}, median {:.6}, p90 {:.6}, p99 {:.6}, max {:.6}",
         report.mean, report.median, report.p90, report.p99, report.max
     );
+    println!(
+        "layers: visible {} (max {:.6}, mean {:.6}, p90 {:.6}), inner {} (max {:.6}, mean {:.6}, p90 {:.6})",
+        report.visible.count,
+        report.visible.max,
+        report.visible.mean,
+        report.visible.p90,
+        report.inner.count,
+        report.inner.max,
+        report.inner.mean,
+        report.inner.p90
+    );
     let bands: Vec<String> = check::DEPTH_THRESHOLDS
         .iter()
         .zip(&report.above)
@@ -1346,10 +1380,61 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
             .collect();
         println!("worst (index, depth): {}", worst.join(", "));
     }
+    if let Some(verdict) = &verdict {
+        if verdict.passed {
+            println!(
+                "verdict: pass (tolerance {:.6}, visible max {:.6})",
+                verdict.tolerance, report.visible.max
+            );
+        } else {
+            println!(
+                "verdict: fail (tolerance {:.6}, visible max {:.6}, {} above)",
+                verdict.tolerance,
+                report.visible.max,
+                verdict.violations.len()
+            );
+            let violating: Vec<String> = verdict
+                .violations
+                .iter()
+                .map(|(vertex, depth)| format!("({vertex}, {depth:.6})"))
+                .collect();
+            println!(
+                "violating visible vertices (index, depth): {}",
+                violating.join(", ")
+            );
+        }
+    }
     println!(
-        "note: inside = behind the nearest body triangle's normal; local one-sided approximation, not visibility or containment"
+        "note: inside = behind the nearest body triangle's normal; visible/inner split by the cosine of the garment vertex normal there (>= 0 visible); local one-sided facing, not occlusion or containment"
     );
     Ok(())
+}
+
+/// JSON view of one penetration layer.
+fn depth_layer_json(layer: &check::DepthLayer) -> serde_json::Value {
+    serde_json::json!({
+        "count": layer.count,
+        "mean": depth_number(layer.mean),
+        "p90": depth_number(layer.p90),
+        "max": depth_number(layer.max),
+    })
+}
+
+/// Parse the optional acceptance tolerance in source units; without it there
+/// is no verdict. Rejects values that cannot name a depth bound.
+fn flag_tolerance(flags: &BTreeMap<String, String>) -> Result<Option<f32>, String> {
+    let Some(value) = flags.get("tolerance") else {
+        return Ok(None);
+    };
+    let tolerance = value
+        .parse::<f32>()
+        .map_err(|_| format!("`--tolerance` must be a number, got `{value}`"))?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(format!(
+            "`--tolerance` must be a finite non-negative number, got `{value}`"
+        ));
+    }
+    Ok(Some(tolerance))
 }
 
 /// JSON depths are rounded to 1e-6 source units: f32's binary expansion adds

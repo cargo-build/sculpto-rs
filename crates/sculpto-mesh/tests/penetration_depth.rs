@@ -158,6 +158,78 @@ fn triangle_contacts_stay_with_the_existing_witness_owners() {
 }
 
 #[test]
+fn layer_follows_the_garment_normal_and_reversing_it_hides_the_depth() {
+    // Three vertices 0.1 behind the cube's `+x` face, whose normal is `+x`:
+    // the outward winding faces the same way and the reversed one does not.
+    let vertices = [[0.9, 0.0, 0.0], [0.9, 0.1, 0.0], [0.9, 0.0, 0.1]];
+    let visible = depth_report(&vertices, &[[0, 1, 2]], &CUBE_POSITIONS, &CUBE_FACES);
+    assert_eq!(visible.inside, 3);
+    assert_eq!(visible.visible.count, 3);
+    assert_eq!(visible.inner.count, 0);
+    close(visible.visible.max, 0.1);
+    close(visible.visible.mean, 0.1);
+    close(visible.visible.p90, 0.1);
+    let failing = visible.visible_verdict(0.05);
+    assert!(!failing.passed);
+    assert_eq!(failing.violations.len(), 3);
+    close(failing.violations[0].1, 0.1);
+
+    let reversed = depth_report(&vertices, &[[0, 2, 1]], &CUBE_POSITIONS, &CUBE_FACES);
+    assert_eq!(reversed.visible.count, 0);
+    assert_eq!(reversed.inner.count, 3);
+    close(reversed.inner.max, 0.1);
+    let hidden = reversed.visible_verdict(0.05);
+    assert!(hidden.passed);
+    assert!(hidden.violations.is_empty());
+    // The layer split classifies the same penetration; it does not remove it.
+    assert_eq!(reversed.inside, 3);
+    assert_eq!(reversed.max, visible.max);
+}
+
+#[test]
+fn the_tolerance_boundary_passes_at_the_bound_and_fails_above_it() {
+    // A garment triangle 0.1 above the plane body, wound so its own normal is
+    // the body's `+y`: a visible layer at the depth it is measured on.
+    let vertices = [[2.0, -0.1, 2.0], [2.1, -0.1, 2.0], [2.0, -0.1, 2.1]];
+    let report = depth_report(&vertices, &[[0, 2, 1]], &PLANE_POSITIONS, &PLANE_FACES);
+    assert_eq!(report.visible.count, 3);
+    assert_eq!(report.inner.count, 0);
+    close(report.visible.max, 0.1);
+
+    let depth = report.visible.max;
+    let at_bound = report.visible_verdict(depth);
+    assert!(at_bound.passed, "a depth at the tolerance passes");
+    assert!(at_bound.violations.is_empty());
+    let above = report.visible_verdict(depth - 1e-3);
+    assert!(!above.passed, "a depth epsilon above the tolerance fails");
+    assert_eq!(above.violations.len(), 3);
+}
+
+#[test]
+fn a_clear_garment_passes_any_tolerance_with_zero_depth() {
+    let garment = [[2.0, 5.0, 2.0], [3.0, 5.0, 2.0], [2.0, 5.0, 3.0]];
+    let report = depth_report(&garment, &[[0, 1, 2]], &PLANE_POSITIONS, &PLANE_FACES);
+    assert_eq!(report.visible.count, 0);
+    assert_eq!(report.inner.count, 0);
+    assert_eq!(report.visible.max, 0.0);
+    let verdict = report.visible_verdict(0.0);
+    assert!(verdict.passed);
+    assert!(verdict.violations.is_empty());
+}
+
+#[test]
+fn a_vertex_without_a_face_counts_as_visible() {
+    // No garment faces means no vertex normals; an unreadable facing must not
+    // hide the depth from the verdict.
+    let garment = [[0.9, 0.0, 0.0], [0.9, 0.1, 0.0], [0.9, 0.0, 0.1]];
+    let report = depth_report(&garment, &[], &CUBE_POSITIONS, &CUBE_FACES);
+    assert_eq!(report.inside, 3);
+    assert_eq!(report.visible.count, 3);
+    assert_eq!(report.inner.count, 0);
+    assert!(!report.visible_verdict(0.05).passed);
+}
+
+#[test]
 fn malformed_input_is_refused_by_name() {
     let valid_garment = [[0.0, 0.0, 0.0]];
     let valid_body = CUBE_POSITIONS;

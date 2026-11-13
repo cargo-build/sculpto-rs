@@ -10,6 +10,7 @@
 
 use std::cmp::Ordering;
 
+use crate::surface_util::vertex_normals;
 use crate::wrap::{FitError, Mesh, validate_geometry};
 
 type Vec3 = [f32; 3];
@@ -1007,15 +1008,48 @@ pub const CONTACT_DISTANCE: f32 = DEPTH_THRESHOLDS[0];
 /// How many worst vertices a [`DepthReport`] lists.
 pub const WORST_VERTICES: usize = 10;
 
+/// Penetration depths of one layer, split by the facing of each inside vertex.
+///
+/// `depths` keeps every vertex of the layer as `(index, depth)`, deepest
+/// first, so a verdict names the vertices it rejects instead of only counting
+/// them. Depths are in the input frame's units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepthLayer {
+    /// Inside vertices in this layer.
+    pub count: usize,
+    /// Mean depth over this layer, zero when the layer is empty.
+    pub mean: f32,
+    /// 90th percentile depth over this layer, zero when the layer is empty.
+    pub p90: f32,
+    /// Deepest depth in this layer, zero when the layer is empty.
+    pub max: f32,
+    /// Layer vertices as `(index, depth)`, deepest first.
+    pub depths: Vec<(usize, f32)>,
+}
+
+/// Visible-layer acceptance against one maximum depth, in source units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepthVerdict {
+    /// Accepted maximum visible depth.
+    pub tolerance: f32,
+    /// `true` when no visible vertex is deeper than [`Self::tolerance`].
+    pub passed: bool,
+    /// Visible vertices deeper than [`Self::tolerance`], deepest first.
+    pub violations: Vec<(usize, f32)>,
+}
+
 /// Garment penetration into a body, measured at the nearest body triangle.
 ///
 /// `mean` through `max` summarise penetrating vertices only (`depth > 0`) and
 /// are zero when nothing penetrates; percentages use linear interpolation
 /// between order statistics, so an even sample's median is the mean of the two
 /// middle depths. `above` counts every vertex deeper than each
-/// [`DEPTH_THRESHOLDS`] entry. Depths are in the input frame's units.
-/// `body_pairs` and `self_pairs` come from the same witness lists as
-/// [`intersection_pairs`] and [`self_intersection_pairs`].
+/// [`DEPTH_THRESHOLDS`] entry. `visible` and `inner` split the same inside
+/// vertices by whether the garment's own normal agrees with the body triangle
+/// at the nearest point; every inside vertex is in exactly one of them.
+/// Depths are in the input frame's units. `body_pairs` and `self_pairs` come
+/// from the same witness lists as [`intersection_pairs`] and
+/// [`self_intersection_pairs`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct DepthReport {
     /// Garment vertices queried.
@@ -1037,12 +1071,42 @@ pub struct DepthReport {
     pub max: f32,
     /// Vertices deeper than each [`DEPTH_THRESHOLDS`] entry.
     pub above: [usize; DEPTH_THRESHOLDS.len()],
+    /// Inside vertices whose own normal agrees with the body triangle at the
+    /// nearest point (cosine `>= 0`): the outer layer, facing outwards.
+    pub visible: DepthLayer,
+    /// Inside vertices facing away from that body triangle (cosine `< 0`): an
+    /// inner layer, hidden while it stays inside.
+    pub inner: DepthLayer,
     /// Deepest penetrating vertices as `(index, depth)`, deepest first.
     pub worst: Vec<(usize, f32)>,
     /// Garment/body triangle contact pairs ([`intersection_pairs`]).
     pub body_pairs: usize,
     /// Garment self contact pairs ([`self_intersection_pairs`]).
     pub self_pairs: usize,
+}
+
+impl DepthReport {
+    /// Acceptance verdict for the visible layer at `tolerance` source units.
+    ///
+    /// A visible vertex at exactly the tolerance passes and anything deeper
+    /// fails, so `--tolerance` means one thing in the CLI, the tests and any
+    /// downstream ledger. The layer split is a facing test, not a visibility
+    /// proof: see [`garment_depth_report`]. Callers validate the tolerance; a
+    /// negative or non-finite one has no accepted reading.
+    pub fn visible_verdict(&self, tolerance: f32) -> DepthVerdict {
+        let violations: Vec<(usize, f32)> = self
+            .visible
+            .depths
+            .iter()
+            .copied()
+            .filter(|&(_, depth)| depth > tolerance)
+            .collect();
+        DepthVerdict {
+            tolerance,
+            passed: violations.is_empty(),
+            violations,
+        }
+    }
 }
 
 /// Measure how far garment vertices lie inside a body.
@@ -1056,6 +1120,14 @@ pub struct DepthReport {
 /// reads as outside. Contacts reuse the [`intersection_pairs`] and
 /// [`self_intersection_pairs`] witnesses.
 ///
+/// Each inside vertex is then classified by the cosine between its own
+/// area-weighted normal (the crate's `vertex_normals` owner) and that body
+/// triangle's normal: `>= 0` is the `visible` layer facing outwards like the
+/// skin, `< 0` is the `inner` layer facing into the body. A vertex without an
+/// incidence face has no normal and counts as `visible`, so an unreadable
+/// facing never hides depth from the verdict. This is a facing comparison, not
+/// a visibility, occlusion or containment result.
+///
 /// # Errors
 ///
 /// Refuses the shared fit-input defects ([`FitError`]): empty garment or body,
@@ -1064,10 +1136,13 @@ pub struct DepthReport {
 pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthReport, FitError> {
     validate_geometry(garment, body)?;
     let index = SurfaceIndex::build(body.0, body.1);
+    let normals = vertex_normals(garment.0, garment.1);
     let mut contacts = 0usize;
     let mut inside = 0usize;
     let mut above = [0usize; DEPTH_THRESHOLDS.len()];
     let mut penetrating = Vec::new();
+    let mut visible = Vec::new();
+    let mut inner = Vec::new();
     for (vertex, &point) in garment.0.iter().enumerate() {
         let Some(closest) = index.closest(point) else {
             return Err(FitError::EmptyBodyFaces);
@@ -1079,7 +1154,8 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
             body.0[face[2] as usize],
         ];
         let offset = sub64(point.map(f64::from), closest.point.map(f64::from));
-        let signed = unit_triangle_normal(corners).map_or(0.0, |normal| dot64(offset, normal));
+        let body_normal = unit_triangle_normal(corners);
+        let signed = body_normal.map_or(0.0, |normal| dot64(offset, normal));
         let is_inside = signed < 0.0;
         if is_inside || closest.distance <= CONTACT_DISTANCE {
             contacts += 1;
@@ -1091,6 +1167,13 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
             }
             inside += 1;
             penetrating.push((vertex, depth));
+            let facing =
+                body_normal.map_or(0.0, |normal| dot64(normals[vertex].map(f64::from), normal));
+            if facing < 0.0 {
+                inner.push((vertex, depth));
+            } else {
+                visible.push((vertex, depth));
+            }
             depth
         } else {
             0.0
@@ -1104,11 +1187,7 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
 
     let mut depths: Vec<f32> = penetrating.iter().map(|&(_, depth)| depth).collect();
     depths.sort_by(f32::total_cmp);
-    let mean = if depths.is_empty() {
-        0.0
-    } else {
-        (depths.iter().map(|&depth| f64::from(depth)).sum::<f64>() / depths.len() as f64) as f32
-    };
+    let mean = mean_of(&depths);
     penetrating.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     penetrating.truncate(WORST_VERTICES);
     Ok(DepthReport {
@@ -1121,10 +1200,35 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
         p99: percentile(&depths, 0.99),
         max: depths.last().copied().unwrap_or(0.0),
         above,
+        visible: depth_layer(visible),
+        inner: depth_layer(inner),
         worst: penetrating,
         body_pairs: intersection_pairs(garment.0, garment.1, body.0, body.1),
         self_pairs: self_intersection_pairs(garment.0, garment.1),
     })
+}
+
+/// Summarise one layer's `(index, depth)` samples, deepest first.
+fn depth_layer(depths: Vec<(usize, f32)>) -> DepthLayer {
+    let mut sorted: Vec<f32> = depths.iter().map(|&(_, depth)| depth).collect();
+    sorted.sort_by(f32::total_cmp);
+    let mut ordered = depths;
+    ordered.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    DepthLayer {
+        count: sorted.len(),
+        mean: mean_of(&sorted),
+        p90: percentile(&sorted, 0.9),
+        max: sorted.last().copied().unwrap_or(0.0),
+        depths: ordered,
+    }
+}
+
+/// Arithmetic mean in f64, zero for an empty sample.
+fn mean_of(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|&sample| f64::from(sample)).sum::<f64>() / samples.len() as f64) as f32
 }
 
 /// Unit face normal, or `None` for a degenerate triangle that cannot name a
