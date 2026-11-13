@@ -78,3 +78,18 @@ fn index_list_get_stats_export() {
     let _ = fs::remove_file(&db);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn missing_db_value_is_refused() {
+    let root = temp_dir("db-missing");
+    let output = Command::new(env!("CARGO_BIN_EXE_boethos"))
+        .args(["list", "--db"])
+        .env("XDG_STATE_HOME", &root)
+        .output()
+        .expect("run boethos");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--db requires a value"), "stderr: {stderr}");
+    assert!(!root.join("boethos/assets.redb").exists());
+    let _ = fs::remove_dir_all(root);
+}

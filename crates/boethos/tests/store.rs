@@ -224,3 +224,38 @@ fn empty_identity_and_reserved_separator_are_refused() {
     );
     let _ = std::fs::remove_file(path);
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CharacterV2 {
+    title: String,
+}
+
+struct ChangedShapeV2;
+
+impl Kind for ChangedShapeV2 {
+    const NAME: &'static str = "character";
+    const VERSION: u32 = 2;
+    type Record = CharacterV2;
+
+    fn validate(_record: &Self::Record) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn version_mismatch_precedes_payload_decoding() {
+    let path = temp_path("version-shape");
+    let store = Store::open(&path).expect("open");
+    store
+        .insert::<Characters>("hero", &character("Hero"))
+        .expect("insert");
+    let error = store
+        .get::<ChangedShapeV2>("hero")
+        .expect_err("changed shape");
+    assert!(matches!(error, boethos::StoreError::VersionMismatch { .. }));
+    let error = store
+        .iter_kind::<ChangedShapeV2>()
+        .expect_err("changed shape");
+    assert!(matches!(error, boethos::StoreError::VersionMismatch { .. }));
+    let _ = std::fs::remove_file(path);
+}

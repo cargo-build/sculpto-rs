@@ -15,6 +15,10 @@ use boethos_catalogue::{Asset, Assets, Category, IndexOptions, Sex, index_root};
 
 fn main() -> ExitCode {
     let mut arguments: Vec<String> = env::args().skip(1).collect();
+    if let Err(error) = validate_value_flags(&arguments) {
+        eprintln!("error: {error}");
+        return ExitCode::from(2);
+    }
     if let Some(index) = arguments.iter().position(|argument| argument == "--db")
         && let Some(value) = arguments.get(index + 1).cloned()
     {
@@ -199,7 +203,7 @@ fn command_get(arguments: &[String]) -> Result<(), String> {
         if let Some(family) = &asset.family {
             println!("family:   {family}");
         }
-        println!("status:   {:?}", asset.status);
+        println!("status:   {}", asset.status.as_str());
         if let Some(archive) = &asset.archive {
             println!("archive:  {archive}");
         }
@@ -260,12 +264,14 @@ fn database_path(arguments: &[String]) -> PathBuf {
     if let Some(path) = flag(arguments, "--db") {
         return PathBuf::from(path);
     }
-    if let Ok(path) = env::var("BOETHOS_DB") {
+    if let Some(path) = env::var("BOETHOS_DB").ok().filter(|path| !path.is_empty()) {
         return PathBuf::from(path);
     }
     let state = env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".to_string())).join(".local/state")
         });
     state.join("boethos/assets.redb")
@@ -309,6 +315,19 @@ const VALUE_FLAGS: [&str; 7] = [
     "--source",
 ];
 
+fn validate_value_flags(arguments: &[String]) -> Result<(), String> {
+    for (index, argument) in arguments.iter().enumerate() {
+        if !VALUE_FLAGS.contains(&argument.as_str()) {
+            continue;
+        }
+        match arguments.get(index + 1) {
+            Some(value) if !value.is_empty() && !value.starts_with("--") => {}
+            _ => return Err(format!("{argument} requires a value")),
+        }
+    }
+    Ok(())
+}
+
 fn positional(arguments: &[String]) -> Option<&str> {
     let mut index = 0;
     while index < arguments.len() {
@@ -337,9 +356,4 @@ fn optional_parse<T>(
             .map(Some)
             .ok_or_else(|| format!("invalid {name} {value:?}")),
     }
-}
-
-#[allow(dead_code)]
-fn path_display(path: &Path) -> String {
-    path.display().to_string()
 }

@@ -96,6 +96,18 @@ pub enum Sex {
     Unknown,
 }
 
+impl Status {
+    /// Stable text token used by reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Prepared => "prepared",
+            Self::Accepted => "accepted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 impl Sex {
     /// Stable text token.
     pub fn as_str(self) -> &'static str {

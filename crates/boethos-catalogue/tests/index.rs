@@ -28,6 +28,9 @@ fn fixture(root: &Path) {
         ),
         ("textures/skin.dds", b"DDS ".as_slice()),
         ("mixamo/animations/walk.fbx", b"FBX".as_slice()),
+        ("body/body.nif", b"NIF-BODY".as_slice()),
+        ("clothes/armor.nif", b"NIF-CLOTHES".as_slice()),
+        ("hair/hair.nif", b"NIF-HAIR".as_slice()),
         ("readme.txt", b"notes".as_slice()),
     ] {
         let target = root.join(path);
@@ -51,8 +54,8 @@ fn classifies_and_indexes_files() {
         },
     );
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert_eq!(report.files, 5);
-    assert_eq!(report.inserted, 5);
+    assert_eq!(report.files, 8);
+    assert_eq!(report.inserted, 8);
     let rows = store.iter_kind::<Assets>().expect("rows");
     let categories: Vec<Category> = rows.iter().map(|(_, asset)| asset.category).collect();
     assert!(categories.contains(&Category::Preset));
@@ -60,6 +63,9 @@ fn classifies_and_indexes_files() {
     assert!(categories.contains(&Category::Texture));
     assert!(categories.contains(&Category::Animation));
     assert!(categories.contains(&Category::Other));
+    assert!(categories.contains(&Category::Body));
+    assert!(categories.contains(&Category::Outfit));
+    assert!(categories.contains(&Category::Hair));
 
     let again = index_root(
         &store,
@@ -70,7 +76,7 @@ fn classifies_and_indexes_files() {
         },
     );
     assert_eq!(again.inserted, 0);
-    assert_eq!(again.replaced, 5);
+    assert_eq!(again.replaced, 8);
     let _ = fs::remove_file(&db);
     let _ = fs::remove_dir_all(root);
 }
@@ -121,6 +127,51 @@ fn family_tokens_do_not_match_substrings() {
     };
     assert_eq!(family("face.dds").as_deref(), Some("pan"));
     assert_eq!(family("leg.dds"), None);
+    let _ = fs::remove_file(root.with_extension("redb"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn indexes_archive_members_end_to_end() {
+    let root = temp_dir("archive");
+    fs::create_dir_all(root.join("SliderPresets")).expect("dirs");
+    fs::write(root.join("SliderPresets/Test.xml"), b"<SliderPresets/>").expect("write");
+    fs::create_dir_all(root.join("FaceGeom/skyrim.esm")).expect("dirs");
+    fs::write(root.join("FaceGeom/skyrim.esm/0001.NIF"), b"NIF").expect("write");
+    let status = std::process::Command::new("7z")
+        .current_dir(&root)
+        .args([
+            "a",
+            "-y",
+            "pack.7z",
+            "SliderPresets/Test.xml",
+            "FaceGeom/skyrim.esm/0001.NIF",
+        ])
+        .status()
+        .expect("7z");
+    assert!(status.success(), "7z could not create the fixture archive");
+    fs::remove_dir_all(root.join("SliderPresets")).expect("remove");
+    fs::remove_dir_all(root.join("FaceGeom")).expect("remove");
+    let store = Store::open(root.with_extension("redb")).expect("store");
+    let report = index_root(
+        &store,
+        &root,
+        "fixture",
+        &IndexOptions {
+            archive_entries: true,
+        },
+    );
+    assert_eq!(report.archives, 1);
+    assert_eq!(report.members, 2, "{:?}", report.errors);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    assert!(
+        rows.iter()
+            .any(|(_, asset)| asset.category == Category::Face)
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, asset)| asset.category == Category::Preset)
+    );
     let _ = fs::remove_file(root.with_extension("redb"));
     let _ = fs::remove_dir_all(root);
 }

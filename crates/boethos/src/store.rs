@@ -91,9 +91,7 @@ impl Store {
         let Some(value) = table.get(key.as_str())? else {
             return Ok(None);
         };
-        let envelope: RecordEnvelope<K::Record> = serde_json::from_slice(value.value())?;
-        check_version::<K>(envelope.version)?;
-        Ok(Some(envelope.record))
+        Ok(Some(decode::<K>(value.value())?))
     }
 
     /// Remove one record; reports whether it existed.
@@ -183,9 +181,7 @@ impl Store {
             let Some(id) = key.strip_prefix(&prefix) else {
                 break;
             };
-            let envelope: RecordEnvelope<K::Record> = serde_json::from_slice(value.value())?;
-            check_version::<K>(envelope.version)?;
-            records.push((id.to_string(), envelope.record));
+            records.push((id.to_string(), decode::<K>(value.value())?));
         }
         Ok(records)
     }
@@ -208,7 +204,12 @@ impl Store {
             output.push('\n');
             count += 1;
         }
-        fs::write(path, output)?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        fs::write(&temporary, output)?;
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         Ok(count)
     }
 
@@ -237,6 +238,12 @@ impl Store {
         transaction.commit()?;
         Ok(outcome)
     }
+}
+
+fn decode<K: Kind>(bytes: &[u8]) -> StoreResult<K::Record> {
+    let envelope: RecordEnvelope<serde_json::Value> = serde_json::from_slice(bytes)?;
+    check_version::<K>(envelope.version)?;
+    Ok(serde_json::from_value(envelope.record)?)
 }
 
 fn encode<K: Kind>(id: &str, record: &K::Record) -> StoreResult<Vec<u8>> {

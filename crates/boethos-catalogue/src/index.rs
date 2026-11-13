@@ -241,6 +241,17 @@ fn classify(path: &Path, extension: &str) -> Category {
     if matches!(extension, "osp" | "osd" | "bsd") {
         return Category::Project;
     }
+    if matches!(extension, "nif" | "glb" | "gltf" | "obj") {
+        if text.contains("hair") || text.contains("hairdos") {
+            return Category::Hair;
+        }
+        if text.contains("body") || text.contains("baseshape") {
+            return Category::Body;
+        }
+        if text.contains("clothes") || text.contains("armor") || text.contains("outfit") {
+            return Category::Outfit;
+        }
+    }
     if extension == "nif" {
         return Category::Mesh;
     }
