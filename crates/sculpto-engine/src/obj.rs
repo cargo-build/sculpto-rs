@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
+use sculpto_core::mesh::{MeshAsset, PartitionId};
 use sculpto_nif::NifShape;
 
 use crate::{CommandError, ErrorKind, errors};
@@ -101,6 +102,145 @@ pub(crate) fn read_obj_surface(path: &Path) -> Result<ObjMesh, CommandError> {
 fn read_text(path: &Path) -> Result<String, ObjError> {
     std::fs::read_to_string(path)
         .map_err(|error| ObjError::Io(format!("{}: {error}", path.display())))
+}
+
+/// Read an OBJ into the export model, keeping per-vertex UVs.
+///
+/// The bundle and head-compatibility paths need the UV set the position-only
+/// readers drop. Positions are converted to the source NIF frame (Z-up) and
+/// UVs to the NIF top-left convention, so an OBJ part and a NIF part assemble
+/// in one frame. The flat model stores one UV per position, so an OBJ with
+/// split UV seams (a corner whose `vt` index differs from its `v` index) is
+/// refused rather than silently collapsed. OBJ carries no skin, normals or
+/// materials here; those stay empty and the compatibility report says so.
+///
+/// # Errors
+/// Refuses unreadable files, malformed vertices/UVs/faces, empty geometry,
+/// out-of-range indices and split-UV seams the model cannot represent.
+pub fn read_obj_asset(path: &Path) -> Result<MeshAsset, ObjError> {
+    let text = read_text(path)?;
+    let mut positions = Vec::new();
+    let mut uvs_raw: Vec<[f32; 2]> = Vec::new();
+    let mut triangles: Vec<[u32; 3]> = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("v ") {
+            positions.push(display_to_source(read_position(rest, line, path)?));
+        } else if let Some(rest) = line.strip_prefix("vt ") {
+            uvs_raw.push(read_uv(rest, line, path)?);
+        } else if let Some(rest) = line.strip_prefix("f ") {
+            triangles.extend(read_face_with_uv(rest, path)?);
+        }
+    }
+    if positions.is_empty() {
+        return Err(malformed(format!("{}: no vertex lines", path.display())));
+    }
+    if let Some(vertex) = triangles
+        .iter()
+        .flatten()
+        .find(|&&index| index as usize >= positions.len())
+    {
+        return Err(malformed(format!(
+            "{}: face references vertex {}, but only {} vertices exist",
+            path.display(),
+            u64::from(*vertex) + 1,
+            positions.len()
+        )));
+    }
+    let uvs = if uvs_raw.is_empty() {
+        Vec::new()
+    } else if uvs_raw.len() == positions.len() {
+        uvs_raw.iter().map(|[u, v]| [*u, 1.0 - v]).collect()
+    } else {
+        return Err(malformed(format!(
+            "{}: {} UVs for {} vertices; the model needs one UV per vertex",
+            path.display(),
+            uvs_raw.len(),
+            positions.len()
+        )));
+    };
+    let name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let triangle_count = triangles.len();
+    Ok(MeshAsset {
+        name,
+        positions,
+        uvs,
+        triangles,
+        triangle_partitions: vec![PartitionId(0); triangle_count],
+        ..MeshAsset::default()
+    })
+}
+
+fn read_uv(rest: &str, line: &str, path: &Path) -> Result<[f32; 2], ObjError> {
+    let mut parts = rest.split_whitespace();
+    let mut coordinate = || -> Result<f32, ObjError> {
+        let value = parts
+            .next()
+            .ok_or_else(|| malformed(format!("{}: incomplete UV line `{line}`", path.display())))?;
+        value
+            .parse::<f32>()
+            .map_err(|error| malformed(format!("{}: `{value}`: {error}", path.display())))
+    };
+    Ok([coordinate()?, coordinate()?])
+}
+
+/// Fan one face to triangles, capturing position indices and checking that any
+/// UV index matches its position index (the flat model has no split UV seams).
+fn read_face_with_uv(rest: &str, path: &Path) -> Result<Vec<[u32; 3]>, ObjError> {
+    let mut corners = Vec::new();
+    for corner in rest.split_whitespace() {
+        let mut fields = corner.split('/');
+        let vertex = fields
+            .next()
+            .ok_or_else(|| malformed(format!("{}: empty face corner", path.display())))?;
+        let one_based = vertex.parse::<u32>().map_err(|_| {
+            malformed(format!(
+                "{}: face corner `{vertex}` is not a vertex index",
+                path.display()
+            ))
+        })?;
+        let index = one_based.checked_sub(1).ok_or_else(|| {
+            malformed(format!(
+                "{}: face corner `{vertex}` is not 1-based",
+                path.display()
+            ))
+        })?;
+        if let Some(uv) = fields.next().filter(|field| !field.is_empty()) {
+            let uv_one_based = uv.parse::<u32>().map_err(|_| {
+                malformed(format!(
+                    "{}: UV index `{uv}` is not a number",
+                    path.display()
+                ))
+            })?;
+            let uv_index = uv_one_based.checked_sub(1).ok_or_else(|| {
+                malformed(format!(
+                    "{}: UV index `{uv}` is not 1-based",
+                    path.display()
+                ))
+            })?;
+            if uv_index != index {
+                return Err(malformed(format!(
+                    "{}: corner `{corner}` splits UVs (v{} vs vt{}); the model stores one UV per vertex",
+                    path.display(),
+                    one_based,
+                    uv_one_based
+                )));
+            }
+        }
+        corners.push(index);
+    }
+    if corners.len() < 3 {
+        return Err(malformed(format!(
+            "{}: face has fewer than three corners",
+            path.display()
+        )));
+    }
+    Ok(corners[1..]
+        .windows(2)
+        .map(|edge| [corners[0], edge[0], edge[1]])
+        .collect())
 }
 
 fn positions_of(text: &str, path: &Path) -> Result<Vec<[f32; 3]>, ObjError> {

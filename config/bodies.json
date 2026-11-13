@@ -1,0 +1,16 @@
+{
+  "bodies": [
+    {
+      "name": "Female 3BBB",
+      "family": "3bbb",
+      "body": "${SCULPTO_KITS_HOME}/objs/f01-ballgown/body.obj",
+      "head": "${SCULPTO_HEAD_HOME}/LydiaHeadHP-source.obj"
+    },
+    {
+      "name": "Male HIMBO",
+      "family": "himbo",
+      "body": "${SCULPTO_KITS_HOME}/objs/m01-imperial-robe/body.obj",
+      "head": "${SCULPTO_BODYSLIDE_HOME}/ShapeData/HIMBO Res/Head/HeadNord.nif"
+    }
+  ]
+}

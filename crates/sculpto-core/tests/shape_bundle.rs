@@ -5,6 +5,7 @@
 use sculpto_core::mesh::{
     BundleError, MeshAsset, MeshError, PartitionId, Skin, Transform, validate_bundle,
 };
+use sculpto_core::role::{ShapeRole, validate_required_roles};
 use sculpto_core::skin::SkinWeights;
 
 /// The shared skeleton every bundled shape repeats, in bind order.
@@ -180,4 +181,79 @@ fn transform_default_is_identity_and_optional() {
     );
     assert_eq!(identity.scale, 1.0);
     assert_eq!(MeshAsset::default().transform, None);
+}
+
+/// Body, hands, feet and a head over one skeleton: the complete character the
+/// required-part gate expects.
+fn body_hands_feet_head() -> Vec<(ShapeRole, MeshAsset)> {
+    let mut shapes = body_hands_feet();
+    shapes.push(skinned_shape("head", &SKELETON));
+    vec![
+        (ShapeRole::Body, shapes[0].clone()),
+        (ShapeRole::Hands, shapes[1].clone()),
+        (ShapeRole::Feet, shapes[2].clone()),
+        (ShapeRole::Head, shapes[3].clone()),
+    ]
+}
+
+#[test]
+fn role_assignment_complete_character_passes_both_gates() {
+    let assigned = body_hands_feet_head();
+    let roles: Vec<ShapeRole> = assigned.iter().map(|(role, _)| *role).collect();
+    validate_required_roles(&roles).expect("body, hands, feet and head are all present");
+    let meshes: Vec<MeshAsset> = assigned.into_iter().map(|(_, mesh)| mesh).collect();
+    validate_bundle(&meshes).expect("one skeleton, unique names, sound palettes");
+}
+
+#[test]
+fn role_assignment_missing_head_is_named() {
+    let assigned = body_hands_feet_head();
+    let roles: Vec<ShapeRole> = assigned
+        .iter()
+        .filter(|(role, _)| *role != ShapeRole::Head)
+        .map(|(role, _)| *role)
+        .collect();
+    assert_eq!(
+        validate_required_roles(&roles),
+        Err(sculpto_core::role::RoleError::MissingRoles(vec![
+            ShapeRole::Head
+        ]))
+    );
+}
+
+#[test]
+fn role_assignment_missing_parts_are_all_named() {
+    // Only the body survives: the gate must name hands, feet and head together.
+    assert_eq!(
+        validate_required_roles(&[ShapeRole::Body]),
+        Err(sculpto_core::role::RoleError::MissingRoles(vec![
+            ShapeRole::Hands,
+            ShapeRole::Feet,
+            ShapeRole::Head,
+        ]))
+    );
+}
+
+#[test]
+fn role_assignment_stamps_each_parts_default_partition() {
+    for (role, mut mesh) in body_hands_feet_head() {
+        let partition = role.default_partition();
+        mesh.triangle_partitions = vec![partition; mesh.triangles.len()];
+        assert!(
+            mesh.triangle_partitions.iter().all(|p| *p == partition),
+            "{role} keeps its default partition"
+        );
+        mesh.validate()
+            .expect("stamping a partition keeps the model valid");
+    }
+    assert_eq!(ShapeRole::Head.default_partition(), PartitionId(30));
+    assert_eq!(ShapeRole::Feet.default_partition(), PartitionId(37));
+}
+
+#[test]
+fn role_assignment_garment_is_optional() {
+    let mut assigned = body_hands_feet_head();
+    assigned.push((ShapeRole::Garment, skinned_shape("robe", &SKELETON)));
+    let roles: Vec<ShapeRole> = assigned.iter().map(|(role, _)| *role).collect();
+    validate_required_roles(&roles).expect("a garment does not break the required contract");
 }

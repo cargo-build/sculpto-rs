@@ -9,7 +9,8 @@ use std::path::Path;
 
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakeError;
-use sculpto_core::mesh::MeshError;
+use sculpto_core::mesh::{BundleError, MeshError};
+use sculpto_core::role::RoleError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
 use sculpto_gltf::sanitize::SanitizeError;
 use sculpto_mesh::conform::ConformError;
@@ -176,6 +177,25 @@ pub fn mesh(error: MeshError) -> CommandError {
         MeshError::Physics { .. } => (ErrorKind::InvalidRequest, "mesh_physics"),
     };
     CommandError::new(kind, code, format!("{error:?}"))
+}
+
+/// A role assignment lacks a required part; every missing role is named.
+pub fn role(error: RoleError) -> CommandError {
+    let code = match &error {
+        RoleError::MissingRoles(_) => "missing_required_roles",
+    };
+    CommandError::new(ErrorKind::Refused, code, error.to_string())
+}
+
+/// A multi-shape bundle failed the SHP-01 gate.
+pub fn bundle(error: BundleError) -> CommandError {
+    let (kind, code) = match &error {
+        BundleError::Empty => (ErrorKind::InvalidParams, "bundle_empty"),
+        BundleError::DuplicateName { .. } => (ErrorKind::Refused, "bundle_duplicate_name"),
+        BundleError::Palettes { .. } => (ErrorKind::Refused, "bundle_palettes"),
+        BundleError::BoneListMismatch { .. } => (ErrorKind::Refused, "bundle_bone_list"),
+    };
+    CommandError::new(kind, code, error.to_string())
 }
 
 /// A bake plan could not be resolved or applied.

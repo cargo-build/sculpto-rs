@@ -33,7 +33,13 @@ use sculpto_nif::{NifDocument, NifRigError, NifShape};
 use crate::errors;
 use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, write_obj_uv};
 
+mod head;
 mod slider;
+pub use head::{
+    AssignedShape, BodiesConfig, BodyDescriptor, CheckStatus, CompatibilityCheck,
+    CompatibilityReport, RoleBundle, head_compatibility, load_bodies_config, load_shape,
+    resolve_default_head,
+};
 pub use slider::{ConformOutcome, ConformParams, conform_sliders};
 
 /// A source NIF and its optional authored outfit declaration.
