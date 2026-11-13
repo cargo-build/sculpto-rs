@@ -198,10 +198,9 @@ fn to64(v: Vec3) -> Vec3d {
 /// Cross-product magnitude below which a triangle carries no surface.
 const DEGENERATE_SPAN: f64 = 1e-15;
 
-/// Whether a position triangle has zero area: repeated corners, coincident
-/// corners or a cross product under [`DEGENERATE_SPAN`] in f64. The same
-/// threshold the intersection tests use to skip unsurfaceable triangles.
-pub(crate) fn zero_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+/// Whether a finite position triangle has no measurable surface. @req DECL0013
+/// Uses the same f64 cross-product threshold as intersection tests.
+pub fn zero_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
     let normal = cross64(sub64(to64(b), to64(a)), sub64(to64(c), to64(a)));
     dot64(normal, normal).sqrt() < DEGENERATE_SPAN
 }

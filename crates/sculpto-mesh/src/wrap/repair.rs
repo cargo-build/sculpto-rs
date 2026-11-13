@@ -84,6 +84,8 @@ pub fn fit_and_repair(
 /// `collision` obstacle, which may add parts the garment must not penetrate.
 /// The extra parts never become pull targets. Passing one mesh for both
 /// surfaces reproduces [`fit_and_repair`]; both are validated before any query.
+/// If the declared collision scope is already clear, the preview returns
+/// without a SurfaceFit pull; callers must include every relevant obstacle.
 /// Fallback, selection and reporting rules are [`fit_and_repair`]'s.
 ///
 /// # Errors

@@ -377,7 +377,7 @@ impl CollisionSurface {
     ///
     /// Alignment is not inferable from coordinates: a surface declared in the
     /// supported frame but assembled somewhere else still passes. This checks
-    /// the declaration, finiteness, faces and index ranges only.
+    /// the declaration, finiteness, face area and index ranges only.
     fn declared(params: &FitParams) -> Result<Option<Self>, CommandError> {
         let Some(path) = &params.collision else {
             return match &params.collision_frame {
@@ -427,6 +427,19 @@ impl CollisionSurface {
                 "outfit_fit_collision_surface",
                 format!(
                     "{}: collision vertex {vertex} is not finite",
+                    path.display()
+                ),
+            ));
+        }
+        if let Some((triangle, _)) = triangles.iter().enumerate().find(|(_, face)| {
+            let [a, b, c] = face.map(|index| positions[index as usize]);
+            sculpto_mesh::check::zero_area(a, b, c)
+        }) {
+            return Err(CommandError::new(
+                ErrorKind::Refused,
+                "outfit_fit_collision_surface",
+                format!(
+                    "{}: collision triangle {triangle} has zero or near-zero area",
                     path.display()
                 ),
             ));

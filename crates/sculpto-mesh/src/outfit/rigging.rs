@@ -28,9 +28,9 @@ pub struct RegionFitReport {
     pub cloth_triangles: usize,
     /// Ordinary clearance, absent when the garment has no ordinary faces.
     pub ordinary: Option<FitRepairReport>,
-    /// Body contacts on the retained cloth region.
+    /// Declared collision-scope contacts on the retained cloth region.
     pub cloth_intersection_pairs: usize,
-    /// Body contacts on the complete garment.
+    /// Declared collision-scope contacts on the complete garment.
     pub intersection_pairs: usize,
     /// Largest vertex displacement of the complete returned garment against
     /// the incoming garment, in mesh units; zero after a self-contact rollback.

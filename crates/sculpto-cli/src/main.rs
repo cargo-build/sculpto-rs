@@ -667,7 +667,7 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     if let Some(regions) = &outcome.regions {
         match &regions.ordinary {
             Some(ordinary) => println!(
-                "regions: ordinary {} faces / {} body contacts / {} inside; Blender Cloth {} faces / {} body contacts",
+                "regions: ordinary {} faces / {} obstacle contacts / {} inside; Blender Cloth {} faces / {} obstacle contacts",
                 regions.ordinary_triangles,
                 ordinary.intersection_pairs,
                 ordinary.inside_after,
@@ -675,7 +675,7 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
                 regions.cloth_intersection_pairs,
             ),
             None => println!(
-                "regions: ordinary 0 faces; Blender Cloth {} faces / {} body contacts",
+                "regions: ordinary 0 faces; Blender Cloth {} faces / {} obstacle contacts",
                 regions.cloth_triangles, regions.cloth_intersection_pairs,
             ),
         }
@@ -685,7 +685,7 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         );
     }
     if let (Some(pairs), Some(inside)) = (outcome.intersection_pairs, outcome.inside_after) {
-        println!("body contacts {pairs}, inside groups {inside}");
+        println!("obstacle contacts {pairs}, inside groups {inside}");
     }
     if let Some(repair) = &outcome.repair {
         println!(

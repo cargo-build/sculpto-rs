@@ -816,7 +816,7 @@ pub struct FitOutcome {
     pub offset_max: f32,
     /// Follow measurement when a second body was given.
     pub follow: Option<(f32, f32, f32)>,
-    /// Measured triangle contacts when previewing a conformed slider.
+    /// Triangle contacts against the selected or caller-declared obstacle.
     pub intersection_pairs: Option<usize>,
     /// Inside groups when previewing a conformed slider.
     pub inside_after: Option<usize>,

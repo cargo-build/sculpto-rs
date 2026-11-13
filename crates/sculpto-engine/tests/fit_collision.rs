@@ -472,4 +472,12 @@ fn malformed_collision_input_is_refused_before_output() {
     let nan = refuse("nan.obj", "v NaN 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
     assert_eq!(nan.code(), "outfit_fit_collision_surface");
     assert!(!fixture.root.join("fitted.obj").exists());
+
+    let degenerate = refuse("degenerate.obj", "v 0 0 0\nv 1 0 0\nv 2 0 0\nf 1 2 3\n");
+    assert_eq!(degenerate.code(), "outfit_fit_collision_surface");
+    assert!(
+        degenerate.to_string().contains("triangle 0"),
+        "{degenerate}"
+    );
+    assert!(!fixture.root.join("fitted.obj").exists());
 }

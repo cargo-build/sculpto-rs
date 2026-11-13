@@ -34,6 +34,9 @@ The guarded fitting work is separating the authored body used for correspondence
 from the caller-declared collision surface, while retaining selected Blender
 Cloth regions. It also reports returned-geometry deformation; fewer contacts
 alone do not establish a good fit. Blender remains the cloth-simulation owner.
+An explicit collision mesh with a zero- or near-zero-area face is refused
+before output. An already clear declared obstacle can stop the guarded path
+before it pulls toward the primary body, so its completeness still matters.
 
 The composed registered path, using a caller-supplied body/hands/feet obstacle,
 returns 100 pairs and two inside groups on the same Mike leg shape, with maximum
