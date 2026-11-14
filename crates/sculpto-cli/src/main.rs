@@ -19,6 +19,8 @@ use sculpto_core::{Document, SliderSize};
 use sculpto_mesh::aura::{Aura, AuraMode, AuraParams};
 use sculpto_mesh::check;
 use sculpto_mesh::classify;
+use sculpto_mesh::wrap::FitOptions;
+use sculpto_mesh::wrap::repair::final_push::{FinalPushOptions, final_push};
 
 use sculpto_engine::obj::write_obj;
 use sculpto_engine::ops;
@@ -50,6 +52,7 @@ commands:
   garment proxies [options] export the body's per-contour collision proxies
   garment check [options] count garment/body triangle intersections (measured gate)
   garment depth [options] penetration depth of garment vertices inside a body
+  garment push [options]  move visible depth violations out to just under a tolerance
   garment trim [options]  cut away garment triangles that intersect the body
   garment cover [options] body coverage per height band (<=2/<=8/<=20 units)
   garment control-exterior [options] keep the outward control surface of a thick shell
@@ -180,6 +183,14 @@ garment control-separate options:
   --profile <json>    the same control profile (contact policy and bounds)
   --out <obj>         control OBJ after the bounded local separation
   --report <json>     the chosen axis, moved vertices and bounds actually used
+
+garment push options:
+  --body <obj>        the surface to grade and push against (display frame)
+  --garment <obj>     fitted garment OBJ (display frame)
+  --tolerance <units> accepted visible depth; deeper graded vertices move out
+  --passes <n>        pass budget (1, bounded by the fitter's 10)
+  --out <obj>         pushed garment OBJ (display frame)
+  --json              print the per-pass report as JSON
 ";
 
 fn main() -> ExitCode {
@@ -645,6 +656,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 fn garment(args: &[String]) -> ExitCode {
     let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj> [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
+       sculpto garment push --body <obj> --garment <obj> --tolerance <units> --out <obj> [--passes <n>] [--json]
        sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
@@ -662,6 +674,7 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "proxies" => garment_proxies_inner(rest),
         [action, rest @ ..] if action == "check" => garment_check_inner(rest),
         [action, rest @ ..] if action == "depth" => garment_depth_inner(rest),
+        [action, rest @ ..] if action == "push" => garment_push_inner(rest),
         [action, rest @ ..] if action == "trim" => garment_trim_inner(rest),
         [action, rest @ ..] if action == "cover" => garment_cover_inner(rest),
         [action, rest @ ..] if action == "control-exterior" => {
@@ -1500,6 +1513,105 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
     }
     println!(
         "note: inside = behind the nearest body triangle's normal; visible/inner split by the cosine of the garment vertex normal there (>= 0 visible); hidden = the garment's own surface is first along that body point's outward normal and it is not the vertex's own triangle (DECL0015 contact point); visible_occluded = visible and not hidden, the graded set; body winding supplies outward and one-sided depth is not containment"
+    );
+    Ok(())
+}
+
+/// The fitter's opt-in final push-out stage over saved geometry.
+///
+/// `garment depth` says what fails; this moves exactly the graded violations the
+/// fit's post-repair stage moves and writes the result, so a fitted OBJ can be
+/// re-graded against the same tolerance. Both inputs share the OBJ display
+/// frame; positions are converted to the source frame the writer expects.
+fn garment_push_inner(args: &[String]) -> Result<(), String> {
+    let mut json = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let flags = parse_flags(&rest)?;
+    let body_path = PathBuf::from(required(&flags, "body")?);
+    let garment_path = PathBuf::from(required(&flags, "garment")?);
+    let out = PathBuf::from(required(&flags, "out")?);
+    let tolerance = flag_tolerance(&flags)?
+        .ok_or("`--tolerance` is required: it states the accepted visible depth")?;
+    let passes = flag_usize(&flags, "passes", 1)?;
+    let passes = u32::try_from(passes)
+        .map_err(|_| format!("`--passes` {passes} is above the supported range"))?;
+    let (body_positions, body_triangles) = read_obj(&body_path)?;
+    let (garment_positions, garment_triangles) = read_obj(&garment_path)?;
+    let (pushed, report) = final_push(
+        (&to_source(&garment_positions), &garment_triangles),
+        (&to_source(&body_positions), &body_triangles),
+        None,
+        &FitOptions::default(),
+        &FinalPushOptions { passes, tolerance },
+    )
+    .map_err(|error| error.to_string())?;
+    write_obj(&out, &pushed, &garment_triangles)
+        .map_err(|error| format!("{}: {error}", out.display()))?;
+    if json {
+        let per_pass: Vec<serde_json::Value> = report
+            .per_pass
+            .iter()
+            .map(|pass| {
+                serde_json::json!({
+                    "pass": pass.pass,
+                    "moved": pass.moved,
+                    "violations": pass.violations,
+                    "max": depth_number(pass.max),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "body": body_path.display().to_string(),
+                "garment": garment_path.display().to_string(),
+                "out": out.display().to_string(),
+                "units": "source",
+                "semantics": "each pass moves the welded group of every graded vertex deeper than the tolerance along the nearest body triangle's outward normal by depth - tolerance + 1e-4",
+                "tolerance": depth_number(report.tolerance),
+                "budget": report.budget,
+                "passes": report.passes,
+                "before_violations": report.before_violations,
+                "before_max": depth_number(report.before_max),
+                "per_pass": per_pass,
+                "violations": report.violations,
+                "max": depth_number(report.max),
+                "held": report.held,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "{}: {} garment vertices, pass budget {}",
+        out.display(),
+        pushed.len(),
+        report.budget
+    );
+    println!(
+        "visible violations {} (max {:.6}) at tolerance {:.6} -> {} (max {:.6}) after {} passes; held {}",
+        report.before_violations,
+        report.before_max,
+        report.tolerance,
+        report.violations,
+        report.max,
+        report.passes,
+        report.held
+    );
+    for pass in &report.per_pass {
+        println!(
+            "pass {}: moved {}, violations {}, max {:.6}",
+            pass.pass, pass.moved, pass.violations, pass.max
+        );
+    }
+    println!(
+        "note: graded vertices are `garment depth`'s visible_occluded set; a fully locked vertex, a rigid part or a vertex whose nearest body triangle is degenerate is held, and welded copies move together; the tolerance stays the caller's"
     );
     Ok(())
 }

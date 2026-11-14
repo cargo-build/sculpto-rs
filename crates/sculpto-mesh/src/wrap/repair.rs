@@ -14,10 +14,11 @@ use super::{
     validate_lengths, weld,
 };
 
+pub mod final_push;
 mod openings;
 
 /// Measurements on the geometry actually returned by the repair.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FitRepairReport {
     /// Welded garment groups still inside according to the SurfaceFit query.
     pub inside_after: usize,
@@ -42,6 +43,8 @@ pub struct FitRepairReport {
     /// Unique edges at least `1e-5` long before fitting but shorter afterward.
     /// These edges are excluded from `max_strain` and need separate review.
     pub collapsed_edges: usize,
+    /// What the opt-in final push-out pass measured, absent when it was off.
+    pub final_push: Option<final_push::FinalPushReport>,
 }
 
 /// Repair a preview and try the configured SurfaceFit mode if contacts remain.
@@ -170,7 +173,57 @@ pub fn fit_and_repair_with_collision(
         preview,
         before,
     )?;
+    let (positions, report) =
+        final_push_stage(garment, collision, lock, options, positions, report)?;
     Ok(attach_deformation(garment.0, garment.1, positions, report))
+}
+
+/// Run the opt-in final push-out pass on the returned geometry. @req DECL0013
+///
+/// `None` leaves the geometry and the report untouched and measures nothing, so
+/// every existing fit keeps its result. When a pass moved vertices the contact
+/// measures are taken again, so [`FitRepairReport::inside_after`] and
+/// [`FitRepairReport::intersection_pairs`] describe the geometry actually
+/// returned. The early clear return above cannot hide a graded violation: a
+/// vertex with visible depth is inside the collision surface, which that branch
+/// already excludes.
+fn final_push_stage(
+    garment: Mesh<'_>,
+    collision: Mesh<'_>,
+    lock: Option<&VertexMask>,
+    options: &FitOptions,
+    positions: Vec<[f32; 3]>,
+    report: FitRepairReport,
+) -> Result<(Vec<[f32; 3]>, FitRepairReport), ClipFixError> {
+    let Some(push) = &options.final_push else {
+        return Ok((positions, report));
+    };
+    let (positions, measured) =
+        final_push::final_push((&positions, garment.1), collision, lock, options, push)
+            .map_err(ClipFixError::FitOptions)?;
+    let report = if measured.passes == 0 {
+        FitRepairReport {
+            final_push: Some(measured),
+            ..report
+        }
+    } else {
+        let surface = BodySurface::build(collision.0, collision.1);
+        let after = measure_contacts(
+            (&positions, garment.1),
+            collision,
+            &surface,
+            options,
+            garment.0,
+        );
+        FitRepairReport {
+            poke_repair_applied: report.poke_repair_applied,
+            projection_applied: report.projection_applied,
+            no_clipping_fallback_applied: report.no_clipping_fallback_applied,
+            final_push: Some(measured),
+            ..after
+        }
+    };
+    Ok((positions, report))
 }
 
 /// Additional strain stays relative to the incoming repaired surface across every attempt.
@@ -402,6 +455,7 @@ pub(crate) fn measure_contacts(
         max_displacement,
         max_strain,
         collapsed_edges,
+        final_push: None,
     }
 }
 

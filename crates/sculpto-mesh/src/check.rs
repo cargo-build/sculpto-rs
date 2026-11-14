@@ -1178,6 +1178,154 @@ impl DepthReport {
     }
 }
 
+/// One graded (occlusion-aware visible) inside vertex.
+///
+/// [`visible_depths`] returns these; the final push-out pass moves each one out
+/// along [`Self::normal`]. The set is [`DepthReport::visible_occluded`]'s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisibleDepth {
+    /// Garment vertex index.
+    pub vertex: usize,
+    /// Penetration depth behind the nearest body triangle, in input units.
+    pub depth: f32,
+    /// Outward normal of that body triangle, `None` when it is degenerate and
+    /// cannot name a side; such a vertex has no push direction.
+    pub normal: Option<[f64; 3]>,
+}
+
+/// One garment vertex measured against the body surface.
+///
+/// The classification [`garment_depth_report`] and [`visible_depths`] both read,
+/// so the DECL0015 contact-point rule has one owner and a caller that only needs
+/// the graded set cannot drift from the report. @req DECL0015
+struct VertexProbe {
+    /// Distance to the nearest body point.
+    distance: f32,
+    /// Signed distance behind the nearest body triangle; negative is inside.
+    signed: f64,
+    /// Outward normal of that triangle; `None` for a degenerate triangle.
+    normal: Option<[f64; 3]>,
+    /// Cosine between the garment vertex normal and `normal`.
+    facing: f64,
+    /// The garment's own surface covers the vertex at its contact point.
+    hidden: bool,
+}
+
+impl VertexProbe {
+    /// Penetration depth behind the nearest body triangle; `None` outside.
+    fn depth(&self) -> Option<f32> {
+        (self.signed < 0.0).then(|| (-self.signed) as f32)
+    }
+
+    /// Inside, facing outwards and not covered by the garment's own surface:
+    /// exactly the vertices [`DepthReport::visible_occluded`] holds.
+    fn graded(&self) -> bool {
+        self.signed < 0.0 && self.facing >= 0.0 && !self.hidden
+    }
+}
+
+/// The per-vertex queries of one measurement, built once.
+///
+/// Both the report and [`visible_depths`] reuse the same body query, the same
+/// garment surface and the same vertex normals, so a second reading of the
+/// DECL0015 rule cannot disagree with the first.
+struct DepthProbe<'a> {
+    garment: Mesh<'a>,
+    body: Mesh<'a>,
+    body_index: SurfaceIndex,
+    garment_surface: SurfaceIndex,
+    garment_normals: Vec<[f32; 3]>,
+}
+
+impl<'a> DepthProbe<'a> {
+    /// Callers validate finite geometry and triangle indices first.
+    fn build(garment: Mesh<'a>, body: Mesh<'a>) -> Self {
+        Self {
+            garment,
+            body,
+            body_index: SurfaceIndex::build(body.0, body.1),
+            garment_surface: SurfaceIndex::build(garment.0, garment.1),
+            garment_normals: vertex_normals(garment.0, garment.1),
+        }
+    }
+
+    /// Classify one garment vertex against the nearest body triangle.
+    fn probe(&self, vertex: usize) -> Result<VertexProbe, FitError> {
+        let point = self.garment.0[vertex];
+        let Some(closest) = self.body_index.closest(point) else {
+            return Err(FitError::EmptyBodyFaces);
+        };
+        let face = self.body.1[closest.triangle];
+        let corners = [
+            self.body.0[face[0] as usize],
+            self.body.0[face[1] as usize],
+            self.body.0[face[2] as usize],
+        ];
+        let offset = sub64(point.map(f64::from), closest.point.map(f64::from));
+        let normal = unit_triangle_normal(corners);
+        let signed = normal.map_or(0.0, |normal| dot64(offset, normal));
+        let facing = normal.map_or(0.0, |normal| {
+            dot64(self.garment_normals[vertex].map(f64::from), normal)
+        });
+        let hidden = normal.is_some_and(|normal| {
+            occlusion_hides_vertex(
+                &self.garment_surface,
+                self.garment.1,
+                closest.point,
+                normal,
+                vertex,
+            )
+        });
+        Ok(VertexProbe {
+            distance: closest.distance,
+            signed,
+            normal,
+            facing,
+            hidden,
+        })
+    }
+}
+
+/// Occlusion-aware visible depths of every graded vertex.
+///
+/// The set and the depth are [`DepthReport::visible_occluded`]'s, without the
+/// contact witnesses or percentiles: a caller that moves vertices and measures
+/// again — the final push-out pass — pays only the per-vertex queries, and it
+/// cannot grade a vertex the report would not. Classification is
+/// [`DepthProbe`]'s, so `hidden`, `inner` and the facing test stay one rule.
+///
+/// The push direction is [`VisibleDepth::normal`]; the tolerance comparison
+/// stays with the caller ([`DepthReport::visible_verdict`] owns it for the
+/// report). Sorting is the caller's: this returns garment vertex order.
+///
+/// # Errors
+/// Refuses the shared fit-input defects ([`FitError`]): empty garment or body,
+/// a body without faces, non-finite positions, out-of-range face ids and a
+/// non-finite computed depth.
+pub fn visible_depths(garment: Mesh<'_>, body: Mesh<'_>) -> Result<Vec<VisibleDepth>, FitError> {
+    validate_geometry(garment, body)?;
+    let probe = DepthProbe::build(garment, body);
+    let mut graded = Vec::new();
+    for vertex in 0..garment.0.len() {
+        let class = probe.probe(vertex)?;
+        if !class.graded() {
+            continue;
+        }
+        let Some(depth) = class.depth() else {
+            continue;
+        };
+        if !depth.is_finite() {
+            return Err(FitError::NonFiniteResult { vertex });
+        }
+        graded.push(VisibleDepth {
+            vertex,
+            depth,
+            normal: class.normal,
+        });
+    }
+    Ok(graded)
+}
+
 /// Measure how far garment vertices lie inside a body.
 ///
 /// The sign comes from the nearest body triangle's normal: a point behind that
@@ -1210,9 +1358,7 @@ impl DepthReport {
 /// non-finite computed depth.
 pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthReport, FitError> {
     validate_geometry(garment, body)?;
-    let index = SurfaceIndex::build(body.0, body.1);
-    let surface = SurfaceIndex::build(garment.0, garment.1);
-    let normals = vertex_normals(garment.0, garment.1);
+    let probe = DepthProbe::build(garment, body);
     let mut contacts = 0usize;
     let mut inside = 0usize;
     let mut above = [0usize; DEPTH_THRESHOLDS.len()];
@@ -1221,43 +1367,25 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
     let mut inner = Vec::new();
     let mut hidden = Vec::new();
     let mut visible_occluded = Vec::new();
-    for (vertex, &point) in garment.0.iter().enumerate() {
-        let Some(closest) = index.closest(point) else {
-            return Err(FitError::EmptyBodyFaces);
-        };
-        let face = body.1[closest.triangle];
-        let corners = [
-            body.0[face[0] as usize],
-            body.0[face[1] as usize],
-            body.0[face[2] as usize],
-        ];
-        let offset = sub64(point.map(f64::from), closest.point.map(f64::from));
-        let body_normal = unit_triangle_normal(corners);
-        let signed = body_normal.map_or(0.0, |normal| dot64(offset, normal));
-        let is_inside = signed < 0.0;
-        if is_inside || closest.distance <= CONTACT_DISTANCE {
+    for vertex in 0..garment.0.len() {
+        let class = probe.probe(vertex)?;
+        if class.signed < 0.0 || class.distance <= CONTACT_DISTANCE {
             contacts += 1;
         }
-        let depth = if is_inside {
-            let depth = (-signed) as f32;
+        let depth = if let Some(depth) = class.depth() {
             if !depth.is_finite() {
                 return Err(FitError::NonFiniteResult { vertex });
             }
             inside += 1;
             penetrating.push((vertex, depth));
-            let facing =
-                body_normal.map_or(0.0, |normal| dot64(normals[vertex].map(f64::from), normal));
-            let occluded = body_normal.is_some_and(|normal| {
-                occlusion_hides_vertex(&surface, garment.1, closest.point, normal, vertex)
-            });
-            if occluded {
+            if class.hidden {
                 hidden.push((vertex, depth));
             }
-            if facing < 0.0 {
+            if class.facing < 0.0 {
                 inner.push((vertex, depth));
             } else {
                 visible.push((vertex, depth));
-                if !occluded {
+                if !class.hidden {
                     visible_occluded.push((vertex, depth));
                 }
             }

@@ -74,6 +74,8 @@ const MAX_ITERATIONS: u32 = 20;
 const MAX_RELIEF_SMOOTHING: u32 = 100;
 const MAX_CLIPPING_PASSES: u32 = 20;
 const MAX_FLIP_RINGS: u32 = 20;
+/// Passes the opt-in final push-out stage may run.
+pub(crate) const MAX_FINAL_PUSH_PASSES: u32 = 10;
 /// This port's bound; the source clamps nothing here.
 const MAX_SOLVER_ITERATIONS: u32 = 100_000;
 
@@ -158,6 +160,11 @@ pub struct FitOptions {
     pub flip_rings: u32,
     /// Blend toward the authored form per flip-repair pass.
     pub flip_strength: f32,
+    /// Opt-in bounded final push-out pass over occlusion-aware visible
+    /// violations. `None` keeps the fitted geometry and costs no measurement;
+    /// `Some` with the caller's tolerance and pass budget runs the stage after
+    /// the repair. @req DECL0013
+    pub final_push: Option<repair::final_push::FinalPushOptions>,
 }
 
 impl Default for FitOptions {
@@ -184,6 +191,7 @@ impl Default for FitOptions {
             opening_direction: None,
             flip_rings: 4,
             flip_strength: 0.5,
+            final_push: None,
         }
     }
 }
@@ -310,6 +318,10 @@ pub enum FitError {
     FlipRings(u32),
     /// `flip_strength` is outside `0..=1` or not finite.
     FlipStrength(f32),
+    /// The opt-in final push-out pass count is zero or above its bound.
+    FinalPushPasses(u32),
+    /// The final push-out tolerance is negative or not finite.
+    FinalPushTolerance(f32),
 }
 
 impl fmt::Display for FitError {
@@ -463,6 +475,14 @@ impl fmt::Display for FitError {
                 formatter,
                 "the flip strength {value} is outside 0..=1 or not finite"
             ),
+            Self::FinalPushPasses(value) => write!(
+                formatter,
+                "the final push pass count {value} is outside 1..={MAX_FINAL_PUSH_PASSES}"
+            ),
+            Self::FinalPushTolerance(value) => write!(
+                formatter,
+                "the final push tolerance {value} is negative or not finite"
+            ),
         }
     }
 }
@@ -536,6 +556,9 @@ impl FitOptions {
         }
         if !self.flip_strength.is_finite() || !(0.0..=1.0).contains(&self.flip_strength) {
             return Err(FitError::FlipStrength(self.flip_strength));
+        }
+        if let Some(push) = &self.final_push {
+            push.validate()?;
         }
         Ok(())
     }

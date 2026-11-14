@@ -253,7 +253,7 @@ fn source_self_and_additional_strain_guards_reject_an_unsafe_opening_candidate()
         &options(),
         &HashSet::new(),
         source.0.clone(),
-        report,
+        report.clone(),
     )
     .expect("guarded proposal");
     assert_eq!(output, source.0);
@@ -307,7 +307,7 @@ fn invalid_configuration_and_zero_budget_are_explicit() {
         },
         &HashSet::new(),
         source.0.clone(),
-        report,
+        report.clone(),
     )
     .expect("zero opening budget");
     assert_eq!(output, source.0);
