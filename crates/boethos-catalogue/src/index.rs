@@ -43,7 +43,17 @@ const GARMENT_WORD_TAGS: &[(&str, &[&str])] = &[
     ("wear:sport", &["sport", "athletic", "training", "gym"]),
     (
         "wear:accessory",
-        &["gloves", "belt", "cape", "cloak", "necklace", "ring"],
+        &[
+            "gloves",
+            "gauntlets",
+            "belt",
+            "cape",
+            "cloak",
+            "necklace",
+            "amulet",
+            "jewelry",
+            "ring",
+        ],
     ),
 ];
 
@@ -183,7 +193,7 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
             bytes,
             sex: sex_from_path(&relative_text),
             family: family_from_path(&relative_text),
-            tags: garment_tags(&relative_text, category),
+            tags: garment_tags(&relative_text, category, source),
             status: status_from_path(&relative_text),
         };
         write(store, &asset, &mut seen, &mut report);
@@ -310,7 +320,7 @@ fn index_archive(
         if entry.path.to_lowercase().contains("facegeom") {
             tags.push("facegeom".to_string());
         }
-        tags.extend(garment_tags(&format!("{name} {}", entry.path), category));
+        tags.extend(garment_tags(&entry.path, category, source));
         tags.sort();
         tags.dedup();
         let member_name = {
@@ -413,7 +423,9 @@ fn classify(path: &Path, extension: &str) -> Category {
     if matches!(extension, "osp" | "osd" | "bsd") {
         return Category::Project;
     }
-    if matches!(extension, "nif" | "glb" | "gltf" | "obj") {
+    if matches!(extension, "nif" | "glb" | "gltf" | "obj")
+        || (extension == "fbx" && !text.contains("animations"))
+    {
         if text.contains("hair") || text.contains("hairdos") {
             return Category::Hair;
         }
@@ -451,6 +463,14 @@ fn classify(path: &Path, extension: &str) -> Category {
 
 fn member_category(path: &str, archive_name: &str) -> Option<Category> {
     let text = path.to_lowercase();
+    let file = text.rsplit('/').next().unwrap_or("");
+    if text.contains("underwear")
+        && ["body", "hands", "feet", "head", "tail", "ears", "mouth"]
+            .iter()
+            .any(|part| file.contains(part))
+    {
+        return None;
+    }
     if text.contains("facegeom") && text.ends_with(".nif") {
         return Some(Category::Face);
     }
@@ -474,6 +494,9 @@ fn member_category(path: &str, archive_name: &str) -> Option<Category> {
     {
         return Some(Category::Hair);
     }
+    if text.ends_with(".nif") && mesh_member && has_garment_token(&text) {
+        return Some(Category::Outfit);
+    }
     None
 }
 
@@ -482,7 +505,7 @@ fn has_hair_token(text: &str) -> bool {
         .any(|token| token.starts_with("hair"))
 }
 
-fn garment_tags(text: &str, category: Category) -> Vec<String> {
+fn garment_tags(text: &str, category: Category, source: &str) -> Vec<String> {
     if category != Category::Outfit {
         return Vec::new();
     }
@@ -513,6 +536,23 @@ fn garment_tags(text: &str, category: Category) -> Vec<String> {
     {
         tags.push(format!("body:{family}"));
     }
+    if let Some(origin) = origin_tag(source, text) {
+        tags.push(origin.to_string());
+    }
+    if tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "wear:underwear"
+                | "wear:top"
+                | "wear:bottom"
+                | "wear:onepiece"
+                | "wear:shoes"
+                | "wear:headwear"
+                | "wear:accessory"
+        )
+    }) {
+        tags.retain(|tag| tag != "wear:armor");
+    }
     if tags.iter().any(|tag| tag == "wear:underwear") {
         tags.push("layer:inner".to_string());
     } else if tags
@@ -524,6 +564,20 @@ fn garment_tags(text: &str, category: Category) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn origin_tag(source: &str, text: &str) -> Option<&'static str> {
+    let source = source.to_lowercase();
+    let text = text.to_lowercase();
+    if source.contains("from-skyrim") || source.contains("skyrimmods") {
+        Some("origin:skyrimmods")
+    } else if source.contains("tripo") || text.contains("tripo") {
+        Some("origin:tripo3d")
+    } else if source == "underwear-extract" || source.contains("sculpto") {
+        Some("origin:sculpto")
+    } else {
+        None
+    }
 }
 
 fn has_garment_token(text: &str) -> bool {
@@ -687,6 +741,25 @@ mod tests {
         assert_ne!(
             member_category("meshes/furniture/chair.nif", "pack.7z"),
             Some(Category::Hair)
+        );
+        assert_eq!(
+            member_category("meshes/armor/cuirass.nif", "pack.7z"),
+            Some(Category::Outfit)
+        );
+        assert_eq!(
+            member_category("meshes/clothes/shirt.nif", "pack.7z"),
+            Some(Category::Outfit)
+        );
+        assert_ne!(
+            member_category("meshes/furniture/table.nif", "pack.7z"),
+            Some(Category::Outfit)
+        );
+        assert_ne!(
+            member_category(
+                "meshes/actors/character/character assets/underwear/femalebody_0.nif",
+                "pack.7z"
+            ),
+            Some(Category::Outfit)
         );
         assert_ne!(
             member_category("textures/KS Hairdo's/hair.dds", "KS Hairdos SSE.7z"),

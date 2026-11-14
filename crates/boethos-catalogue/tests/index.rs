@@ -184,6 +184,8 @@ fn indexes_archive_members_end_to_end() {
         b"HAIR",
     )
     .expect("write");
+    fs::create_dir_all(root.join("meshes/clothes")).expect("dirs");
+    fs::write(root.join("meshes/clothes/shirt.nif"), b"SHIRT").expect("write");
     let status = std::process::Command::new("7z")
         .current_dir(&root)
         .args([
@@ -193,6 +195,7 @@ fn indexes_archive_members_end_to_end() {
             "SliderPresets/Test.xml",
             "FaceGeom/skyrim.esm/0001.NIF",
             "meshes/actors/character/hair/hair01.nif",
+            "meshes/clothes/shirt.nif",
         ])
         .status()
         .expect("7z");
@@ -204,14 +207,14 @@ fn indexes_archive_members_end_to_end() {
     let report = index_root(
         &store,
         &root,
-        "fixture",
+        "from-skyrim-community",
         &IndexOptions {
             archive_entries: true,
             prune: false,
         },
     );
     assert_eq!(report.archives, 1);
-    assert_eq!(report.members, 3, "{:?}", report.errors);
+    assert_eq!(report.members, 4, "{:?}", report.errors);
     let rows = store.iter_kind::<Assets>().expect("rows");
     assert!(
         rows.iter()
@@ -224,6 +227,17 @@ fn indexes_archive_members_end_to_end() {
     assert!(
         rows.iter()
             .any(|(_, asset)| asset.category == Category::Hair)
+    );
+    let shirt = rows
+        .iter()
+        .find(|(_, asset)| asset.name.ends_with("shirt.nif"))
+        .map(|(_, asset)| asset)
+        .expect("garment member");
+    assert_eq!(shirt.category, Category::Outfit);
+    assert!(
+        shirt.tags.contains(&"wear:top".to_string()),
+        "{:?}",
+        shirt.tags
     );
     let _ = fs::remove_file(root.with_extension("redb"));
     let _ = fs::remove_dir_all(root);
@@ -284,6 +298,38 @@ fn classifies_extracted_underwear_as_tagged_outfit() {
         );
     }
     assert_eq!(row("femalebody_0.nif").category, Category::Body);
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn garment_named_fbx_is_tagged_outfit() {
+    let root = temp_dir("garment-fbx");
+    fs::write(root.join("female-cbbe-armor.fbx"), b"FBX").expect("write");
+    let db = root.with_extension("redb");
+    let store = Store::open(&db).expect("store");
+    let report = index_root(
+        &store,
+        &root,
+        "tripo3d",
+        &IndexOptions {
+            archive_entries: false,
+            prune: false,
+        },
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    let asset = rows.first().expect("garment row").1.clone();
+    assert_eq!(asset.category, Category::Outfit);
+    assert_eq!(asset.sex, Some(boethos_catalogue::Sex::Female));
+    assert_eq!(asset.family.as_deref(), Some("cbbe"));
+    for tag in ["wear:armor", "sex:female", "body:cbbe", "origin:tripo3d"] {
+        assert!(
+            asset.tags.contains(&tag.to_string()),
+            "{tag}: {:?}",
+            asset.tags
+        );
+    }
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }
