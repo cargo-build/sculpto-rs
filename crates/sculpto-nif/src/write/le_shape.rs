@@ -103,10 +103,9 @@ pub(super) fn write(
         index => vec![index],
     };
     if let Some((plan, nodes)) = prepared.skin.as_ref().zip(skin_nodes) {
-        blocks.push(Block {
-            type_name: skin::INSTANCE_TYPE,
-            body: skin::instance(3, 4, nodes.root, &nodes.bones),
-        });
+        let (type_name, body) =
+            skin::instance_block(3, 4, nodes.root, &nodes.bones, &asset.partitions);
+        blocks.push(Block { type_name, body });
         blocks.push(Block {
             type_name: skin::DATA_TYPE,
             body: skin::data(
@@ -128,7 +127,7 @@ pub(super) fn write(
     if shader_index >= 0 {
         blocks.push(Block {
             type_name: shader::SHADER_TYPE,
-            body: prepared.shader_body(name_index, texture_index),
+            body: prepared.shader_body(texture_index),
         });
         if texture_index >= 0 {
             blocks.push(Block {
@@ -350,6 +349,7 @@ mod tests {
             normal: None,
             specular: None,
             double_sided: false,
+            ..MaterialSlot::default()
         }];
         let bytes = write_le_shape(&asset).expect("writes");
         let scene = byroredux_nif::parse_nif(&bytes).expect("parses");

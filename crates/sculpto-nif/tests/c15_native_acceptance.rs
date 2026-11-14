@@ -44,6 +44,7 @@ fn synthetic_skinned_textured_mesh(name: &str) -> MeshAsset {
             normal: Some("textures/actors/character/robe_n.dds".into()),
             specular: None,
             double_sided: false,
+            ..MaterialSlot::default()
         }],
         skin: Some(Skin {
             bones: vec!["NPC Root [Root]".into(), "NPC Spine [Spn0]".into()],

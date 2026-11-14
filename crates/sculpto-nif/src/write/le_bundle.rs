@@ -162,10 +162,9 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
         });
         if let (Some(plan), Some((_, data, partition))) = (prepared.skin.as_ref(), index.skin) {
             let palette: Vec<i32> = plan.names.iter().map(|bone| bones.block(bone)).collect();
-            blocks.push(Block {
-                type_name: skin::INSTANCE_TYPE,
-                body: skin::instance(data, partition, root, &palette),
-            });
+            let (type_name, body) =
+                skin::instance_block(data, partition, root, &palette, &shape.partitions);
+            blocks.push(Block { type_name, body });
             blocks.push(Block {
                 type_name: skin::DATA_TYPE,
                 body: skin::data(plan, &skin::identity())?,
@@ -178,7 +177,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
         if index.shader >= 0 {
             blocks.push(Block {
                 type_name: shader::SHADER_TYPE,
-                body: prepared.shader_body(*name, index.texture),
+                body: prepared.shader_body(index.texture),
             });
             if index.texture >= 0 {
                 blocks.push(Block {

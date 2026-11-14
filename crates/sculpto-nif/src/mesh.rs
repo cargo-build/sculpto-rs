@@ -19,10 +19,15 @@ impl From<&NifShape> for MeshAsset {
             normals: shape.normals.clone(),
             tangents: shape.tangents.clone(),
             triangles: shape.triangles.clone(),
-            // NifShape carries no partition metadata; one partition is the
-            // honest default until the reader exposes it.
-            triangle_partitions: vec![PartitionId(0); shape.triangles.len()],
+            // A source without an attributable partition table keeps the one
+            // partition every writer can express.
+            triangle_partitions: match shape.triangle_partitions.is_empty() {
+                true => vec![PartitionId(0); shape.triangles.len()],
+                false => shape.triangle_partitions.clone(),
+            },
+            partitions: shape.partitions.clone(),
             skin: shape.skin.clone(),
+            materials: shape.materials.clone(),
             ..Self::default()
         }
     }
@@ -31,9 +36,10 @@ impl From<&NifShape> for MeshAsset {
 /// Project the model back to the reader's shape type.
 ///
 /// This is the compatibility path for the existing slice-based consumers:
-/// `NifShape -> MeshAsset -> NifShape` preserves every field `NifShape` owns.
-/// Materials and morphs have no `NifShape` slot and are dropped by this
-/// projection.
+/// `NifShape -> MeshAsset -> NifShape` preserves every field `NifShape` owns,
+/// except that the model's one-partition default for a shape with no authored
+/// table comes back as the explicit ids it became. Morphs still have no
+/// `NifShape` slot and are dropped by this projection.
 impl From<&MeshAsset> for NifShape {
     fn from(mesh: &MeshAsset) -> Self {
         Self {
@@ -44,6 +50,9 @@ impl From<&MeshAsset> for NifShape {
             tangents: mesh.tangents.clone(),
             triangles: mesh.triangles.clone(),
             skin: mesh.skin.clone(),
+            triangle_partitions: mesh.triangle_partitions.clone(),
+            partitions: mesh.partitions.clone(),
+            materials: mesh.materials.clone(),
         }
     }
 }
@@ -71,6 +80,9 @@ mod tests {
                 )
                 .expect("a four-lane row fits"),
             }),
+            triangle_partitions: vec![PartitionId(0)],
+            partitions: Vec::new(),
+            materials: Vec::new(),
         }
     }
 
@@ -98,6 +110,16 @@ mod tests {
         let mesh = MeshAsset::from(&source);
         let back = NifShape::from(&mesh);
         assert_eq!(back, source);
+        mesh.validate().expect("valid");
+    }
+
+    #[test]
+    fn a_shape_without_a_partition_table_gets_one_partition() {
+        let mut source = shape();
+        source.triangle_partitions.clear();
+        let mesh = MeshAsset::from(&source);
+        assert_eq!(mesh.triangle_partitions, vec![PartitionId(0)]);
+        assert!(mesh.partitions.is_empty());
         mesh.validate().expect("valid");
     }
 

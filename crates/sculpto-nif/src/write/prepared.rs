@@ -169,10 +169,10 @@ impl PreparedShape {
         }
     }
 
-    /// `BSLightingShaderProperty` body for the assigned blocks.
-    pub(super) fn shader_body(&self, name: i32, texture_set: i32) -> Vec<u8> {
+    /// `BSLightingShaderProperty` body for the assigned texture block.
+    pub(super) fn shader_body(&self, texture_set: i32) -> Vec<u8> {
         match &self.material {
-            Some(slot) => shader::shader(slot, texture_set, name),
+            Some(slot) => shader::shader(slot, texture_set),
             None => Vec::new(),
         }
     }

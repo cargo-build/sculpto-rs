@@ -207,6 +207,7 @@ fn textured() -> MeshAsset {
         normal: Some("textures/robe_n.dds".into()),
         specular: None,
         double_sided: true,
+        ..MaterialSlot::default()
     }];
     asset
 }
@@ -511,8 +512,8 @@ fn compare_partitions(model: &MeshAsset, target: NifTarget) -> Result<(), String
     Ok(())
 }
 
-/// The texture paths `write::shader::texture_set` projects for a slot:
-/// diffuse then normal, trimmed to the highest present role.
+/// The texture paths `write::shader::texture_set` projects for a slot without
+/// an authored table: diffuse then normal, trimmed to the highest present role.
 fn expected_texture_paths(material: &MaterialSlot) -> Vec<String> {
     let diffuse = material.diffuse.as_deref().unwrap_or("");
     let normal = material.normal.as_deref().unwrap_or("");

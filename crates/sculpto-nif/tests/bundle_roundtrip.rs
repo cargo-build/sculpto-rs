@@ -87,6 +87,7 @@ fn bundle() -> Vec<MeshAsset> {
                 normal: Some("textures/body_n.dds".into()),
                 specular: None,
                 double_sided: true,
+                ..MaterialSlot::default()
             }),
         ),
         shape(
@@ -101,6 +102,7 @@ fn bundle() -> Vec<MeshAsset> {
                 normal: None,
                 specular: None,
                 double_sided: false,
+                ..MaterialSlot::default()
             }),
         ),
         shape("Feet", 9.0, 3, ([0, 2, 0, 0], [0.75, 0.25, 0.0, 0.0]), None),

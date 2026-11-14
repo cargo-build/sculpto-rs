@@ -57,6 +57,7 @@ fn material_uris_and_primitive_index_round_trip() {
         normal: Some("textures/robe_n.png".into()),
         specular: None,
         double_sided: true,
+        ..MaterialSlot::default()
     }];
 
     let bytes = write_glb(&asset).expect("valid model with material writes");

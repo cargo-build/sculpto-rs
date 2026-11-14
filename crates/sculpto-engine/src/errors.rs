@@ -180,6 +180,15 @@ pub fn mesh(error: MeshError) -> CommandError {
         MeshError::UnmatchedPartition { .. } => {
             (ErrorKind::InvalidRequest, "mesh_unmatched_partition")
         }
+        MeshError::DuplicatePartitionSlot { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_duplicate_partition_slot")
+        }
+        MeshError::UnusedPartitionSlot { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_unused_partition_slot")
+        }
+        MeshError::MissingPartitionSlot { .. } => {
+            (ErrorKind::InvalidRequest, "mesh_missing_partition_slot")
+        }
         MeshError::Material { .. } => (ErrorKind::InvalidRequest, "mesh_material"),
         MeshError::Physics { .. } => (ErrorKind::InvalidRequest, "mesh_physics"),
     };

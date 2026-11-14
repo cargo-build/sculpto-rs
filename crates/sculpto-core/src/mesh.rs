@@ -22,6 +22,23 @@ use crate::skin::{SkinWeightError, SkinWeights};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PartitionId(pub u16);
 
+/// One authored partition entry: the id its triangles carry plus the body-part
+/// tags the source authors beside it.
+///
+/// The entry order is the source's own partition order, which the dismember
+/// table is parallel to; keeping both in one list lets a writer emit the two
+/// blocks without a second ordering rule. Empty in [`MeshAsset::partitions`]
+/// means the source authors no dismember table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionSlot {
+    /// The partition id this entry's triangles carry.
+    pub partition: PartitionId,
+    /// `BSDismemberSkinInstance` part flags (`PF_*` bits).
+    pub part_flag: u16,
+    /// `BSDismemberSkinInstance` body part (`SBP_*` value).
+    pub body_part: u16,
+}
+
 /// One sparse morph displacement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MorphDelta {
@@ -108,6 +125,20 @@ impl TextureSlot {
             TextureSlot::Specular => "specular",
         }
     }
+
+    /// Position in an authored texture-set table
+    /// ([`MaterialSlot::texture_set`]), for the roles that table covers.
+    ///
+    /// The table's third slot is the source's tint/glow/soft-light channel, not
+    /// a specular map, so [`TextureSlot::Specular`] has no table position and
+    /// keeps reading its own field.
+    fn authored_index(self) -> Option<usize> {
+        match self {
+            TextureSlot::Diffuse => Some(0),
+            TextureSlot::Normal => Some(1),
+            TextureSlot::Specular => None,
+        }
+    }
 }
 
 /// One material slot. Format-specific fields stay in the adapters.
@@ -125,11 +156,33 @@ pub struct MaterialSlot {
     pub specular: Option<String>,
     /// Render both faces.
     pub double_sided: bool,
+    /// Authored texture-set slots in source order, when the source authors a
+    /// fixed slot table (Skyrim `BSShaderTextureSet`).
+    ///
+    /// An empty path is an unassigned slot that keeps its position, and the
+    /// table also carries the slots the neutral roles do not name (the source's
+    /// tint/glow, environment and mask channels). Empty when the slot is
+    /// authored through the role fields; a non-empty table then wins for every
+    /// role it covers.
+    pub texture_set: Vec<String>,
 }
 
 impl MaterialSlot {
     /// Read one texture channel, so Skyrim and glTF projections share a source.
+    ///
+    /// A non-empty [`Self::texture_set`] is the authored value for the roles it
+    /// covers, including an empty slot; the role fields below serve materials
+    /// authored without a slot table.
     pub fn texture(&self, slot: TextureSlot) -> Option<&str> {
+        if !self.texture_set.is_empty()
+            && let Some(index) = slot.authored_index()
+        {
+            return self
+                .texture_set
+                .get(index)
+                .filter(|path| !path.is_empty())
+                .map(String::as_str);
+        }
         match slot {
             TextureSlot::Diffuse => self.diffuse.as_deref(),
             TextureSlot::Normal => self.normal.as_deref(),
@@ -219,6 +272,14 @@ pub struct MeshAsset {
     pub triangles: Vec<[u32; 3]>,
     /// One partition id per triangle.
     pub triangle_partitions: Vec<PartitionId>,
+    /// Authored partition entries in source order, when the source authors a
+    /// dismember table; empty for a shape whose partitions carry no body-part
+    /// tags.
+    ///
+    /// Non-empty means every distinct [`Self::triangle_partitions`] id has
+    /// exactly one entry, so a writer emits one partition block entry per slot,
+    /// in this order, plus the dismember table beside it.
+    pub partitions: Vec<PartitionSlot>,
     /// One ordered skin, when the mesh is skinned.
     pub skin: Option<Skin>,
     /// Morph targets, sparse and vertex-sorted.
@@ -393,6 +454,12 @@ pub enum MeshError {
     DuplicatePartitionPalette { partition: PartitionId },
     /// A triangle carries the reader's unmatched-partition sentinel.
     UnmatchedPartition { triangle: usize },
+    /// Two partition slots use the same partition id.
+    DuplicatePartitionSlot { partition: PartitionId },
+    /// No triangle carries a partition slot's id.
+    UnusedPartitionSlot { partition: PartitionId },
+    /// A triangle's partition id has no slot in [`MeshAsset::partitions`].
+    MissingPartitionSlot { partition: PartitionId },
     /// A material slot violates a named rule.
     Material { slot: usize, defect: MaterialDefect },
     /// The physics reference is malformed.
@@ -651,6 +718,31 @@ impl MeshAsset {
         for (triangle, partition) in self.triangle_partitions.iter().enumerate() {
             if partition.0 == u16::MAX {
                 return Err(MeshError::UnmatchedPartition { triangle });
+            }
+        }
+        if !self.partitions.is_empty() {
+            let mut slots = BTreeSet::new();
+            for slot in &self.partitions {
+                if !slots.insert(slot.partition) {
+                    return Err(MeshError::DuplicatePartitionSlot {
+                        partition: slot.partition,
+                    });
+                }
+            }
+            let used: BTreeSet<PartitionId> = self.triangle_partitions.iter().copied().collect();
+            for slot in &self.partitions {
+                if !used.contains(&slot.partition) {
+                    return Err(MeshError::UnusedPartitionSlot {
+                        partition: slot.partition,
+                    });
+                }
+            }
+            for partition in &used {
+                if !slots.contains(partition) {
+                    return Err(MeshError::MissingPartitionSlot {
+                        partition: *partition,
+                    });
+                }
             }
         }
 
@@ -980,6 +1072,14 @@ impl MeshAsset {
             .collect();
         let triangles = std::mem::take(&mut chunk.triangles);
         let triangle_partitions = vec![partition; triangles.len()];
+        // A split shape keeps the slot of the partition its triangles carry;
+        // every other slot describes an entry this chunk does not hold.
+        let partitions = self
+            .partitions
+            .iter()
+            .filter(|slot| slot.partition == partition)
+            .copied()
+            .collect();
         chunk.map.clear();
         chunk.vertices.clear();
         Ok(Self {
@@ -990,6 +1090,7 @@ impl MeshAsset {
             tangents,
             triangles,
             triangle_partitions,
+            partitions,
             skin,
             morphs,
             materials: self.materials.clone(),
@@ -1554,6 +1655,7 @@ mod tests {
                 normal: Some("body_n.dds".into()),
                 specular: None,
                 double_sided: false,
+                ..MaterialSlot::default()
             },
             MaterialSlot {
                 name: "robe".into(),
@@ -1621,6 +1723,83 @@ mod tests {
             Err(MeshError::Material {
                 slot: 0,
                 defect: MaterialDefect::EmptyTexturePath(TextureSlot::Diffuse)
+            })
+        );
+    }
+
+    #[test]
+    fn an_authored_texture_table_carries_every_slot_in_order() {
+        let mut mesh = one_triangle();
+        mesh.materials = vec![MaterialSlot {
+            name: "body".into(),
+            diffuse: Some("ignored_when_a_table_is_set.dds".into()),
+            texture_set: vec![
+                "body_d.dds".into(),
+                "body_n.dds".into(),
+                "body_sk.dds".into(),
+                String::new(),
+                "chitin_e.dds".into(),
+            ],
+            ..MaterialSlot::default()
+        }];
+        mesh.validate().expect("an empty slot keeps its position");
+        let slot = &mesh.materials[0];
+        // The table wins for the roles it covers, including an empty slot.
+        assert_eq!(slot.texture(TextureSlot::Diffuse), Some("body_d.dds"));
+        assert_eq!(slot.texture(TextureSlot::Normal), Some("body_n.dds"));
+        // Its third slot is the source's tint channel, not a specular map.
+        assert_eq!(slot.texture(TextureSlot::Specular), None);
+        assert_eq!(slot.texture_set.len(), 5);
+        assert_eq!(slot.texture_set[2], "body_sk.dds");
+    }
+
+    #[test]
+    fn partition_slots_must_match_the_triangle_ids_exactly() {
+        let mut mesh = MeshAsset {
+            positions: vec![[0.0; 3]; 3],
+            triangles: vec![[0, 1, 2]],
+            triangle_partitions: vec![PartitionId(0)],
+            ..MeshAsset::default()
+        };
+        mesh.partitions = vec![PartitionSlot {
+            partition: PartitionId(0),
+            part_flag: 257,
+            body_part: 32,
+        }];
+        mesh.validate().expect("one slot for the one partition");
+
+        // A second slot for the same id cannot be expressed.
+        let mut duplicate = mesh.clone();
+        duplicate.partitions.push(mesh.partitions[0]);
+        assert_eq!(
+            duplicate.validate(),
+            Err(MeshError::DuplicatePartitionSlot {
+                partition: PartitionId(0)
+            })
+        );
+
+        // A slot no triangle carries would be written as an empty entry.
+        let mut unused = mesh.clone();
+        unused.partitions.push(PartitionSlot {
+            partition: PartitionId(7),
+            part_flag: 257,
+            body_part: 38,
+        });
+        assert_eq!(
+            unused.validate(),
+            Err(MeshError::UnusedPartitionSlot {
+                partition: PartitionId(7)
+            })
+        );
+
+        // A triangle whose partition has no slot would lose its body part.
+        let mut missing = mesh.clone();
+        missing.triangle_partitions.push(PartitionId(1));
+        missing.triangles.push([0, 2, 1]);
+        assert_eq!(
+            missing.validate(),
+            Err(MeshError::MissingPartitionSlot {
+                partition: PartitionId(1)
             })
         );
     }

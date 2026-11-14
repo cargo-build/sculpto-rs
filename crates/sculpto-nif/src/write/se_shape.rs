@@ -2,7 +2,8 @@
 //!
 //! C03 wrote positions and triangles, C05 added UVs, C06 byte normals and SE
 //! tangents, C07 added the skin: one `NiSkinInstance` + `NiSkinData`, one named
-//! `NiNode` per bone, and the per-vertex influences (`VF_SKINNED`). C10 writes
+//! `NiNode` per bone, and the per-vertex influences (`VF_SKINNED`). An authored
+//! partition table makes that instance a `BSDismemberSkinInstance`. C10 writes
 //! the shader and texture set; C11 adds the HDT-SMP physics link as one
 //! `NiStringExtraData`. A skinned shape keeps no inline geometry: the packed
 //! vertex stream lives once in `NiSkinPartition.global_vertex_data`, which is
@@ -110,10 +111,9 @@ pub(super) fn write(
         index => vec![index],
     };
     if let Some((plan, nodes)) = prepared.skin.as_ref().zip(skin_nodes) {
-        blocks.push(Block {
-            type_name: skin::INSTANCE_TYPE,
-            body: skin::instance(2, 3, nodes.root, &nodes.bones),
-        });
+        let (type_name, body) =
+            skin::instance_block(2, 3, nodes.root, &nodes.bones, &asset.partitions);
+        blocks.push(Block { type_name, body });
         blocks.push(Block {
             type_name: skin::DATA_TYPE,
             body: skin::data(
@@ -135,7 +135,7 @@ pub(super) fn write(
     if shader_index >= 0 {
         blocks.push(Block {
             type_name: shader::SHADER_TYPE,
-            body: prepared.shader_body(name_index, texture_index),
+            body: prepared.shader_body(texture_index),
         });
         if texture_index >= 0 {
             blocks.push(Block {
@@ -475,6 +475,7 @@ mod tests {
             normal: Some("textures/robe_n.dds".into()),
             specular: None,
             double_sided: true,
+            ..MaterialSlot::default()
         }];
         asset
     }

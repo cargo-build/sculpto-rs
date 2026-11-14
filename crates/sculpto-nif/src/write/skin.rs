@@ -2,7 +2,8 @@
 //!
 //! The model carries bone names, per-bone bind matrices and each vertex's
 //! authored influence row, whatever its width. Both targets write
-//! `NiSkinInstance` + `NiSkinData`; SE additionally
+//! `NiSkinInstance` + `NiSkinData`, and the `BSDismemberSkinInstance` subtype
+//! when the shape authors partition slots; SE additionally
 //! packs every vertex once into `NiSkinPartition.global_vertex_data`
 //! (`VF_SKINNED` included) and leaves the shape without inline geometry, while
 //! LE keeps geometry on `NiTriShapeData` and reads weights from the sparse
@@ -11,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sculpto_core::mesh::{MeshAsset, MeshError, PartitionPalette};
+use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, PartitionPalette, PartitionSlot};
 use sculpto_core::skin::FourLane;
 
 use super::header::{NifTarget, NifWriteError};
@@ -20,6 +21,9 @@ use super::{DroppedInfluence, InfluencePolicy};
 
 /// Block type table name for the skin instance.
 pub(super) const INSTANCE_TYPE: &str = "NiSkinInstance";
+/// Block type table name for the dismemberment skin instance, which carries the
+/// body-part table beside the plain instance fields.
+pub(super) const DISMEMBER_TYPE: &str = "BSDismemberSkinInstance";
 /// Block type table name for the skin data.
 pub(super) const DATA_TYPE: &str = "NiSkinData";
 /// Block type table name for the skin partition.
@@ -211,6 +215,34 @@ pub fn instance(data: i32, partition: i32, skeleton_root: i32, bones: &[i32]) ->
     bytes
 }
 
+/// The skin-instance block type and body for one shape.
+///
+/// A shape that authors partition slots writes the `BSDismemberSkinInstance`
+/// subtype: the plain instance fields followed by the body-part table, in the
+/// same order as the `NiSkinPartition` entries the writer emits. Without slots
+/// the block stays a plain `NiSkinInstance`, which the reader opens as "no
+/// dismember table" rather than as an empty one.
+pub fn instance_block(
+    data: i32,
+    partition: i32,
+    skeleton_root: i32,
+    bones: &[i32],
+    slots: &[PartitionSlot],
+) -> (&'static str, Vec<u8>) {
+    let mut bytes = instance(data, partition, skeleton_root, bones);
+    match slots.is_empty() {
+        true => (INSTANCE_TYPE, bytes),
+        false => {
+            push_u32(&mut bytes, slots.len() as u32);
+            for slot in slots {
+                push_u16(&mut bytes, slot.part_flag);
+                push_u16(&mut bytes, slot.body_part);
+            }
+            (DISMEMBER_TYPE, bytes)
+        }
+    }
+}
+
 /// A `NiSkinData` body with the source global-to-skin transform and sparse weights.
 pub(crate) fn data(plan: &SkinPlan, global_skin: &[[f32; 4]; 4]) -> Result<Vec<u8>, NifWriteError> {
     let mut bytes = Vec::new();
@@ -303,7 +335,10 @@ pub struct GlobalVertices<'a> {
 
 /// A `NiSkinPartition` body: one entry per triangle partition.
 ///
-/// Each entry's palette contains the bones used by the emitted lanes.
+/// Each entry's palette contains the bones used by the emitted lanes. An
+/// authored partition table ([`MeshAsset::partitions`]) owns the entry order, so
+/// the entries stay parallel to the `BSDismemberSkinInstance` slots; without one
+/// the entries follow ascending partition id.
 /// A `global` buffer selects the SSE layout: the packed
 /// vertices are written once before the entries, and both triangle copies use
 /// mesh-global indices (nifly forces `bMappedIndices = false` on stream 100).
@@ -326,11 +361,18 @@ pub(crate) fn partitions(
             );
         }
     }
-    let palettes = bones_by_partition
+    let order: Vec<PartitionId> = match mesh.partitions.is_empty() {
+        true => bones_by_partition.keys().copied().collect(),
+        false => mesh.partitions.iter().map(|slot| slot.partition).collect(),
+    };
+    let palettes = order
         .into_iter()
-        .map(|(partition, bones)| PartitionPalette {
+        .map(|partition| PartitionPalette {
             partition,
-            bones: bones.into_iter().collect(),
+            bones: bones_by_partition
+                .get(&partition)
+                .map(|bones| bones.iter().copied().collect())
+                .unwrap_or_default(),
         })
         .collect::<Vec<_>>();
     pack_partitions(mesh, &palettes, &plan.lanes, global)

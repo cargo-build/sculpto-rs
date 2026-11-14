@@ -1,16 +1,23 @@
-//! Authored skin weights read from the source bytes, before any projection.
+//! Authored source facts read from the file's own blocks, before projection.
 //!
 //! The vendored importer renormalizes an inline SE vertex stream
 //! (`renormalize_skin_weights`, `blocks/tri_shape/mod.rs:83-96`) and truncates
 //! plus renormalizes LE sparse data to four lanes
-//! (`import/mesh/skin.rs:828-905`). Neither value is the authored one, so this
-//! module reads the skin channels itself:
+//! (`import/mesh/skin.rs:828-905`). Neither value is the authored one, so the
+//! weight channels are read here:
 //!
 //! - LE: every `NiSkinData` sparse `(vertex, weight)` entry, all influences.
 //! - SE: the packed vertex lanes, either the retained
 //!   `NiSkinPartition.global_vertex_data.raw_bytes` when the shape carries no
 //!   inline stream, or the inline run located by re-reading the shape's block
 //!   prefix from the original bytes with the public header/stream/AV-object API.
+//!
+//! The importer also projects the source's partition table and shader onto
+//! renderer values. The export projection needs the authored ones instead, so
+//! this module captures them from the same resolved block: the
+//! `NiSkinPartition` entry order with its per-triangle attribution and the
+//! `BSDismemberSkinInstance` body-part tags, plus the
+//! `BSLightingShaderProperty`'s texture-set slot list.
 //!
 //! A shape that cannot be matched unambiguously, or whose required raw payload
 //! is missing or malformed, is a named refusal. Nothing is normalized, dropped
@@ -20,6 +27,7 @@ use std::ops::Range;
 
 use byroredux_nif::blocks::base::NiAVObjectData;
 use byroredux_nif::blocks::node::NiNode;
+use byroredux_nif::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet};
 use byroredux_nif::blocks::skin::{
     BsDismemberSkinInstance, NiSkinData, NiSkinInstance, NiSkinPartition,
 };
@@ -29,6 +37,7 @@ use byroredux_nif::import::ImportedMesh;
 use byroredux_nif::scene::NifScene;
 use byroredux_nif::stream::NifStream;
 use byroredux_nif::types::BlockRef;
+use sculpto_core::mesh::{MaterialSlot, PartitionId, PartitionSlot, ShaderKind};
 use sculpto_core::skin::{FourLane, SkinWeights};
 
 use crate::NifError;
@@ -53,15 +62,33 @@ const BSVER_FALLOUT4: u32 = 130;
 /// Bytes of one vertex's skin channel: four `f16` weights then four `u8` bones.
 const SKIN_CHANNEL_BYTES: usize = 12;
 
-/// Capture the authored influences of every imported mesh, in mesh order.
+/// `BSLightingShaderProperty` shader-flag word 2 bit 4: double-sided.
+const DOUBLE_SIDED: u32 = 0x0000_0010;
+
+/// The source facts one imported mesh's block carries beyond the importer's
+/// projection.
+pub(crate) struct Captured {
+    /// Authored influence rows, `None` for an unskinned mesh.
+    pub(crate) weights: Option<SkinWeights>,
+    /// One partition id per imported triangle; empty when the source authors
+    /// no partition table this projection can attribute.
+    pub(crate) triangle_partitions: Vec<PartitionId>,
+    /// Authored partition entries in source order with their body-part tags.
+    pub(crate) partitions: Vec<PartitionSlot>,
+    /// Authored material slots (at most one per block).
+    pub(crate) materials: Vec<MaterialSlot>,
+}
+
+/// Capture the authored facts of every imported mesh, in mesh order.
 ///
-/// `Some` for a skinned mesh, `None` for an unskinned one. The row count of a
-/// captured skin must equal the mesh's vertex count; the caller checks that.
+/// A skinned mesh must resolve to one source block; an unskinned one resolves
+/// only when its name and vertex count pick out exactly one block, so an
+/// ambiguous static keeps the importer's projection instead of guessing.
 pub(crate) fn capture(
     bytes: &[u8],
     scene: &NifScene,
     meshes: &[ImportedMesh],
-) -> Result<Vec<Option<SkinWeights>>, NifError> {
+) -> Result<Vec<Captured>, NifError> {
     let (header, data_start) =
         NifHeader::parse(bytes).map_err(|error| weights_error(format_args!("header: {error}")))?;
     if !header.block_sizes.is_empty() && header.block_sizes.len() != scene.blocks.len() {
@@ -75,28 +102,45 @@ pub(crate) fn capture(
     let sources = source_shapes(scene);
     meshes
         .iter()
-        .map(|mesh| match &mesh.skin {
-            None => Ok(None),
-            Some(skin) => {
-                let palette: Vec<String> = skin
-                    .bones
-                    .iter()
-                    .map(|bone| bone.name.to_string())
-                    .collect();
-                let source = match_shapes(
-                    &sources,
-                    mesh.name.as_deref(),
-                    &palette,
-                    mesh.positions.len(),
-                )?;
-                let rows = source.rows(bytes, &header, &blocks, scene)?;
-                build_rows(rows, palette.len(), &source.name).map(Some)
-            }
+        .map(|mesh| {
+            let source = match_shapes(&sources, mesh)?;
+            let weights = match (&mesh.skin, source) {
+                (None, _) => None,
+                (Some(skin), Some(source)) => {
+                    let palette: Vec<String> = skin
+                        .bones
+                        .iter()
+                        .map(|bone| bone.name.to_string())
+                        .collect();
+                    let rows = source.rows(bytes, &header, &blocks, scene)?;
+                    build_rows(rows, palette.len(), &source.name).map(Some)?
+                }
+                (Some(_), None) => {
+                    return Err(shape_error(
+                        mesh.name.as_deref().unwrap_or_default(),
+                        "the imported skin has no source block",
+                    ));
+                }
+            };
+            let (partitions, triangle_partitions) = match source {
+                Some(source) => partitions(scene, source, mesh)?,
+                None => (Vec::new(), Vec::new()),
+            };
+            let materials = match source {
+                Some(source) => materials(scene, source),
+                None => Vec::new(),
+            };
+            Ok(Captured {
+                weights,
+                triangle_partitions,
+                partitions,
+                materials,
+            })
         })
         .collect()
 }
 
-/// One source shape that could carry the skin of an imported mesh.
+/// One source shape that could carry an imported mesh's authored facts.
 struct SourceShape {
     /// Block index in the file.
     block: usize,
@@ -104,6 +148,8 @@ struct SourceShape {
     name: String,
     /// The shape's skin instance, when it has one.
     skin_ref: BlockRef,
+    /// The shape's shader property, when it names one.
+    shader_ref: BlockRef,
     /// Palette node names in skin-instance order.
     palette: Vec<String>,
     /// Vertex count the shape declares, when it declares one.
@@ -152,56 +198,55 @@ fn instance_of(scene: &NifScene, index: usize) -> Option<&NiSkinInstance> {
     }
 }
 
-/// Every skinnable shape block with its palette identity.
+/// Every shape block with its palette identity.
 fn source_shapes(scene: &NifScene) -> Vec<SourceShape> {
     let mut shapes = Vec::new();
     for block in 0..scene.blocks.len() {
-        let (name, skin_ref, vertices) = if let Some(shape) = scene.get_as::<BsTriShape>(block) {
-            (
-                shape.av.net.name.as_deref().unwrap_or_default().to_string(),
-                shape.skin_ref,
-                match shape.num_vertices {
-                    0 => None,
-                    count => Some(count as usize),
-                },
-            )
-        } else if let Some(shape) = scene.get_as::<NiTriShape>(block) {
-            let vertices = shape
-                .data_ref
-                .index()
-                .and_then(|index| scene.get_as::<NiTriShapeData>(index))
-                .map(|data| data.vertices.len());
-            (
-                shape.av.net.name.as_deref().unwrap_or_default().to_string(),
-                shape.skin_instance_ref,
-                vertices,
-            )
-        } else {
-            continue;
+        let (name, skin_ref, shader_ref, vertices) =
+            if let Some(shape) = scene.get_as::<BsTriShape>(block) {
+                (
+                    shape.av.net.name.as_deref().unwrap_or_default().to_string(),
+                    shape.skin_ref,
+                    shape.shader_property_ref,
+                    match shape.num_vertices {
+                        0 => None,
+                        count => Some(count as usize),
+                    },
+                )
+            } else if let Some(shape) = scene.get_as::<NiTriShape>(block) {
+                let vertices = shape
+                    .data_ref
+                    .index()
+                    .and_then(|index| scene.get_as::<NiTriShapeData>(index))
+                    .map(|data| data.vertices.len());
+                (
+                    shape.av.net.name.as_deref().unwrap_or_default().to_string(),
+                    shape.skin_instance_ref,
+                    shape.shader_property_ref,
+                    vertices,
+                )
+            } else {
+                continue;
+            };
+        let palette = match skin_ref.index().and_then(|index| instance_of(scene, index)) {
+            Some(instance) => instance
+                .bone_refs
+                .iter()
+                .enumerate()
+                .map(|(index, bone)| {
+                    bone.index()
+                        .and_then(|index| scene.get_as::<NiNode>(index))
+                        .and_then(|node| node.av.net.name.as_ref().map(|name| name.to_string()))
+                        .unwrap_or_else(|| format!("Bone{index}"))
+                })
+                .collect(),
+            None => Vec::new(),
         };
-        let Some(index) = skin_ref.index() else {
-            continue;
-        };
-        let Some(instance) = instance_of(scene, index) else {
-            continue;
-        };
-        // Same spelling as the importer's palette (`resolve_node_name`, with the
-        // positional fallback), so identity and palette compare like for like.
-        let palette = instance
-            .bone_refs
-            .iter()
-            .enumerate()
-            .map(|(index, bone)| {
-                bone.index()
-                    .and_then(|index| scene.get_as::<NiNode>(index))
-                    .and_then(|node| node.av.net.name.as_ref().map(|name| name.to_string()))
-                    .unwrap_or_else(|| format!("Bone{index}"))
-            })
-            .collect();
         shapes.push(SourceShape {
             block,
             name,
             skin_ref,
+            shader_ref,
             palette,
             vertices,
         });
@@ -209,24 +254,36 @@ fn source_shapes(scene: &NifScene) -> Vec<SourceShape> {
     shapes
 }
 
-/// Find the source shape that carries an imported mesh's skin.
+/// Find the source shape that carries an imported mesh's authored facts.
 ///
-/// Identity first: the importer copies the shape block's `NiObjectNET` name onto
-/// the mesh, so a present name selects that block and its declared vertex count
-/// is then verified. Without an identity the palette must be unique; several
-/// matches are disambiguated by vertex count and otherwise refused with every
-/// candidate listed. @req DECL0008
+/// A skinned mesh keeps the identity-first rule: the importer copies the shape
+/// block's `NiObjectNET` name onto the mesh, so a present name selects that
+/// block and its declared vertex count is then verified; without an identity the
+/// palette must be unique, several matches are disambiguated by vertex count and
+/// otherwise refused with every candidate listed.
+///
+/// An unskinned mesh has no palette to identify it, so only a unique
+/// name-and-vertex-count match resolves it; `None` leaves the importer's
+/// projection in place rather than guessing between look-alike statics.
 fn match_shapes<'a>(
     shapes: &'a [SourceShape],
-    name: Option<&str>,
-    palette: &[String],
-    vertices: usize,
-) -> Result<&'a SourceShape, NifError> {
+    mesh: &ImportedMesh,
+) -> Result<Option<&'a SourceShape>, NifError> {
+    let vertices = mesh.positions.len();
+    let name = mesh.name.as_deref().filter(|name| !name.is_empty());
+    let Some(skin) = &mesh.skin else {
+        return Ok(rigid_match(shapes, name, vertices));
+    };
+    let palette: Vec<String> = skin
+        .bones
+        .iter()
+        .map(|bone| bone.name.to_string())
+        .collect();
     let candidates: Vec<&SourceShape> = shapes
         .iter()
         .filter(|shape| shape.palette == palette)
         .collect();
-    if let Some(name) = name.filter(|name| !name.is_empty()) {
+    if let Some(name) = name {
         let named: Vec<&SourceShape> = candidates
             .iter()
             .copied()
@@ -238,7 +295,7 @@ fn match_shapes<'a>(
                     "weights: shape `{name}` declares {declared} vertices but the imported mesh \
                      has {vertices}"
                 ))),
-                _ => Ok(*shape),
+                _ => Ok(Some(*shape)),
             },
             [] => Err(NifError::Malformed(format!(
                 "weights: no source shape named `{name}` carries the {}-bone palette",
@@ -252,7 +309,7 @@ fn match_shapes<'a>(
         };
     }
     match candidates.as_slice() {
-        [shape] => Ok(*shape),
+        [shape] => Ok(Some(*shape)),
         [] => Err(NifError::Malformed(format!(
             "weights: no source shape carries the {}-bone palette",
             palette.len()
@@ -267,7 +324,7 @@ fn match_shapes<'a>(
                 })
                 .collect();
             match counted.as_slice() {
-                [shape] => Ok(*shape),
+                [shape] => Ok(Some(*shape)),
                 _ => Err(NifError::Malformed(format!(
                     "weights: {} source shapes share the palette and none is identified by \
                      vertex count ({})",
@@ -276,6 +333,24 @@ fn match_shapes<'a>(
                 ))),
             }
         }
+    }
+}
+
+/// The single unskinned block matching an imported rigid mesh.
+fn rigid_match<'a>(
+    shapes: &'a [SourceShape],
+    name: Option<&str>,
+    vertices: usize,
+) -> Option<&'a SourceShape> {
+    let name = name?;
+    let mut matching = shapes.iter().filter(|shape| {
+        shape.skin_ref.index().is_none()
+            && shape.name == name
+            && shape.vertices.is_none_or(|declared| declared == vertices)
+    });
+    match (matching.next(), matching.next()) {
+        (Some(shape), None) => Some(shape),
+        _ => None,
     }
 }
 
@@ -289,6 +364,173 @@ fn list_shapes(shapes: &[&SourceShape]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Canonical form of one triangle, so a partition entry matches its imported
+/// triangle whatever the winding or vertex order.
+fn canonical_triangle(mut triangle: [u32; 3]) -> [u32; 3] {
+    triangle.sort_unstable();
+    triangle
+}
+
+/// Read the source's partition table: the authored entry order with its
+/// body-part tags, and the entry each imported triangle belongs to.
+///
+/// The table is authoritative in both halves. A single-entry table covers the
+/// shape exactly when its triangle count matches, so the whole mesh maps to
+/// entry 0 without a triangle walk. A multi-entry table is attributed by
+/// triangle identity, the same index space the importer uses
+/// (`import/mesh/skin.rs` `triangle_body_parts`): SSE triangles address the
+/// packed buffer directly, LE triangles address the entry's `vertex_map`. A
+/// triangle that no entry claims is a refusal, because writing the collapsed
+/// table instead would silently merge authored segments.
+fn partitions(
+    scene: &NifScene,
+    source: &SourceShape,
+    mesh: &ImportedMesh,
+) -> Result<(Vec<PartitionSlot>, Vec<PartitionId>), NifError> {
+    let Some(instance) = source
+        .skin_ref
+        .index()
+        .and_then(|index| instance_of(scene, index))
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let slots = source
+        .skin_ref
+        .index()
+        .and_then(|index| scene.get_as::<BsDismemberSkinInstance>(index))
+        .map(|dismember| {
+            dismember
+                .partitions
+                .iter()
+                .map(|slot| PartitionSlot {
+                    partition: PartitionId(0),
+                    part_flag: slot.part_flag,
+                    body_part: slot.body_part,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(partition) = instance
+        .skin_partition_ref
+        .index()
+        .and_then(|index| scene.get_as::<NiSkinPartition>(index))
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if partition.partitions.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if !slots.is_empty() && slots.len() != partition.partitions.len() {
+        return Err(shape_error(
+            &source.name,
+            &format!(
+                "the dismember table has {} slots for {} partition entries",
+                slots.len(),
+                partition.partitions.len()
+            ),
+        ));
+    }
+    let entries = partition.partitions.len();
+    let triangles: Vec<[u32; 3]> = mesh.indices.as_chunks::<3>().0.to_vec();
+    // SSE entries address the packed buffer; LE entries address their own
+    // `vertex_map`. An empty map means the entry's indices are already global.
+    let addressable = partition.global_vertex_data.is_some();
+    let index_of: Vec<PartitionId> = match entries {
+        1 if partition.partitions[0].triangles.len() == triangles.len() => {
+            vec![PartitionId(0); triangles.len()]
+        }
+        _ => {
+            let mut by_triangle = std::collections::HashMap::new();
+            for (entry, body) in partition.partitions.iter().enumerate() {
+                for triangle in &body.triangles {
+                    let mut global = [0_u32; 3];
+                    let mut valid = true;
+                    for (target, &local) in global.iter_mut().zip(triangle) {
+                        *target = match addressable || body.vertex_map.is_empty() {
+                            true => u32::from(local),
+                            false => match body.vertex_map.get(usize::from(local)) {
+                                Some(&mapped) => u32::from(mapped),
+                                None => {
+                                    valid = false;
+                                    break;
+                                }
+                            },
+                        };
+                    }
+                    if valid {
+                        by_triangle
+                            .entry(canonical_triangle(global))
+                            .or_insert(PartitionId(entry as u16));
+                    }
+                }
+            }
+            triangles
+                .iter()
+                .enumerate()
+                .map(|(triangle, vertices)| {
+                    by_triangle
+                        .get(&canonical_triangle(*vertices))
+                        .copied()
+                        .ok_or_else(|| {
+                            shape_error(
+                                &source.name,
+                                &format!(
+                                    "triangle {triangle} belongs to none of the {entries} partition \
+                                     entries"
+                                ),
+                            )
+                        })
+                })
+                .collect::<Result<_, NifError>>()?
+        }
+    };
+    let slots = slots
+        .into_iter()
+        .enumerate()
+        .map(|(entry, slot)| PartitionSlot {
+            partition: PartitionId(entry as u16),
+            ..slot
+        })
+        .collect();
+    Ok((slots, index_of))
+}
+
+/// Read the shape's shader block as one material slot.
+///
+/// The authored `BSShaderTextureSet` slot list is carried verbatim, including
+/// the empty slots that hold their position; the model's role fields stay empty
+/// so the table is the single carrier. A shape whose shader block is absent, or
+/// not a `BSLightingShaderProperty`, carries no material.
+fn materials(scene: &NifScene, source: &SourceShape) -> Vec<MaterialSlot> {
+    let Some(shader) = source
+        .shader_ref
+        .index()
+        .and_then(|index| scene.get_as::<BSLightingShaderProperty>(index))
+    else {
+        return Vec::new();
+    };
+    let texture_set = shader
+        .texture_set_ref
+        .index()
+        .and_then(|index| scene.get_as::<BSShaderTextureSet>(index))
+        .map(|set| set.textures.clone())
+        .unwrap_or_default();
+    let name = match (source.name.is_empty(), shader.net.name.as_deref()) {
+        (false, _) => source.name.clone(),
+        (true, Some(name)) if !name.is_empty() => name.to_string(),
+        (true, _) => "material".to_string(),
+    };
+    vec![MaterialSlot {
+        name,
+        shader: ShaderKind::Default,
+        diffuse: None,
+        normal: None,
+        specular: None,
+        double_sided: shader.shader_flags_2 & DOUBLE_SIDED != 0,
+        texture_set,
+    }]
 }
 
 /// LE: every sparse `NiSkinData` entry, all influences, source order.

@@ -15,13 +15,12 @@ use std::fmt;
 use byroredux_core::string::StringPool;
 use byroredux_nif::import::{ImportedMesh, import_nif_scene};
 use byroredux_nif::parse_nif;
-use sculpto_core::mesh::Skin;
+use sculpto_core::mesh::{MaterialSlot, PartitionId, PartitionSlot, Skin};
 use sculpto_core::rig::Rig;
-use sculpto_core::skin::SkinWeights;
 
 mod mesh;
 mod rig;
-mod weights;
+mod source;
 pub mod write;
 
 pub use rig::{NifRigError, ShapePlacement, ShapeSource, yup_matrix_to_zup, yup_transform_to_zup};
@@ -63,6 +62,15 @@ pub struct NifShape {
     /// One skin: palette names, per-bone binds in the source Z-up frame and the
     /// authored influence rows read from the file's own skin channel.
     pub skin: Option<Skin>,
+    /// One partition id per triangle, in the source's partition order; empty
+    /// when the source authors no attributable partition table.
+    pub triangle_partitions: Vec<PartitionId>,
+    /// Authored partition entries in source order with their dismember
+    /// body-part tags; empty when the source authors no dismember table.
+    pub partitions: Vec<PartitionSlot>,
+    /// Authored material slots; empty when the shape names no readable
+    /// `BSLightingShaderProperty`.
+    pub materials: Vec<MaterialSlot>,
 }
 
 impl NifShape {
@@ -180,13 +188,13 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
     }
     let mut pool = StringPool::new();
     let imported = import_nif_scene(&scene, &mut pool);
-    let weights = weights::capture(bytes, &scene, &imported.meshes)?;
+    let captured = source::capture(bytes, &scene, &imported.meshes)?;
     let nodes: Vec<rig::NodeView<'_>> = imported.nodes.iter().map(rig::NodeView::from).collect();
     let graph = rig::capture_graph(&nodes)?;
     let mut shapes = Vec::with_capacity(imported.meshes.len());
     let mut sources = Vec::with_capacity(imported.meshes.len());
-    for (mesh, influences) in imported.meshes.iter().zip(weights) {
-        shapes.push(project_shape(mesh, influences)?);
+    for (mesh, captured) in imported.meshes.iter().zip(captured) {
+        shapes.push(project_shape(mesh, captured)?);
         sources.push(rig::capture_shape(
             &rig::MeshView::from(mesh),
             imported.nodes.len(),
@@ -203,10 +211,7 @@ pub fn read(bytes: &[u8]) -> Result<NifDocument, NifError> {
 }
 
 /// Project one imported shape onto the adapter's shape type.
-fn project_shape(
-    mesh: &ImportedMesh,
-    influences: Option<SkinWeights>,
-) -> Result<NifShape, NifError> {
+fn project_shape(mesh: &ImportedMesh, captured: source::Captured) -> Result<NifShape, NifError> {
     let chunks = mesh.indices.as_chunks::<3>();
     if !chunks.1.is_empty() {
         return Err(NifError::Malformed(format!(
@@ -216,7 +221,7 @@ fn project_shape(
         )));
     }
     let name = mesh.name.as_deref().unwrap_or_default();
-    let skin = match (&mesh.skin, influences) {
+    let skin = match (&mesh.skin, captured.weights) {
         (Some(skin), Some(influences)) => {
             if influences.rows() != mesh.positions.len() {
                 return Err(NifError::Malformed(format!(
@@ -277,5 +282,8 @@ fn project_shape(
             .map(|tri| [tri[0], tri[1], tri[2]])
             .collect(),
         skin,
+        triangle_partitions: captured.triangle_partitions,
+        partitions: captured.partitions,
+        materials: captured.materials,
     })
 }

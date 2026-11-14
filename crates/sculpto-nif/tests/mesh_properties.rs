@@ -1,11 +1,20 @@
 //! Round-trip properties between the reader shape and the export model.
 
-use sculpto_core::mesh::{MeshAsset, MeshError, Skin};
+use sculpto_core::mesh::{MeshAsset, MeshError, PartitionId, Skin};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::NifShape;
 
 fn shape(seed: u64) -> NifShape {
     let vertices = 3 + (seed as usize % 25);
+    let triangles: Vec<[u32; 3]> = (0..1 + seed as usize % 30)
+        .map(|index| {
+            [
+                (index % vertices) as u32,
+                ((index + 1) % vertices) as u32,
+                ((index + 2) % vertices) as u32,
+            ]
+        })
+        .collect();
     let positions = (0..vertices)
         .map(|index| {
             let value = index as f32 + seed as f32;
@@ -39,15 +48,8 @@ fn shape(seed: u64) -> NifShape {
                 ]
             })
             .collect(),
-        triangles: (0..1 + seed as usize % 30)
-            .map(|index| {
-                [
-                    (index % vertices) as u32,
-                    ((index + 1) % vertices) as u32,
-                    ((index + 2) % vertices) as u32,
-                ]
-            })
-            .collect(),
+        triangle_partitions: vec![PartitionId(0); triangles.len()],
+        triangles,
         skin: Some(Skin {
             bones: vec!["root".into(), "spine".into()],
             bind_inverse: (0..2)
@@ -67,6 +69,8 @@ fn shape(seed: u64) -> NifShape {
             )
             .expect("four-lane rows"),
         }),
+        partitions: Vec::new(),
+        materials: Vec::new(),
     }
 }
 

@@ -1,10 +1,14 @@
 //! Shader and texture-set blocks.
 //!
-//! The model carries neutral [`MaterialSlot`] values; both Skyrim targets use
-//! `BSLightingShaderProperty` + `BSShaderTextureSet`. Only the roles with a
-//! measured Skyrim slot are projected: diffuse (0) and normal (1). A specular
-//! path has no confirmed slot in this layout, so it is refused instead of being
-//! written into the glow slot and misread by every consumer.
+//! The model carries neutral [`MaterialSlot`] values, and an authored slot table
+//! when the source had one; both Skyrim targets use
+//! `BSLightingShaderProperty` + `BSShaderTextureSet`. An authored table is
+//! written verbatim — count and slot order included, empty slots keeping their
+//! position — because a source's slot vocabulary is wider than the neutral
+//! roles. A slot authored through the roles projects only diffuse (0) and
+//! normal (1): a specular path has no confirmed slot in this layout, so it is
+//! refused instead of being written into the glow slot and misread by every
+//! consumer.
 
 use sculpto_core::mesh::{MaterialSlot, MeshAsset, TextureSlot};
 
@@ -33,9 +37,24 @@ pub(super) fn single_slot(asset: &MeshAsset) -> Result<Option<&MaterialSlot>, Ni
 
 /// Write a `BSShaderTextureSet` body for a material slot.
 ///
-/// The list is trimmed to the highest present role; an absent earlier role is
-/// written as an empty path, which the reader treats as "no texture".
+/// An authored table is written exactly: every slot keeps its position and the
+/// count is the table's length, so a later consumer reads the same slot
+/// vocabulary back. Without one the role view is written, trimmed to the highest
+/// present role; an absent earlier role is written as an empty path, which the
+/// reader treats as "no texture".
 pub fn texture_set(material: &MaterialSlot) -> Result<Vec<u8>, NifWriteError> {
+    if !material.texture_set.is_empty() {
+        if material.texture_set.iter().all(String::is_empty) {
+            return Ok(Vec::new());
+        }
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, material.texture_set.len() as u32);
+        for value in &material.texture_set {
+            push_u32(&mut bytes, value.len() as u32);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        return Ok(bytes);
+    }
     if material.texture(TextureSlot::Specular).is_some() {
         return Err(NifWriteError::TextureSlotUnsupported { slot: "specular" });
     }
@@ -63,13 +82,15 @@ pub fn texture_set(material: &MaterialSlot) -> Result<Vec<u8>, NifWriteError> {
 /// Write a `BSLightingShaderProperty` body.
 ///
 /// `texture_set` is the block index of the matching `BSShaderTextureSet`, or
-/// `-1` when the slot declares no textures. Flags carry only the measured
+/// `-1` when the slot declares no textures. The shader block stays unnamed: the
+/// model's slot name is a slot label, not the block's `NiObjectNET` name, and
+/// the shipped Skyrim shader blocks carry none. Flags carry only the measured
 /// double-sided bit; tint and gloss data have no model field and stay neutral.
-pub fn shader(material: &MaterialSlot, texture_set: i32, name: i32) -> Vec<u8> {
+pub fn shader(material: &MaterialSlot, texture_set: i32) -> Vec<u8> {
     let mut bytes = Vec::new();
     push_u32(&mut bytes, SHADER_TYPE_DEFAULT);
-    // NiObjectNET: name, no extra data, no controller.
-    push_i32(&mut bytes, name);
+    // NiObjectNET: no name, no extra data, no controller.
+    push_i32(&mut bytes, -1);
     push_u32(&mut bytes, 0);
     push_i32(&mut bytes, -1);
     push_u32(&mut bytes, 0); // shader flags 1

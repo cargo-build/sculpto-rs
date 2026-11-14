@@ -48,6 +48,7 @@ fn textured() -> MeshAsset {
         normal: None,
         specular: None,
         double_sided: false,
+        ..MaterialSlot::default()
     }];
     asset
 }

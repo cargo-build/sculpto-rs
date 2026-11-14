@@ -50,6 +50,7 @@ fn robe() -> MeshAsset {
             normal: Some("textures/robe_n.dds".into()),
             specular: None,
             double_sided: true,
+            ..MaterialSlot::default()
         }],
         physics: Some(PhysicsRef::Path(PHYSICS_PATH.into())),
         ..MeshAsset::default()
