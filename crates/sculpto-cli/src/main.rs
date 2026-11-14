@@ -1402,7 +1402,10 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
     let (body_positions, body_triangles) = read_obj(&body_path)?;
     let (garment_positions, garment_triangles) = read_obj(&garment_path)?;
     // Both inputs share the OBJ display frame, so pure geometric queries need
-    // no conversion.
+    // no conversion: this is the frame `garment push` grades and writes, and a
+    // re-grade of its output repeats its reported maximum. The predicate picks
+    // one nearest body triangle, so it is not invariant under a rotation; a
+    // caller comparing two measurements must keep both in one frame.
     let report = check::garment_depth_report(
         (&garment_positions, &garment_triangles),
         (&body_positions, &body_triangles),
@@ -1569,8 +1572,15 @@ fn garment_depth_inner(args: &[String]) -> Result<(), String> {
 ///
 /// `garment depth` says what fails; this moves exactly the graded violations the
 /// fit's post-repair stage moves and writes the result, so a fitted OBJ can be
-/// re-graded against the same tolerance. Both inputs share the OBJ display
-/// frame; positions are converted to the source frame the writer expects.
+/// re-graded against the same tolerance.
+///
+/// One frame: the OBJ's own coordinates, the ones `garment depth` grades. The
+/// depth predicate picks the single nearest body triangle and resolves its near
+/// ties by traversal order, so a rotated copy of the same geometry grades
+/// differently and a pass that graded a converted frame would report numbers its
+/// own output cannot reproduce. Only the writer's source-frame input is
+/// converted, at the write boundary, where it is exactly inverted.
+/// @req DECL0013 DECL0015
 fn garment_push_inner(args: &[String]) -> Result<(), String> {
     let mut json = false;
     let mut rest = Vec::with_capacity(args.len());
@@ -1593,14 +1603,16 @@ fn garment_push_inner(args: &[String]) -> Result<(), String> {
     let (body_positions, body_triangles) = read_obj(&body_path)?;
     let (garment_positions, garment_triangles) = read_obj(&garment_path)?;
     let (pushed, report) = final_push(
-        (&to_source(&garment_positions), &garment_triangles),
-        (&to_source(&body_positions), &body_triangles),
+        (&garment_positions, &garment_triangles),
+        (&body_positions, &body_triangles),
         None,
         &FitOptions::default(),
         &FinalPushOptions { passes, tolerance },
     )
     .map_err(|error| error.to_string())?;
-    write_obj(&out, &pushed, &garment_triangles)
+    // `write_obj` takes the source frame; converting on the way in and out is
+    // exact, so the file keeps the coordinates this report graded.
+    write_obj(&out, &to_source(&pushed), &garment_triangles)
         .map_err(|error| format!("{}: {error}", out.display()))?;
     if json {
         let per_pass: Vec<serde_json::Value> = report
@@ -1659,7 +1671,7 @@ fn garment_push_inner(args: &[String]) -> Result<(), String> {
         );
     }
     println!(
-        "note: graded vertices are `garment depth`'s visible_occluded set; a fully locked vertex, a rigid part or a vertex whose nearest body triangle is degenerate is held, and welded copies move together; the tolerance stays the caller's"
+        "note: graded vertices are `garment depth`'s visible_occluded set; a fully locked vertex, a rigid part or a vertex whose nearest body triangle is degenerate is held, and welded copies move together; the tolerance stays the caller's; grading, the push and the written file all use the OBJ's own coordinates, so a re-grade of the output repeats these numbers"
     );
     Ok(())
 }

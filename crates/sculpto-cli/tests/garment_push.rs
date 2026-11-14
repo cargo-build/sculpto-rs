@@ -121,6 +121,74 @@ fn depth(body: &Path, garment: &Path, tolerance: f32) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// The graded maximum `garment depth` reports, in the one measurement both
+/// commands share.
+fn depth_max(body: &Path, garment: &Path, tolerance: f32) -> f64 {
+    let output = Command::new(env!("CARGO_BIN_EXE_sculpto"))
+        .args(["garment", "depth", "--body"])
+        .arg(body)
+        .arg("--garment")
+        .arg(garment)
+        .arg("--tolerance")
+        .arg(tolerance.to_string())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    payload["layers"]["visible_occluded"]["max"]
+        .as_f64()
+        .unwrap()
+}
+
+/// The frame defect on a frame-sensitive pair: an exact rotation of the same
+/// geometry grades differently, so a pass that graded a converted frame used to
+/// report a maximum its own output could not reproduce. Opt in with both
+/// fixture paths; without them the assertion is vacuous and says so.
+#[test]
+fn a_frame_sensitive_pair_reports_the_maximum_its_output_reproduces() {
+    let (Some(garment), Some(body)) = (
+        std::env::var_os("SCULPTO_FRAME_GARMENT"),
+        std::env::var_os("SCULPTO_FRAME_BODY"),
+    ) else {
+        eprintln!(
+            "SKIP a_frame_sensitive_pair_reports_the_maximum_its_output_reproduces: missing SCULPTO_FRAME_GARMENT and SCULPTO_FRAME_BODY"
+        );
+        return;
+    };
+    let garment = PathBuf::from(garment);
+    let body = PathBuf::from(body);
+    let directory = fixture_directory("frame-pair");
+    let out = directory.join("pushed.obj");
+    let tolerance = 0.15_f32;
+
+    let output = push(&body, &garment, &out, Some("0.15"), "10", true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let before = depth_max(&body, &garment, tolerance);
+    let after = depth_max(&body, &out, tolerance);
+    assert!(
+        (report["before_max"].as_f64().unwrap() - before).abs() < 1e-6,
+        "reported before {} vs depth {before}",
+        report["before_max"]
+    );
+    assert!(
+        (report["max"].as_f64().unwrap() - after).abs() < 1e-6,
+        "reported max {} vs depth {after}",
+        report["max"]
+    );
+    assert_eq!(report["violations"], 0);
+    assert!(after < f64::from(tolerance), "{after}");
+}
+
 #[test]
 fn the_push_closes_a_visible_violation_and_the_regrade_passes() {
     let directory = fixture_directory("closes");
@@ -149,6 +217,42 @@ fn the_push_closes_a_visible_violation_and_the_regrade_passes() {
         regrade.contains("verdict: pass (tolerance 0.050000, visible max 0.049900)"),
         "{regrade}"
     );
+}
+
+/// The frame contract: the pass grades the coordinates it writes, so its
+/// `before_max` is `garment depth`'s maximum on the input and its `max` is that
+/// command's maximum on its own output. Grading a converted frame would report
+/// numbers the written file cannot reproduce, because the depth predicate
+/// resolves one nearest body triangle and its near ties break by traversal
+/// order.
+#[test]
+fn the_report_repeats_the_depth_regrade() {
+    let directory = fixture_directory("frame");
+    let body = write(&directory, "body.obj", &cube_obj());
+    let garment = write(&directory, "garment.obj", &penetrating_obj());
+    let out = directory.join("pushed.obj");
+
+    let output = push(&body, &garment, &out, Some("0.05"), "3", true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let before = depth_max(&body, &garment, 0.05);
+    let after = depth_max(&body, &out, 0.05);
+    let reported_before = report["before_max"].as_f64().unwrap();
+    let reported_after = report["max"].as_f64().unwrap();
+    assert!(
+        (reported_before - before).abs() < 1e-6,
+        "reported before {reported_before} vs depth {before}"
+    );
+    assert!(
+        (reported_after - after).abs() < 1e-6,
+        "reported max {reported_after} vs depth {after}"
+    );
+    assert!(after < 0.05, "{after}");
 }
 
 #[test]
