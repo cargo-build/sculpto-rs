@@ -200,7 +200,7 @@ pub fn bundle(error: BundleError) -> CommandError {
         BundleError::Empty => (ErrorKind::InvalidParams, "bundle_empty"),
         BundleError::DuplicateName { .. } => (ErrorKind::Refused, "bundle_duplicate_name"),
         BundleError::Palettes { .. } => (ErrorKind::Refused, "bundle_palettes"),
-        BundleError::BoneListMismatch { .. } => (ErrorKind::Refused, "bundle_bone_list"),
+        BundleError::SkeletonRootMissing { .. } => (ErrorKind::Refused, "bundle_skeleton_root"),
     };
     CommandError::new(kind, code, error.to_string())
 }

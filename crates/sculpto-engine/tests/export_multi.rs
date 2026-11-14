@@ -3,10 +3,18 @@
 //! Each source is built with the real SE bundle writer, so the input is a file
 //! the reader already accepts. The round trip reads the source, exports every
 //! shape and re-reads the output: shape count, names, per-shape counts and the
-//! shared skin must survive. No private payload or byte fixture is needed.
+//! shared skin must survive. No private payload or byte fixture is needed for
+//! those synthetic controls.
+//!
+//! One control is the private-host tier: `SCULPTO_BUNDLE_NIF` names a real
+//! authored outfit whose shapes are skinned to different subsets of one
+//! skeleton. It skips with a message when unset, like the other fixture-gated
+//! tests.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use sculpto_core::mesh::validate_bundle;
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
 use sculpto_core::skin::SkinWeights;
 use sculpto_engine::ErrorKind;
@@ -306,4 +314,138 @@ fn the_default_export_stays_single_shape() {
     let document = sculpto_nif::read(&std::fs::read(&out).expect("bytes")).expect("re-read");
     assert_eq!(document.shapes.len(), 1);
     assert_eq!(document.shapes[0].name, "Body");
+}
+
+/// The private-host control: a real authored outfit whose shapes are skinned to
+/// different bone subsets of one skeleton.
+///
+/// The bundle gate must accept the shared union (a common root is the only
+/// skeleton requirement), and `--all-shapes` must re-encode every shape with its
+/// own palette, in its authored order.
+#[test]
+fn real_subset_outfit_bundle_roundtrip() {
+    let Ok(path) = std::env::var("SCULPTO_BUNDLE_NIF") else {
+        eprintln!("SCULPTO_BUNDLE_NIF not set; skipping the real subset outfit control");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("the fixture NIF is readable");
+    let source = sculpto_nif::read(&bytes).expect("the real outfit parses");
+    let target = match source.bsver {
+        83 => ExportTarget::Le,
+        _ => ExportTarget::Se,
+    };
+    let expected: Vec<ShapeCount> = source
+        .shapes
+        .iter()
+        .map(|shape| ShapeCount {
+            name: shape.name.clone(),
+            vertices: shape.positions.len(),
+            triangles: shape.triangles.len(),
+        })
+        .collect();
+    let palettes: Vec<Vec<String>> = source
+        .shapes
+        .iter()
+        .map(|shape| {
+            shape
+                .skin
+                .as_ref()
+                .map(|skin| skin.bones.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    let union: BTreeSet<&str> = palettes
+        .iter()
+        .flat_map(|palette| palette.iter().map(String::as_str))
+        .collect();
+    for (index, palette) in palettes.iter().enumerate() {
+        eprintln!(
+            "source shape {index}: `{}` {} vertices / {} triangles, {} bones",
+            expected[index].name,
+            expected[index].vertices,
+            expected[index].triangles,
+            palette.len()
+        );
+    }
+    eprintln!(
+        "{:?} carries {} shapes over a {} bone union (bsver {})",
+        path,
+        expected.len(),
+        union.len(),
+        source.bsver
+    );
+    assert!(
+        palettes.iter().any(|palette| *palette != palettes[0]),
+        "the control needs shapes whose palettes are not all identical"
+    );
+    let mut shared = union.clone();
+    for palette in &palettes {
+        shared.retain(|bone| palette.iter().any(|name| name == bone));
+    }
+    eprintln!("common skeleton root: {shared:?}");
+
+    let assets = source
+        .shapes
+        .iter()
+        .map(MeshAsset::from)
+        .collect::<Vec<_>>();
+    validate_bundle(&assets).expect("one skeleton with per-shape subsets is a bundle");
+
+    let scratch = Scratch::new("real");
+    let out = scratch.path().join("out.nif");
+    let outcome = ops::export_nif_bundle(&params(PathBuf::from(&path), out.clone(), target))
+        .expect("--all-shapes re-encodes the authored outfit");
+    assert_eq!(
+        outcome.shapes, expected,
+        "the outcome reports every source shape"
+    );
+    assert_eq!(
+        outcome.vertices,
+        expected.iter().map(|s| s.vertices).sum::<usize>()
+    );
+    assert_eq!(
+        outcome.triangles,
+        expected.iter().map(|s| s.triangles).sum::<usize>()
+    );
+
+    let written = std::fs::read(&out).expect("output bytes");
+    let document = sculpto_nif::read(&written).expect("the export re-reads");
+    assert_eq!(
+        document.shapes.len(),
+        expected.len(),
+        "no authored shape was dropped"
+    );
+    let counts: Vec<ShapeCount> = document
+        .shapes
+        .iter()
+        .map(|shape| ShapeCount {
+            name: shape.name.clone(),
+            vertices: shape.positions.len(),
+            triangles: shape.triangles.len(),
+        })
+        .collect();
+    assert_eq!(counts, expected, "names and per-shape counts survive");
+    let written_palettes: Vec<Vec<String>> = document
+        .shapes
+        .iter()
+        .map(|shape| {
+            shape
+                .skin
+                .as_ref()
+                .map(|skin| skin.bones.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        written_palettes, palettes,
+        "each shape keeps its own bone subset, in authored order"
+    );
+    assert_eq!(outcome.bytes, written.len());
+    eprintln!(
+        "re-encoded {} bytes: {} shapes, {} palettes distinct, {} bone union",
+        written.len(),
+        counts.len(),
+        palettes.iter().collect::<BTreeSet<&Vec<String>>>().len(),
+        union.len()
+    );
 }

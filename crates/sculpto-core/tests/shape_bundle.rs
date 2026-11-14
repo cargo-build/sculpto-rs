@@ -1,6 +1,7 @@
 //! The multi-shape bundle contract: body, hands and feet travel together only
-//! when names are unique, palettes are sound and every skinned shape repeats
-//! one bone list in the same order.
+//! when names are unique, palettes are sound and every skinned shape belongs to
+//! one skeleton with a bone all of them share. Each shape keeps its own subset
+//! of that skeleton's bones, in its own order.
 
 use sculpto_core::mesh::{
     BundleError, MeshAsset, MeshError, PartitionId, Skin, Transform, validate_bundle,
@@ -8,7 +9,7 @@ use sculpto_core::mesh::{
 use sculpto_core::role::{ShapeRole, validate_required_roles};
 use sculpto_core::skin::SkinWeights;
 
-/// The shared skeleton every bundled shape repeats, in bind order.
+/// The shared skeleton of the classic body/hands/feet bundle, in bind order.
 const SKELETON: [&str; 6] = ["root", "spine", "hand_l", "hand_r", "foot_l", "foot_r"];
 
 /// One skinned triangle weighted to the first bone; the palette gate derives
@@ -61,6 +62,64 @@ fn valid_body_hands_feet_bundle_passes() {
 }
 
 #[test]
+fn per_shape_bone_subsets_pass() {
+    // An outfit's belt, robe and body cover different bones of one armature:
+    // each palette is a subset of the union and they share the root.
+    let shapes = vec![
+        skinned_shape("body", &SKELETON),
+        skinned_shape("belt", &["root", "spine"]),
+        skinned_shape("robe", &["spine", "root", "hand_l"]),
+    ];
+    validate_bundle(&shapes).expect("subsets of one skeleton with a shared root are a bundle");
+}
+
+#[test]
+fn a_reordered_palette_still_shares_the_root() {
+    // Bone order is per shape: only the names and the shared root matter here.
+    let mut shapes = body_hands_feet();
+    shapes[2].skin.as_mut().expect("skin").bones = vec![
+        "spine".into(),
+        "root".into(),
+        "hand_l".into(),
+        "hand_r".into(),
+        "foot_l".into(),
+        "foot_r".into(),
+    ];
+    validate_bundle(&shapes).expect("a reordered palette is the same skeleton");
+}
+
+#[test]
+fn disjoint_palette_rejected() {
+    // Same count, no common bone: two armatures, not one skeleton.
+    let mut shapes = body_hands_feet();
+    shapes[2].skin.as_mut().expect("skin").bones = vec![
+        "tail".into(),
+        "jaw".into(),
+        "wing_l".into(),
+        "wing_r".into(),
+        "claw_l".into(),
+        "claw_r".into(),
+    ];
+    assert_eq!(
+        validate_bundle(&shapes),
+        Err(BundleError::SkeletonRootMissing { shape: 2 })
+    );
+}
+
+#[test]
+fn the_shape_that_empties_the_shared_root_is_named() {
+    let shapes = vec![
+        skinned_shape("body", &["root", "spine"]),
+        skinned_shape("belt", &["spine"]),
+        skinned_shape("robe", &["hand_l"]),
+    ];
+    assert_eq!(
+        validate_bundle(&shapes),
+        Err(BundleError::SkeletonRootMissing { shape: 2 })
+    );
+}
+
+#[test]
 fn single_shape_bundle_passes() {
     let shapes = vec![skinned_shape("body", &SKELETON)];
     validate_bundle(&shapes).expect("a one-shape bundle is still a bundle");
@@ -85,58 +144,20 @@ fn duplicate_name_rejected() {
 }
 
 #[test]
-fn mismatched_bone_order_rejected() {
-    let mut shapes = body_hands_feet();
-    shapes[2].skin.as_mut().expect("skin").bones = vec![
-        "spine".into(),
-        "root".into(),
-        "hand_l".into(),
-        "hand_r".into(),
-        "foot_l".into(),
-        "foot_r".into(),
-    ];
-    assert_eq!(
-        validate_bundle(&shapes),
-        Err(BundleError::BoneListMismatch { shape: 2 })
-    );
-}
-
-#[test]
-fn mismatched_bone_name_rejected() {
-    let mut shapes = body_hands_feet();
-    shapes[2].skin.as_mut().expect("skin").bones =
-        vec!["root".into(), "spine".into(), "tail".into()];
-    assert_eq!(
-        validate_bundle(&shapes),
-        Err(BundleError::BoneListMismatch { shape: 2 })
-    );
-}
-
-#[test]
-fn first_skinned_shape_sets_the_bone_reference() {
-    let mut unskinned = skinned_shape("cloth", &SKELETON);
-    unskinned.skin = None;
-    let shapes = vec![
-        unskinned,
-        skinned_shape("body", &["root", "spine"]),
-        skinned_shape("feet", &["root"]),
-    ];
-    assert_eq!(
-        validate_bundle(&shapes),
-        Err(BundleError::BoneListMismatch { shape: 2 })
-    );
-}
-
-#[test]
 fn unskinned_shapes_carry_no_bone_constraint() {
     let mut cloth = skinned_shape("cloth", &SKELETON);
     cloth.skin = None;
     let shapes = vec![skinned_shape("body", &SKELETON), cloth];
     validate_bundle(&shapes).expect("an unskinned shape joins a skinned bundle");
 
+    // An unskinned shape before the skinned ones is not the reference either.
     let mut bare = skinned_shape("bare", &SKELETON);
     bare.skin = None;
     validate_bundle(&[bare]).expect("a bundle without skins has no bone reference");
+    let mut lead = skinned_shape("lead", &SKELETON);
+    lead.skin = None;
+    let shapes = vec![lead, skinned_shape("feet", &["root"])];
+    validate_bundle(&shapes).expect("the first skinned shape cannot fail against a non-skin");
 }
 
 #[test]
@@ -158,10 +179,10 @@ fn invalid_palettes_rejected() {
 }
 
 #[test]
-fn duplicate_name_is_reported_before_bone_mismatch() {
+fn duplicate_name_is_reported_before_skeleton_root() {
     let mut shapes = body_hands_feet();
     shapes[1].name = "body".into();
-    shapes[2].skin.as_mut().expect("skin").bones = vec!["root".into()];
+    shapes[2].skin.as_mut().expect("skin").bones = vec!["tail".into()];
     assert_eq!(
         validate_bundle(&shapes),
         Err(BundleError::DuplicateName {

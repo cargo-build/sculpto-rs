@@ -666,8 +666,9 @@ pub struct ExportBundleOutcome {
 ///
 /// # Errors
 /// An unknown shape name is `shape_not_found`; bundle defects (no shapes,
-/// repeated names, differing bone lists) and per-shape writer refusals map
-/// through [`errors::nif_write`]. No output file is written on any failure.
+/// repeated names, palettes with no common skeleton root) and per-shape writer
+/// refusals map through [`errors::nif_write`]. No output file is written on any
+/// failure.
 pub fn export_nif_bundle(params: &ExportBundleParams) -> Result<ExportBundleOutcome, CommandError> {
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;

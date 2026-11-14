@@ -2,10 +2,11 @@
 //! pairs.
 //!
 //! A bundle is gated by [`validate_bundle`] first (at least one shape, unique
-//! names, valid partition palettes, one shared bone list), then the file gets a
-//! single string table, block type table and block-size array covering every
-//! block, one root `NiNode` whose children are all the shape blocks, one
-//! `NiNode` per bone of the shapes' shared palette, and per shape its paired data
+//! names, valid partition palettes, one skeleton the skinned shapes share a
+//! root with), then the file gets a single string table, block type table and
+//! block-size array covering every block, one root `NiNode` whose children are
+//! all the shape blocks, one `NiNode` per bone of the shapes' union palette, and
+//! per shape its paired data
 //! block plus its own `NiSkinInstance`/`NiSkinData`/`NiSkinPartition` and its own
 //! shader property and texture set.
 //!
@@ -39,8 +40,9 @@ use super::{InfluencePolicy, WrittenNif};
 
 /// Write one LE NIF carrying every shape of a bundle.
 ///
-/// The shapes must share one skeleton: [`validate_bundle`] refuses differing
-/// bone lists and duplicate names. Each shape keeps its own geometry data
+/// The shapes must share one skeleton: [`validate_bundle`] refuses duplicate
+/// names and palettes with no common root, while each shape keeps its own bone
+/// subset. Each shape keeps its own geometry data
 /// block, skin partition and shader; the emitted file has one root node, so a
 /// reader opens it as one scene instead of one file per body part.
 ///

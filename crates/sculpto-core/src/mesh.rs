@@ -10,8 +10,8 @@
 //! while preserving partition ids and morph deltas.
 //!
 //! [`validate_bundle`] gates a multi-shape set (body, hands, feet) before a
-//! writer projects it: unique names, sound partition palettes and one shared
-//! bone list across the skinned shapes.
+//! writer projects it: unique names, sound partition palettes and one skeleton
+//! the skinned shapes share a root with, while each shape keeps its own palette.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -470,9 +470,10 @@ pub enum BundleError {
         /// The palette defect.
         error: MeshError,
     },
-    /// A skinned shape's bone list differs from the first skinned shape's.
-    BoneListMismatch {
-        /// The failing shape's position in the bundle.
+    /// A skinned shape's palette shares no bone with the shapes before it, so
+    /// the bundle has no skeleton root.
+    SkeletonRootMissing {
+        /// The shape whose palette emptied the shared set.
         shape: usize,
     },
 }
@@ -488,9 +489,9 @@ impl fmt::Display for BundleError {
                 formatter,
                 "shape {shape} has invalid partition palettes: {error:?}"
             ),
-            Self::BoneListMismatch { shape } => write!(
+            Self::SkeletonRootMissing { shape } => write!(
                 formatter,
-                "shape {shape} bone list differs from the first skinned shape"
+                "shape {shape} shares no skeleton root with the earlier skinned shapes"
             ),
         }
     }
@@ -502,14 +503,18 @@ impl std::error::Error for BundleError {}
 ///
 /// The bundle must carry at least one shape, every shape name must be unique,
 /// each shape's derived partition palettes must pass
-/// [`MeshAsset::validate_partition_palettes`], and every skinned shape must
-/// repeat the first skinned shape's bone list exactly — same names, same
-/// order — because the bundled shapes share one skeleton's bone indices.
+/// [`MeshAsset::validate_partition_palettes`], and the skinned shapes must
+/// share one skeleton: every shape's bone list belongs to that skeleton's bone
+/// union, and at least one bone (the root) is common to all of them. A shape
+/// may skin fewer bones than the union holds — an outfit's belt, robe and body
+/// cover different subsets of one armature — but disjoint sets are not one
+/// skeleton. Each shape keeps its own palette, names and order: the writers
+/// build one bone node per union name and point each shape's palette at it.
 /// Unskinned shapes carry no bone constraint.
 ///
 /// # Errors
 /// [`BundleError`] names the first defect in check order: an empty bundle, a
-/// repeated name, a palette failure, then a bone-list mismatch.
+/// repeated name, a palette failure, then a shared skeleton without a root.
 pub fn validate_bundle(shapes: &[MeshAsset]) -> Result<(), BundleError> {
     if shapes.is_empty() {
         return Err(BundleError::Empty);
@@ -537,16 +542,21 @@ pub fn validate_bundle(shapes: &[MeshAsset]) -> Result<(), BundleError> {
                 error,
             })?;
     }
-    let Some(reference) = shapes.iter().find_map(|shape| shape.skin.as_ref()) else {
-        return Ok(());
-    };
-    if let Some((index, _)) = shapes.iter().enumerate().find(|(_, shape)| {
-        shape
-            .skin
-            .as_ref()
-            .is_some_and(|skin| skin.bones != reference.bones)
-    }) {
-        return Err(BundleError::BoneListMismatch { shape: index });
+    let mut shared: Option<BTreeSet<&str>> = None;
+    for (index, shape) in shapes.iter().enumerate() {
+        let Some(skin) = shape.skin.as_ref() else {
+            continue;
+        };
+        let bones: BTreeSet<&str> = skin.bones.iter().map(String::as_str).collect();
+        match shared.as_mut() {
+            None => shared = Some(bones),
+            Some(common) => {
+                common.retain(|bone| bones.contains(bone));
+                if common.is_empty() {
+                    return Err(BundleError::SkeletonRootMissing { shape: index });
+                }
+            }
+        }
     }
     Ok(())
 }
