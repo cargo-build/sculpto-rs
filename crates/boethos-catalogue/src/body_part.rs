@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::model::{Asset, Category, Sex, Status};
 
@@ -51,12 +50,19 @@ pub struct BodyPartInput {
 /// The identity is derived from source, source path/entry and shape name, so a
 /// re-import updates the same row and two shapes in one NIF stay distinct.
 pub fn body_part_asset(input: &BodyPartInput) -> Result<Asset, String> {
-    let path = match (&input.archive, &input.entry) {
-        (Some(archive), Some(entry)) => format!("{archive}::{entry}"),
-        _ => input
-            .path
-            .clone()
-            .ok_or_else(|| format!("{}: body part needs path or archive+entry", input.name))?,
+    let (path, archive, entry) = match (&input.path, &input.archive, &input.entry) {
+        (Some(path), None, None) => (path.clone(), None, None),
+        (None, Some(archive), Some(entry)) => (
+            format!("{archive}::{entry}"),
+            Some(archive.clone()),
+            Some(entry.clone()),
+        ),
+        _ => {
+            return Err(format!(
+                "{}: body part needs exactly one of path or archive+entry",
+                input.name
+            ));
+        }
     };
     let format = Path::new(&path)
         .extension()
@@ -68,24 +74,25 @@ pub fn body_part_asset(input: &BodyPartInput) -> Result<Asset, String> {
     if let Some(part) = part_tag(&input.name, &input.shape) {
         tags.push(part.to_string());
     }
-    if let Some(origin) = origin_tag(&input.source) {
+    if let Some(origin) = crate::origin_tag(&input.source, "") {
         tags.push(origin.to_string());
     }
     tags.sort();
     tags.dedup();
     Ok(Asset {
-        id: identity(&["body-part", &input.source, &path, &input.shape]),
+        id: crate::identity(&["body-part", &input.source, &path, &input.shape]),
         category: Category::BodyPart,
         name: input.name.clone(),
         path: path.clone(),
         source: input.source.clone(),
-        archive: input.archive.clone(),
-        entry: input.entry.clone(),
+        archive,
+        entry,
         format,
         shape: Some(input.shape.clone()),
         vertices: Some(input.vertices),
         triangles: Some(input.triangles),
         sha256: input.sha256.clone(),
+        source_sha256: None,
         bytes: input.bytes,
         sex: input.sex,
         family: input.family.clone(),
@@ -116,23 +123,4 @@ fn part_tag(name: &str, shape: &str) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-fn origin_tag(source: &str) -> Option<&'static str> {
-    let source = source.to_lowercase();
-    if source.contains("from-skyrim") || source.contains("skyrimmods") {
-        Some("origin:skyrimmods")
-    } else if source.contains("tripo") {
-        Some("origin:tripo3d")
-    } else if source.contains("sculpto") || source.contains("preset") {
-        Some("origin:sculpto")
-    } else {
-        None
-    }
-}
-
-fn identity(parts: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(parts.join("\u{1f}").as_bytes());
-    format!("{:x}", hasher.finalize())
 }

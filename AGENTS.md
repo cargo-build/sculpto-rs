@@ -91,7 +91,7 @@ triangle deletion is not successful construction-preserving fitting.
 | [sculpto-gltf](crates/sculpto-gltf/src/lib.rs) | GLB writing and append-only cloth packing | engine/actor exports; `crates/sculpto-gltf/tests` |
 | [sculpto-engine](crates/sculpto-engine/src/lib.rs) | Closed command catalogue, schemas, classified errors and operations | CLI/run/MCP; `crates/sculpto-engine/tests` |
 | [sculpto-cli](crates/sculpto-cli/src/main.rs) | argv and stdio transports | users/adapters; `crates/sculpto-cli/tests` |
-| [tools](tools/) | Optional Blender adapters, native reduction, viewers and diagnostics | [recipes and restrictions](README.md); `tools/tests` |
+| [tools](tools/) | Optional Blender adapters, native reduction, viewers and diagnostics; `tripo-split` writes one GLB per generated figure plus a catalogue manifest | [recipes and restrictions](README.md); `tools/tests` |
 
 Put shared rules in the owning Rust crate; keep adapters thin. This is a
 package/command navigator, not an exhaustive function map. In managed work,

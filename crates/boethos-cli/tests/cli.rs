@@ -390,7 +390,19 @@ fn imports_body_part_manifest() {
         ),
     )
     .expect("manifest");
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).expect("empty root");
     let db = root.with_extension("redb");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--root",
+            empty.to_str().expect("empty"),
+            "--no-archives",
+        ],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
     let (code, stdout, stderr) = run(
         &db,
         &[
@@ -401,6 +413,16 @@ fn imports_body_part_manifest() {
     );
     assert_eq!(code, 0, "{stdout} {stderr}");
     assert!(stdout.contains("inserted 2"), "{stdout}");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(stdout.contains("unchanged 2"), "{stdout}");
     let (code, stdout, stderr) = run(&db, &["list", "--category", "body-part", "--name", "feet"]);
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("femalefeet_0.nif"), "{stdout}");
@@ -428,6 +450,182 @@ fn imports_body_part_manifest() {
             .iter()
             .any(|tag| tag == "part:feet")
     );
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn refuses_malformed_body_part_manifest_before_writing() {
+    let root = temp_dir("bad-parts");
+    let manifest = root.join("parts.jsonl");
+    fs::write(
+        &manifest,
+        concat!(
+            "{\"name\":\"Feet\",\"shape\":\"Feet\",\"source\":\"test\",\"path\":\"/assets/feet.nif\",\"vertices\":1,\"triangles\":1}\n",
+            "{\"name\":\"Hands\",\"shape\":\"Hands\",\"source\":\"test\",\"entry\":\"meshes/hands.nif\",\"vertices\":1,\"triangles\":1}\n"
+        ),
+    )
+    .expect("manifest");
+    let db = root.with_extension("redb");
+    let _ = fs::remove_file(&db);
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 2, "{stdout} {stderr}");
+    assert!(stderr.contains("parts.jsonl:2"), "{stderr}");
+    assert!(!db.exists(), "pre-parse must not open the store");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn body_part_import_refuses_missing_database_and_empty_manifest() {
+    let root = temp_dir("parts-contract");
+    let empty_manifest = root.join("empty.jsonl");
+    fs::write(&empty_manifest, "").expect("empty manifest");
+    let valid_manifest = root.join("valid.jsonl");
+    fs::write(
+        &valid_manifest,
+        "{\"name\":\"Feet\",\"shape\":\"Feet\",\"source\":\"test\",\"path\":\"/assets/feet.nif\",\"vertices\":1,\"triangles\":1}\n",
+    )
+    .expect("valid manifest");
+    let db = root.with_extension("redb");
+    let _ = fs::remove_file(&db);
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            valid_manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("database not indexed"), "{stderr}");
+    assert!(!db.exists(), "missing database must not be created");
+
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).expect("empty root");
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--root",
+            empty.to_str().expect("empty"),
+            "--no-archives",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            empty_manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("no body-part records"), "{stderr}");
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn body_part_import_reports_duplicate_and_remeasured_rows() {
+    let root = temp_dir("parts-duplicates");
+    let manifest = root.join("parts.jsonl");
+    let line = "{\"name\":\"Feet\",\"shape\":\"Feet\",\"source\":\"test\",\"path\":\"/assets/feet.nif\",\"vertices\":8876,\"triangles\":16288}\n";
+    fs::write(&manifest, format!("{line}{line}")).expect("manifest");
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).expect("empty root");
+    let db = root.with_extension("redb");
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--root",
+            empty.to_str().expect("empty"),
+            "--no-archives",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("inserted 1") && stdout.contains("unchanged 1"),
+        "{stdout}"
+    );
+    fs::write(
+        &manifest,
+        "{\"name\":\"Feet\",\"shape\":\"Feet\",\"source\":\"test\",\"path\":\"/assets/feet.nif\",\"vertices\":8877,\"triangles\":16288}\n",
+    )
+    .expect("manifest");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(stdout.contains("updated 1"), "{stdout}");
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn imports_raw_part_manifest() {
+    let root = temp_dir("raw-parts");
+    let manifest = root.join("parts.jsonl");
+    fs::write(
+        &manifest,
+        "{\"name\":\"female-mannequin-figure-01\",\"part\":\"figure-01\",\"category\":\"mesh\",\"source\":\"tripo3d-parts\",\"path\":\"/parts/female-mannequin-figure-01.glb\",\"source_sha256\":\"597dfcf0\",\"vertices\":197966,\"triangles\":383838,\"tags\":[\"figure:01\"]}\n",
+    )
+    .expect("manifest");
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).expect("empty root");
+    let db = root.with_extension("redb");
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--root",
+            empty.to_str().expect("empty"),
+            "--no-archives",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "import-raw-parts",
+            "--manifest",
+            manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(stdout.contains("inserted 1"), "{stdout}");
+    let (code, stdout, stderr) = run(
+        &db,
+        &["list", "--category", "mesh", "--tag", "raw:part", "--json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let rows: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let row = &rows.as_array().expect("array")[0];
+    assert_eq!(row["shape"], "figure-01");
+    assert_eq!(row["source_sha256"], "597dfcf0");
+    assert_eq!(row["vertices"], 197966);
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }

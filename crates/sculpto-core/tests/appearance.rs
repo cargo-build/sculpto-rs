@@ -32,6 +32,7 @@ fn asset(id: &str, category: Category, name: &str, entry: Option<&str>, sex: Opt
         vertices: None,
         triangles: None,
         sha256: None,
+        source_sha256: None,
         bytes: None,
         sex,
         family: sex.map(|sex| match sex {

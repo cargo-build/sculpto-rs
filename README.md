@@ -44,6 +44,20 @@ actor's other geometry, materials and skeletal animation; it does not qualify
 fit, collisions or periodic motion. The current packing consumer supports
 2–256 targets. Base textures must be embedded or self-contained data URIs.
 
+Raw generated exports can contain several figures in one mesh. Split them before
+catalogue ingestion:
+
+```sh
+cargo run -p tripo-split --release -- --glb scene.glb --out-dir parts \
+  --manifest parts.jsonl --source tripo3d-parts
+target/debug/boethos import-raw-parts --manifest parts.jsonl
+```
+
+The splitter uses empty world-space X bands (1% of the model extent) and
+refuses a triangle that crosses a band. It writes one geometry GLB per figure;
+embedded textures stay with the source GLB. The manifest carries the source
+digest and each part's vertices/triangles for `boethos import-raw-parts`.
+
 `actor rig` samples the same explicit parts/pose and additionally reports the
 reduced skin correspondence used by fitting adapters:
 

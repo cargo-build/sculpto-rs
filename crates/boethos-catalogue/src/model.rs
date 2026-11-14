@@ -178,6 +178,9 @@ pub struct Asset {
     pub triangles: Option<u64>,
     /// Content hash when the file was read; `None` for archive members.
     pub sha256: Option<String>,
+    /// Digest of the source model a derived part came from.
+    #[serde(default)]
+    pub source_sha256: Option<String>,
     /// Size in bytes when known.
     pub bytes: Option<u64>,
     /// Declared target sex.

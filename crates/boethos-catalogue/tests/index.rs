@@ -398,3 +398,62 @@ fn body_part_bra_is_underwear_not_body() {
     let json = serde_json::to_value(&asset).expect("json");
     assert_eq!(json["category"], "body-part");
 }
+
+#[test]
+fn body_part_asset_refuses_ambiguous_location() {
+    let base = boethos_catalogue::BodyPartInput {
+        name: "Feet".to_string(),
+        shape: "Feet".to_string(),
+        sex: None,
+        family: None,
+        source: "test".to_string(),
+        path: Some("/assets/body.nif".to_string()),
+        archive: Some("/assets/pack.7z".to_string()),
+        entry: Some("meshes/feet.nif".to_string()),
+        sha256: None,
+        bytes: None,
+        tags: Vec::new(),
+        vertices: 1,
+        triangles: 1,
+    };
+    assert!(boethos_catalogue::body_part_asset(&base).is_err());
+    let mut path_with_entry = base.clone();
+    path_with_entry.archive = None;
+    assert!(boethos_catalogue::body_part_asset(&path_with_entry).is_err());
+    let mut archive_without_entry = base.clone();
+    archive_without_entry.path = None;
+    archive_without_entry.entry = None;
+    assert!(boethos_catalogue::body_part_asset(&archive_without_entry).is_err());
+}
+
+#[test]
+fn raw_part_asset_keeps_source_digest_and_part_tags() {
+    let asset = boethos_catalogue::raw_part_asset(&boethos_catalogue::RawPartInput {
+        name: "female-mannequin-figure-01".to_string(),
+        part: "figure-01".to_string(),
+        category: Some("mesh".to_string()),
+        sex: Some(boethos_catalogue::Sex::Female),
+        family: None,
+        source: "tripo3d-parts".to_string(),
+        path: "/parts/female-mannequin-figure-01.glb".to_string(),
+        source_path: Some("/assets/female mannequin 3d model.glb".to_string()),
+        source_sha256: Some("597dfcf0".to_string()),
+        sha256: Some("part-sha".to_string()),
+        bytes: Some(42),
+        tags: vec!["figure:01".to_string()],
+        vertices: 197_966,
+        triangles: 383_838,
+    })
+    .expect("raw part");
+    assert_eq!(asset.category, Category::Mesh);
+    assert_eq!(asset.shape.as_deref(), Some("figure-01"));
+    assert_eq!(asset.source_sha256.as_deref(), Some("597dfcf0"));
+    for tag in ["raw:part", "figure:01", "origin:tripo3d"] {
+        assert!(
+            asset.tags.contains(&tag.to_string()),
+            "{tag}: {:?}",
+            asset.tags
+        );
+    }
+    assert_eq!(asset.vertices, Some(197_966));
+}

@@ -15,6 +15,7 @@ name = "boethos"
 path = "src/main.rs"
 
 [dependencies]
-boethos = { version = "0.1.0", path = "../boethos" }
-boethos-catalogue = { version = "0.1.0", path = "../boethos-catalogue" }
+boethos = { version = "0.2.0", path = "../boethos" }
+boethos-catalogue = { version = "0.2.0", path = "../boethos-catalogue" }
+serde = "1"
 serde_json = "1"

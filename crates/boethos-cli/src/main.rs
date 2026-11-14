@@ -13,7 +13,8 @@ use std::process::ExitCode;
 
 use boethos::Store;
 use boethos_catalogue::{
-    Asset, Assets, BodyPartInput, Category, IndexOptions, Sex, body_part_asset, index_root,
+    Asset, Assets, BodyPartInput, Category, IndexOptions, RawPartInput, Sex, body_part_asset,
+    index_root, raw_part_asset,
 };
 
 fn main() -> ExitCode {
@@ -120,6 +121,12 @@ fn spec(command: &str) -> Option<Spec> {
             max_positionals: 0,
         },
         "import-parts" => Spec {
+            values: &["--manifest"],
+            switches: &["--json"],
+            repeat: &[],
+            max_positionals: 0,
+        },
+        "import-raw-parts" => Spec {
             values: &["--manifest"],
             switches: &["--json"],
             repeat: &[],
@@ -288,6 +295,8 @@ commands:
         print counts by category and the database path
   import-parts --manifest PATH [--json]
         import measured body-part shapes from JSONL
+  import-raw-parts --manifest PATH [--json]
+        import split raw-model parts from JSONL
   export PATH
         write one JSON object per record, in identity order
   help, --help, --version
@@ -297,14 +306,14 @@ database:
   else $HOME/.local/state/boethos/assets.redb
 
 categories:
-  body outfit hair face animation preset face_preset project
+  body body-part outfit hair face animation preset face_preset project
   texture mesh image archive other
 
 sex:
   female male unknown
 
 exit codes:
-  0 success, 2 refusal (usage, missing database, failed index)
+  0 success, 2 refusal (usage, missing database, failed index or import)
 
 text list columns: id, category, sex, name, path (tab-separated, escaped)
 json list: array of asset records; index: one report object"
@@ -318,6 +327,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         "delete" => command_delete(cli),
         "stats" => command_stats(cli),
         "import-parts" => command_import_parts(cli),
+        "import-raw-parts" => command_import_raw_parts(cli),
         "export" => command_export(cli),
         other => Err(format!("unknown command {other:?}; run `boethos help`")),
     }
@@ -536,6 +546,15 @@ fn command_get(cli: &Cli) -> Result<(), String> {
         if let Some(entry) = &asset.entry {
             println!("entry:    {entry}");
         }
+        if let Some(shape) = &asset.shape {
+            println!("shape:    {shape}");
+        }
+        if let Some(vertices) = asset.vertices {
+            println!("vertices: {vertices}");
+        }
+        if let Some(triangles) = asset.triangles {
+            println!("triangles:{triangles}");
+        }
     }
     Ok(())
 }
@@ -586,23 +605,43 @@ fn command_import_parts(cli: &Cli) -> Result<(), String> {
     let manifest = cli
         .value("--manifest")
         .ok_or_else(|| "import-parts requires --manifest PATH".to_string())?;
+    import_manifest::<BodyPartInput, _>(cli, manifest, "body-part", body_part_asset)
+}
+
+fn command_import_raw_parts(cli: &Cli) -> Result<(), String> {
+    let manifest = cli
+        .value("--manifest")
+        .ok_or_else(|| "import-raw-parts requires --manifest PATH".to_string())?;
+    import_manifest::<RawPartInput, _>(cli, manifest, "raw part", raw_part_asset)
+}
+
+fn import_manifest<T, F>(cli: &Cli, manifest: &str, noun: &str, build: F) -> Result<(), String>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> Result<Asset, String>,
+{
     let text = fs::read_to_string(manifest).map_err(|error| format!("{manifest}: {error}"))?;
-    let store = open_write(cli)?;
-    let mut inserted = 0usize;
-    let mut updated = 0usize;
-    let mut unchanged = 0usize;
-    let mut errors = Vec::new();
-    let mut total = 0usize;
+    let mut assets = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        total += 1;
-        let input: BodyPartInput = serde_json::from_str(line)
+        let input: T = serde_json::from_str(line)
             .map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
-        let asset = body_part_asset(&input)
-            .map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
+        let asset = build(&input).map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
+        assets.push(asset);
+    }
+    if assets.is_empty() {
+        return Err(format!("{manifest}: no {noun} records"));
+    }
+    let total = assets.len();
+    let store = open_write_existing(cli)?;
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
+    let mut unchanged = 0usize;
+    let mut errors = Vec::new();
+    for asset in assets {
         match store.get::<Assets>(&asset.id) {
             Ok(Some(existing)) if existing == asset => {
                 unchanged += 1;
@@ -635,7 +674,7 @@ fn command_import_parts(cli: &Cli) -> Result<(), String> {
         );
     } else {
         println!(
-            "imported {total} body parts: inserted {inserted}, updated {updated}, unchanged {unchanged}, errors {}",
+            "imported {total} {noun}s: inserted {inserted}, updated {updated}, unchanged {unchanged}, errors {}",
             errors.len()
         );
     }
@@ -644,7 +683,8 @@ fn command_import_parts(cli: &Cli) -> Result<(), String> {
     }
     if inserted + updated == 0 && !errors.is_empty() {
         return Err(format!(
-            "import-parts wrote nothing: {} errors",
+            "{} wrote nothing: {} errors",
+            cli.command,
             errors.len()
         ));
     }
@@ -699,6 +739,17 @@ fn command_export(cli: &Cli) -> Result<(), String> {
 
 fn open_write(cli: &Cli) -> Result<Store, String> {
     let path = database_path(cli.db.as_deref());
+    Store::open(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn open_write_existing(cli: &Cli) -> Result<Store, String> {
+    let path = database_path(cli.db.as_deref());
+    if !path.is_file() {
+        return Err(format!(
+            "{}: database not indexed; run `boethos index --root DIR`",
+            path.display()
+        ));
+    }
     Store::open(&path).map_err(|error| format!("{}: {error}", path.display()))
 }
 

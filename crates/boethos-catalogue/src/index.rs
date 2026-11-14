@@ -181,7 +181,7 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
         let path_text = path.to_string_lossy().into_owned();
         let bytes = fs::metadata(&path).ok().map(|meta| meta.len());
         let asset = Asset {
-            id: identity(&["file", source, &path_text]),
+            id: crate::identity(&["file", source, &path_text]),
             category,
             name: file_name(&path),
             path: path_text.clone(),
@@ -193,6 +193,7 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
             vertices: None,
             triangles: None,
             sha256: Some(sha),
+            source_sha256: None,
             bytes,
             sex: sex_from_path(&relative_text),
             family: family_from_path(&relative_text),
@@ -280,7 +281,7 @@ fn index_archive(
         ));
     }
     let sha = computed.or_else(|| readme_hashes.get(&name).cloned());
-    let archive_id = identity(&["archive", source, &path_text]);
+    let archive_id = crate::identity(&["archive", source, &path_text]);
     let archive_asset = Asset {
         id: archive_id.clone(),
         category: Category::Archive,
@@ -294,6 +295,7 @@ fn index_archive(
         vertices: None,
         triangles: None,
         sha256: sha,
+        source_sha256: None,
         bytes: fs::metadata(path).ok().map(|meta| meta.len()),
         sex: None,
         family: family_from_path(&name),
@@ -318,7 +320,7 @@ fn index_archive(
         let Some(category) = member_category(&entry.path, &name) else {
             continue;
         };
-        let member_identity = identity(&["member", &archive_id, &entry.path]);
+        let member_identity = crate::identity(&["member", &archive_id, &entry.path]);
         let mut tags = Vec::new();
         if let Some(crc) = &entry.crc {
             tags.push(format!("crc:{crc}"));
@@ -349,6 +351,7 @@ fn index_archive(
             vertices: None,
             triangles: None,
             sha256: None,
+            source_sha256: None,
             bytes: entry.size,
             sex,
             family,
@@ -545,7 +548,7 @@ fn garment_tags(text: &str, category: Category, source: &str) -> Vec<String> {
     {
         tags.push(format!("body:{family}"));
     }
-    if let Some(origin) = origin_tag(source, text) {
+    if let Some(origin) = crate::origin_tag(source, text) {
         tags.push(origin.to_string());
     }
     if tags.iter().any(|tag| {
@@ -573,20 +576,6 @@ fn garment_tags(text: &str, category: Category, source: &str) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
-}
-
-fn origin_tag(source: &str, text: &str) -> Option<&'static str> {
-    let source = source.to_lowercase();
-    let text = text.to_lowercase();
-    if source.contains("from-skyrim") || source.contains("skyrimmods") {
-        Some("origin:skyrimmods")
-    } else if source.contains("tripo") || text.contains("tripo") {
-        Some("origin:tripo3d")
-    } else if source == "underwear-extract" || source.contains("sculpto") {
-        Some("origin:sculpto")
-    } else {
-        None
-    }
 }
 
 fn has_garment_token(text: &str) -> bool {
@@ -667,16 +656,6 @@ fn extension(path: &Path) -> String {
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_lowercase()
-}
-
-fn identity(parts: &[&str]) -> String {
-    sha256_bytes(parts.join("\u{1f}").as_bytes())
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
