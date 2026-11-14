@@ -250,7 +250,7 @@ fn index_archive(
         if entry.is_directory {
             continue;
         }
-        let Some(category) = member_category(&entry.path) else {
+        let Some(category) = member_category(&entry.path, &name) else {
             continue;
         };
         let member_identity = identity(&["member", &archive_id, &entry.path]);
@@ -393,7 +393,7 @@ fn classify(path: &Path, extension: &str) -> Category {
     Category::Other
 }
 
-fn member_category(path: &str) -> Option<Category> {
+fn member_category(path: &str, archive_name: &str) -> Option<Category> {
     let text = path.to_lowercase();
     if text.contains("facegeom") && text.ends_with(".nif") {
         return Some(Category::Face);
@@ -409,7 +409,20 @@ fn member_category(path: &str) -> Option<Category> {
     if text.ends_with(".jslot") {
         return Some(Category::FacePreset);
     }
+    // Supplied hair packs keep meshes under a `hair`/`hairdos` token or, like
+    // KS Hairdos, directly under an archive whose name carries the token.
+    if text.ends_with(".nif")
+        && text.contains("/meshes/")
+        && (has_hair_token(&text) || has_hair_token(&archive_name.to_lowercase()))
+    {
+        return Some(Category::Hair);
+    }
     None
+}
+
+fn has_hair_token(text: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.starts_with("hair"))
 }
 
 fn sex_from_path(text: &str) -> Option<Sex> {
@@ -538,4 +551,41 @@ fn read_readme_hashes(root: &Path) -> HashMap<String, String> {
         }
     }
     hashes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_hair_members_without_chair_false_positive() {
+        assert_eq!(
+            member_category("Data/meshes/KS Hairdo's/911.nif", "KS Hairdos SSE.7z"),
+            Some(Category::Hair)
+        );
+        assert_eq!(
+            member_category("meshes/actors/character/hair/hair01.nif", "pack.7z"),
+            Some(Category::Hair)
+        );
+        assert_eq!(
+            member_category("meshes/elsewhere/hair01.nif", "KS Hairdos SSE.7z"),
+            Some(Category::Hair)
+        );
+        assert_ne!(
+            member_category("meshes/furniture/chair.nif", "pack.7z"),
+            Some(Category::Hair)
+        );
+        assert_ne!(
+            member_category("textures/KS Hairdo's/hair.dds", "KS Hairdos SSE.7z"),
+            Some(Category::Hair)
+        );
+        assert_ne!(
+            member_category("Data/KS Hairdo's.esp", "KS Hairdos SSE.7z"),
+            Some(Category::Hair)
+        );
+        assert_eq!(
+            member_category("meshes/FaceGeom/skyrim.esm/0001.nif", "KS Hairdos SSE.7z"),
+            Some(Category::Face)
+        );
+    }
 }

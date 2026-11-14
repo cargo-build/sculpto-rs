@@ -104,7 +104,13 @@ fn home(tag: &str, target: NifTarget) -> (PathBuf, PathBuf) {
 
 /// A home whose project, presets and morph blocks the caller supplies, for the
 /// zap variants.
-fn zap_home(tag: &str, target: NifTarget, project: &str, presets: &str, blocks: &[BlockSpec]) -> (PathBuf, PathBuf) {
+fn zap_home(
+    tag: &str,
+    target: NifTarget,
+    project: &str,
+    presets: &str,
+    blocks: &[BlockSpec],
+) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("sculpto-c12-{tag}-{}", std::process::id()));
     let shape_data = root.join("ShapeData/Test");
     for dir in [
