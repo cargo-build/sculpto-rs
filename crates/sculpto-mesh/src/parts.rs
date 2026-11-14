@@ -18,7 +18,7 @@
 //! display-to-source rotation. Height bands use the detected up axis
 //! ([`crate::aura::up_axis`]), so Y-up and Z-up inputs classify the same way.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::aura::{extent, up_axis};
@@ -391,9 +391,11 @@ struct Shell {
     local: HashMap<usize, usize>,
     /// Materialized positions, parallel to `vertices`.
     positions: Vec<[f32; 3]>,
-    /// Global indices of boundary vertices.
+    /// Global indices of boundary vertices, chain by chain.
     boundary: Vec<usize>,
-    /// Boundary chains, largest first.
+    /// Boundary chains, largest first, equal sizes by ascending ids; the
+    /// vertices of each chain ascend. Ordered, never hash-ordered: the order is
+    /// reported and feeds the socket-arc tie-break.
     chains: Vec<Chain>,
 }
 
@@ -429,7 +431,10 @@ impl Shell {
         if own.is_empty() {
             return None;
         }
-        let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
+        // Ordered maps, not hash maps: the chain order and the walk order decide
+        // the reported boundary order, so they must not follow a per-process
+        // hash seed.
+        let mut counts: BTreeMap<(u32, u32), u32> = BTreeMap::new();
         for [a, b, c] in &own {
             for (left, right) in [(a, b), (b, c), (c, a)] {
                 let key = if left <= right {
@@ -440,7 +445,7 @@ impl Shell {
                 *counts.entry(key).or_default() += 1;
             }
         }
-        let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut adjacency: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for ((left, right), count) in &counts {
             if *count == 1 {
                 adjacency.entry(*left).or_default().push(*right);
@@ -449,7 +454,7 @@ impl Shell {
         }
         let mut chains: Vec<Chain> = Vec::new();
         let mut visited: HashSet<u32> = HashSet::new();
-        for start in adjacency.keys().copied().collect::<Vec<_>>() {
+        for start in adjacency.keys().copied() {
             if !visited.insert(start) {
                 continue;
             }
@@ -463,10 +468,21 @@ impl Shell {
                     }
                 }
             }
+            // Ascending ids: the boundary order is part of the report, so it is
+            // independent of the walk that discovered it.
+            vertices.sort_unstable();
             let centroid = mean_over(&vertices, |&global| positions[global]);
             chains.push(Chain { vertices, centroid });
         }
-        chains.sort_by_key(|chain| std::cmp::Reverse(chain.vertices.len()));
+        // Largest first, equal sizes by ascending ids: a total order, so two
+        // runs on one input list the chains the same way.
+        chains.sort_by(|left, right| {
+            right
+                .vertices
+                .len()
+                .cmp(&left.vertices.len())
+                .then_with(|| left.vertices.cmp(&right.vertices))
+        });
         let boundary: Vec<usize> = chains
             .iter()
             .flat_map(|chain| chain.vertices.iter().copied())
@@ -620,6 +636,9 @@ struct Bodies<'a> {
     shells: &'a [Shell],
     /// Ring positions per shell, stable so the ring trees can borrow them.
     ring_points: &'a [Vec<[f32; 3]>],
+    /// Global vertex ids of [`Self::ring_points`], parallel to it: the
+    /// socket-arc tie-break names a vertex, not a position in a walk.
+    ring_ids: &'a [Vec<usize>],
     shell_trees: &'a [PointIndex<'a>],
     ring_trees: &'a [Option<PointIndex<'a>>],
     /// Shell indices large enough to be parts or sockets.
@@ -673,6 +692,7 @@ pub fn audit(
     });
 
     let ring_points: Vec<Vec<[f32; 3]>> = shells.iter().map(Shell::ring_positions_owned).collect();
+    let ring_ids: Vec<Vec<usize>> = shells.iter().map(|shell| shell.boundary.clone()).collect();
     let shell_trees: Vec<PointIndex<'_>> = shells
         .iter()
         .map(|shell| PointIndex::build(shell.positions.as_slice()))
@@ -687,6 +707,7 @@ pub fn audit(
     let bodies = Bodies {
         shells: shells.as_slice(),
         ring_points: ring_points.as_slice(),
+        ring_ids: ring_ids.as_slice(),
         shell_trees: shell_trees.as_slice(),
         ring_trees: ring_trees.as_slice(),
         large: large.as_slice(),
@@ -1107,6 +1128,7 @@ fn seam_rows(
                     let (socket_ring, coverage) = measure_coverage(
                         part_ring_positions,
                         bodies.ring_points[partner].as_slice(),
+                        bodies.ring_ids[partner].as_slice(),
                         bodies.ring_trees[partner].as_ref(),
                     );
                     let offset = chain_offset(
@@ -1152,6 +1174,7 @@ fn lateral_offset(a: [f64; 3], b: [f64; 3], lateral: usize) -> f64 {
 fn measure_coverage(
     part_ring_positions: &[[f32; 3]],
     partner_ring: &[[f32; 3]],
+    partner_ring_ids: &[usize],
     partner_ring_tree: Option<&PointIndex<'_>>,
 ) -> (usize, f64) {
     let Some(ring_tree) = partner_ring_tree else {
@@ -1161,15 +1184,25 @@ fn measure_coverage(
         return (0, 0.0);
     }
     let part_ring_tree = PointIndex::build(part_ring_positions);
+    // The anchor is the socket-ring vertex nearest the part ring. An authored
+    // coincident seam ships many vertices tied at that minimum, so equal minima
+    // break by the lower global vertex id: the arc — hence `socket_ring` and
+    // `coverage` — must name one authored vertex, not whichever the boundary
+    // walk reached first.
     let anchor = partner_ring
         .iter()
         .copied()
-        .map(|point| {
+        .zip(partner_ring_ids.iter().copied())
+        .map(|(point, id)| {
             let nearest = part_ring_tree.nearest(point);
-            (point, distance(point, part_ring_positions[nearest]))
+            (point, distance(point, part_ring_positions[nearest]), id)
         })
-        .min_by(|left, right| left.1.total_cmp(&right.1));
-    let Some((anchor, _)) = anchor else {
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.2.cmp(&right.2))
+        });
+    let Some((anchor, _, _)) = anchor else {
         return (0, 0.0);
     };
     let arc = ring_tree.within_radius(anchor, SOCKET_PROXIMITY as f32);
@@ -1460,10 +1493,17 @@ fn apply_overrides(
                 nearest: f64::INFINITY,
             });
         };
-        let nearest = row_of_shell
+        // Candidate shells in ascending order: an override whose centroid is
+        // equidistant from two shipped parts must bind to the same one every
+        // run, not to whichever key the hash map yielded first.
+        let mut candidates: Vec<usize> = row_of_shell
             .keys()
             .copied()
             .filter(|index| !replaced.contains(index))
+            .collect();
+        candidates.sort_unstable();
+        let nearest = candidates
+            .into_iter()
             .filter_map(|index| {
                 bodies.shells[index]
                     .ring_centroid()
@@ -1908,5 +1948,126 @@ mod tests {
             closed.note.as_deref(),
             Some("closed shell: no ring seam to measure")
         );
+    }
+
+    /// A regular ring of `sides` vertices in the z plane.
+    fn ring_of(radius: f32, z: f32, sides: usize) -> Vec<[f32; 3]> {
+        (0..sides)
+            .map(|k| {
+                let angle = k as f32 * std::f32::consts::TAU / sides as f32;
+                [radius * angle.cos(), radius * angle.sin(), z]
+            })
+            .collect()
+    }
+
+    /// A 96-vertex socket ring whose coincident run is unevenly spaced: every
+    /// one of the leg's eight top vertices ties the socket anchor at distance
+    /// zero, so only the id tie-break decides which arc the row measures.
+    fn tied_socket_rings() -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<usize>) {
+        const RUN: [usize; 8] = [10, 11, 12, 20, 21, 45, 70, 71];
+        let socket = ring_of(40.0, 0.0, 96);
+        let part: Vec<[f32; 3]> = RUN.iter().map(|&index| socket[index]).collect();
+        let ids: Vec<usize> = (0..socket.len()).collect();
+        (part, socket, ids)
+    }
+
+    #[test]
+    fn socket_arc_does_not_follow_ring_order() {
+        let (part, socket, ids) = tied_socket_rings();
+        let measure = |ring: &[[f32; 3]], ring_ids: &[usize]| {
+            let tree = PointIndex::build(ring);
+            measure_coverage(part.as_slice(), ring, ring_ids, Some(&tree))
+        };
+        let reference = measure(socket.as_slice(), ids.as_slice());
+        // The ids travel with their positions: a ring collected in another
+        // order names the same anchor vertex, so the arc and its coverage are a
+        // property of the geometry, not of the walk that collected the ring.
+        let mut reversed = socket.clone();
+        reversed.reverse();
+        let mut reversed_ids = ids.clone();
+        reversed_ids.reverse();
+        assert_eq!(
+            measure(reversed.as_slice(), reversed_ids.as_slice()),
+            reference
+        );
+        let rotated: Vec<[f32; 3]> = socket
+            .iter()
+            .copied()
+            .cycle()
+            .skip(37)
+            .take(socket.len())
+            .collect();
+        let rotated_ids: Vec<usize> = ids
+            .iter()
+            .copied()
+            .cycle()
+            .skip(37)
+            .take(ids.len())
+            .collect();
+        assert_eq!(
+            measure(rotated.as_slice(), rotated_ids.as_slice()),
+            reference
+        );
+        assert_eq!(reference.0, 5, "five socket vertices inside the radius");
+        assert!(reference.1 > 0.0, "the arc clears the part ring");
+    }
+
+    #[test]
+    fn repeated_audits_of_tied_sockets_report_identical_rows() {
+        // Torso: a 96-vertex ring pair tall enough to own the up axis. Leg: its
+        // top ring is eight of the torso's bottom vertices at uneven spacing,
+        // so the coincident anchor is a tie of eight.
+        let torso_bottom = ring_of(40.0, 0.0, 96);
+        let torso_top = ring_of(30.0, 100.0, 96);
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        positions.extend(torso_bottom.iter().copied());
+        positions.extend(torso_top.iter().copied());
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        for k in 0..96u32 {
+            let next = (k + 1) % 96;
+            let (b0, b1, t0, t1) = (k, next, 96 + k, 96 + next);
+            triangles.push([b0, b1, t1]);
+            triangles.push([b0, t1, t0]);
+        }
+        let base = positions.len() as u32;
+        positions.extend(
+            [0, 1, 2, 20, 21, 45, 70, 71]
+                .iter()
+                .map(|&i| torso_bottom[i]),
+        );
+        positions.extend(ring_of(3.0, -40.0, 8));
+        for k in 0..8u32 {
+            let next = (k + 1) % 8;
+            triangles.push([base + k, base + next, base + 8 + next]);
+            triangles.push([base + k, base + 8 + next, base + 8 + k]);
+        }
+
+        let rows = |report: &PartAudit| -> Vec<(String, String, usize, usize, u64, u64, String)> {
+            report
+                .parts
+                .iter()
+                .flat_map(|part| {
+                    part.seams.iter().map(move |seam| {
+                        (
+                            part.name.clone(),
+                            seam.socket.clone(),
+                            seam.ring,
+                            seam.socket_ring,
+                            seam.coverage.to_bits(),
+                            seam.slot_min.to_bits(),
+                            part.verdict.to_string(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        let first = audit(&positions, &triangles, &[]).unwrap();
+        let second = audit(&positions, &triangles, &[]).unwrap();
+        assert_eq!(first.verdict(), "accept", "{:?}", first.refusals);
+        assert_eq!(rows(&first), rows(&second));
+        let leg = first.parts.first().expect("leg row first");
+        assert_eq!(leg.class, PartClass::Leg);
+        assert_eq!(leg.seams[0].socket, "torso");
+        assert_eq!(leg.seams[0].coincident, 8);
     }
 }

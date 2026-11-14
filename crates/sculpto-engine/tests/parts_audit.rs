@@ -201,6 +201,27 @@ fn a_refused_audit_keeps_every_refusal_in_the_message() {
 }
 
 #[test]
+fn repeated_audits_in_one_process_report_identical_rows() {
+    // The socket arc and its coverage are picked from an equal-minimum set of
+    // coincident vertices; two audits in one process must not differ, which the
+    // hash-map boundary order used to decide.
+    let path = write_body("repeat", 0.0, 0.0);
+    let input = json!({
+        "body": path.display().to_string(),
+        "strict": false,
+    });
+    let first = dispatch("body.audit_parts", &input).expect("first audit");
+    let second = dispatch("body.audit_parts", &input).expect("second audit");
+    assert_eq!(first["verdict"], "accept");
+    assert_eq!(first, second, "rows are equal across two runs");
+    assert_eq!(
+        first.to_string(),
+        second.to_string(),
+        "rows are byte-identical across two runs"
+    );
+}
+
+#[test]
 fn strict_false_returns_the_full_report_with_the_refusals() {
     let path = write_body("report", -0.5, 0.0);
     let out = dispatch(
