@@ -16,6 +16,7 @@
 //! Everything here is a pure parse or transformation step: no UI, no file
 //! writes, no hidden global state, so results are reproducible and testable.
 
+pub mod appearance;
 pub mod document;
 pub mod error;
 pub mod mesh;
@@ -28,6 +29,10 @@ pub mod shape_data;
 pub mod skin;
 mod xml_util;
 
+pub use appearance::{
+    AppearanceCatalogue, AppearanceError, FaceApplication, FaceRace, HairstyleEntry, HeadEntry,
+    HeadRig, SUPPORTED_BODY_FAMILIES, load_appearance_catalogue,
+};
 pub use document::Document;
 pub use error::{Error, ErrorKind, Result};
 pub use preset::{Preset, PresetValue, SliderSize};

@@ -7,5 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+boethos = { path = "../boethos" }
+boethos-catalogue = { path = "../boethos-catalogue" }
 glam.workspace = true
 roxmltree.workspace = true

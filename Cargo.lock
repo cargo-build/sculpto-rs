@@ -608,6 +608,8 @@ dependencies = [
 name = "sculpto-core"
 version = "0.1.0"
 dependencies = [
+ "boethos",
+ "boethos-catalogue",
  "glam 0.34.3",
  "roxmltree",
 ]
