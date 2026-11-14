@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakeError;
+use sculpto_core::bsa::BsaError;
 use sculpto_core::mesh::{BundleError, MeshError};
 use sculpto_core::role::RoleError;
 use sculpto_core::{Error as DocumentError, ErrorKind as DocumentKind};
@@ -103,6 +104,22 @@ pub fn outfit(error: OutfitError) -> CommandError {
         OutfitError::AmbiguousShape(_) => (ErrorKind::Refused, "outfit_shape_ambiguous"),
         OutfitError::DuplicateShape(_) => (ErrorKind::InvalidParams, "outfit_shape_duplicate"),
         OutfitError::InvalidCloth { .. } => (ErrorKind::Refused, "outfit_cloth_invalid"),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A BSA could not be indexed or one of its members could not be extracted.
+pub fn bsa(error: BsaError) -> CommandError {
+    let (kind, code) = match &error {
+        BsaError::Io { .. } => (ErrorKind::Io, "bsa_io"),
+        BsaError::Magic { .. } => (ErrorKind::InvalidRequest, "bsa_magic"),
+        BsaError::Version { .. } => (ErrorKind::Unsupported, "bsa_version"),
+        BsaError::Flags { .. } => (ErrorKind::InvalidRequest, "bsa_flags"),
+        BsaError::Truncated { .. } => (ErrorKind::Refused, "bsa_truncated"),
+        BsaError::CountMismatch { .. } => (ErrorKind::Refused, "bsa_count_mismatch"),
+        BsaError::NameTable => (ErrorKind::InvalidRequest, "bsa_name_table"),
+        BsaError::MemberNotFound(_) => (ErrorKind::NotFound, "bsa_member_missing"),
+        BsaError::Decompress { .. } => (ErrorKind::Refused, "bsa_decompress"),
     };
     CommandError::new(kind, code, error.to_string())
 }
@@ -494,6 +511,39 @@ mod tests {
             codes.len(),
             "IntakeError variants must stay distinct"
         );
+    }
+
+    #[test]
+    fn every_bsa_variant_has_its_own_code() {
+        let cases = [
+            BsaError::Io {
+                path: "p".into(),
+                message: "m".into(),
+            },
+            BsaError::Magic { found: 1 },
+            BsaError::Version { found: 0x67 },
+            BsaError::Flags { found: 0 },
+            BsaError::Truncated { what: "header" },
+            BsaError::CountMismatch {
+                declared: 2,
+                folders: 1,
+            },
+            BsaError::NameTable,
+            BsaError::MemberNotFound("x".into()),
+            BsaError::Decompress {
+                member: "m".into(),
+                message: "short".into(),
+            },
+        ];
+        let mut codes = Vec::new();
+        for error in cases {
+            let mapped = bsa(error);
+            assert!(!mapped.code().is_empty());
+            codes.push(mapped.code());
+        }
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), 9, "bsa variants must map to distinct codes");
     }
 
     #[test]

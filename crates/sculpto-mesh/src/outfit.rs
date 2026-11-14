@@ -6,6 +6,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use sculpto_core::bsa::{BsaIndex, TextureSource, resolve_texture};
+use sculpto_core::mesh::MaterialSlot;
+
 pub mod rigging;
 
 /// The source asset and its authored part identities.
@@ -327,6 +330,92 @@ pub fn completeness_defects(
                 shape: slot.name.clone(),
                 defect: CompletenessDefect::MissingMaterial,
             })
+        })
+        .collect()
+}
+
+/// One authored texture reference and its resolution outcome.
+///
+/// The JSON form carries the slot index and authored path, plus the loose
+/// file or archive member that answered it; `source: null` marks an
+/// unresolved reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureRef {
+    /// Position in the authored texture-set table.
+    pub slot: usize,
+    /// Authored path, backslashes kept.
+    pub path: String,
+    /// Loose file or archive member that resolved it; `None` when unresolved.
+    pub source: Option<TextureSource>,
+}
+
+impl Serialize for TextureRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("TextureRef", 3)?;
+        state.serialize_field("slot", &self.slot)?;
+        state.serialize_field("path", &self.path)?;
+        match &self.source {
+            None => state.serialize_field("source", &Option::<()>::None)?,
+            Some(TextureSource::Loose(path)) => state.serialize_field(
+                "source",
+                &LooseRef {
+                    source: "loose",
+                    path,
+                },
+            )?,
+            Some(TextureSource::Archive { bsa, member }) => state.serialize_field(
+                "source",
+                &ArchiveRef {
+                    source: "archive",
+                    bsa,
+                    member,
+                },
+            )?,
+        }
+        state.end()
+    }
+}
+
+#[derive(Serialize)]
+struct LooseRef<'a> {
+    source: &'a str,
+    path: &'a PathBuf,
+}
+
+#[derive(Serialize)]
+struct ArchiveRef<'a> {
+    source: &'a str,
+    bsa: &'a PathBuf,
+    member: &'a str,
+}
+
+/// Resolve every authored texture reference of every shape, in source shape
+/// order (parallel to [`census`] output).
+///
+/// A material reports its authored slot-table references: non-empty entries
+/// of `texture_set`, keeping their positions. A material authored through
+/// role fields alone has no slot table to report — the NIF round trip always
+/// materializes one, so sources read from a NIF report fully. Empty slots are
+/// positions, not references, and stay unreported.
+pub fn texture_report(
+    materials: &[&[MaterialSlot]],
+    roots: &[PathBuf],
+    indexes: &[BsaIndex],
+) -> Vec<Vec<TextureRef>> {
+    materials
+        .iter()
+        .map(|slots| {
+            slots
+                .iter()
+                .flat_map(|material| material.texture_set.iter().enumerate())
+                .filter(|(_, path)| !path.is_empty())
+                .map(|(slot, path)| TextureRef {
+                    slot,
+                    path: path.clone(),
+                    source: resolve_texture(path, roots, indexes),
+                })
+                .collect()
         })
         .collect()
 }

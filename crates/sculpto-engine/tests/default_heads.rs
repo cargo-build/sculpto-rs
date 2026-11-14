@@ -237,6 +237,7 @@ fn missing_configured_head_is_a_named_refusal() {
         family: "test".into(),
         body: PathBuf::from("/nonexistent/shp02/body.obj"),
         head: PathBuf::from("/nonexistent/shp02/head.obj"),
+        skin: None,
     };
     let error = resolve_default_head(&descriptor).expect_err("missing head must refuse");
     assert_eq!(error.kind(), ErrorKind::NotFound);

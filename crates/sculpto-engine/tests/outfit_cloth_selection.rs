@@ -274,3 +274,146 @@ fn real_outfit_census() {
         }
     }
 }
+
+/// A fixture whose shape carries a material with an authored texture-set
+/// table, written through the real NIF writer and read back through the real
+/// reader.
+fn texture_table(label: &str, table: &[&str]) -> Fixture {
+    let directory = std::env::temp_dir().join(format!(
+        "sculpto-outfit-textures-{label}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).expect("test directory");
+    let nif = directory.join("outfit.nif");
+    let shape = MeshAsset {
+        name: "robe".into(),
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.5, 0.5, 1.0],
+        ],
+        triangles: vec![[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
+        triangle_partitions: vec![PartitionId(0); 4],
+        materials: vec![MaterialSlot {
+            name: "robe".into(),
+            texture_set: table.iter().map(|path| path.to_string()).collect(),
+            ..MaterialSlot::default()
+        }],
+        ..MeshAsset::default()
+    };
+    std::fs::write(&nif, write_se_shape(&shape).expect("fixture writes")).expect("fixture");
+    Fixture { directory, nif }
+}
+
+#[test]
+fn authored_textures_resolve_loose_and_report_the_missing() {
+    let fixture = texture_table(
+        "mixed",
+        &[
+            "textures\\divineelegance\\robe_d.dds",
+            "textures\\missing.dds",
+        ],
+    );
+    let root = fixture.directory.clone();
+    let loose = root.join("textures/divineelegance/robe_d.dds");
+    std::fs::create_dir_all(loose.parent().expect("parent")).expect("loose dir");
+    std::fs::write(&loose, b"DDS").expect("loose file");
+
+    let request = json!({
+        "nif": fixture.nif,
+        "texture_roots": [root],
+    });
+    let result = dispatch("outfit.inspect", &request).expect("texture resolution runs");
+    assert_eq!(result["textures"]["resolved"], 1);
+    assert_eq!(
+        result["textures"]["unresolved"],
+        json!(["textures\\missing.dds"])
+    );
+    let row = &result["textures"]["shapes"][0];
+    assert_eq!(row[0]["slot"], 0);
+    assert_eq!(row[0]["path"], "textures\\divineelegance\\robe_d.dds");
+    assert_eq!(row[0]["source"]["source"], "loose");
+    assert!(
+        row[0]["source"]["path"]
+            .as_str()
+            .expect("loose path")
+            .replace('\\', "/")
+            .contains("textures/divineelegance/robe_d.dds")
+    );
+    assert_eq!(row[1]["slot"], 1);
+    assert_eq!(row[1]["source"], serde_json::Value::Null);
+}
+
+#[test]
+fn without_roots_or_archives_no_reference_invents_resolution() {
+    let fixture = texture_table("orphan", &["textures\\divineelegance\\robe_d.dds"]);
+    let result = dispatch("outfit.inspect", &request(&fixture.nif, None))
+        .expect("the report runs without sources");
+    assert_eq!(result["textures"]["resolved"], 0);
+    assert_eq!(
+        result["textures"]["unresolved"],
+        json!(["textures\\divineelegance\\robe_d.dds"])
+    );
+}
+
+#[test]
+fn an_archive_that_does_not_index_is_a_named_refusal() {
+    let fixture = texture_table("bad-bsa", &[]);
+    // Header-sized non-BSA bytes: a shorter file would refuse as truncated
+    // before the magic is even read.
+    let mut fake = b"BTDX".to_vec();
+    fake.resize(64, 0);
+    std::fs::write(fixture.directory.join("not.bsa"), fake).expect("fake archive");
+    let request = json!({
+        "nif": fixture.nif,
+        "archives": [fixture.directory.join("not.bsa")],
+    });
+    let error = dispatch("outfit.inspect", &request).expect_err("a non-BSA archive refuses");
+    assert_eq!(error.code(), "bsa_magic");
+}
+
+/// Real gate (tier 2): the Nightshade female outfit resolves every authored
+/// texture from the configured Apachii textures BSA.
+#[test]
+fn real_outfit_textures_resolve_from_the_configured_archive() {
+    let (Some(root), Some(archive)) = (
+        std::env::var_os("SCULPTO_MOD_FIXTURE"),
+        std::env::var_os("SCULPTO_MOD_BSA"),
+    ) else {
+        eprintln!(
+            "SCULPTO_MOD_FIXTURE or SCULPTO_MOD_BSA not set; skipping real texture resolution"
+        );
+        return;
+    };
+    let nif = PathBuf::from(root)
+        .join("apachii-divine-elegance/unpacked-bsa/meshes/divineelegance/female/robes/nightshade/robef_1.nif");
+    let archive = PathBuf::from(archive).display().to_string();
+    let request = json!({ "nif": nif, "archives": [archive] });
+    let result = dispatch("outfit.inspect", &request).expect("real textures resolve");
+    assert_eq!(
+        result["textures"]["unresolved"],
+        json!([]),
+        "every Nightshade texture resolves from the archive"
+    );
+    for row in result["textures"]["shapes"].as_array().expect("shape rows") {
+        for reference in row.as_array().expect("texture rows") {
+            eprintln!(
+                "slot {} `{}` -> {}",
+                reference["slot"],
+                reference["path"].as_str().unwrap(),
+                serde_json::to_string(&reference["source"]).unwrap_or_else(|_| "?".into())
+            );
+        }
+    }
+    let resolved = result["textures"]["resolved"].as_u64().expect("counted");
+    // Four shapes: pants, belt and sleeves carry the vampire pair, the robe
+    // the robe pair — eight references, four unique paths (pinned by the
+    // first configured run, MOD-03 D-5).
+    assert_eq!(
+        resolved, 8,
+        "every Nightshade reference resolves from the archive"
+    );
+    eprintln!("resolved references: {resolved}");
+}

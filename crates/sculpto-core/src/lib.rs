@@ -12,11 +12,13 @@
 //! - [`project`] models `.osp` `SliderSetInfo` projects (buildable slider sets).
 //! - [`shape_data`] decodes `.osd`/`.bsd` morph containers into sparse offsets.
 //! - [`report`] records children the readers do not model, instead of failing.
+//! - [`bsa`] indexes Skyrim SSE BSA archives and resolves texture paths.
 //!
 //! Everything here is a pure parse or transformation step: no UI, no file
 //! writes, no hidden global state, so results are reproducible and testable.
 
 pub mod appearance;
+pub mod bsa;
 pub mod document;
 pub mod error;
 pub mod mesh;

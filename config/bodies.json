@@ -1,10 +1,16 @@
 {
   "bodies": [
     {
-      "name": "Female 3BBB",
-      "family": "3bbb",
-      "body": "${SCULPTO_KITS_HOME}/objs/f01-ballgown/body.obj",
-      "head": "${SCULPTO_HEAD_HOME}/LydiaHeadHP-source.obj"
+      "name": "Female Bijin",
+      "family": "cbbe",
+      "body": "${SCULPTO_RIG_TEMPLATE_FIXTURES}/bijin.nif",
+      "head": "${SCULPTO_HEAD_HOME}/LydiaHeadHP-source.obj",
+      "skin": {
+        "root": "${SCULPTO_MOD_FIXTURE}/bijin-skin-cbbe",
+        "diffuse": "1 - Diffuse Body Options/2K - Shaved/textures/actors/character/female/femalebody_1.dds",
+        "normal": "2 - Normal Options/Default/textures/actors/character/female/femalebody_1_msn.dds",
+        "specular": "3 - Specular Options/Default 2K/textures/actors/character/female/femalebody_1_s.dds"
+      }
     },
     {
       "name": "Male HIMBO",

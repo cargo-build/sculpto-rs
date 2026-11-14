@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use sculpto_core::mesh::{MeshAsset, validate_bundle};
+use sculpto_core::mesh::{MaterialSlot, MeshAsset, ShaderKind, TextureSlot, validate_bundle};
 use sculpto_core::role::{ShapeRole, validate_required_roles};
 
 use crate::obj::{ObjError, pick_shape, read_obj_asset};
@@ -29,12 +29,75 @@ use crate::{CommandError, ErrorKind, errors};
 pub struct BodyDescriptor {
     /// Display name, unique within the config.
     pub name: String,
-    /// Body family label (for example `3bbb`, `himbo`).
+    /// Body family label (for example `cbbe`, `himbo`).
     pub family: String,
     /// Body mesh source (`.obj` or `.nif`).
     pub body: PathBuf,
     /// Default head source (`.obj` or `.nif`) for this body's head slot.
     pub head: PathBuf,
+    /// Supplied skin this default wears; absent for bodies without one.
+    pub skin: Option<SkinTextureSet>,
+}
+
+/// The supplied skin maps one configured default body wears.
+///
+/// The three maps are FOMOD-tree paths relative to `root`; each must sit
+/// under a `textures/` data root, from which the authored (game-relative,
+/// backslash) path is derived, so the exported NIF references game paths
+/// while the loose fixture file stays verifiable. @req DECL0008
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkinTextureSet {
+    /// Loose fixture root the relative paths resolve against.
+    pub root: PathBuf,
+    /// Diffuse map, relative to `root`.
+    pub diffuse: String,
+    /// Normal map, relative to `root`.
+    pub normal: String,
+    /// Specular map, relative to `root`.
+    pub specular: String,
+}
+
+impl SkinTextureSet {
+    /// The loose file one slot resolves to.
+    pub fn host_path(&self, slot: TextureSlot) -> PathBuf {
+        self.root.join(self.relative(slot))
+    }
+
+    /// The authored, game-relative texture path one slot writes.
+    ///
+    /// Everything from the `textures/` data root onward, separators as the
+    /// game authors them.
+    pub fn authored_path(&self, slot: TextureSlot) -> String {
+        data_relative(self.relative(slot))
+    }
+
+    fn relative(&self, slot: TextureSlot) -> &str {
+        match slot {
+            TextureSlot::Diffuse => &self.diffuse,
+            TextureSlot::Normal => &self.normal,
+            TextureSlot::Specular => &self.specular,
+            _ => "",
+        }
+    }
+}
+
+/// The data-relative part of a FOMOD path: from the `textures/` root onward,
+/// with game separators. Empty when the path has no data root.
+fn data_relative(relative: &str) -> String {
+    let normalized = relative.replace('\\', "/");
+    let lowered = normalized.to_ascii_lowercase();
+    let Some(at) = lowered.rfind("textures/") else {
+        return String::new();
+    };
+    normalized[at..].replace('/', "\\")
+}
+
+/// Whether one skin path sits under a `textures/` data root.
+fn under_data_root(relative: &str) -> bool {
+    relative
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("textures/")
 }
 
 /// The configured default bodies, each with its head slot.
@@ -55,6 +118,16 @@ struct RawBody {
     family: String,
     body: String,
     head: String,
+    #[serde(default)]
+    skin: Option<RawSkin>,
+}
+
+#[derive(Deserialize)]
+struct RawSkin {
+    root: String,
+    diffuse: String,
+    normal: String,
+    specular: String,
 }
 
 /// Load and validate the body/head config, expanding `~` and `${VAR}` paths.
@@ -102,14 +175,59 @@ pub fn load_bodies_config(path: &Path) -> Result<BodiesConfig, CommandError> {
         let head = expand_path(&raw_body.head).map_err(|missing| {
             config_unresolved(&raw_body.name, "head", &raw_body.head, &missing)
         })?;
+        let skin = raw_body
+            .skin
+            .map(|raw| parse_skin(&raw_body.name, raw))
+            .transpose()?;
         bodies.push(BodyDescriptor {
             name: raw_body.name,
             family: raw_body.family,
             body,
             head,
+            skin,
         });
     }
     Ok(BodiesConfig { bodies })
+}
+
+/// Validate one skin entry: expand its root, refuse empty fields and paths
+/// outside a `textures/` data root.
+fn parse_skin(body: &str, raw: RawSkin) -> Result<SkinTextureSet, CommandError> {
+    let root = expand_path(&raw.root)
+        .map_err(|missing| config_unresolved(body, "skin.root", &raw.root, &missing))?;
+    for (field, value) in [
+        ("skin.root", raw.root.as_str()),
+        ("skin.diffuse", raw.diffuse.as_str()),
+        ("skin.normal", raw.normal.as_str()),
+        ("skin.specular", raw.specular.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(errors::invalid(
+                field,
+                format!("body `{body}` needs a nonempty skin {field}"),
+            ));
+        }
+    }
+    for (field, value) in [
+        ("skin.diffuse", &raw.diffuse),
+        ("skin.normal", &raw.normal),
+        ("skin.specular", &raw.specular),
+    ] {
+        if !under_data_root(value) {
+            return Err(errors::invalid(
+                field,
+                format!(
+                    "body `{body}` skin path `{value}` does not sit under a `textures/` data root"
+                ),
+            ));
+        }
+    }
+    Ok(SkinTextureSet {
+        root,
+        diffuse: raw.diffuse,
+        normal: raw.normal,
+        specular: raw.specular,
+    })
 }
 
 fn config_unresolved(body: &str, field: &str, raw: &str, var: &str) -> CommandError {
@@ -201,6 +319,72 @@ pub fn resolve_default_head(descriptor: &BodyDescriptor) -> Result<MeshAsset, Co
         ));
     }
     load_shape(&descriptor.head)
+}
+
+/// Apply a configured skin to one body's material, and to nothing else.
+///
+/// Material-only: positions, UVs, skin weights, partitions and the hidden
+/// flag are never touched (the acceptance pins a geometry/rig fingerprint
+/// before and after). A body that carries no material gains one named after
+/// its shape with the skin-shader family; a body that carries one has its
+/// authored texture-set slots 0 (diffuse) and 1 (normal) overridden in place
+/// and its specular written to slot 7 when the table is long enough — the
+/// writer's alternate-specular position. The role fields mirror the same
+/// three maps so the neutral view stays consistent.
+///
+/// # Errors
+/// [`skin_missing`](CommandError) names the first absent map file; a missing
+/// skin asset is never a silent untextured fallback.
+pub fn apply_default_skin(body: &mut MeshAsset, skin: &SkinTextureSet) -> Result<(), CommandError> {
+    for slot in [
+        TextureSlot::Diffuse,
+        TextureSlot::Normal,
+        TextureSlot::Specular,
+    ] {
+        let path = skin.host_path(slot);
+        if !path.is_file() {
+            return Err(CommandError::new(
+                ErrorKind::NotFound,
+                "skin_missing",
+                format!(
+                    "configured default skin for body `{}` is missing its {} map: {}",
+                    body.name,
+                    slot.as_str(),
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let diffuse = skin.authored_path(TextureSlot::Diffuse);
+    let normal = skin.authored_path(TextureSlot::Normal);
+    let specular = skin.authored_path(TextureSlot::Specular);
+    if body.materials.is_empty() {
+        body.materials.push(MaterialSlot {
+            name: body.name.clone(),
+            shader: ShaderKind::Skin,
+            diffuse: Some(diffuse),
+            normal: Some(normal),
+            specular: Some(specular),
+            ..MaterialSlot::default()
+        });
+        return Ok(());
+    }
+    let material = &mut body.materials[0];
+    if !material.texture_set.is_empty() {
+        if let Some(slot0) = material.texture_set.get_mut(0) {
+            *slot0 = diffuse.clone();
+        }
+        if let Some(slot1) = material.texture_set.get_mut(1) {
+            *slot1 = normal.clone();
+        }
+        if material.texture_set.len() > 7 {
+            material.texture_set[7] = specular.clone();
+        }
+    }
+    material.diffuse = Some(diffuse);
+    material.normal = Some(normal);
+    material.specular = Some(specular);
+    Ok(())
 }
 
 /// Outcome of one compatibility check.

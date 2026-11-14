@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakePlan;
@@ -25,7 +25,8 @@ use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::{Conform, ConformError};
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_mesh::outfit::{
-    CheckShape, OutfitError, OutfitManifest, ShapeInfo, ShapeReport, census, completeness_defects,
+    CheckShape, OutfitError, OutfitManifest, ShapeInfo, ShapeReport, TextureRef, census,
+    completeness_defects, texture_report,
 };
 use sculpto_mesh::surface::SurfaceBinding;
 use sculpto_mesh::wrap::repair::final_push::FinalPushOptions;
@@ -48,8 +49,8 @@ mod slider;
 mod stack_fit;
 pub use head::{
     AssignedShape, BodiesConfig, BodyDescriptor, CheckStatus, CompatibilityCheck,
-    CompatibilityReport, RoleBundle, head_compatibility, load_bodies_config, load_shape,
-    resolve_default_head,
+    CompatibilityReport, RoleBundle, SkinTextureSet, apply_default_skin, head_compatibility,
+    load_bodies_config, load_shape, resolve_default_head,
 };
 pub use slider::{ConformOutcome, ConformParams, conform_sliders};
 pub use stack_fit::{ObstacleProvenance, StackFitOutcome, StackFitParams, StackFitStep, stack_fit};
@@ -61,6 +62,25 @@ pub struct OutfitInspectParams {
     pub nif: PathBuf,
     /// JSON manifest bound to this source.
     pub manifest: Option<PathBuf>,
+    /// Loose data roots searched before the archives, in order (loose first).
+    pub texture_roots: Vec<PathBuf>,
+    /// BSA archives indexed for texture resolution, in priority order.
+    pub archives: Vec<PathBuf>,
+}
+
+/// The texture resolution summary `outfit.inspect` reports.
+///
+/// `resolved` counts resolved non-empty slot references; `unresolved` lists
+/// the unique unresolved paths, sorted; `shapes` carries per-shape rows in
+/// source order (MOD-03 D-5).
+#[derive(Debug, Clone, Serialize)]
+pub struct TextureResolution {
+    /// Number of resolved slot references.
+    pub resolved: usize,
+    /// Unique unresolved authored paths, sorted.
+    pub unresolved: Vec<String>,
+    /// Per-shape texture rows, parallel to `OutfitInspectOutcome::shapes`.
+    pub shapes: Vec<Vec<TextureRef>>,
 }
 
 /// What the outfit contains and how each garment part should move.
@@ -70,13 +90,15 @@ pub struct OutfitInspectOutcome {
     pub outfit: Option<String>,
     /// Census and cloth selection in source order.
     pub shapes: Vec<ShapeReport>,
+    /// Texture resolution of every authored reference.
+    pub textures: TextureResolution,
 }
 
 /// Read an outfit without changing its geometry or rig.
 ///
 /// # Errors
-/// Refuses unreadable sources, invalid manifests and selections that cannot
-/// bind to the imported shapes.
+/// Refuses unreadable sources, invalid manifests, selections that cannot
+/// bind to the imported shapes, and archives that do not index.
 pub fn inspect_outfit(params: &OutfitInspectParams) -> Result<OutfitInspectOutcome, CommandError> {
     let source =
         std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
@@ -97,9 +119,38 @@ pub fn inspect_outfit(params: &OutfitInspectParams) -> Result<OutfitInspectOutco
         })
         .collect();
     let shapes = census(&shapes, manifest.as_ref()).map_err(errors::outfit)?;
+    let indexes = params
+        .archives
+        .iter()
+        .map(|archive| sculpto_core::bsa::index_bsa(archive).map_err(errors::bsa))
+        .collect::<Result<Vec<_>, _>>()?;
+    let materials: Vec<&[sculpto_core::mesh::MaterialSlot]> = document
+        .shapes
+        .iter()
+        .map(|shape| shape.materials.as_slice())
+        .collect();
+    let texture_rows = texture_report(&materials, &params.texture_roots, &indexes);
+    let mut unresolved: Vec<String> = texture_rows
+        .iter()
+        .flatten()
+        .filter(|reference| reference.source.is_none())
+        .map(|reference| reference.path.clone())
+        .collect();
+    unresolved.sort_unstable();
+    unresolved.dedup();
+    let resolved = texture_rows
+        .iter()
+        .flatten()
+        .filter(|reference| reference.source.is_some())
+        .count();
     Ok(OutfitInspectOutcome {
         outfit: manifest.map(|manifest| manifest.outfit),
         shapes,
+        textures: TextureResolution {
+            resolved,
+            unresolved,
+            shapes: texture_rows,
+        },
     })
 }
 

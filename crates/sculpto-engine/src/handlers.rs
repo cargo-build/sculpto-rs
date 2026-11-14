@@ -150,14 +150,23 @@ fn checked_optional_path(input: &Value, field: &str) -> Result<Option<PathBuf>, 
 
 pub fn outfit_inspect(input: &Value) -> Result<Value, CommandError> {
     let manifest = checked_optional_path(input, "manifest")?;
+    let texture_roots = string_list(input, "texture_roots")?
+        .map(|values| values.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default();
+    let archives = string_list(input, "archives")?
+        .map(|values| values.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default();
     let outcome = ops::inspect_outfit(&ops::OutfitInspectParams {
         nif: path(input, "nif")?,
         manifest,
+        texture_roots,
+        archives,
     })?;
     Ok(json!({
         "outfit": outcome.outfit,
         "shapes": outcome.shapes,
         "manifest_errors": [],
+        "textures": outcome.textures,
     }))
 }
 

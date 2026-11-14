@@ -324,7 +324,7 @@ const COMMANDS: &[Spec] = &[
     },
     Spec {
         id: CommandId::OutfitInspect,
-        summary: "List outfit shapes and identify Blender Cloth or ordinary rigged regions.",
+        summary: "List outfit shapes, cloth selection and texture resolution (loose roots, then BSA archives).",
         mutates: false,
         stub: false,
         schema: handlers::outfit_inspect_schema,
