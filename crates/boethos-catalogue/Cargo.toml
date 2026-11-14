@@ -5,9 +5,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["assets", "catalogue", "gamedev", "redb"]
+categories = ["game-development", "database"]
 
 [dependencies]
-boethos = { path = "../boethos" }
+boethos = { version = "0.1.0", path = "../boethos" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
