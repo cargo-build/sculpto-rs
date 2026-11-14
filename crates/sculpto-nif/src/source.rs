@@ -27,17 +27,24 @@ use std::ops::Range;
 
 use byroredux_nif::blocks::base::NiAVObjectData;
 use byroredux_nif::blocks::node::NiNode;
-use byroredux_nif::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet};
+use byroredux_nif::blocks::properties::NiAlphaProperty;
+use byroredux_nif::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet, ShaderTypeData};
 use byroredux_nif::blocks::skin::{
     BsDismemberSkinInstance, NiSkinData, NiSkinInstance, NiSkinPartition,
 };
 use byroredux_nif::blocks::tri_shape::{BsTriShape, NiTriShape, NiTriShapeData};
 use byroredux_nif::header::NifHeader;
-use byroredux_nif::import::ImportedMesh;
+use byroredux_nif::import::{
+    ImportedMesh, TextureRole, TextureSlotContext, TextureSlotLayout, canonical_shader_type,
+    slot_to_role,
+};
 use byroredux_nif::scene::NifScene;
+use byroredux_nif::shader_flags::{skyrim_slsf1, skyrim_slsf2};
 use byroredux_nif::stream::NifStream;
 use byroredux_nif::types::BlockRef;
-use sculpto_core::mesh::{MaterialSlot, PartitionId, PartitionSlot, ShaderKind};
+use sculpto_core::mesh::{
+    AlphaProperty, MaterialSlot, PartitionId, PartitionSlot, ShaderFlags, ShaderKind,
+};
 use sculpto_core::skin::{FourLane, SkinWeights};
 
 use crate::NifError;
@@ -62,8 +69,20 @@ const BSVER_FALLOUT4: u32 = 130;
 /// Bytes of one vertex's skin channel: four `f16` weights then four `u8` bones.
 const SKIN_CHANNEL_BYTES: usize = 12;
 
-/// `BSLightingShaderProperty` shader-flag word 2 bit 4: double-sided.
-const DOUBLE_SIDED: u32 = 0x0000_0010;
+/// `SkyrimShaderPropertyFlags1` bit 0: specular term enabled.
+///
+/// The vendored flag module declares only the SLSF1 bits its own importers read
+/// (`shader_flags.rs`); nif.xml's `SkyrimShaderPropertyFlags1` is the authority
+/// for this position, which `Fallout4ShaderPropertyFlags1` repeats.
+const SLSF1_SPECULAR: u32 = 0x0000_0001;
+/// `SkyrimShaderPropertyFlags1` bit 3: per-vertex alpha modulates the surface.
+const SLSF1_VERTEX_ALPHA: u32 = 0x0000_0008;
+/// `SkyrimShaderPropertyFlags1` bit 7: environment reflection map applies.
+const SLSF1_ENVIRONMENT_MAPPING: u32 = 0x0000_0080;
+/// `NiAlphaProperty.flags` bit 0: colour blending enabled.
+const ALPHA_BLEND: u16 = 0x0001;
+/// `NiAlphaProperty.flags` bit 9: alpha test enabled.
+const ALPHA_TEST: u16 = 0x0200;
 
 /// The source facts one imported mesh's block carries beyond the importer's
 /// projection.
@@ -150,6 +169,8 @@ struct SourceShape {
     skin_ref: BlockRef,
     /// The shape's shader property, when it names one.
     shader_ref: BlockRef,
+    /// The shape's alpha property, when it names one.
+    alpha_ref: BlockRef,
     /// Palette node names in skin-instance order.
     palette: Vec<String>,
     /// Vertex count the shape declares, when it declares one.
@@ -202,12 +223,13 @@ fn instance_of(scene: &NifScene, index: usize) -> Option<&NiSkinInstance> {
 fn source_shapes(scene: &NifScene) -> Vec<SourceShape> {
     let mut shapes = Vec::new();
     for block in 0..scene.blocks.len() {
-        let (name, skin_ref, shader_ref, vertices) =
+        let (name, skin_ref, shader_ref, alpha_ref, vertices) =
             if let Some(shape) = scene.get_as::<BsTriShape>(block) {
                 (
                     shape.av.net.name.as_deref().unwrap_or_default().to_string(),
                     shape.skin_ref,
                     shape.shader_property_ref,
+                    shape.alpha_property_ref,
                     match shape.num_vertices {
                         0 => None,
                         count => Some(count as usize),
@@ -223,6 +245,7 @@ fn source_shapes(scene: &NifScene) -> Vec<SourceShape> {
                     shape.av.net.name.as_deref().unwrap_or_default().to_string(),
                     shape.skin_instance_ref,
                     shape.shader_property_ref,
+                    shape.alpha_property_ref,
                     vertices,
                 )
             } else {
@@ -247,6 +270,7 @@ fn source_shapes(scene: &NifScene) -> Vec<SourceShape> {
             name,
             skin_ref,
             shader_ref,
+            alpha_ref,
             palette,
             vertices,
         });
@@ -500,9 +524,12 @@ fn partitions(
 /// Read the shape's shader block as one material slot.
 ///
 /// The authored `BSShaderTextureSet` slot list is carried verbatim, including
-/// the empty slots that hold their position; the model's role fields stay empty
-/// so the table is the single carrier. A shape whose shader block is absent, or
-/// not a `BSLightingShaderProperty`, carries no material.
+/// the empty slots that hold their position; the roles whose slot is
+/// polymorphic or flag-gated (glow, environment, environment mask, specular)
+/// are resolved through the vendored `slot_to_role` table so this adapter never
+/// keeps a second copy of it. The fixed-position roles stay in the table alone.
+/// A shape whose shader block is absent, or not a `BSLightingShaderProperty`,
+/// carries no material. @req DECL0008
 fn materials(scene: &NifScene, source: &SourceShape) -> Vec<MaterialSlot> {
     let Some(shader) = source
         .shader_ref
@@ -522,15 +549,122 @@ fn materials(scene: &NifScene, source: &SourceShape) -> Vec<MaterialSlot> {
         (true, Some(name)) if !name.is_empty() => name.to_string(),
         (true, _) => "material".to_string(),
     };
+    let flags = shader_flags(shader);
+    let layout = TextureSlotLayout::from_bsver(scene.bsver);
+    let context = TextureSlotContext {
+        layout,
+        shader_type: canonical_shader_type(layout, shader.shader_type),
+        glow_map: flags.glow_map,
+        model_space_normals: flags.model_space_normals,
+        soft_lighting: flags.soft_lighting,
+        rim_lighting: flags.rim_lighting,
+        back_lighting: flags.back_lighting,
+    };
+    let mut roles = RolePaths::default();
+    for (slot, path) in texture_set.iter().enumerate() {
+        if path.is_empty() {
+            continue;
+        }
+        // Roles the model does not name (the skin-tint mask, the detail/height
+        // and inner-layer channels, the lighting and back-light masks) stay in
+        // the table alone; first slot wins for a role that two slots can carry.
+        match slot_to_role(context, slot as u32) {
+            Some(TextureRole::Emissive) => set_once(&mut roles.glow, path),
+            Some(TextureRole::Environment) => set_once(&mut roles.environment, path),
+            Some(TextureRole::EnvironmentMask) => set_once(&mut roles.environment_mask, path),
+            Some(TextureRole::Specular | TextureRole::SmoothSpec) => {
+                set_once(&mut roles.specular, path);
+            }
+            Some(
+                TextureRole::BaseColor
+                | TextureRole::Normal
+                | TextureRole::Tint
+                | TextureRole::Detail
+                | TextureRole::Height
+                | TextureRole::GreyscaleLut
+                | TextureRole::InnerLayer
+                | TextureRole::LightingMask
+                | TextureRole::BackLighting
+                | TextureRole::Wrinkle,
+            )
+            | None => {}
+        }
+    }
     vec![MaterialSlot {
         name,
         shader: ShaderKind::Default,
         diffuse: None,
         normal: None,
-        specular: None,
-        double_sided: shader.shader_flags_2 & DOUBLE_SIDED != 0,
+        specular: roles.specular,
+        glow: roles.glow,
+        environment: roles.environment,
+        environment_mask: roles.environment_mask,
+        skin_tint: match &shader.shader_type_data {
+            ShaderTypeData::SkinTint {
+                skin_tint_color, ..
+            } => Some(*skin_tint_color),
+            _ => None,
+        },
+        specular_power: shader.specular_strength,
+        emissive_color: shader.emissive_color,
+        emissive_multiple: shader.emissive_multiple,
+        alpha: alpha_property(scene, source),
+        flags,
         texture_set,
     }]
+}
+
+/// The semantic texture paths one authored table resolves to.
+#[derive(Default)]
+struct RolePaths {
+    specular: Option<String>,
+    glow: Option<String>,
+    environment: Option<String>,
+    environment_mask: Option<String>,
+}
+
+/// Record one authored path for a role, first slot wins.
+fn set_once(target: &mut Option<String>, path: &str) {
+    if target.is_none() {
+        *target = Some(path.to_string());
+    }
+}
+
+/// One shape's authored `NiAlphaProperty`, when it names one.
+///
+/// Bit layout as the vendored importer decodes it
+/// (`import/material/mod.rs`: `blend` bit 0, source factor bits 1-4, destination
+/// factor bits 5-8, `test` bit 9, test function bits 10-12). @req DECL0008
+fn alpha_property(scene: &NifScene, source: &SourceShape) -> Option<AlphaProperty> {
+    let property = source
+        .alpha_ref
+        .index()
+        .and_then(|index| scene.get_as::<NiAlphaProperty>(index))?;
+    Some(AlphaProperty {
+        blend: property.flags & ALPHA_BLEND != 0,
+        test: property.flags & ALPHA_TEST != 0,
+        src_blend: ((property.flags >> 1) & 0xF) as u8,
+        dst_blend: ((property.flags >> 5) & 0xF) as u8,
+        threshold: f32::from(property.threshold) / 255.0,
+    })
+}
+
+/// The model's neutral view of one shader block's feature gates.
+fn shader_flags(shader: &BSLightingShaderProperty) -> ShaderFlags {
+    let one = shader.shader_flags_1;
+    let two = shader.shader_flags_2;
+    ShaderFlags {
+        specular: one & SLSF1_SPECULAR != 0,
+        environment_mapping: one & SLSF1_ENVIRONMENT_MAPPING != 0,
+        emissive: one & skyrim_slsf1::OWN_EMIT != 0,
+        model_space_normals: one & skyrim_slsf1::MODEL_SPACE_NORMALS != 0,
+        vertex_alpha: one & SLSF1_VERTEX_ALPHA != 0,
+        double_sided: two & skyrim_slsf2::DOUBLE_SIDED != 0,
+        glow_map: two & skyrim_slsf2::GLOW_MAP != 0,
+        soft_lighting: two & skyrim_slsf2::SOFT_LIGHTING != 0,
+        rim_lighting: two & skyrim_slsf2::RIM_LIGHTING != 0,
+        back_lighting: two & skyrim_slsf2::BACK_LIGHTING != 0,
+    }
 }
 
 /// LE: every sparse `NiSkinData` entry, all influences, source order.

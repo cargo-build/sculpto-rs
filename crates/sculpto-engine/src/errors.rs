@@ -152,9 +152,6 @@ pub fn nif_write(error: NifWriteError) -> CommandError {
             (ErrorKind::Refused, "nif_write_weight_unrepresentable")
         }
         NifWriteError::SingularBind { .. } => (ErrorKind::Refused, "nif_write_singular_bind"),
-        NifWriteError::TextureSlotUnsupported { .. } => {
-            (ErrorKind::Refused, "nif_write_texture_slot_unsupported")
-        }
         NifWriteError::MultipleMaterialSlots { .. } => {
             (ErrorKind::Refused, "nif_write_multiple_material_slots")
         }
@@ -410,7 +407,6 @@ mod tests {
             },
             NifWriteError::TooManyBones { bones: 1 },
             NifWriteError::SingularBind { bone: 0 },
-            NifWriteError::TextureSlotUnsupported { slot: "specular" },
             NifWriteError::MultipleMaterialSlots { count: 2 },
             NifWriteError::InlinePhysicsUnsupported,
         ];
@@ -424,7 +420,7 @@ mod tests {
         codes.dedup();
         assert_eq!(
             codes.len(),
-            19,
+            18,
             "NifWriteError variants must map to distinct codes"
         );
     }

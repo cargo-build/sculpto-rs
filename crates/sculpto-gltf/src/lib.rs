@@ -555,7 +555,7 @@ fn encode_glb(
             textures.push(json!({ "source": image_idx }));
             material.insert("normalTexture".into(), json!({ "index": texture_idx }));
         }
-        if slot.double_sided {
+        if slot.flags.double_sided {
             material.insert("doubleSided".into(), json!(true));
         }
         materials.push(Value::Object(material));

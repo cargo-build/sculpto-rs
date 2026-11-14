@@ -114,6 +114,12 @@ pub enum TextureSlot {
     Normal,
     /// Specular or roughness map.
     Specular,
+    /// Glow or emissive map.
+    Glow,
+    /// Environment reflection map.
+    Environment,
+    /// Environment reflection mask.
+    EnvironmentMask,
 }
 
 impl TextureSlot {
@@ -123,26 +129,85 @@ impl TextureSlot {
             TextureSlot::Diffuse => "diffuse",
             TextureSlot::Normal => "normal",
             TextureSlot::Specular => "specular",
+            TextureSlot::Glow => "glow",
+            TextureSlot::Environment => "environment",
+            TextureSlot::EnvironmentMask => "environment_mask",
         }
     }
 
     /// Position in an authored texture-set table
-    /// ([`MaterialSlot::texture_set`]), for the roles that table covers.
+    /// ([`MaterialSlot::texture_set`]), for the roles whose position is fixed.
     ///
-    /// The table's third slot is the source's tint/glow/soft-light channel, not
-    /// a specular map, so [`TextureSlot::Specular`] has no table position and
-    /// keeps reading its own field.
+    /// The table's third slot is polymorphic — the source's tint, glow or
+    /// soft/rim channel depending on flags — and slots 4, 5 and 7 are gated by
+    /// shader type and feature flags, so only the two unconditional roles have
+    /// a position. [`TextureSlot::Specular`] and the semantic roles keep
+    /// reading their own field, which the format adapter fills from the
+    /// source's own routing table. @req DECL0008
     fn authored_index(self) -> Option<usize> {
         match self {
             TextureSlot::Diffuse => Some(0),
             TextureSlot::Normal => Some(1),
-            TextureSlot::Specular => None,
+            TextureSlot::Specular
+            | TextureSlot::Glow
+            | TextureSlot::Environment
+            | TextureSlot::EnvironmentMask => None,
         }
     }
 }
 
+/// Skyrim lighting-shader feature gates carried by one material slot.
+///
+/// Neutral booleans, not format words: the NIF adapter maps the source's two
+/// flag words onto these gates and the writer projects them back. Keeping the
+/// gates named is what lets a consumer know that a shape's normals are already
+/// in model space (the source skips normal export for them) without holding a
+/// format-specific bit. @req DECL0008
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShaderFlags {
+    /// The specular term is enabled.
+    pub specular: bool,
+    /// An environment reflection map applies.
+    pub environment_mapping: bool,
+    /// The surface is self-illuminating (additive own-emit).
+    pub emissive: bool,
+    /// Authored normals are already in model space, not tangent space.
+    pub model_space_normals: bool,
+    /// Per-vertex alpha modulates the surface.
+    pub vertex_alpha: bool,
+    /// Both faces render.
+    pub double_sided: bool,
+    /// The glow channel is an emissive map rather than a lighting mask.
+    pub glow_map: bool,
+    /// A soft-light mask applies.
+    pub soft_lighting: bool,
+    /// A rim-light mask applies.
+    pub rim_lighting: bool,
+    /// A back-light transmission map applies.
+    pub back_lighting: bool,
+}
+
+/// One authored alpha property: blending, alpha test and their factors.
+///
+/// The source stores the test threshold as a byte; the model keeps the
+/// normalized value it means. `src_blend`, `dst_blend` and the test function are
+/// the source's own enum numbers, uninterpreted. @req DECL0008
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlphaProperty {
+    /// Colour blending is enabled.
+    pub blend: bool,
+    /// The alpha test is enabled.
+    pub test: bool,
+    /// Source blend factor, as the source's enum number.
+    pub src_blend: u8,
+    /// Destination blend factor, as the source's enum number.
+    pub dst_blend: u8,
+    /// Test threshold in `0.0..=1.0`.
+    pub threshold: f32,
+}
+
 /// One material slot. Format-specific fields stay in the adapters.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MaterialSlot {
     /// Slot name, as authored.
     pub name: String,
@@ -154,8 +219,24 @@ pub struct MaterialSlot {
     pub normal: Option<String>,
     /// Specular/roughness map path.
     pub specular: Option<String>,
-    /// Render both faces.
-    pub double_sided: bool,
+    /// Glow or emissive map path.
+    pub glow: Option<String>,
+    /// Environment reflection map path.
+    pub environment: Option<String>,
+    /// Environment reflection mask path.
+    pub environment_mask: Option<String>,
+    /// Skin- or hair-tint colour the surface modulates toward.
+    pub skin_tint: Option<[f32; 3]>,
+    /// Authored specular highlight power.
+    pub specular_power: f32,
+    /// Emissive colour the surface adds.
+    pub emissive_color: [f32; 3],
+    /// Emissive strength multiplier.
+    pub emissive_multiple: f32,
+    /// The authored alpha property, when the source names one.
+    pub alpha: Option<AlphaProperty>,
+    /// Shader feature gates.
+    pub flags: ShaderFlags,
     /// Authored texture-set slots in source order, when the source authors a
     /// fixed slot table (Skyrim `BSShaderTextureSet`).
     ///
@@ -172,7 +253,8 @@ impl MaterialSlot {
     ///
     /// A non-empty [`Self::texture_set`] is the authored value for the roles it
     /// covers, including an empty slot; the role fields below serve materials
-    /// authored without a slot table.
+    /// authored without a slot table and the roles whose slot is polymorphic or
+    /// flag-gated.
     pub fn texture(&self, slot: TextureSlot) -> Option<&str> {
         if !self.texture_set.is_empty()
             && let Some(index) = slot.authored_index()
@@ -187,6 +269,9 @@ impl MaterialSlot {
             TextureSlot::Diffuse => self.diffuse.as_deref(),
             TextureSlot::Normal => self.normal.as_deref(),
             TextureSlot::Specular => self.specular.as_deref(),
+            TextureSlot::Glow => self.glow.as_deref(),
+            TextureSlot::Environment => self.environment.as_deref(),
+            TextureSlot::EnvironmentMask => self.environment_mask.as_deref(),
         }
     }
 }
@@ -804,6 +889,9 @@ impl MeshAsset {
                 TextureSlot::Diffuse,
                 TextureSlot::Normal,
                 TextureSlot::Specular,
+                TextureSlot::Glow,
+                TextureSlot::Environment,
+                TextureSlot::EnvironmentMask,
             ] {
                 if material
                     .texture(texture)
@@ -1668,7 +1756,6 @@ mod tests {
                 diffuse: Some("body_d.dds".into()),
                 normal: Some("body_n.dds".into()),
                 specular: None,
-                double_sided: false,
                 ..MaterialSlot::default()
             },
             MaterialSlot {
@@ -1686,7 +1773,7 @@ mod tests {
         assert_eq!(body.texture(TextureSlot::Normal), Some("body_n.dds"));
         assert_eq!(body.texture(TextureSlot::Specular), None);
         assert_eq!(body.shader, ShaderKind::Skin);
-        assert!(!body.double_sided);
+        assert!(!body.flags.double_sided);
 
         let mut empty_name = one_triangle();
         empty_name.materials = vec![MaterialSlot::default()];
@@ -1739,6 +1826,17 @@ mod tests {
                 defect: MaterialDefect::EmptyTexturePath(TextureSlot::Diffuse)
             })
         );
+
+        // A semantic role with no fixed table position validates its own field.
+        empty_path.materials[0].diffuse = None;
+        empty_path.materials[0].glow = Some("   ".into());
+        assert_eq!(
+            empty_path.validate(),
+            Err(MeshError::Material {
+                slot: 0,
+                defect: MaterialDefect::EmptyTexturePath(TextureSlot::Glow)
+            })
+        );
     }
 
     #[test]
@@ -1763,6 +1861,8 @@ mod tests {
         assert_eq!(slot.texture(TextureSlot::Normal), Some("body_n.dds"));
         // Its third slot is the source's tint channel, not a specular map.
         assert_eq!(slot.texture(TextureSlot::Specular), None);
+        // A flag-gated role reads the adapter's own routing, not a position.
+        assert_eq!(slot.texture(TextureSlot::Environment), None);
         assert_eq!(slot.texture_set.len(), 5);
         assert_eq!(slot.texture_set[2], "body_sk.dds");
     }

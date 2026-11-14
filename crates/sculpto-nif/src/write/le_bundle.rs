@@ -98,12 +98,21 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
             }
             false => -1,
         };
+        let alpha = match shape.alpha_body().is_some() {
+            true => {
+                let index = next;
+                next += 1;
+                index
+            }
+            false => -1,
+        };
         layout.push(ShapeBlocks {
             geometry,
             data: geometry + 1,
             skin: skin_group,
             shader: shader_block,
             texture,
+            alpha,
         });
     }
     let root = next;
@@ -152,6 +161,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
                     data: index.data,
                     skin: skin_ref,
                     shader: index.shader,
+                    alpha: index.alpha,
                 },
                 NativeTransform::IDENTITY,
                 shape.hidden,
@@ -186,6 +196,12 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
                     body: prepared.texture.clone(),
                 });
             }
+        }
+        if index.alpha >= 0 {
+            blocks.push(Block {
+                type_name: shader::ALPHA_TYPE,
+                body: prepared.alpha_body().expect("the block was allocated"),
+            });
         }
     }
     blocks.push(Block {
@@ -226,4 +242,6 @@ struct ShapeBlocks {
     shader: i32,
     /// `BSShaderTextureSet`, or `-1`.
     texture: i32,
+    /// `NiAlphaProperty`, or `-1`.
+    alpha: i32,
 }

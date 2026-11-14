@@ -112,8 +112,6 @@ pub enum NifWriteError {
         /// Positive authored weight.
         weight: f32,
     },
-    /// A texture role has no confirmed slot in the target layout.
-    TextureSlotUnsupported { slot: &'static str },
     /// More than one material slot needs per-triangle material authoring.
     MultipleMaterialSlots { count: usize },
     /// An inline physics sidecar has no file the HDT link could name.
@@ -203,9 +201,6 @@ impl fmt::Display for NifWriteError {
             ),
             Self::SingularBind { bone } => {
                 write!(formatter, "bone {bone} has a singular bind matrix")
-            }
-            Self::TextureSlotUnsupported { slot } => {
-                write!(formatter, "texture role `{slot}` has no confirmed slot")
             }
             Self::MultipleMaterialSlots { count } => {
                 write!(

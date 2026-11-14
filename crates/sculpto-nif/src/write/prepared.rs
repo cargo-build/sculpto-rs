@@ -99,7 +99,7 @@ impl PreparedShape {
         };
         let material = shader::single_slot(asset)?.cloned();
         let texture = match &material {
-            Some(slot) => shader::texture_set(slot)?,
+            Some(slot) => shader::texture_set(slot),
             None => Vec::new(),
         };
         let physics = extra::physics_link(asset)?;
@@ -175,6 +175,13 @@ impl PreparedShape {
             Some(slot) => shader::shader(slot, texture_set),
             None => Vec::new(),
         }
+    }
+
+    /// `NiAlphaProperty` body, when the slot authors an alpha property.
+    pub(super) fn alpha_body(&self) -> Option<Vec<u8>> {
+        self.material
+            .as_ref()
+            .and_then(|slot| slot.alpha.as_ref().map(shader::alpha))
     }
 }
 

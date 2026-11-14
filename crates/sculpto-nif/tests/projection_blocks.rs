@@ -10,7 +10,9 @@ use byroredux_nif::blocks::skin::{BsDismemberSkinInstance, NiSkinInstance, NiSki
 use byroredux_nif::blocks::tri_shape::{BsTriShape, NiTriShape};
 use byroredux_nif::parse_nif;
 use byroredux_nif::scene::NifScene;
-use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, PartitionSlot, ShaderKind, Skin};
+use sculpto_core::mesh::{
+    MaterialSlot, MeshAsset, PartitionId, PartitionSlot, ShaderFlags, ShaderKind, Skin,
+};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::read;
 use sculpto_nif::write::header::NifTarget;
@@ -79,7 +81,10 @@ fn authored() -> MeshAsset {
         materials: vec![MaterialSlot {
             name: "robes".into(),
             shader: ShaderKind::Cloth,
-            double_sided: true,
+            flags: ShaderFlags {
+                double_sided: true,
+                ..ShaderFlags::default()
+            },
             texture_set: texture_set(),
             ..MaterialSlot::default()
         }],

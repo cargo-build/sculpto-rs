@@ -67,6 +67,11 @@ pub(super) fn write(
         true => take(&mut next_block),
         false => -1,
     };
+    let alpha = prepared.alpha_body();
+    let alpha_index = match alpha.is_some() {
+        true => take(&mut next_block),
+        false => -1,
+    };
     let extra_index = match prepared.physics.is_some() {
         true => next_block,
         false => -1,
@@ -89,6 +94,7 @@ pub(super) fn write(
                     data: 1,
                     skin: if skinned { 2 } else { -1 },
                     shader: shader_index,
+                    alpha: alpha_index,
                 },
                 checked.map_or(NativeTransform::IDENTITY, |scene| scene.placement),
                 asset.hidden,
@@ -137,6 +143,12 @@ pub(super) fn write(
             });
         }
     }
+    if let Some(body) = alpha {
+        blocks.push(Block {
+            type_name: shader::ALPHA_TYPE,
+            body,
+        });
+    }
     if let Some(link) = prepared.physics.as_ref() {
         blocks.push(Block {
             type_name: extra::BLOCK_TYPE,
@@ -170,6 +182,8 @@ pub(super) struct ShapeRefs {
     pub(super) skin: i32,
     /// Block index of `BSLightingShaderProperty`, or `-1`.
     pub(super) shader: i32,
+    /// Block index of `NiAlphaProperty`, or `-1`.
+    pub(super) alpha: i32,
 }
 
 /// Encode one `NiTriShape` block body.
@@ -194,7 +208,7 @@ pub(super) fn shape_body(refs: ShapeRefs, transform: NativeTransform, hidden: bo
     push_u32(&mut shape, 0); // active_material_index
     shape.push(0); // dirty flag
     push_i32(&mut shape, refs.shader);
-    push_i32(&mut shape, -1); // alpha
+    push_i32(&mut shape, refs.alpha);
     shape
 }
 
@@ -269,7 +283,9 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sculpto_core::mesh::{MaterialSlot, PartitionId, ShaderKind, Skin};
+    use sculpto_core::mesh::{
+        AlphaProperty, MaterialSlot, PartitionId, ShaderFlags, ShaderKind, Skin,
+    };
     use sculpto_core::skin::SkinWeights;
 
     fn triangle() -> MeshAsset {
@@ -349,7 +365,10 @@ mod tests {
             diffuse: Some("textures/robe_d.dds".into()),
             normal: None,
             specular: None,
-            double_sided: false,
+            flags: ShaderFlags {
+                double_sided: false,
+                ..ShaderFlags::default()
+            },
             ..MaterialSlot::default()
         }];
         let bytes = write_le_shape(&asset).expect("writes");
@@ -362,6 +381,45 @@ mod tests {
             .get_as::<byroredux_nif::blocks::shader::BSShaderTextureSet>(texture_index)
             .expect("texture set block");
         assert_eq!(textures.textures, vec!["textures/robe_d.dds"]);
+    }
+
+    #[test]
+    fn le_shader_block_carries_flags_tint_and_the_alpha_property() {
+        let mut asset = triangle();
+        asset.name = "Head".into();
+        asset.materials = vec![MaterialSlot {
+            name: "head".into(),
+            shader: ShaderKind::Skin,
+            diffuse: Some("textures/head_d.dds".into()),
+            skin_tint: Some([0.5, 0.25, 0.75]),
+            specular_power: 2.5,
+            emissive_multiple: 1.5,
+            alpha: Some(AlphaProperty {
+                blend: false,
+                test: true,
+                src_blend: 6,
+                dst_blend: 7,
+                threshold: 0.25,
+            }),
+            flags: ShaderFlags {
+                specular: true,
+                model_space_normals: true,
+                ..ShaderFlags::default()
+            },
+            ..MaterialSlot::default()
+        }];
+        let bytes = write_le_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("our LE NIF parses");
+        let slot = &document.shapes[0].materials[0];
+        assert_eq!(slot.skin_tint, Some([0.5, 0.25, 0.75]));
+        assert!((slot.specular_power - 2.5).abs() <= 1e-6);
+        assert!((slot.emissive_multiple - 1.5).abs() <= 1e-6);
+        assert!(slot.flags.specular);
+        assert!(slot.flags.model_space_normals);
+        let alpha = slot.alpha.expect("the shape carries an alpha property");
+        assert!(alpha.test);
+        assert!(!alpha.blend);
+        assert!((alpha.threshold - 64.0 / 255.0).abs() <= 1e-6);
     }
 
     #[test]

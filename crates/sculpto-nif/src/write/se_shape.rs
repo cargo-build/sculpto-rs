@@ -78,6 +78,11 @@ pub(super) fn write(
         true => take(&mut next_block),
         false => -1,
     };
+    let alpha = prepared.alpha_body();
+    let alpha_index = match alpha.is_some() {
+        true => take(&mut next_block),
+        false => -1,
+    };
     // Nothing follows the physics link, so its index is the last block.
     let extra_index = match prepared.physics.is_some() {
         true => next_block,
@@ -102,6 +107,7 @@ pub(super) fn write(
                 extra: shape_extra,
                 skin: if skinned { 1 } else { -1 },
                 shader: shader_index,
+                alpha: alpha_index,
             },
             transform,
         ),
@@ -144,6 +150,12 @@ pub(super) fn write(
             });
         }
     }
+    if let Some(body) = alpha {
+        blocks.push(Block {
+            type_name: shader::ALPHA_TYPE,
+            body,
+        });
+    }
     if let Some(link) = prepared.physics.as_ref() {
         blocks.push(Block {
             type_name: extra::BLOCK_TYPE,
@@ -175,6 +187,8 @@ pub(super) struct ShapeRefs {
     pub(super) skin: i32,
     /// Block index of `BSLightingShaderProperty`, or `-1`.
     pub(super) shader: i32,
+    /// Block index of `NiAlphaProperty`, or `-1`.
+    pub(super) alpha: i32,
 }
 
 /// Encode one `BSTriShape` block body.
@@ -207,7 +221,7 @@ pub(super) fn body(
     }
     push_i32(&mut body, refs.skin);
     push_i32(&mut body, refs.shader);
-    push_i32(&mut body, -1); // alpha
+    push_i32(&mut body, refs.alpha);
     push_u64(&mut body, prepared.descriptor());
     let data_size = asset.positions.len() as u64 * u64::from(prepared.packed_size())
         + asset.triangles.len() as u64 * 6;
@@ -253,7 +267,9 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sculpto_core::mesh::{MaterialSlot, PartitionId, ShaderKind, Skin};
+    use sculpto_core::mesh::{
+        AlphaProperty, MaterialSlot, PartitionId, ShaderFlags, ShaderKind, Skin,
+    };
     use sculpto_core::skin::SkinWeights;
 
     fn triangle() -> MeshAsset {
@@ -475,7 +491,10 @@ mod tests {
             diffuse: Some("textures/robe_d.dds".into()),
             normal: Some("textures/robe_n.dds".into()),
             specular: None,
-            double_sided: true,
+            flags: ShaderFlags {
+                double_sided: true,
+                ..ShaderFlags::default()
+            },
             ..MaterialSlot::default()
         }];
         asset
@@ -501,13 +520,55 @@ mod tests {
     }
 
     #[test]
-    fn specular_textures_are_refused_until_the_slot_is_measured() {
+    fn specular_and_semantic_roles_project_onto_the_source_slots() {
         let mut asset = textured();
+        asset.materials[0].glow = Some("textures/robe_g.dds".into());
+        asset.materials[0].environment = Some("textures/robe_e.dds".into());
         asset.materials[0].specular = Some("textures/robe_s.dds".into());
-        assert!(matches!(
-            write_se_shape(&asset),
-            Err(NifWriteError::TextureSlotUnsupported { slot: "specular" })
-        ));
+        let bytes = write_se_shape(&asset).expect("writes");
+        let scene = byroredux_nif::parse_nif(&bytes).expect("parses");
+        let shader = scene
+            .get_as::<byroredux_nif::blocks::shader::BSLightingShaderProperty>(1)
+            .expect("shader block");
+        let texture_index = shader.texture_set_ref.index().expect("texture set ref");
+        let textures = scene
+            .get_as::<byroredux_nif::blocks::shader::BSShaderTextureSet>(texture_index)
+            .expect("texture set block");
+        assert_eq!(
+            textures.textures,
+            vec![
+                "textures/robe_d.dds",
+                "textures/robe_n.dds",
+                "textures/robe_g.dds",
+                "",
+                "textures/robe_e.dds",
+                "",
+                "",
+                "textures/robe_s.dds",
+            ],
+            "roles land on their source slots with empty inner positions kept"
+        );
+    }
+
+    #[test]
+    fn the_alpha_property_roundtrips_through_the_shape_reference() {
+        let mut asset = textured();
+        asset.materials[0].alpha = Some(AlphaProperty {
+            blend: true,
+            test: false,
+            src_blend: 6,
+            dst_blend: 7,
+            threshold: 0.5,
+        });
+        let bytes = write_se_shape(&asset).expect("writes");
+        let document = crate::read(&bytes).expect("our SE NIF parses");
+        let alpha = document.shapes[0].materials[0]
+            .alpha
+            .expect("the shape carries an alpha property");
+        assert!(alpha.blend);
+        assert!(!alpha.test);
+        assert_eq!((alpha.src_blend, alpha.dst_blend), (6, 7));
+        assert!((alpha.threshold - 128.0 / 255.0).abs() <= 1e-6);
     }
 
     #[test]

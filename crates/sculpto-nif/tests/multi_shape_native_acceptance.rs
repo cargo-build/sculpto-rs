@@ -23,7 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderKind, Skin};
+use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderFlags, ShaderKind, Skin};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::le_bundle::write_le_bundle;
 use sculpto_nif::write::le_shape::write_le_shape;
@@ -141,7 +141,10 @@ fn bundle() -> Vec<MeshAsset> {
                 diffuse: Some("textures/actors/character/shp06_body_d.dds".into()),
                 normal: Some("textures/actors/character/shp06_body_n.dds".into()),
                 specular: None,
-                double_sided: true,
+                flags: ShaderFlags {
+                    double_sided: true,
+                    ..ShaderFlags::default()
+                },
                 ..MaterialSlot::default()
             }),
         ),
@@ -163,7 +166,10 @@ fn bundle() -> Vec<MeshAsset> {
                 diffuse: Some("textures/actors/character/shp06_hands_d.dds".into()),
                 normal: None,
                 specular: None,
-                double_sided: false,
+                flags: ShaderFlags {
+                    double_sided: false,
+                    ..ShaderFlags::default()
+                },
                 ..MaterialSlot::default()
             }),
         ),

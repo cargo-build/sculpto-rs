@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use byroredux_nif::blocks::shader::{BSLightingShaderProperty, BSShaderTextureSet};
 use byroredux_nif::blocks::skin::NiSkinPartition;
 use byroredux_nif::parse_nif;
-use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderKind, Skin};
+use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, ShaderFlags, ShaderKind, Skin};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::header::{NifTarget, VERSION};
 use sculpto_nif::write::le_shape::write_le_shape;
@@ -206,7 +206,10 @@ fn textured() -> MeshAsset {
         diffuse: Some("textures/robe_d.dds".into()),
         normal: Some("textures/robe_n.dds".into()),
         specular: None,
-        double_sided: true,
+        flags: ShaderFlags {
+            double_sided: true,
+            ..ShaderFlags::default()
+        },
         ..MaterialSlot::default()
     }];
     asset

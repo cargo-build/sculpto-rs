@@ -22,7 +22,9 @@ use byroredux_nif::blocks::tri_shape::{BsTriShape, NiTriShape};
 use byroredux_nif::parse_nif;
 use byroredux_nif::scene::NifScene;
 use byroredux_nif::types::BlockRef;
-use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId, PhysicsRef, ShaderKind, Skin};
+use sculpto_core::mesh::{
+    MaterialSlot, MeshAsset, PartitionId, PhysicsRef, ShaderFlags, ShaderKind, Skin,
+};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::write::extra::{BLOCK_TYPE, HDT_PHYSICS_NAME};
 use sculpto_nif::write::le_shape::write_le_shape;
@@ -49,7 +51,10 @@ fn robe() -> MeshAsset {
             diffuse: Some("textures/robe_d.dds".into()),
             normal: Some("textures/robe_n.dds".into()),
             specular: None,
-            double_sided: true,
+            flags: ShaderFlags {
+                double_sided: true,
+                ..ShaderFlags::default()
+            },
             ..MaterialSlot::default()
         }],
         physics: Some(PhysicsRef::Path(PHYSICS_PATH.into())),

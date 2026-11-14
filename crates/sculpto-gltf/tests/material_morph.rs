@@ -6,7 +6,7 @@
 use gltf::Gltf;
 use sculpto_core::mesh::{
     MaterialSlot, MeshAsset, MeshError, MorphDelta, MorphScope, MorphTarget, PartitionId,
-    ShaderKind,
+    ShaderFlags, ShaderKind,
 };
 use sculpto_gltf::{GltfError, write_glb};
 
@@ -56,7 +56,10 @@ fn material_uris_and_primitive_index_round_trip() {
         diffuse: Some("textures/robe_d.png".into()),
         normal: Some("textures/robe_n.png".into()),
         specular: None,
-        double_sided: true,
+        flags: ShaderFlags {
+            double_sided: true,
+            ..ShaderFlags::default()
+        },
         ..MaterialSlot::default()
     }];
 

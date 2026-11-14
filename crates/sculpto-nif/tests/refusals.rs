@@ -8,7 +8,9 @@
 //! `UnsupportedEndian`) belong to `read_header` and are pinned in
 //! `src/write/header.rs`, not here.
 
-use sculpto_core::mesh::{MaterialSlot, MeshAsset, MeshError, PartitionId, ShaderKind, Skin};
+use sculpto_core::mesh::{
+    MaterialSlot, MeshAsset, MeshError, PartitionId, ShaderFlags, ShaderKind, Skin,
+};
 use sculpto_core::skin::SkinWeights;
 use sculpto_nif::NifHeader;
 use sculpto_nif::write::header::{NifTarget, NifWriteError, VERSION, write_header_for};
@@ -47,7 +49,10 @@ fn textured() -> MeshAsset {
         diffuse: Some("textures/robe_d.dds".into()),
         normal: None,
         specular: None,
-        double_sided: false,
+        flags: ShaderFlags {
+            double_sided: false,
+            ..ShaderFlags::default()
+        },
         ..MaterialSlot::default()
     }];
     asset
@@ -258,15 +263,24 @@ fn singular_bind_matrices_are_refused() {
     assert_eq!(write_le_shape(&asset), Err(expected));
 }
 
+/// A specular path is no longer refused: it projects to the source's
+/// alternate-specular slot (7) on both shape types.
 #[test]
-fn specular_textures_are_refused() {
-    let expected = NifWriteError::TextureSlotUnsupported { slot: "specular" };
-    let mut se = textured();
-    se.materials[0].specular = Some("textures/robe_s.dds".into());
-    assert_eq!(write_se_shape(&se), Err(expected.clone()));
-    let mut le = textured();
-    le.materials[0].specular = Some("textures/robe_s.dds".into());
-    assert_eq!(write_le_shape(&le), Err(expected));
+fn specular_textures_project_to_the_alternate_specular_slot() {
+    let mut asset = textured();
+    asset.materials[0].specular = Some("textures/robe_s.dds".into());
+    for bytes in [
+        write_se_shape(&asset).expect("SE writes the specular slot"),
+        write_le_shape(&asset).expect("LE writes the specular slot"),
+    ] {
+        let document = sculpto_nif::read(&bytes).expect("our own NIF parses");
+        let table = &document.shapes[0].materials[0].texture_set;
+        assert_eq!(
+            table.get(7).map(String::as_str),
+            Some("textures/robe_s.dds")
+        );
+        assert_eq!(table.len(), 8, "an absent inner slot keeps its position");
+    }
 }
 
 #[test]
