@@ -17,14 +17,16 @@ use serde::Deserialize;
 
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakePlan;
-use sculpto_core::mesh::MeshAsset;
+use sculpto_core::mesh::{MeshAsset, TextureSlot};
 use sculpto_core::rig::Rig;
 use sculpto_core::rig::template::{TemplateRoots, complete_family_rig};
 use sculpto_core::{SliderSize, document::Document};
 use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::{Conform, ConformError};
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
-use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
+use sculpto_mesh::outfit::{
+    CheckShape, OutfitError, OutfitManifest, ShapeInfo, ShapeReport, census, completeness_defects,
+};
 use sculpto_mesh::surface::SurfaceBinding;
 use sculpto_mesh::wrap::repair::final_push::FinalPushOptions;
 use sculpto_nif::write::header::{NifTarget, NifWriteError};
@@ -99,6 +101,116 @@ pub fn inspect_outfit(params: &OutfitInspectParams) -> Result<OutfitInspectOutco
         outfit: manifest.map(|manifest| manifest.outfit),
         shapes,
     })
+}
+
+/// Everything `outfit.check` needs.
+#[derive(Debug, Clone, JsonSchema)]
+pub struct OutfitCheckParams {
+    /// Assembled outfit NIF bundle to gate.
+    pub nif: PathBuf,
+    /// JSON manifest bound to this bundle (required, unlike inspect).
+    pub manifest: PathBuf,
+}
+
+/// One manifest garment's measured completeness row.
+#[derive(Debug)]
+pub struct OutfitCheckShape {
+    /// Manifest garment name.
+    pub name: String,
+    /// Zero-based shape ordinal in the bundle; `None` when the name is absent.
+    pub shape_index: Option<usize>,
+    /// Vertices of the matched shape; 0 when the name is absent.
+    pub vertices: usize,
+    /// Triangles of the matched shape; 0 when absent or empty.
+    pub triangles: usize,
+    /// The manifest slot's material expectation.
+    pub requires_material: bool,
+    /// At least one material slot of the matched shape names a diffuse path.
+    pub has_diffuse: bool,
+}
+
+/// What `outfit.check` produced; `Ok` implies the complete verdict.
+#[derive(Debug)]
+pub struct OutfitCheckOutcome {
+    /// Manifest outfit identity.
+    pub outfit: String,
+    /// One row per manifest garment slot, in manifest order.
+    pub shapes: Vec<OutfitCheckShape>,
+}
+
+/// Gate an assembled outfit bundle against its manifest.
+///
+/// Every manifest garment shape must be present with triangles, and a slot
+/// that `requires_material` must name a diffuse texture path. Unlike
+/// [`inspect_outfit`], presence is evaluated here instead of through the
+/// strict census binding, so a missing shape is reported as an incomplete
+/// outfit rather than an unknown-shape refusal.
+///
+/// # Errors
+/// Refuses unreadable sources, invalid manifests and any incomplete garment
+/// requirement; the refusal message names every failing shape.
+pub fn check_outfit(params: &OutfitCheckParams) -> Result<OutfitCheckOutcome, CommandError> {
+    let source =
+        std::fs::canonicalize(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
+    let manifest = read_outfit_manifest(&params.manifest, &source)?;
+    if manifest.outfit.trim().is_empty() {
+        return Err(errors::outfit(OutfitError::BlankOutfit));
+    }
+    let bytes = std::fs::read(&source).map_err(|error| errors::io(&source, error))?;
+    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let shapes: Vec<_> = document
+        .shapes
+        .iter()
+        .map(|shape| CheckShape {
+            name: &shape.name,
+            triangles: shape.triangles.len(),
+            has_diffuse: shape
+                .materials
+                .iter()
+                .any(|material| material.texture(TextureSlot::Diffuse).is_some()),
+        })
+        .collect();
+    let failures = completeness_defects(&shapes, &manifest);
+    let rows = manifest
+        .garment_shapes
+        .iter()
+        .filter(|slot| !manifest.body_shapes.contains(&slot.name))
+        .map(|slot| {
+            let index = document
+                .shapes
+                .iter()
+                .position(|shape| shape.name == slot.name);
+            OutfitCheckShape {
+                name: slot.name.clone(),
+                vertices: index.map_or(0, |index| document.shapes[index].positions.len()),
+                triangles: index.map_or(0, |index| document.shapes[index].triangles.len()),
+                has_diffuse: index.is_some_and(|index| {
+                    document.shapes[index]
+                        .materials
+                        .iter()
+                        .any(|material| material.texture(TextureSlot::Diffuse).is_some())
+                }),
+                shape_index: index,
+                requires_material: slot.requires_material,
+            }
+        })
+        .collect();
+    if failures.is_empty() {
+        return Ok(OutfitCheckOutcome {
+            outfit: manifest.outfit,
+            shapes: rows,
+        });
+    }
+    let detail = failures
+        .iter()
+        .map(|failure| failure.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CommandError::new(
+        ErrorKind::Refused,
+        "outfit_incomplete",
+        format!("outfit is incomplete: {detail}"),
+    ))
 }
 
 fn read_outfit_manifest(path: &Path, nif: &Path) -> Result<OutfitManifest, CommandError> {

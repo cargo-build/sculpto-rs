@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use sculpto_core::mesh::{MeshAsset, PartitionId};
+use sculpto_core::mesh::{MaterialSlot, MeshAsset, PartitionId};
 use sculpto_engine::{ErrorKind, dispatch};
 use sculpto_nif::write::se_shape::write_se_shape;
 use serde_json::{Value, json};
@@ -12,6 +12,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str, shape_name: &str) -> Self {
+        Self::textured(label, shape_name, None)
+    }
+
+    /// A fixture whose shape carries one material slot with an optional
+    /// diffuse path, so the material leg of `outfit.check` runs through the
+    /// real writer and reader.
+    fn textured(label: &str, shape_name: &str, diffuse: Option<&str>) -> Self {
         let directory =
             std::env::temp_dir().join(format!("sculpto-outfit-{}-{label}", std::process::id()));
         std::fs::create_dir(&directory).expect("test directory");
@@ -27,6 +34,11 @@ impl Fixture {
             ],
             triangles: vec![[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
             triangle_partitions: vec![PartitionId(0); 4],
+            materials: vec![MaterialSlot {
+                name: shape_name.into(),
+                diffuse: diffuse.map(str::to_string),
+                ..MaterialSlot::default()
+            }],
             ..MeshAsset::default()
         };
         std::fs::write(&nif, write_se_shape(&shape).expect("fixture writes")).expect("fixture");
@@ -167,6 +179,62 @@ fn an_authored_garment_role_can_override_a_body_name() {
     assert_eq!(
         overridden["shapes"][0]["cloth"][0]["path"],
         "ordinary_rigged"
+    );
+}
+
+#[test]
+fn outfit_check_refuses_a_missing_required_shape_as_incomplete() {
+    let fixture = Fixture::new("check-missing", "robe");
+    let manifest = fixture.manifest(json!([
+        { "name": "robe" },
+        { "name": "belt" },
+    ]));
+    let error = dispatch("outfit.check", &request(&fixture.nif, Some(&manifest)))
+        .expect_err("a belt-less bundle is incomplete, not unknown");
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert_eq!(error.code(), "outfit_incomplete");
+    assert!(error.message().contains("belt"), "{}", error.message());
+    assert!(!error.message().contains("robe"), "{}", error.message());
+}
+
+#[test]
+fn outfit_check_passes_a_complete_bundle() {
+    let fixture = Fixture::new("check-complete", "robe");
+    let manifest = fixture.manifest(json!([{ "name": "robe" }]));
+    let result = dispatch("outfit.check", &request(&fixture.nif, Some(&manifest)))
+        .expect("every manifest requirement is met");
+
+    assert_eq!(result["outfit"], "mixed");
+    assert_eq!(result["verdict"], "complete");
+    let rows = result["shapes"].as_array().expect("one row per slot");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "robe");
+    assert_eq!(rows[0]["shape_index"], 0);
+    assert_eq!(rows[0]["vertices"], 5);
+    assert_eq!(rows[0]["triangles"], 4);
+    assert_eq!(rows[0]["requires_material"], false);
+    assert_eq!(rows[0]["has_diffuse"], false);
+}
+
+#[test]
+fn outfit_check_requires_the_declared_diffuse() {
+    let textured = Fixture::textured("check-diffuse", "robe", Some("textures/robe_d.dds"));
+    let manifest = textured.manifest(json!([{ "name": "robe", "requires_material": true }]));
+    let result = dispatch("outfit.check", &request(&textured.nif, Some(&manifest)))
+        .expect("the authored diffuse satisfies the slot");
+    assert_eq!(result["verdict"], "complete");
+    assert_eq!(result["shapes"][0]["has_diffuse"], true);
+
+    let bare = Fixture::textured("check-bare", "robe", None);
+    let manifest = bare.manifest(json!([{ "name": "robe", "requires_material": true }]));
+    let error = dispatch("outfit.check", &request(&bare.nif, Some(&manifest)))
+        .expect_err("a declared diffuse is missing");
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert_eq!(error.code(), "outfit_incomplete");
+    assert!(
+        error.message().contains("robe has no diffuse material"),
+        "{}",
+        error.message()
     );
 }
 

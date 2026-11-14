@@ -48,6 +48,8 @@ commands:
   body seal-joints --body <obj> --out <obj> --joint <part>:<socket>[:seat]
                         seal open joint rims (neck, wrists); report boundary counts
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
+  outfit check --nif <path> --manifest <json>
+                        refuse a partial outfit (exit 1 names the gaps)
   outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
                  --presets <xml> --preset <name> --set <name> --out <osd>
                  [--body-nif <path>] [--home <path>]
@@ -264,6 +266,9 @@ fn main() -> ExitCode {
         }
         [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
             outfit_inspect(rest)
+        }
+        [command, action, rest @ ..] if command == "outfit" && action == "check" => {
+            outfit_check(rest)
         }
         [command, action, rest @ ..] if command == "outfit" && action == "conform" => {
             outfit_conform(rest)
@@ -616,6 +621,28 @@ fn outfit_inspect(args: &[String]) -> ExitCode {
         Ok(input) => run::dispatch_payload("outfit.inspect", &input),
         Err(error) => {
             eprintln!("outfit inspect: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn outfit_check(args: &[String]) -> ExitCode {
+    let input = parse_flags(args).and_then(|flags| {
+        if let Some(key) = flags
+            .keys()
+            .find(|key| !matches!(key.as_str(), "nif" | "manifest"))
+        {
+            return Err(format!("unknown option `--{key}`"));
+        }
+        Ok(serde_json::json!({
+            "nif": required(&flags, "nif")?,
+            "manifest": required(&flags, "manifest")?,
+        }))
+    });
+    match input {
+        Ok(input) => run::dispatch_payload("outfit.check", &input),
+        Err(error) => {
+            eprintln!("outfit check: {error}");
             ExitCode::from(2)
         }
     }

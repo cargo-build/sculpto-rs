@@ -54,6 +54,8 @@ pub enum CommandId {
     OutfitPlace,
     /// Cut the body band one garment class covers.
     OutfitBand,
+    /// Refuse a partial outfit against its manifest.
+    OutfitCheck,
     /// Fill garment UVs by ray-casting the placed raw asset.
     OutfitProjection,
     /// Transfer body weights to a garment and unpose its rest geometry.
@@ -93,6 +95,7 @@ impl CommandId {
             CommandId::OutfitOffsets => "outfit.offsets",
             CommandId::OutfitPlace => "outfit.place",
             CommandId::OutfitBand => "outfit.band",
+            CommandId::OutfitCheck => "outfit.check",
             CommandId::OutfitProjection => "outfit.projection",
             CommandId::OutfitWeights => "outfit.weights",
             CommandId::ExportObj => "export.obj",
@@ -352,6 +355,14 @@ const COMMANDS: &[Spec] = &[
         handler: rules::band,
     },
     Spec {
+        id: CommandId::OutfitCheck,
+        summary: "Refuse a partial outfit: every manifest garment shape present with >0 triangles and its declared diffuse material.",
+        mutates: false,
+        stub: false,
+        schema: handlers::outfit_check_schema,
+        handler: handlers::outfit_check,
+    },
+    Spec {
         id: CommandId::OutfitProjection,
         summary: "Fill garment UVs by ray-casting the placed raw asset.",
         mutates: false,
@@ -521,6 +532,7 @@ mod tests {
             "outfit.offsets",
             "outfit.place",
             "outfit.band",
+            "outfit.check",
             "outfit.projection",
             "outfit.weights",
             "export.obj",

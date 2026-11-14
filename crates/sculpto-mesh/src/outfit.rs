@@ -246,6 +246,91 @@ pub fn census(
         .collect()
 }
 
+/// The completeness facts one imported shape contributes.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckShape<'a> {
+    /// Source shape name (exact, case-sensitive like [`census`] binding).
+    pub name: &'a str,
+    /// Triangle count; 0 means empty geometry.
+    pub triangles: usize,
+    /// At least one material slot names a diffuse texture path.
+    pub has_diffuse: bool,
+}
+
+/// Why one manifest garment shape fails the completeness gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletenessDefect {
+    /// No source shape carries this exact name.
+    Absent,
+    /// The shape exists but holds no triangles.
+    EmptyGeometry,
+    /// `requires_material` is set and no slot names a diffuse path.
+    MissingMaterial,
+}
+
+/// One failed manifest garment requirement, in manifest garment order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletenessFailure {
+    /// Manifest garment name.
+    pub shape: String,
+    /// What the source lacks.
+    pub defect: CompletenessDefect,
+}
+
+impl fmt::Display for CompletenessFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.defect {
+            CompletenessDefect::Absent => {
+                write!(formatter, "{} is not in the bundle", self.shape)
+            }
+            CompletenessDefect::EmptyGeometry => {
+                write!(formatter, "{} has no triangles", self.shape)
+            }
+            CompletenessDefect::MissingMaterial => {
+                write!(formatter, "{} has no diffuse material", self.shape)
+            }
+        }
+    }
+}
+
+/// Every manifest garment requirement the assembled source fails, in manifest
+/// order.
+///
+/// Unlike [`census`], a manifest name missing from the source is a reported
+/// defect, not a binding error: the caller refuses the partial outfit by naming
+/// every gap. Only manifest garment slots are evaluated; a slot also declared
+/// as a body shape is excluded, and each slot is judged independently of any
+/// duplicate.
+/// @req DECL0010
+pub fn completeness_defects(
+    shapes: &[CheckShape<'_>],
+    manifest: &OutfitManifest,
+) -> Vec<CompletenessFailure> {
+    manifest
+        .garment_shapes
+        .iter()
+        .filter(|slot| !manifest.body_shapes.contains(&slot.name))
+        .filter_map(|slot| {
+            let Some(shape) = shapes.iter().find(|shape| shape.name == slot.name) else {
+                return Some(CompletenessFailure {
+                    shape: slot.name.clone(),
+                    defect: CompletenessDefect::Absent,
+                });
+            };
+            if shape.triangles == 0 {
+                return Some(CompletenessFailure {
+                    shape: slot.name.clone(),
+                    defect: CompletenessDefect::EmptyGeometry,
+                });
+            }
+            (slot.requires_material && !shape.has_diffuse).then_some(CompletenessFailure {
+                shape: slot.name.clone(),
+                defect: CompletenessDefect::MissingMaterial,
+            })
+        })
+        .collect()
+}
+
 fn bind_role<'a>(
     shapes: &[ShapeInfo<'_>],
     assigned: &mut [Option<ManifestRole<'a>>],

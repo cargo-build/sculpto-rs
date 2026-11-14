@@ -46,6 +46,11 @@ pub fn outfit_inspect_schema() -> Value {
     schema_for::<ops::OutfitInspectParams>()
 }
 
+/// Schema for the outfit completeness gate.
+pub fn outfit_check_schema() -> Value {
+    schema_for::<ops::OutfitCheckParams>()
+}
+
 /// Schema derived from the typed `export.obj` parameters.
 pub fn export_obj_schema() -> Value {
     schema_for::<ops::ExportObjParams>()
@@ -153,6 +158,34 @@ pub fn outfit_inspect(input: &Value) -> Result<Value, CommandError> {
         "outfit": outcome.outfit,
         "shapes": outcome.shapes,
         "manifest_errors": [],
+    }))
+}
+
+/// The complete verdict is constant on the success path: a partial outfit
+/// returns the typed `outfit_incomplete` refusal, never an `Ok` verdict.
+pub fn outfit_check(input: &Value) -> Result<Value, CommandError> {
+    let outcome = ops::check_outfit(&ops::OutfitCheckParams {
+        nif: path(input, "nif")?,
+        manifest: path(input, "manifest")?,
+    })?;
+    let shapes: Vec<Value> = outcome
+        .shapes
+        .iter()
+        .map(|shape| {
+            json!({
+                "name": shape.name,
+                "shape_index": shape.shape_index,
+                "vertices": shape.vertices,
+                "triangles": shape.triangles,
+                "requires_material": shape.requires_material,
+                "has_diffuse": shape.has_diffuse,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "outfit": outcome.outfit,
+        "verdict": "complete",
+        "shapes": shapes,
     }))
 }
 
