@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub enum Category {
     /// Body mesh or body source.
     Body,
+    /// A shape inside a body NIF (body, feet, hands, head, underwear).
+    #[serde(rename = "body-part")]
+    BodyPart,
     /// Garment or armour.
     Outfit,
     /// Hairstyle.
@@ -42,6 +45,7 @@ impl Category {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Body => "body",
+            Self::BodyPart => "body-part",
             Self::Outfit => "outfit",
             Self::Hair => "hair",
             Self::Face => "face",
@@ -61,6 +65,7 @@ impl Category {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "body" => Self::Body,
+            "body-part" => Self::BodyPart,
             "outfit" => Self::Outfit,
             "hair" => Self::Hair,
             "face" => Self::Face,
@@ -162,6 +167,15 @@ pub struct Asset {
     pub entry: Option<String>,
     /// Lowercase extension without the dot.
     pub format: String,
+    /// Shape name inside a NIF, when this row is a body part.
+    #[serde(default)]
+    pub shape: Option<String>,
+    /// Shape vertex count, when measured.
+    #[serde(default)]
+    pub vertices: Option<u64>,
+    /// Shape triangle count, when measured.
+    #[serde(default)]
+    pub triangles: Option<u64>,
     /// Content hash when the file was read; `None` for archive members.
     pub sha256: Option<String>,
     /// Size in bytes when known.

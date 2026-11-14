@@ -377,3 +377,57 @@ fn garment_tags_filter_extracted_underwear() {
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn imports_body_part_manifest() {
+    let root = temp_dir("body-parts");
+    let manifest = root.join("parts.jsonl");
+    fs::write(
+        &manifest,
+        concat!(
+            "{\"name\":\"Feet\",\"shape\":\"Feet\",\"sex\":\"female\",\"family\":\"cbbe-3ba\",\"source\":\"from-skyrim-community\",\"archive\":\"/assets/pack.7z\",\"entry\":\"meshes/femalefeet_0.nif\",\"vertices\":8876,\"triangles\":16288}\n",
+            "{\"name\":\"Hands\",\"shape\":\"Hands\",\"sex\":\"female\",\"family\":\"cbbe-3ba\",\"source\":\"from-skyrim-community\",\"archive\":\"/assets/pack.7z\",\"entry\":\"meshes/femalehands_0.nif\",\"vertices\":6374,\"triangles\":11776}\n"
+        ),
+    )
+    .expect("manifest");
+    let db = root.with_extension("redb");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "import-parts",
+            "--manifest",
+            manifest.to_str().expect("manifest"),
+        ],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(stdout.contains("inserted 2"), "{stdout}");
+    let (code, stdout, stderr) = run(&db, &["list", "--category", "body-part", "--name", "feet"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("femalefeet_0.nif"), "{stdout}");
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "list",
+            "--category",
+            "body-part",
+            "--sex",
+            "female",
+            "--family",
+            "cbbe-3ba",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let rows: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(rows.as_array().expect("array").len(), 2);
+    assert_eq!(rows[0]["vertices"], 8876);
+    assert!(
+        rows[0]["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .any(|tag| tag == "part:feet")
+    );
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}

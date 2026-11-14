@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use boethos::Store;
-use boethos_catalogue::{Asset, Assets, Category, IndexOptions, Sex, index_root};
+use boethos_catalogue::{
+    Asset, Assets, BodyPartInput, Category, IndexOptions, Sex, body_part_asset, index_root,
+};
 
 fn main() -> ExitCode {
     match parse_args(env::args().skip(1).collect()) {
@@ -117,6 +119,12 @@ fn spec(command: &str) -> Option<Spec> {
             repeat: &[],
             max_positionals: 0,
         },
+        "import-parts" => Spec {
+            values: &["--manifest"],
+            switches: &["--json"],
+            repeat: &[],
+            max_positionals: 0,
+        },
         "export" => Spec {
             values: &[],
             switches: &[],
@@ -133,7 +141,7 @@ fn spec(command: &str) -> Option<Spec> {
     })
 }
 
-const VALUE_FLAGS: [&str; 10] = [
+const VALUE_FLAGS: [&str; 11] = [
     "--db",
     "--root",
     "--source",
@@ -144,6 +152,7 @@ const VALUE_FLAGS: [&str; 10] = [
     "--name",
     "--limit",
     "--offset",
+    "--manifest",
 ];
 
 fn parse_args(mut arguments: Vec<String>) -> Result<Invocation, String> {
@@ -277,6 +286,8 @@ commands:
         remove one asset and, for an archive, its indexed members
   stats [--json]
         print counts by category and the database path
+  import-parts --manifest PATH [--json]
+        import measured body-part shapes from JSONL
   export PATH
         write one JSON object per record, in identity order
   help, --help, --version
@@ -306,6 +317,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         "get" => command_get(cli),
         "delete" => command_delete(cli),
         "stats" => command_stats(cli),
+        "import-parts" => command_import_parts(cli),
         "export" => command_export(cli),
         other => Err(format!("unknown command {other:?}; run `boethos help`")),
     }
@@ -567,6 +579,75 @@ fn command_delete(cli: &Cli) -> Result<(), String> {
         }
     }
     println!("deleted {removed} record(s) for {}", asset.id);
+    Ok(())
+}
+
+fn command_import_parts(cli: &Cli) -> Result<(), String> {
+    let manifest = cli
+        .value("--manifest")
+        .ok_or_else(|| "import-parts requires --manifest PATH".to_string())?;
+    let text = fs::read_to_string(manifest).map_err(|error| format!("{manifest}: {error}"))?;
+    let store = open_write(cli)?;
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
+    let mut unchanged = 0usize;
+    let mut errors = Vec::new();
+    let mut total = 0usize;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        total += 1;
+        let input: BodyPartInput = serde_json::from_str(line)
+            .map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
+        let asset = body_part_asset(&input)
+            .map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
+        match store.get::<Assets>(&asset.id) {
+            Ok(Some(existing)) if existing == asset => {
+                unchanged += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                errors.push(format!("{}: {error}", asset.path));
+                continue;
+            }
+        }
+        match store.upsert::<Assets>(&asset.id, &asset) {
+            Ok(boethos::Put::Inserted) => inserted += 1,
+            Ok(boethos::Put::Replaced) => updated += 1,
+            Ok(boethos::Put::Exists) => unchanged += 1,
+            Err(error) => errors.push(format!("{}: {error}", asset.path)),
+        }
+    }
+    if cli.has("--json") {
+        let json = serde_json::json!({
+            "records": total,
+            "inserted": inserted,
+            "updated": updated,
+            "unchanged": unchanged,
+            "errors": errors,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "imported {total} body parts: inserted {inserted}, updated {updated}, unchanged {unchanged}, errors {}",
+            errors.len()
+        );
+    }
+    for error in &errors {
+        eprintln!("warning: {error}");
+    }
+    if inserted + updated == 0 && !errors.is_empty() {
+        return Err(format!(
+            "import-parts wrote nothing: {} errors",
+            errors.len()
+        ));
+    }
     Ok(())
 }
 

@@ -333,3 +333,68 @@ fn garment_named_fbx_is_tagged_outfit() {
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn body_part_asset_keeps_shape_counts_and_origin() {
+    let asset = boethos_catalogue::body_part_asset(&boethos_catalogue::BodyPartInput {
+        name: "Feet".to_string(),
+        shape: "Feet".to_string(),
+        sex: Some(boethos_catalogue::Sex::Female),
+        family: Some("cbbe-3ba".to_string()),
+        source: "from-skyrim-community".to_string(),
+        path: None,
+        archive: Some("/assets/pack.7z".to_string()),
+        entry: Some("meshes/.../femalefeet_0.nif".to_string()),
+        sha256: Some("b6658f".to_string()),
+        bytes: Some(123),
+        tags: Vec::new(),
+        vertices: 8_876,
+        triangles: 16_288,
+    })
+    .expect("body part");
+    assert_eq!(asset.category, Category::BodyPart);
+    assert_eq!(asset.shape.as_deref(), Some("Feet"));
+    assert_eq!(asset.vertices, Some(8_876));
+    assert_eq!(asset.triangles, Some(16_288));
+    assert_eq!(asset.family.as_deref(), Some("cbbe-3ba"));
+    for tag in ["body-part", "part:feet", "origin:skyrimmods"] {
+        assert!(
+            asset.tags.contains(&tag.to_string()),
+            "{tag}: {:?}",
+            asset.tags
+        );
+    }
+    assert_eq!(asset.path, "/assets/pack.7z::meshes/.../femalefeet_0.nif");
+}
+
+#[test]
+fn body_part_bra_is_underwear_not_body() {
+    let asset = boethos_catalogue::body_part_asset(&boethos_catalogue::BodyPartInput {
+        name: "CBBE bra".to_string(),
+        shape: "Bra".to_string(),
+        sex: Some(boethos_catalogue::Sex::Female),
+        family: Some("cbbe".to_string()),
+        source: "from-skyrim-community".to_string(),
+        path: None,
+        archive: Some("/assets/pack.7z".to_string()),
+        entry: Some("meshes/femalebody_0.nif".to_string()),
+        sha256: None,
+        bytes: None,
+        tags: vec!["wear:underwear".to_string()],
+        vertices: 500,
+        triangles: 926,
+    })
+    .expect("bra");
+    assert!(
+        asset.tags.contains(&"part:underwear".to_string()),
+        "{:?}",
+        asset.tags
+    );
+    assert!(
+        !asset.tags.contains(&"part:body".to_string()),
+        "{:?}",
+        asset.tags
+    );
+    let json = serde_json::to_value(&asset).expect("json");
+    assert_eq!(json["category"], "body-part");
+}
