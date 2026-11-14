@@ -1085,7 +1085,8 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 }
 
 fn garment(args: &[String]) -> ExitCode {
-    let usage = "usage: sculpto garment fit --nif <path> --shape <name> [--body-shape <name>] --body <obj> --out <obj> [--body-ref <obj>] [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+    let usage = "usage: sculpto garment fit --nif <path> --shape <name> [--body-shape <name>] --body <obj> --out <obj> [--body-ref <obj>] [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]
+       sculpto garment dress --body <obj> --garment <obj> --out <obj> [--clearance <units>] [--contact <units>] [--cuts <n>] [--iterations <n>] [--max-step <units>] [--relax <weight>] [--rounds <n>] [--poke-passes <n>] [--tolerance <units> [--passes <n>]] [--report <json>] [--json]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
        sculpto garment push --body <obj> --garment <obj> --tolerance <units> --out <obj> [--passes <n>] [--json]
        sculpto garment stack --outfit <layers.json> [--body <obj>] --tolerance <units> [--json]
@@ -1100,6 +1101,7 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "fit" => garment_fit_inner(rest),
         [action, rest @ ..] if action == "follow" => garment_follow_inner(rest),
         [action, rest @ ..] if action == "aura" => garment_aura_inner(rest),
+        [action, rest @ ..] if action == "dress" => garment_dress_inner(rest),
         [action, rest @ ..] if action == "classify" => garment_classify_inner(rest),
         [action, rest @ ..] if action == "intake" => garment_intake_inner(rest),
         [action, rest @ ..] if action == "strip" => garment_strip_inner(rest),
@@ -1316,6 +1318,114 @@ fn print_final_push(report: &sculpto_mesh::wrap::repair::final_push::FinalPushRe
             pass.pass, pass.moved, pass.violations, pass.max
         );
     }
+}
+
+/// `garment dress`: register a raw garment onto the body, densify it and
+/// resolve every vertex into its declared contact band.
+///
+/// Both surfaces are read in the OBJ display frame and the output is converted
+/// back through [`to_source`] before [`write_obj`], so the file keeps the exact
+/// coordinates the solve measured. @req DECL0013
+fn garment_dress_inner(args: &[String]) -> Result<(), String> {
+    let mut json = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let flags = parse_flags(&rest)?;
+    let params = sculpto_engine::ops::DressParams {
+        body: PathBuf::from(required(&flags, "body")?),
+        garment: PathBuf::from(required(&flags, "garment")?),
+        out: PathBuf::from(required(&flags, "out")?),
+        clearance: optional_number(&flags, "clearance")?,
+        contact: optional_number(&flags, "contact")?,
+        cuts: optional_count(&flags, "cuts")?,
+        iterations: optional_count(&flags, "iterations")?,
+        max_step: optional_number(&flags, "max-step")?,
+        relax: optional_number(&flags, "relax")?,
+        rounds: optional_count(&flags, "rounds")?,
+        poke_passes: optional_count(&flags, "poke-passes")?,
+        tolerance: flag_tolerance(&flags)?,
+        passes: optional_count(&flags, "passes")?,
+        report: flags.get("report").map(PathBuf::from),
+    };
+    let outcome = sculpto_engine::ops::dress_garment(&params).map_err(|error| error.to_string())?;
+    if json {
+        let text =
+            serde_json::to_string_pretty(&outcome.to_json()).map_err(|error| error.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    let mesh = &outcome.mesh;
+    println!(
+        "dress: {} v / {} f -> {} v / {} f ({} cut), clearance {:.3}, contact {:.3}, registration rounds {}",
+        mesh.source_vertices,
+        mesh.source_triangles,
+        mesh.vertices,
+        mesh.triangles,
+        outcome.solve.cuts,
+        outcome.solve.clearance,
+        outcome.solve.contact,
+        outcome.solve.rounds,
+    );
+    println!(
+        "dress: {} iteration(s), {}, moved {} of {} (max {:.4})",
+        mesh.iterations,
+        match mesh.converged {
+            true => "converged",
+            false => "budget spent",
+        },
+        mesh.moved,
+        mesh.vertices,
+        mesh.max_move,
+    );
+    println!(
+        "dress: floating {} (max {:.4}) -> max {:.4} of declared {:.4}; penetrating {} (max {:.4}) -> max {:.4} of contact {:.4}; body pokes {} -> {}; flipped {}",
+        mesh.floating_before,
+        mesh.max_floating_gap_before,
+        mesh.max_floating_gap,
+        outcome.solve.clearance,
+        mesh.penetrating_before,
+        mesh.max_penetration_before,
+        mesh.max_penetration,
+        outcome.solve.contact,
+        mesh.pokes_before,
+        mesh.pokes_after,
+        mesh.flipped,
+    );
+    if let Some(push) = &outcome.final_push {
+        print_final_push(push);
+    }
+    println!("{}: written", outcome.out.display());
+    Ok(())
+}
+
+/// An optional finite number flag.
+fn optional_number(flags: &BTreeMap<String, String>, name: &str) -> Result<Option<f32>, String> {
+    let Some(value) = flags.get(name) else {
+        return Ok(None);
+    };
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(Some)
+        .ok_or_else(|| format!("`--{name}` must be a finite number, got `{value}`"))
+}
+
+/// An optional whole-number flag.
+fn optional_count(flags: &BTreeMap<String, String>, name: &str) -> Result<Option<u32>, String> {
+    let Some(value) = flags.get(name) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("`--{name}` must be a nonnegative whole number, got `{value}`"))
 }
 
 fn garment_aura_inner(args: &[String]) -> Result<(), String> {

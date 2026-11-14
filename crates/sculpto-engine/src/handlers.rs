@@ -36,6 +36,11 @@ pub fn stack_fit_schema() -> Value {
     schema_for::<ops::StackFitParams>()
 }
 
+/// Schema derived from the typed `outfit.dress` parameters.
+pub fn dress_schema() -> Value {
+    schema_for::<ops::DressParams>()
+}
+
 /// Schema for the authored garment slider conformance command.
 pub fn conform_schema() -> Value {
     schema_for::<ops::ConformParams>()
@@ -100,6 +105,32 @@ pub(crate) fn missing(field: &str) -> CommandError {
         "missing_field",
         format!("`{field}` is required"),
     )
+}
+
+/// An optional finite number; a present but unusable value is refused, never
+/// dropped, so a typo cannot silently fall back to a default.
+fn optional_f32(input: &Value, field: &str) -> Result<Option<f32>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| errors::invalid(field, "must be a finite number")),
+    }
+}
+
+/// An optional non-negative whole number.
+fn optional_u32(input: &Value, field: &str) -> Result<Option<u32>, CommandError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| errors::invalid(field, "must be a nonnegative integer")),
+    }
 }
 
 fn string_list(input: &Value, field: &str) -> Result<Option<Vec<String>>, CommandError> {
@@ -373,6 +404,26 @@ pub fn stack_fit(input: &Value) -> Result<Value, CommandError> {
         passes,
     };
     Ok(ops::stack_fit(&params)?.to_json())
+}
+
+pub fn dress(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::DressParams {
+        body: path(input, "body")?,
+        garment: path(input, "garment")?,
+        out: path(input, "out")?,
+        clearance: optional_f32(input, "clearance")?,
+        contact: optional_f32(input, "contact")?,
+        cuts: optional_u32(input, "cuts")?,
+        iterations: optional_u32(input, "iterations")?,
+        max_step: optional_f32(input, "max_step")?,
+        relax: optional_f32(input, "relax")?,
+        rounds: optional_u32(input, "rounds")?,
+        poke_passes: optional_u32(input, "poke_passes")?,
+        tolerance: optional_f32(input, "tolerance")?,
+        passes: optional_u32(input, "passes")?,
+        report: checked_optional_path(input, "report")?,
+    };
+    Ok(ops::dress_garment(&params)?.to_json())
 }
 
 pub fn conform(input: &Value) -> Result<Value, CommandError> {

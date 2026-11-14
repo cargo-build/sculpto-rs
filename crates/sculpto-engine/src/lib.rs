@@ -47,6 +47,8 @@ pub enum CommandId {
     OutfitFit,
     /// Fit an ordered layer stack against the accumulated obstacle surface.
     OutfitStackFit,
+    /// Register, densify and dress one raw garment onto a body.
+    OutfitDress,
     /// Write garment offsets for an authored body slider set.
     OutfitConform,
     /// Report the source shapes and the cloth selection.
@@ -94,6 +96,7 @@ impl CommandId {
             CommandId::BodySealJoints => "body.seal_joints",
             CommandId::OutfitFit => "outfit.fit",
             CommandId::OutfitStackFit => "outfit.stack_fit",
+            CommandId::OutfitDress => "outfit.dress",
             CommandId::OutfitConform => "outfit.conform",
             CommandId::OutfitInspect => "outfit.inspect",
             CommandId::OutfitOffsets => "outfit.offsets",
@@ -327,6 +330,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::stack_fit,
     },
     Spec {
+        id: CommandId::OutfitDress,
+        summary: "Register, densify and dress a raw garment onto a body with per-vertex contact.",
+        mutates: true,
+        stub: false,
+        schema: handlers::dress_schema,
+        handler: handlers::dress,
+    },
+    Spec {
         id: CommandId::OutfitConform,
         summary: "Conform authored body sliders and write one garment OSD.",
         mutates: true,
@@ -540,6 +551,7 @@ mod tests {
             "bake",
             "outfit.fit",
             "outfit.stack_fit",
+            "outfit.dress",
             "outfit.inspect",
             "outfit.offsets",
             "outfit.place",

@@ -44,9 +44,11 @@ use crate::obj::{
     pick_shape, pick_shape_index, read_obj_positions, read_obj_surface, write_obj, write_obj_uv,
 };
 
+mod dress;
 mod head;
 mod slider;
 mod stack_fit;
+pub use dress::{DressMeasurements, DressOutcome, DressParams, dress_garment};
 pub use head::{
     AssignedShape, BodiesConfig, BodyDescriptor, CheckStatus, CompatibilityCheck,
     CompatibilityReport, RoleBundle, SkinTextureSet, apply_default_skin, head_compatibility,
