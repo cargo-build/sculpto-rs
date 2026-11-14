@@ -20,7 +20,7 @@ const ROBE: &str = "apachii-divine-elegance/unpacked-bsa/meshes/divineelegance/f
 
 /// The fixture NIF, or `None` with a printed skip notice.
 fn robe_path() -> Option<PathBuf> {
-    let Some(root) = std::env::var_os(ROOT_VARIABLE) else {
+    let Some(root) = std::env::var_os("SCULPTO_MOD_FIXTURE") else {
         eprintln!("SKIP material roundtrip: {ROOT_VARIABLE} unset");
         return None;
     };
