@@ -66,6 +66,11 @@ pub fn export_bundle_schema() -> Value {
     schema_for::<ops::ExportBundleParams>()
 }
 
+/// Schema derived from the typed `export.tri` parameters.
+pub fn export_tri_schema() -> Value {
+    schema_for::<ops::ExportTriParams>()
+}
+
 /// Schema derived from the typed GLB repair parameters.
 pub fn glb_file_schema() -> Value {
     schema_for::<ops::GlbFileParams>()
@@ -431,6 +436,28 @@ pub fn export_bundle(input: &Value) -> Result<Value, CommandError> {
         "shapes": shapes,
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
+        "bytes": outcome.bytes,
+    }))
+}
+
+/// Parse the nested `export.tri` document through its typed parameters: the
+/// morph list has two levels, so a field-by-field reader would duplicate the
+/// same three shape rules.
+pub fn export_tri(input: &Value) -> Result<Value, CommandError> {
+    let params: ops::ExportTriParams = serde_json::from_value(input.clone()).map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidParams,
+            "export_tri_input",
+            error.to_string(),
+        )
+    })?;
+    let outcome = ops::export_tri(&params)?;
+    Ok(json!({
+        "out": outcome.out.display().to_string(),
+        "shape": outcome.shape,
+        "vertex_count": outcome.vertex_count,
+        "morphs": outcome.morphs,
+        "offsets": outcome.offsets,
         "bytes": outcome.bytes,
     }))
 }

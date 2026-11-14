@@ -19,6 +19,7 @@ use sculpto_mesh::garment::GarmentRuleError;
 use sculpto_mesh::intake_gltf::{DefectOverLimit, IntakeError};
 use sculpto_mesh::outfit::OutfitError;
 use sculpto_nif::NifError;
+use sculpto_nif::TriError;
 use sculpto_nif::write::header::NifWriteError;
 
 /// A file-system failure, with the path in the message.
@@ -42,6 +43,26 @@ pub fn document(error: DocumentError) -> CommandError {
         // request: the `document_` prefix keeps the code distinct from
         // `errors::invalid`. @req DECL0007
         DocumentKind::InvalidValue => (ErrorKind::InvalidParams, "document_invalid_value"),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A `.tri` document the writer refused.
+///
+/// The writer's refusals are caller-input defects (a name, count or index the
+/// format cannot hold); the read-side variants only reach this mapping through a
+/// caller that hands bytes to the reader.
+pub fn tri(error: TriError) -> CommandError {
+    let (kind, code) = match &error {
+        TriError::VertexOutOfRange { .. } => (ErrorKind::InvalidParams, "tri_vertex_out_of_range"),
+        TriError::DuplicateVertexId { .. } => (ErrorKind::InvalidParams, "tri_duplicate_vertex"),
+        TriError::NameTooLong { .. } => (ErrorKind::InvalidParams, "tri_name_too_long"),
+        TriError::TooManyShapes { .. } => (ErrorKind::InvalidParams, "tri_too_many_shapes"),
+        TriError::TooManyMorphs { .. } => (ErrorKind::InvalidParams, "tri_too_many_morphs"),
+        TriError::TooManyVertices { .. } => (ErrorKind::InvalidParams, "tri_too_many_vertices"),
+        TriError::InvalidMagic { .. }
+        | TriError::Truncated { .. }
+        | TriError::InvalidUtf8 { .. } => (ErrorKind::InvalidRequest, "tri_malformed"),
     };
     CommandError::new(kind, code, error.to_string())
 }

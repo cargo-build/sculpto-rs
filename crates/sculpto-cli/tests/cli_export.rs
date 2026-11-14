@@ -309,3 +309,77 @@ fn the_bundle_command_is_registered_and_dispatches() {
     assert_eq!(result["shapes"], expected_shapes());
     assert_output_shapes(&out);
 }
+
+/// `export.tri` has two transports over one handler: the argv surface reads the
+/// nested morph document from a file, `run` reads it from JSON, and both write
+/// the same bytes.
+#[test]
+fn export_tri_argv_and_run_write_the_same_file() {
+    let scratch = Scratch::new("tri");
+    let document = json!({
+        "shape": "SculptoCliTri",
+        "vertex_count": 8,
+        "morphs": [
+            {
+                "name": "Width",
+                "offsets": [
+                    { "vertex": 2, "position": [0.5, -1.25, 0.0] },
+                    { "vertex": 5, "position": [0.0, 0.0, 2.0] }
+                ]
+            }
+        ]
+    });
+    let spec = scratch.path().join("morphs.json");
+    std::fs::write(
+        &spec,
+        serde_json::to_string_pretty(&document).expect("spec"),
+    )
+    .expect("write the spec");
+
+    let argv_out = scratch.path().join("argv.tri");
+    let result = run_ok(&[
+        "export-tri",
+        "--spec",
+        spec.to_str().expect("path"),
+        "--out",
+        argv_out.to_str().expect("path"),
+    ]);
+    assert_eq!(result["shape"], "SculptoCliTri");
+    assert_eq!(result["morphs"], 1);
+    assert_eq!(result["offsets"], 2);
+    assert_eq!(
+        result["bytes"].as_u64().expect("bytes"),
+        std::fs::metadata(&argv_out).expect("file").len()
+    );
+
+    let run_out = scratch.path().join("run.tri");
+    let mut input = document.clone();
+    input["out"] = json!(run_out.to_str().expect("path"));
+    let dispatched = run_ok(&["run", "--cmd", "export.tri", "--input", &input.to_string()]);
+    assert_eq!(dispatched["shape"], result["shape"]);
+
+    assert_eq!(
+        std::fs::read(&argv_out).expect("argv bytes"),
+        std::fs::read(&run_out).expect("run bytes"),
+        "one handler, one file"
+    );
+    let decoded = sculpto_nif::read_tri(&std::fs::read(&argv_out).expect("bytes"))
+        .expect("the written file re-reads");
+    assert_eq!(decoded.shapes[0].name, "SculptoCliTri");
+    assert_eq!(decoded.shapes[0].position_morphs[0].name, "Width");
+}
+
+/// The flags are the only source of `out`, and a usage error writes nothing.
+#[test]
+fn export_tri_refuses_a_missing_spec() {
+    let scratch = Scratch::new("tri-missing");
+    let out = scratch.path().join("out.tri");
+    let output = sculpto()
+        .args(["export-tri", "--out", out.to_str().expect("path")])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2), "a usage error exits 2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--spec"), "{stderr}");
+    assert!(!out.exists(), "a refused request writes no file");
+}

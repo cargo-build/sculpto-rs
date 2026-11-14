@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
+use serde::Deserialize;
 
 use crate::{CommandError, ErrorKind};
 use sculpto_bake::BakePlan;
@@ -30,9 +31,9 @@ use sculpto_nif::write::le_bundle::write_le_bundle;
 use sculpto_nif::write::se_bundle::write_se_bundle;
 use sculpto_nif::write::{
     DroppedInfluence, InfluencePolicy, WrittenNif, write_rigged_shape, write_rigged_shape_deleted,
-    write_shape_with_policy,
+    write_shape_with_policy, write_tri,
 };
-use sculpto_nif::{NifDocument, NifRigError, NifShape};
+use sculpto_nif::{NifDocument, NifRigError, NifShape, TriFile};
 
 use crate::errors;
 use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, write_obj_uv};
@@ -800,6 +801,135 @@ pub fn export_nif_bundle(params: &ExportBundleParams) -> Result<ExportBundleOutc
         vertices: shapes.iter().map(|shape| shape.vertices).sum(),
         triangles: shapes.iter().map(|shape| shape.triangles).sum(),
         shapes,
+        bytes: bytes.len(),
+    })
+}
+
+/// One sparse offset in [`ExportTriParams`]: a base-shape vertex and its move.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TriOffsetParams {
+    /// Index into the base shape's vertex arena.
+    pub vertex: u32,
+    /// Displacement in the base shape's units.
+    pub position: [f32; 3],
+}
+
+/// One named `.tri` morph: the slider Outfit Studio will list, and its offsets.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TriMorphParams {
+    /// Slider name; native Outfit Studio adds an empty slider when the project
+    /// does not own the name yet.
+    pub name: String,
+    /// Sparse offsets in caller order.
+    pub offsets: Vec<TriOffsetParams>,
+}
+
+/// Everything `export.tri` needs.
+///
+/// The command is the product surface over [`sculpto_nif::write_tri`]; it carries
+/// its morph data instead of reading it from a NIF, because no reader produces
+/// morph targets today. `shape` and `vertex_count` are required: the format
+/// binds morphs to a shape by name and addresses base-shape vertices, so a
+/// default would invent the identity the file claims. @req DECL0007
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportTriParams {
+    /// Output `.tri` path.
+    pub out: PathBuf,
+    /// Shape name the morphs bind to.
+    pub shape: String,
+    /// Vertex count of the base shape the offsets address.
+    pub vertex_count: u32,
+    /// Morphs in write order.
+    pub morphs: Vec<TriMorphParams>,
+}
+
+/// What `export.tri` produced.
+#[derive(Debug, Clone)]
+pub struct ExportTriOutcome {
+    /// Output path.
+    pub out: PathBuf,
+    /// Shape name written.
+    pub shape: String,
+    /// Vertex count written.
+    pub vertex_count: u32,
+    /// Morphs written.
+    pub morphs: usize,
+    /// Sparse offsets written across every morph.
+    pub offsets: usize,
+    /// Bytes written.
+    pub bytes: usize,
+}
+
+/// Write sparse morph targets as a Skyrim `.tri` slider file.
+///
+/// The bytes come from the one landed encoder: the parameters project into the
+/// core `.tri` model, which [`sculpto_nif::TriShape`] converts into the writer's
+/// shape, so no second encoder exists. The writer's own limits (name length,
+/// `u16` morph and vertex counts, offsets inside `vertex_count`, one offset per
+/// vertex) refuse before anything is written.
+///
+/// # Errors
+/// A non-finite displacement and a vertex index above the format's `u16` field
+/// are `invalid_value`; writer refusals map through [`errors::tri`] and the file
+/// I/O through [`errors::io`]. No output file is written on any failure.
+pub fn export_tri(params: &ExportTriParams) -> Result<ExportTriOutcome, CommandError> {
+    let shape = sculpto_core::mesh::TriShape {
+        name: params.shape.clone(),
+        vertex_count: params.vertex_count,
+        morphs: params
+            .morphs
+            .iter()
+            .map(|morph| {
+                let offsets = morph
+                    .offsets
+                    .iter()
+                    .map(|offset| {
+                        // The `.tri` field is a `u16` while a caller names a
+                        // model-space index, so the narrowing is refused, never
+                        // truncated.
+                        let vertex = u16::try_from(offset.vertex).map_err(|_| {
+                            errors::invalid(
+                                "morphs",
+                                format!(
+                                    "morph `{}` addresses vertex {}, above the `.tri` `u16` field",
+                                    morph.name, offset.vertex
+                                ),
+                            )
+                        })?;
+                        if !offset.position.iter().all(|lane| lane.is_finite()) {
+                            return Err(errors::invalid(
+                                "morphs",
+                                format!(
+                                    "morph `{}` has a non-finite offset at vertex {}",
+                                    morph.name, offset.vertex
+                                ),
+                            ));
+                        }
+                        Ok(sculpto_core::mesh::TriOffset {
+                            vertex,
+                            position: offset.position,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CommandError>>()?;
+                Ok(sculpto_core::mesh::TriMorph {
+                    name: morph.name.clone(),
+                    offsets,
+                })
+            })
+            .collect::<Result<Vec<_>, CommandError>>()?,
+    };
+    let file = TriFile::new(vec![sculpto_nif::TriShape::from(&shape)]);
+    let bytes = write_tri(&file).map_err(errors::tri)?;
+    std::fs::write(&params.out, &bytes).map_err(|error| errors::io(&params.out, error))?;
+    Ok(ExportTriOutcome {
+        out: params.out.clone(),
+        shape: shape.name,
+        vertex_count: shape.vertex_count,
+        morphs: shape.morphs.len(),
+        offsets: shape.morphs.iter().map(|morph| morph.offsets.len()).sum(),
         bytes: bytes.len(),
     })
 }

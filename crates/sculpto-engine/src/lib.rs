@@ -60,6 +60,8 @@ pub enum CommandId {
     ExportNif,
     /// Re-encode all or selected NIF shapes into one multi-shape bundle.
     ExportBundle,
+    /// Write sparse morph targets as a Skyrim `.tri` slider file.
+    ExportTri,
     /// Zero a GLB's default morph weights.
     GltfResetWeights,
     /// Clamp a GLB's negative `texCoord` indices to UV set 0.
@@ -87,6 +89,7 @@ impl CommandId {
             CommandId::IntakeCheck => "intake.check",
             CommandId::ExportNif => "export.nif",
             CommandId::ExportBundle => "export.bundle",
+            CommandId::ExportTri => "export.tri",
             CommandId::GltfResetWeights => "gltf.reset_weights",
             CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
         }
@@ -370,6 +373,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::export_bundle,
     },
     Spec {
+        id: CommandId::ExportTri,
+        summary: "Write sparse morph targets as a Skyrim `.tri` slider file.",
+        mutates: true,
+        stub: false,
+        schema: handlers::export_tri_schema,
+        handler: handlers::export_tri,
+    },
+    Spec {
         id: CommandId::GltfResetWeights,
         summary: "Zero every mesh's default morph weights in a written GLB.",
         mutates: true,
@@ -480,6 +491,7 @@ mod tests {
             "export.pair",
             "export.nif",
             "export.bundle",
+            "export.tri",
             "intake.check",
             "gltf.reset_weights",
             "gltf.clamp_texcoord",

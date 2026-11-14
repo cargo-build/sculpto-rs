@@ -42,6 +42,7 @@ commands:
   presets [options]     list presets in a SliderPresets collection
   export-obj [options]  read a NIF and write one shape as an OBJ
   export-nif [options]  re-encode NIF shapes for a Skyrim target (one shape or a bundle)
+  export-tri [options]  write sparse morph targets as a Skyrim `.tri` slider file
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
   outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
                  --presets <xml> --preset <name> --set <name> --out <osd>
@@ -105,6 +106,10 @@ export-nif options:
   --shapes <name>    explicit shape list, repeatable (bundle mode)
   --all-shapes       export every document shape (bundle mode)
   --rig-template <path>  family skeleton NIF (single-shape mode only)
+
+export-tri options:
+  --spec <json>      morph document: `shape`, `vertex_count` and `morphs`
+  --out <path>       output `.tri`
 
 garment fit options:
   --nif <path>         garment NIF
@@ -219,6 +224,7 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "presets" => presets(rest),
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
         [command, rest @ ..] if command == "export-nif" => export_nif(rest),
+        [command, rest @ ..] if command == "export-tri" => export_tri(rest),
         [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
             outfit_inspect(rest)
         }
@@ -652,6 +658,42 @@ fn export_nif_input(args: &[String]) -> Result<(&'static str, serde_json::Value)
                 input["rig_template"] = serde_json::json!(rig);
             }
             Ok(("export.nif", input))
+        }
+    }
+}
+
+/// `sculpto export-tri --spec <json> --out <path>`.
+///
+/// The morph document has two nesting levels, so argv keeps the same answer the
+/// other nested commands use: the document is a file, and the flags only say
+/// where it goes. `--out` overrides any `out` the document already carries.
+fn export_tri(args: &[String]) -> ExitCode {
+    let input = parse_flags(args).and_then(|flags| {
+        if let Some(key) = flags
+            .keys()
+            .find(|key| !matches!(key.as_str(), "spec" | "out"))
+        {
+            return Err(format!("unknown option `--{key}`"));
+        }
+        let spec = PathBuf::from(required(&flags, "spec")?);
+        let text = std::fs::read_to_string(&spec)
+            .map_err(|error| format!("{}: {error}", spec.display()))?;
+        let mut input: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", spec.display()))?;
+        if !input.is_object() {
+            return Err(format!(
+                "{}: the spec must be a JSON object",
+                spec.display()
+            ));
+        }
+        input["out"] = serde_json::json!(required(&flags, "out")?);
+        Ok(input)
+    });
+    match input {
+        Ok(input) => run::dispatch_payload("export.tri", &input),
+        Err(error) => {
+            eprintln!("export-tri: {error}");
+            ExitCode::from(2)
         }
     }
 }
