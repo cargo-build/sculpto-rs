@@ -298,6 +298,9 @@ fn obj_error(error: ObjError) -> CommandError {
     match error {
         ObjError::Io(message) => CommandError::new(ErrorKind::Io, "io_error", message),
         ObjError::Malformed(message) => errors::invalid("obj", message),
+        // `read_obj_asset` reads the whole file, so a block selection cannot
+        // reach this mapping; the typed arm keeps the match exhaustive.
+        ObjError::MissingObject { name, .. } => errors::not_found("object", &name),
     }
 }
 

@@ -1708,7 +1708,7 @@ fn fit_shape<'a>(
 }
 
 /// SHA-256 of a file's bytes, hex-encoded.
-fn file_sha256(path: &Path) -> Result<String, CommandError> {
+pub(crate) fn file_sha256(path: &Path) -> Result<String, CommandError> {
     let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
     Ok(sha256_hex(&bytes))
 }
@@ -1724,7 +1724,7 @@ fn positions_sha256(positions: &[[f32; 3]]) -> String {
     sha256_hex(&bytes)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()

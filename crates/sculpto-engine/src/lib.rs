@@ -13,6 +13,7 @@
 
 use serde_json::{Value, json};
 
+mod assemble;
 mod component;
 pub mod errors;
 mod handlers;
@@ -36,6 +37,8 @@ pub enum CommandId {
     CommandsList,
     /// Resolve a slider preset into offsets and apply it to a source NIF.
     Bake,
+    /// Build the prepared body from declared parts and seal its joints.
+    BodyAssemble,
     /// Audit attached body parts against their sockets; read-only.
     BodyAuditParts,
     /// Seal open joint rims (neck, wrists) into one watertight, smoothed seam.
@@ -86,6 +89,7 @@ impl CommandId {
             CommandId::Version => "version",
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
+            CommandId::BodyAssemble => "body.assemble",
             CommandId::BodyAuditParts => "body.audit_parts",
             CommandId::BodySealJoints => "body.seal_joints",
             CommandId::OutfitFit => "outfit.fit",
@@ -281,6 +285,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: handlers::bake_schema,
         handler: handlers::bake,
+    },
+    Spec {
+        id: CommandId::BodyAssemble,
+        summary: "Build the prepared body from a versioned part manifest: place each declared part, concatenate in a stable order and seal the declared joints.",
+        mutates: true,
+        stub: false,
+        schema: assemble::schema,
+        handler: assemble::assemble,
     },
     Spec {
         id: CommandId::BodyAuditParts,

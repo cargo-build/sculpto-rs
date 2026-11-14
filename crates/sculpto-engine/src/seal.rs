@@ -90,7 +90,7 @@ pub(crate) fn seal(input: &Value) -> Result<Value, CommandError> {
     Ok(render(&params.out, &outcome))
 }
 
-fn seal_error(error: joint_seal::SealError) -> CommandError {
+pub(crate) fn seal_error(error: joint_seal::SealError) -> CommandError {
     let kind = if error.parameter_problem() {
         ErrorKind::InvalidParams
     } else {
@@ -140,7 +140,7 @@ fn seat_row(seat: &joint_seal::SeatReport) -> Value {
     })
 }
 
-fn joint_row(joint: &JointReport) -> Value {
+pub(crate) fn joint_row(joint: &JointReport) -> Value {
     json!({
         "joint": joint.joint,
         "part": joint.part_shell,

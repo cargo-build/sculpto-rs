@@ -317,6 +317,13 @@ fn obj_error(role: &str, path: &Path, error: &crate::obj::ObjError) -> CommandEr
             malformed_code,
             format!("{}: {message}", path.display()),
         ),
+        // The whole-file reader never selects a block; the typed arm keeps the
+        // match exhaustive.
+        crate::obj::ObjError::MissingObject { name, .. } => CommandError::new(
+            ErrorKind::NotFound,
+            io_code,
+            format!("{}: object `{name}` not found", path.display()),
+        ),
     }
 }
 

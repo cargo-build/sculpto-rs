@@ -43,6 +43,8 @@ commands:
   export-obj [options]  read a NIF and write one shape as an OBJ
   export-nif [options]  re-encode NIF shapes for a Skyrim target (one shape or a bundle)
   export-tri [options]  write sparse morph targets as a Skyrim `.tri` slider file
+  body assemble --manifest <json> --out <obj> [--report <json>]
+                        place and concatenate the declared parts, then seal the joints
   body audit-parts [options]
                         audit attached body parts against their sockets (read-only)
   body seal-joints --body <obj> --out <obj> --joint <part>:<socket>[:seat]
@@ -118,6 +120,27 @@ export-nif options:
 export-tri options:
   --spec <json>      morph document: `shape`, `vertex_count` and `morphs`
   --out <path>       output `.tri`
+
+body assemble manifest (version 1; source units, source Z-up frame, nothing inferred):
+  {\"version\": 1,
+   \"parts\": [{\"path\": \"<body-obj>\", \"role\": \"body\", \"object\": \"BaseShape\"},
+             {\"path\": \"<body-obj>\", \"role\": \"feet\", \"object\": \"femalefeet_1\"},
+             {\"path\": \"<head-obj>\", \"role\": \"head\",
+              \"rotate\": {\"axis\": \"x\", \"degrees\": -90.0}},
+             {\"path\": \"<hands-obj>\", \"role\": \"hands\"}],
+   \"joints\": [{\"part\": \"head\", \"socket\": \"body\"},
+              {\"part\": \"hands\", \"socket\": \"body\", \"seat\": true}]}
+  roles: body | feet | head | hands | hand-left | hand-right; `feet` may repeat.
+  `object` selects one `o` block. Placement is scale -> rotate -> translate,
+  then `drop` (downward-only sugar on the up lane); a negative `scale` lane is a
+  declared mirror and rewinds the part's faces. Nothing else moves a part, and
+  a joint resolves to the seal's own shell names. Ankles are not a joint role:
+  feet are accepted as authored.
+
+body assemble options:
+  --manifest <json>  versioned part/joint manifest (above)
+  --out <obj>        assembled, sealed body OBJ
+  --report <json>    also write the JSON report (part hashes, offsets, joint rows)
 
 body audit-parts options (read-only: measures, never writes or corrects):
   --body <obj>        multi-part body OBJ: the torso shell plus its attached
@@ -258,6 +281,9 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
         [command, rest @ ..] if command == "export-nif" => export_nif(rest),
         [command, rest @ ..] if command == "export-tri" => export_tri(rest),
+        [command, action, rest @ ..] if command == "body" && action == "assemble" => {
+            body_assemble(rest)
+        }
         [command, action, rest @ ..] if command == "body" && action == "audit-parts" => {
             body_audit_parts(rest)
         }
@@ -476,6 +502,31 @@ fn required<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a s
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| format!("`--{name}` is required"))
+}
+
+/// `body assemble`: the flags are one each, so [`parse_flags`] suffices; the
+/// manifest itself carries the parts, placement and joints.
+fn body_assemble(args: &[String]) -> ExitCode {
+    let input = parse_flags(args).and_then(|flags| {
+        if let Some(key) = flags
+            .keys()
+            .find(|key| !matches!(key.as_str(), "manifest" | "out" | "report"))
+        {
+            return Err(format!("unknown option `--{key}`"));
+        }
+        Ok(serde_json::json!({
+            "manifest": required(&flags, "manifest")?,
+            "out": required(&flags, "out")?,
+            "report": flags.get("report"),
+        }))
+    });
+    match input {
+        Ok(input) => run::dispatch_payload("body.assemble", &input),
+        Err(error) => {
+            eprintln!("body assemble: {error}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `body audit-parts`: read-only socket audit; `--part` repeats, so the flags
