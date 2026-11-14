@@ -426,7 +426,7 @@ fn classify(path: &Path, extension: &str) -> Category {
     if matches!(extension, "nif" | "glb" | "gltf" | "obj")
         || (extension == "fbx" && !text.contains("animations"))
     {
-        if text.contains("hair") || text.contains("hairdos") {
+        if has_hair_token(&text) {
             return Category::Hair;
         }
         if text.contains("body") || text.contains("baseshape") {
@@ -502,7 +502,7 @@ fn member_category(path: &str, archive_name: &str) -> Option<Category> {
 
 fn has_hair_token(text: &str) -> bool {
     text.split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|token| token.starts_with("hair"))
+        .any(|token| token == "hair" || token.starts_with("hairdo") || token == "hairline")
 }
 
 fn garment_tags(text: &str, category: Category, source: &str) -> Vec<String> {
@@ -772,6 +772,14 @@ mod tests {
         assert_eq!(
             member_category("meshes/FaceGeom/skyrim.esm/0001.nif", "KS Hairdos SSE.7z"),
             Some(Category::Face)
+        );
+        assert_eq!(
+            classify(Path::new("white-haired-anime-elf-figure-8k.fbx"), "fbx"),
+            Category::Mesh
+        );
+        assert_eq!(
+            classify(Path::new("hair/hair01.nif"), "nif"),
+            Category::Hair
         );
     }
 }
