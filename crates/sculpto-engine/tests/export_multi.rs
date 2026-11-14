@@ -288,10 +288,8 @@ fn repeated_names_are_a_bundle_refusal() {
 #[test]
 fn the_default_export_stays_single_shape() {
     let scratch = Scratch::new("compat");
-    // Unskinned: the checked-rig single-shape path needs a reader-captured
-    // skeleton root, which the writers' flat bone nodes do not provide. That
-    // pre-existing gap is independent of the bundle surface; the compatibility
-    // contract here is "default writes the largest shape, one shape only".
+    // Unskinned control: the default still writes the largest shape and only
+    // that shape. The skinned fallback has its own control below.
     let shapes = bundle()
         .into_iter()
         .map(|shape| MeshAsset {
@@ -314,6 +312,98 @@ fn the_default_export_stays_single_shape() {
     let document = sculpto_nif::read(&std::fs::read(&out).expect("bytes")).expect("re-read");
     assert_eq!(document.shapes.len(), 1);
     assert_eq!(document.shapes[0].name, "Body");
+}
+
+/// The falsifying control for the checked-rig refusal: a skinned source built by
+/// the bundle writer captures no skeleton root, so the default single-shape
+/// export must take the unproven writer instead of refusing. @req DECL0008
+#[test]
+fn the_default_export_single_shape_succeeds_on_skinned_bundle_source() {
+    let scratch = Scratch::new("skinned-default");
+    let source = source_nif(scratch.path(), &bundle());
+    let read_back = sculpto_nif::read(&std::fs::read(&source).expect("source")).expect("read");
+    let roots: Vec<Option<&str>> = read_back
+        .sources
+        .iter()
+        .map(|shape| shape.skeleton_root.as_deref())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![None, None],
+        "the fixture must reproduce the missing captured root"
+    );
+    let unbound = read_back
+        .bind_rest()
+        .expect_err("the checked proof has no captured root to anchor");
+    assert!(format!("{unbound}").contains("skeleton root"), "{unbound}");
+
+    let out = scratch.path().join("out.nif");
+    let outcome = ops::export_nif(&ExportNifParams {
+        nif: source,
+        out: out.clone(),
+        target: ExportTarget::Se,
+        shape: None,
+        rig_template: None,
+    })
+    .expect("a skinned writer-built source exports through the unproven fallback");
+    assert_eq!(outcome.vertices, 4, "the largest shape, not the first");
+    assert_eq!(outcome.triangles, 2);
+
+    let document = sculpto_nif::read(&std::fs::read(&out).expect("bytes")).expect("re-read");
+    assert_eq!(document.shapes.len(), 1);
+    assert_eq!(document.shapes[0].name, "Body");
+    let skin = document.shapes[0]
+        .skin
+        .as_ref()
+        .expect("the unproven writer keeps the skin");
+    assert_eq!(
+        skin.bones,
+        vec!["Root", "Spine"],
+        "the bone subset survives"
+    );
+    assert_eq!(skin.influences.rows(), 4);
+    for vertex in 0..skin.influences.rows() {
+        let row = skin.influences.row(vertex).expect("row");
+        assert_eq!(row.joints, &[0, 1], "bone lanes survive");
+        for (left, right) in row.weights.iter().zip([0.75, 0.25]) {
+            assert!((left - right).abs() <= 1e-3, "weight drifted (f16)");
+        }
+    }
+}
+
+/// A requested family template is a caller decision, not a gap to paper over:
+/// when the completed rig still has no captured root for the proof, the export
+/// refuses instead of falling back. @req DECL0008
+#[test]
+fn a_rig_template_that_cannot_satisfy_the_proof_still_refuses() {
+    let scratch = Scratch::new("template-refusal");
+    let source = source_nif(scratch.path(), &bundle());
+    let template = scratch.path().join("template-se.nif");
+    std::fs::write(
+        &template,
+        write_se_bundle(&bundle()).expect("the template writes as an SE bundle"),
+    )
+    .expect("template bytes");
+
+    let out = scratch.path().join("out.nif");
+    let error = ops::export_nif(&ExportNifParams {
+        nif: source,
+        out: out.clone(),
+        target: ExportTarget::Se,
+        shape: None,
+        rig_template: Some(template),
+    })
+    .expect_err("a rig template request must not fall back to the unproven writer");
+
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert_eq!(error.code(), "nif_write_invalid_rig");
+    assert!(
+        error.message().contains("skeleton root"),
+        "{}",
+        error.message()
+    );
+    assert!(!out.exists(), "a refused export must write no file");
+    eprintln!("refusal: {}: {}", error.code(), error.message());
 }
 
 /// The private-host control: a real authored outfit whose shapes are skinned to

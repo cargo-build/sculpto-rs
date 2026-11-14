@@ -583,6 +583,16 @@ pub struct ExportNifOutcome {
 }
 
 /// Re-encode one shape of a source NIF for the requested Skyrim target.
+///
+/// A skinned shape whose source names no skeleton root (a writer-built bundle)
+/// takes the unproven writer instead of the checked rest proof, which has no
+/// authored root to anchor. A requested `rig_template` still refuses when the
+/// completed family rig cannot satisfy that proof.
+///
+/// # Errors
+/// An unknown shape name is `shape_not_found`; mesh, rig and writer refusals map
+/// through [`errors::mesh`], [`errors::nif_write`] and [`errors::invalid`]. No
+/// output file is written on any failure.
 pub fn export_nif(params: &ExportNifParams) -> Result<ExportNifOutcome, CommandError> {
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
@@ -750,7 +760,19 @@ fn export_rig<'a>(
         .as_ref()
         .ok_or_else(|| errors::nif_write(NifWriteError::InvalidRig(NifRigError::MissingRig)))?;
     let Some(path) = template_path else {
-        return Ok(Some(Cow::Borrowed(authored)));
+        // The bundle writer leaves its scene root unnamed, so a writer-built
+        // source re-reads with no captured skeleton root and the checked rest
+        // proof has nothing to anchor. The unproven writer keeps that export
+        // available; an authored root, or a requested family template, still
+        // takes the checked path. @req DECL0008
+        return match document
+            .sources
+            .get(index)
+            .and_then(|source| source.skeleton_root.as_deref())
+        {
+            Some(_) => Ok(Some(Cow::Borrowed(authored))),
+            None => Ok(None),
+        };
     };
     let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;

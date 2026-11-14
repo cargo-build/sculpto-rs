@@ -80,26 +80,6 @@ fn source_nif(directory: &Path) -> PathBuf {
     path
 }
 
-/// Unskinned variant for the single-shape default: the checked-rig path needs
-/// a reader-captured skeleton root the writers' flat bone nodes do not provide
-/// (pre-existing, independent of the bundle surface).
-fn unskinned_source_nif(directory: &Path) -> PathBuf {
-    let shapes = vec![
-        MeshAsset {
-            skin: None,
-            ..skinned("Hands", 4.0, 3)
-        },
-        MeshAsset {
-            skin: None,
-            ..skinned("Body", 0.0, 4)
-        },
-    ];
-    let path = directory.join("source-unskinned.nif");
-    let bytes = write_se_bundle(&shapes).expect("the fixture writes as an SE bundle");
-    std::fs::write(&path, bytes).expect("source bytes");
-    path
-}
-
 fn run_ok(args: &[&str]) -> Value {
     let output = sculpto().args(args).output().expect("run");
     assert!(
@@ -221,10 +201,13 @@ fn explicit_shapes_keep_the_list_order() {
     assert_eq!(names, vec!["Body", "Hands"]);
 }
 
+/// The default writes one shape; the skinned source also proves the unproven
+/// fallback on the process boundary (the bundle writer captures no skeleton
+/// root, so the checked rest proof has no anchor).
 #[test]
 fn the_default_stays_single_shape() {
     let scratch = Scratch::new("default");
-    let source = unskinned_source_nif(scratch.path());
+    let source = source_nif(scratch.path());
     let out = scratch.path().join("out.nif");
     let result = run_ok(&[
         "export-nif",
@@ -241,6 +224,15 @@ fn the_default_stays_single_shape() {
     let document = sculpto_nif::read(&std::fs::read(&out).expect("bytes")).expect("re-read");
     assert_eq!(document.shapes.len(), 1);
     assert_eq!(document.shapes[0].name, "Body");
+    let skin = document.shapes[0]
+        .skin
+        .as_ref()
+        .expect("the unproven writer keeps the skin");
+    assert_eq!(
+        skin.bones,
+        vec!["Root", "Spine"],
+        "the bone subset survives"
+    );
 }
 
 #[test]
