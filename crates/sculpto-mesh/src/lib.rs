@@ -18,7 +18,9 @@
 //! reads the raw generated export (`.glb`, `.gltf`, `.obj`) behind that audit
 //! and normalises it to the declared metre scale. [`check`](check)
 //! adds the measured gates: triangle-pair intersections that vertex-inside
-//! counting cannot see.
+//! counting cannot see. [`layer_stack`](layer_stack) grades a declared outfit
+//! as an ordered stack: per-pair contact classified by type, with accessory
+//! anchors and the footwear mode as the declared exceptions.
 
 pub mod actor;
 pub mod aura;
@@ -32,6 +34,7 @@ pub mod delta_conform;
 pub mod garment;
 pub mod intake;
 pub mod intake_gltf;
+pub mod layer_stack;
 pub mod mask;
 pub mod outfit;
 mod point_query;

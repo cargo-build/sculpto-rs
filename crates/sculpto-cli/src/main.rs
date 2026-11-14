@@ -19,6 +19,7 @@ use sculpto_core::{Document, SliderSize};
 use sculpto_mesh::aura::{Aura, AuraMode, AuraParams};
 use sculpto_mesh::check;
 use sculpto_mesh::classify;
+use sculpto_mesh::layer_stack;
 use sculpto_mesh::wrap::FitOptions;
 use sculpto_mesh::wrap::repair::final_push::{FinalPushOptions, final_push};
 
@@ -53,6 +54,7 @@ commands:
   garment check [options] count garment/body triangle intersections (measured gate)
   garment depth [options] penetration depth of garment vertices inside a body
   garment push [options]  move visible depth violations out to just under a tolerance
+  garment stack [options] grade a declared ordered layer stack by contact type
   garment trim [options]  cut away garment triangles that intersect the body
   garment cover [options] body coverage per height band (<=2/<=8/<=20 units)
   garment control-exterior [options] keep the outward control surface of a thick shell
@@ -193,6 +195,12 @@ garment push options:
   --passes <n>        pass budget (1, bounded by the fitter's 10)
   --out <obj>         pushed garment OBJ (display frame)
   --json              print the per-pass report as JSON
+
+garment stack options:
+  --outfit <json>     layer manifest: body plus ordered layers, anchors and boot mode
+  --body <obj>        body/collision surface to grade against; may come from the manifest
+  --tolerance <units> accepted visible depth for every declared pair
+  --json              print the per-pair and per-layer report as JSON
 ";
 
 fn main() -> ExitCode {
@@ -659,6 +667,7 @@ fn garment(args: &[String]) -> ExitCode {
     let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj> [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
        sculpto garment push --body <obj> --garment <obj> --tolerance <units> --out <obj> [--passes <n>] [--json]
+       sculpto garment stack --outfit <layers.json> [--body <obj>] --tolerance <units> [--json]
        sculpto garment control-exterior --source <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-repair --control <obj> --profile <json> --out <obj> --plan <json>
        sculpto garment control-check --control <obj> --source <obj> --profile <json> --report <json>
@@ -677,6 +686,7 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "check" => garment_check_inner(rest),
         [action, rest @ ..] if action == "depth" => garment_depth_inner(rest),
         [action, rest @ ..] if action == "push" => garment_push_inner(rest),
+        [action, rest @ ..] if action == "stack" => garment_stack_inner(rest),
         [action, rest @ ..] if action == "trim" => garment_trim_inner(rest),
         [action, rest @ ..] if action == "cover" => garment_cover_inner(rest),
         [action, rest @ ..] if action == "control-exterior" => {
@@ -1672,6 +1682,187 @@ fn garment_push_inner(args: &[String]) -> Result<(), String> {
     }
     println!(
         "note: graded vertices are `garment depth`'s visible_occluded set; a fully locked vertex, a rigid part or a vertex whose nearest body triangle is degenerate is held, and welded copies move together; the tolerance stays the caller's; grading, the push and the written file all use the OBJ's own coordinates, so a re-grade of the output repeats these numbers"
+    );
+    Ok(())
+}
+
+/// Grade a declared layer stack: one visible-depth verdict per declared pair,
+/// classified by the relation the manifest declares.
+///
+/// Read-only and report-only. The tolerance is the caller's and the exit code
+/// stays `0`, like `garment depth --tolerance`: the acceptance criterion is
+/// operator-owned, so `pass` in the report is the verdict and a script reads
+/// it. Grading, the CLI and any re-grade of the same files share the OBJs' own
+/// coordinates, so the numbers repeat.
+/// @req DECL0015
+fn garment_stack_inner(args: &[String]) -> Result<(), String> {
+    let mut json = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let flags = parse_flags(&rest)?;
+    if let Some(key) = flags
+        .keys()
+        .find(|key| !matches!(key.as_str(), "outfit" | "body" | "tolerance"))
+    {
+        return Err(format!("unknown option `--{key}`"));
+    }
+    let manifest = PathBuf::from(required(&flags, "outfit")?);
+    let tolerance = flag_tolerance(&flags)?
+        .ok_or("`--tolerance` is required: it states the accepted visible depth")?;
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
+    let stack =
+        layer_stack::LayerStack::parse_json(&text, &manifest).map_err(|error| error.to_string())?;
+    let selected = flags.get("body").map(PathBuf::from);
+    let body = layer_stack::resolve_body(&stack, selected.as_deref())
+        .map_err(|error| error.to_string())?;
+    let report = layer_stack::grade(&stack, &body, tolerance, read_obj)
+        .map_err(|error| error.to_string())?;
+
+    if json {
+        let layers: Vec<serde_json::Value> = report
+            .layers
+            .iter()
+            .map(|layer| {
+                serde_json::json!({
+                    "id": layer.id,
+                    "order": layer.order,
+                    "classification": layer.classification.id(),
+                    "pairs": layer.pairs,
+                    "failed": layer.failed,
+                    "visible_max": depth_number(layer.visible_max),
+                })
+            })
+            .collect();
+        let pairs: Vec<serde_json::Value> = report
+            .pairs
+            .iter()
+            .map(|pair| {
+                let worst: Vec<serde_json::Value> = pair
+                    .worst
+                    .iter()
+                    .map(|&(vertex, depth)| {
+                        serde_json::json!({
+                            "vertex": vertex,
+                            "depth": depth_number(depth),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "outer": pair.outer,
+                    "inner": pair.inner,
+                    "kind": pair.kind.id(),
+                    "classification": pair.classification.id(),
+                    "tolerance": depth_number(pair.tolerance),
+                    "vertices": pair.vertices,
+                    "inside": pair.inside,
+                    "inner_facing": pair.inner_facing,
+                    "hidden": pair.hidden,
+                    "visible": pair.visible,
+                    "visible_max": depth_number(pair.visible_max),
+                    "violations": pair.violations,
+                    "worst": worst,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "outfit": manifest.display().to_string(),
+                "body": body.display().to_string(),
+                "units": "source",
+                "semantics": "each declared pair grades the outer piece's garment_depth_report visible_occluded depth against the inner surface; a boot pair is graded in the direction its declared mode names; an accessory pair with its anchor is reported, never failed; a pair is never graded inner-against-outer",
+                "tolerance": depth_number(report.tolerance),
+                "layers": layers,
+                "pairs": pairs,
+                "pass": report.pass,
+                "failures": {
+                    "penetration": report.penetrations,
+                    "boot_mode_violation": report.boot_violations,
+                },
+            })
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}: {} layers, body {}, tolerance {:.6}, units: source",
+        manifest.display(),
+        report.layers.len(),
+        body.display(),
+        report.tolerance
+    );
+    println!(
+        "pairs: {} graded, {} penetration, {} boot-mode violations",
+        report.pairs.len(),
+        report.penetrations,
+        report.boot_violations
+    );
+    let width = report
+        .pairs
+        .iter()
+        .map(|pair| pair.outer.len().max(pair.inner.len()))
+        .max()
+        .unwrap_or(0);
+    for pair in &report.pairs {
+        println!(
+            "  {:<width$} vs {:<width$} {:<20} visible {} max {:.6}, hidden {}, inner-facing {}, inside {} of {}",
+            pair.outer,
+            pair.inner,
+            pair.classification.id(),
+            pair.visible,
+            pair.visible_max,
+            pair.hidden,
+            pair.inner_facing,
+            pair.inside,
+            pair.vertices
+        );
+        if !pair.worst.is_empty() {
+            let worst: Vec<String> = pair
+                .worst
+                .iter()
+                .map(|(vertex, depth)| format!("({vertex}, {depth:.6})"))
+                .collect();
+            println!(
+                "  {:<width$}    {:>3} of {} above; deepest (index, depth): {}",
+                "",
+                pair.violations,
+                pair.visible,
+                worst.join(", ")
+            );
+        }
+    }
+    println!("layers:");
+    for layer in &report.layers {
+        println!(
+            "  {:<width$} order {} {:<20} pairs {} failed {} visible max {:.6}",
+            layer.id,
+            layer.order,
+            layer.classification.id(),
+            layer.pairs,
+            layer.failed,
+            layer.visible_max
+        );
+    }
+    if report.pass {
+        println!(
+            "verdict: pass (tolerance {:.6}; no penetration, no boot-mode violation)",
+            report.tolerance
+        );
+    } else {
+        println!(
+            "verdict: fail (tolerance {:.6}; {} penetration, {} boot-mode violation)",
+            report.tolerance, report.penetrations, report.boot_violations
+        );
+    }
+    println!(
+        "note: a pair is graded outer-against-inner only, so an inner piece outside its outer layer is never a defect; hidden = the outer piece's own surface covers the graded vertex (DECL0015) and is not graded as visible; an accessory pair with its anchor is allowed and reported; footwear is graded in its declared mode direction, and the report, not the exit code, carries the verdict"
     );
     Ok(())
 }
