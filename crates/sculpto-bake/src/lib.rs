@@ -8,13 +8,18 @@
 //!
 //! Application takes positions, not a mesh: the NIF adapter supplies vertices
 //! later, and this crate deliberately does not depend on a format reader.
+//! Zap sliders are the one slider class the plan resolves beyond offsets: an
+//! active zap's block is read as deletion indices, ready for the build step
+//! that removes the tagged geometry.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use sculpto_core::shape_data::MorphData;
-use sculpto_core::{Preset, Project, SliderDataRef, SliderSet, SliderSize, VertexOffset};
+use sculpto_core::{
+    Preset, Project, SliderDataRef, SliderDef, SliderSet, SliderSize, VertexOffset,
+};
 
 /// One resolved block and the shape it deforms.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +89,20 @@ impl PlannedSlider {
     }
 }
 
+/// A zap slider resolved to the vertices it deletes for one target. @req BLD-01
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedZap {
+    /// Slider name.
+    pub slider: String,
+    /// Target shape the deletions apply to.
+    pub target: String,
+    /// Block name the indices were collected from.
+    pub block: String,
+    /// Vertices the zap deletes: every index with a non-zero delta on any
+    /// axis, ascending without duplicates.
+    pub indices: Vec<u16>,
+}
+
 /// Why a `Data` reference could not be joined to an offset block.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedReason {
@@ -137,6 +156,10 @@ pub struct BakePlan {
     pub size: SliderSize,
     /// Sliders that apply to positions.
     pub sliders: Vec<PlannedSlider>,
+    /// Zap sliders resolved to deletion indices, in document order. They never
+    /// enter `sliders`: native collects indices at build time and deletes the
+    /// geometry instead of deforming it.
+    pub zaps: Vec<PlannedZap>,
     /// References that could not be resolved.
     pub unresolved: Vec<UnresolvedRef>,
     /// Sliders deferred to a later contract.
@@ -292,6 +315,7 @@ impl BakePlan {
 
         let mut cache: BTreeMap<PathBuf, MorphData> = BTreeMap::new();
         let mut sliders = Vec::new();
+        let mut zaps = Vec::new();
         let mut unresolved = Vec::new();
         let mut deferred = Vec::new();
 
@@ -321,6 +345,28 @@ impl BakePlan {
                     name: slider.name.clone(),
                     reason: DeferredReason::Zap,
                 });
+                // Native collects zap indices only when the post-inversion
+                // value is positive (`vbig > 0`, BodySlideApp.cpp:5215), so a
+                // zero or negative zap deletes nothing. UV zaps never reach
+                // here: native reads them through the UV path
+                // (`bZap && !bUV`, BodySlideApp.cpp:5206).
+                if native_value(percent, slider.invert) > 0.0 {
+                    for data in &slider.data {
+                        match resolve_ref(home, set, slider, data, &mut cache, &mut load)? {
+                            Ok(shape) => zaps.push(PlannedZap {
+                                slider: slider.name.clone(),
+                                target: shape.target,
+                                block: shape.block,
+                                indices: zap_block_indices(&shape.offsets),
+                            }),
+                            Err(reason) => unresolved.push(UnresolvedRef {
+                                slider: slider.name.clone(),
+                                target: data.target.clone(),
+                                reason,
+                            }),
+                        }
+                    }
+                }
                 continue;
             }
             if slider.clamp || slider.default.is_some() {
@@ -333,41 +379,12 @@ impl BakePlan {
 
             let mut shapes = Vec::new();
             for data in &slider.data {
-                let Some(file) = data.file.as_deref() else {
-                    unresolved.push(UnresolvedRef {
+                match resolve_ref(home, set, slider, data, &mut cache, &mut load)? {
+                    Ok(shape) => shapes.push(shape),
+                    Err(reason) => unresolved.push(UnresolvedRef {
                         slider: slider.name.clone(),
                         target: data.target.clone(),
-                        reason: UnresolvedReason::Unrecorded,
-                    });
-                    continue;
-                };
-                let path = container_path(home, set, data, file);
-                if !cache.contains_key(&path) {
-                    if !path.is_file() {
-                        unresolved.push(UnresolvedRef {
-                            slider: slider.name.clone(),
-                            target: data.target.clone(),
-                            reason: UnresolvedReason::MissingFile(path),
-                        });
-                        continue;
-                    }
-                    cache.insert(path.clone(), load(&path)?.into());
-                }
-                let data_file = &cache[&path];
-                let block_name = data
-                    .record
-                    .clone()
-                    .unwrap_or_else(|| format!("{}{}", data.target, slider.name));
-                match data_file.offsets(&block_name) {
-                    Some(offsets) => shapes.push(PlannedShape {
-                        target: data.target.clone(),
-                        block: block_name,
-                        offsets: offsets.to_vec(),
-                    }),
-                    None => unresolved.push(UnresolvedRef {
-                        slider: slider.name.clone(),
-                        target: data.target.clone(),
-                        reason: UnresolvedReason::MissingBlock(block_name),
+                        reason,
                     }),
                 }
             }
@@ -386,6 +403,7 @@ impl BakePlan {
             preset: preset.name.clone(),
             size,
             sliders,
+            zaps,
             unresolved,
             deferred,
         })
@@ -430,6 +448,31 @@ impl BakePlan {
         self.sliders.iter().map(|slider| slider.shapes.len()).sum()
     }
 
+    /// Deletion indices per target shape: every active zap's indices unioned,
+    /// ascending without duplicates. @req BLD-01
+    ///
+    /// Native accumulates one sorted, deduplicated list per shape across all
+    /// active zap sliders (`zapIdxAll`, BodySlideApp.cpp:5215-5217), so a
+    /// vertex named by two zaps is deleted once. Targets appear once, ordered
+    /// by name; the reference map is unordered and read by shape name.
+    pub fn zap_indices(&self) -> Vec<(String, Vec<u16>)> {
+        let mut per_target: BTreeMap<&str, Vec<u16>> = BTreeMap::new();
+        for zap in &self.zaps {
+            per_target
+                .entry(zap.target.as_str())
+                .or_default()
+                .extend_from_slice(&zap.indices);
+        }
+        per_target
+            .into_iter()
+            .map(|(target, mut indices)| {
+                indices.sort_unstable();
+                indices.dedup();
+                (target.to_string(), indices)
+            })
+            .collect()
+    }
+
     /// Apply every planned offset for `target` to a copy of `positions`.
     pub fn apply(&self, target: &str, positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, BakeError> {
         let mut out = positions.to_vec();
@@ -452,6 +495,64 @@ fn native_value(percent: f32, invert: bool) -> f32 {
         true => 1.0 - authored,
         false => authored,
     }
+}
+
+/// Resolve one `Data` reference to its offset block.
+///
+/// The outer `Err` aborts the plan: an unreadable container fails the bake.
+/// The inner `Err` is reported by name, because a silently missing record is
+/// a wrong body.
+fn resolve_ref<F, T>(
+    home: &Path,
+    set: &SliderSet,
+    slider: &SliderDef,
+    data: &SliderDataRef,
+    cache: &mut BTreeMap<PathBuf, MorphData>,
+    load: &mut F,
+) -> Result<Result<PlannedShape, UnresolvedReason>, BakeError>
+where
+    F: FnMut(&Path) -> Result<T, BakeError>,
+    T: Into<MorphData>,
+{
+    let Some(file) = data.file.as_deref() else {
+        return Ok(Err(UnresolvedReason::Unrecorded));
+    };
+    let path = container_path(home, set, data, file);
+    if !cache.contains_key(&path) {
+        if !path.is_file() {
+            return Ok(Err(UnresolvedReason::MissingFile(path)));
+        }
+        let loaded: MorphData = load(&path)?.into();
+        cache.insert(path.clone(), loaded);
+    }
+    let block_name = data
+        .record
+        .clone()
+        .unwrap_or_else(|| format!("{}{}", data.target, slider.name));
+    match cache[&path].offsets(&block_name) {
+        Some(offsets) => Ok(Ok(PlannedShape {
+            target: data.target.clone(),
+            block: block_name,
+            offsets: offsets.to_vec(),
+        })),
+        None => Ok(Err(UnresolvedReason::MissingBlock(block_name))),
+    }
+}
+
+/// Vertices one zap block deletes. @req BLD-01
+///
+/// Mirrors `GetDiffIndices` with threshold 0 (DiffData.cpp:556-580): an index
+/// is kept when any delta component's magnitude is strictly positive, then the
+/// output is sorted ascending and deduplicated.
+fn zap_block_indices(offsets: &[VertexOffset]) -> Vec<u16> {
+    let mut indices: Vec<u16> = offsets
+        .iter()
+        .filter(|offset| offset.delta.iter().any(|d| d.abs() > 0.0))
+        .map(|offset| offset.index)
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 /// Keep file selection independent of block lookup, matching native builds. @req BLD-05

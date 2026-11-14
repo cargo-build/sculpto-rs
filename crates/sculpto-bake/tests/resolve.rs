@@ -215,6 +215,224 @@ fn uv_and_zap_sliders_are_deferred() {
     assert_eq!(plan.sliders.len(), 1, "only the position slider applies");
 }
 
+/// One set with a position slider, two data-backed zaps and a UV zap. Zap
+/// defaults are authored at 0 like the real sets (CBBE.osp `Remove Bra`), so a
+/// test activates a zap through its preset value.
+const ZAP_PROJECT: &str = r#"<SliderSetInfo version="1">
+  <SliderSet name="Body">
+    <DataFolder>HIMBO</DataFolder>
+    <SourceFile>body.nif</SourceFile>
+    <OutputPath>meshes</OutputPath>
+    <OutputFile>body</OutputFile>
+    <Shape target="Body">Body</Shape>
+    <Slider name="Lean" small="0" big="100">
+      <Data target="Body" local="true">body.osd\BodyLean</Data>
+    </Slider>
+    <Slider name="Paint" small="0" big="0" uv="true" zap="true">
+      <Data target="Body" local="true">body.osd\BodyPaint</Data>
+    </Slider>
+    <Slider name="Cut" small="0" big="0" zap="true">
+      <Data target="Body" local="true">body.osd\BodyCut</Data>
+    </Slider>
+    <Slider name="Trim" small="0" big="0" zap="true">
+      <Data target="Body" local="true">body.osd\BodyTrim</Data>
+    </Slider>
+  </SliderSet>
+</SliderSetInfo>"#;
+
+/// `BodyCut` overlaps `BodyTrim` at index 7, one duplicate index repeats
+/// inside `BodyCut`, and one offset carries an all-zero delta: the three ways
+/// a naive collection would differ from `GetDiffIndices`.
+fn zap_blocks() -> Vec<(&'static str, Vec<VertexOffset>)> {
+    vec![
+        (
+            "BodyCut",
+            vec![
+                offset(7, [1.0, 0.0, 0.0]),
+                offset(2, [0.0, 0.0, -0.5]),
+                offset(5, [0.0, 0.0, 0.0]),
+                offset(7, [0.0, 0.25, 0.0]),
+            ],
+        ),
+        (
+            "BodyTrim",
+            vec![offset(9, [0.0, 0.0, 1.0]), offset(7, [2.0, 0.0, 0.0])],
+        ),
+        ("BodyPaint", vec![offset(11, [1.0, 0.0, 0.0])]),
+        ("BodyLean", vec![offset(0, [1.0, 0.0, 0.0])]),
+    ]
+}
+
+fn zap_plan(tag: &str, values: &[(&str, f32)], blocks: &[(&str, Vec<VertexOffset>)]) -> BakePlan {
+    let set = values
+        .iter()
+        .map(|(name, value)| format!(r#"<SetSlider name="{name}" size="big" value="{value}"/>"#))
+        .collect::<Vec<_>>()
+        .concat();
+    BakePlan::resolve_with(
+        &zap_project(),
+        &preset(&set),
+        "Body",
+        SliderSize::Big,
+        &home(tag),
+        move |_path| Ok(container(blocks)),
+    )
+    .expect("plan resolves")
+}
+
+fn zap_project() -> Project {
+    match Document::parse_str(ZAP_PROJECT, "inline.osp") {
+        Ok(Document::Project(project)) => project,
+        other => panic!("expected a project: {other:?}"),
+    }
+}
+
+#[test]
+fn zap_at_zero_and_negative_percent_collects_nothing() {
+    let plan = zap_plan("zap-zero", &[("Cut", 0.0), ("Trim", -10.0)], &zap_blocks());
+    assert!(plan.zaps.is_empty(), "{:?}", plan.zaps);
+    assert!(plan.zap_indices().is_empty());
+}
+
+#[test]
+fn active_zap_collects_the_blocks_indices_sorted_ascending() {
+    let plan = zap_plan("zap-positive", &[("Cut", 25.0)], &zap_blocks());
+    assert_eq!(plan.zaps.len(), 1, "Trim stays at its 0 default");
+    assert_eq!(plan.zaps[0].slider, "Cut");
+    assert_eq!(plan.zaps[0].target, "Body");
+    assert_eq!(plan.zaps[0].block, "BodyCut");
+    // 2 and 7 once each: the zero delta and the duplicate index drop out.
+    assert_eq!(plan.zaps[0].indices, [2, 7]);
+    assert_eq!(plan.zap_indices(), [("Body".to_string(), vec![2, 7])]);
+}
+
+#[test]
+fn two_active_zaps_union_without_duplicates() {
+    let plan = zap_plan(
+        "zap-union",
+        &[("Cut", 100.0), ("Trim", 50.0)],
+        &zap_blocks(),
+    );
+    let per_slider: Vec<(&str, Vec<u16>)> = plan
+        .zaps
+        .iter()
+        .map(|zap| (zap.slider.as_str(), zap.indices.clone()))
+        .collect();
+    assert_eq!(per_slider, [("Cut", vec![2, 7]), ("Trim", vec![7, 9])]);
+    assert_eq!(plan.zap_indices(), [("Body".to_string(), vec![2, 7, 9])]);
+}
+
+#[test]
+fn non_zap_sliders_never_contribute_indices() {
+    let plan = zap_plan(
+        "zap-non-zap",
+        &[("Lean", 100.0), ("Paint", 100.0)],
+        &zap_blocks(),
+    );
+    assert_eq!(plan.sliders.len(), 1, "the position slider still applies");
+    assert!(plan.zaps.is_empty(), "a UV zap reads as UV, not a zap");
+    assert!(plan.zap_indices().is_empty());
+}
+
+/// Native inverts a slider value before the zap test (`vbig = 1 - vbig`,
+/// BodySlideApp.cpp:5206-5215), so an inverted zap fires at 0 percent and is
+/// inert at 100.
+#[test]
+fn inverted_zap_fires_only_when_the_complement_is_positive() {
+    let xml = ZAP_PROJECT.replace(
+        r#"<Slider name="Cut" small="0" big="0" zap="true">"#,
+        r#"<Slider name="Cut" small="0" big="0" invert="true" zap="true">"#,
+    );
+    let project = match Document::parse_str(&xml, "inline.osp") {
+        Ok(Document::Project(project)) => project,
+        other => panic!("expected a project: {other:?}"),
+    };
+    let resolve = |tag: &str, value: f32| {
+        BakePlan::resolve_with(
+            &project,
+            &preset(&format!(
+                r#"<SetSlider name="Cut" size="big" value="{value}"/>"#
+            )),
+            "Body",
+            SliderSize::Big,
+            &home(tag),
+            move |_path| Ok(container(&zap_blocks())),
+        )
+        .expect("plan resolves")
+    };
+    assert_eq!(
+        resolve("zap-invert-zero", 0.0).zaps[0].indices,
+        [2, 7],
+        "0 percent is the full zap when inverted"
+    );
+    assert!(
+        resolve("zap-invert-full", 100.0).zaps.is_empty(),
+        "100 percent is inert when inverted"
+    );
+}
+
+#[test]
+fn an_active_zaps_missing_block_is_reported() {
+    let plan = zap_plan(
+        "zap-missing-block",
+        &[("Cut", 100.0)],
+        &[("BodyLean", vec![])],
+    );
+    assert!(plan.zaps.is_empty());
+    assert_eq!(plan.unresolved.len(), 1);
+    assert_eq!(plan.unresolved[0].slider, "Cut");
+    assert_eq!(
+        plan.unresolved[0].reason,
+        UnresolvedReason::MissingBlock("BodyCut".into())
+    );
+}
+
+/// The real CBBE zap the BLD-01 acceptance names: `Remove Bra` forced to 100
+/// resolves its block and collects indices. Deletion itself belongs to the
+/// build step, so the counts are printed as the hand-off evidence.
+#[test]
+fn real_cbbe_remove_bra_collects_indices() {
+    let Some(home) = std::env::var_os("SCULPTO_BODYSLIDE_HOME") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    let project = match Document::parse_file(home.join("SliderSets/CBBE.osp")) {
+        Ok(Document::Project(project)) => project,
+        other => panic!("expected a project: {other:?}"),
+    };
+    let presets = match Document::parse_file(home.join("SliderPresets/CBBE.xml")) {
+        Ok(Document::Presets(presets)) => presets,
+        other => panic!("expected presets: {other:?}"),
+    };
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert("Remove Bra".to_string(), 100.0);
+    let plan = BakePlan::resolve_overrides(
+        &project,
+        &presets[0],
+        "CBBE NeverNude",
+        SliderSize::Big,
+        &home,
+        &overrides,
+    )
+    .expect("plan resolves");
+    assert_eq!(plan.zaps.len(), 1);
+    let zap = &plan.zaps[0];
+    assert_eq!(zap.slider, "Remove Bra");
+    assert_eq!(zap.target, "Bra");
+    assert_eq!(zap.block, "BraRemove Bra");
+    assert!(!zap.indices.is_empty());
+    assert!(
+        zap.indices.windows(2).all(|pair| pair[0] < pair[1]),
+        "strictly ascending"
+    );
+    eprintln!(
+        "Remove Bra: {} indices, first {:?}, last {:?}",
+        zap.indices.len(),
+        zap.indices.first(),
+        zap.indices.last()
+    );
+}
+
 #[test]
 fn unrecorded_reference_is_reported() {
     let xml = PROJECT.replace(r"body.osd\BodyLean", "");
