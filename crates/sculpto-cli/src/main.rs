@@ -129,8 +129,8 @@ body seal-joints options:
   --body <obj>        multi-part body OBJ (torso + head/hand shells)
   --out <obj>         output OBJ with the sealed seams
   --joint <p>:<s>[:seat]  declared joint: part shell, socket shell, optional seat
-  --iterations <n>    Laplacian passes (default 2)
-  --band <n>          ring distance that may move (default 1)
+  --iterations <n>    Laplacian passes (default 12)
+  --band <n>          ring distance that may move (default 2)
   --max-shift <units> hard displacement bound per vertex
   --arc-band <units>  candidate-rim proximity band (derived when absent)
   --head-drop <units> explicit vertical seat of the part shell before pairing (default 0)

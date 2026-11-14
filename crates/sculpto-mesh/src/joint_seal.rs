@@ -2,22 +2,22 @@
 //! bridge them into a watertight seam without adding or deleting a vertex,
 //! then smooth the band under a hard displacement bound. @req BLD-13
 //!
-//! The product rule for the neck (arbitrated by the design review over the
-//! two researcher seams): a compound boundary loop is mostly seam cuts at
-//! duplicated positions, so the real opening is its **run of unique-position
-//! vertices**; when the run's flanking vertices coincide (the pinch), the
-//! collar closes into a cycle after merging that one pair (the default,
-//! reported as `pinch_edges`) and bridges against the socket ring
-//! closed-to-closed — 26 ↔ 26 → 52 triangles on the Bijin fixture. The
-//! competing 29-vertex proximity/planarity arc is rejected because its extra
-//! vertices are coincident slit duplicates: bridging them would weld the
-//! head's authored slits while the report claimed them closed.
+//! The neck seam is the socket ring against the part's **proximity arc**: the
+//! maximal cyclic run of head-loop vertices within the derived band of the
+//! socket. On the Bijin fixture that is a 29-vertex arc whose end vertices
+//! coincide (a seam cut through the collar), so the arc stays open and the
+//! bridge consumes 26 ring edges + 28 arc edges = 54 triangles. A closed
+//! collar (a run covering the whole loop) bridges closed-to-closed; its pinch
+//! pair is welded and the boundary edges that merge actually removed are
+//! reported as `pinch_edges`. Bridging the whole 86-vertex head loop would
+//! weld its authored slits, so the arc is selected instead.
 //!
 //! Nothing moves during the weld. A caller may declare an explicit
 //! [`SealOptions::head_drop`] seat step (translation only, separately
 //! reported, default 0 — the measured fixture head is already seated) or a
-//! seated hands joint (uniform scale from span and perimeter, per-cuff
-//! translation). Smoothing moves only the bridge band plus `band` rings of
+//! seated hands joint (the span/perimeter scale and per-cuff translation;
+//! the measured rotation and cross-side seat are still pending). Smoothing
+//! moves only the bridge band plus `band` rings of
 //! neighbours, under a bound that refuses rather than clips.
 
 use std::collections::{BTreeSet, HashMap};
@@ -102,6 +102,8 @@ pub enum SealError {
     HandednessAmbiguous { parts: Vec<String> },
     /// A seated part still does not reach its socket band.
     SeatUnreachable { gap: f64, band: f64 },
+    /// A caller-supplied option is outside its documented range.
+    InvalidOption { option: &'static str, value: String },
 }
 
 impl SealError {
@@ -125,6 +127,7 @@ impl SealError {
             Self::WristCrossPair { .. } => "seal_wrist_cross_pair",
             Self::HandednessAmbiguous { .. } => "seal_handedness_ambiguous",
             Self::SeatUnreachable { .. } => "seal_seat_unreachable",
+            Self::InvalidOption { .. } => "seal_invalid_option",
         }
     }
 
@@ -137,6 +140,7 @@ impl SealError {
                 | Self::BadIndex { .. }
                 | Self::JointUnknown { .. }
                 | Self::JointSameShell { .. }
+                | Self::InvalidOption { .. }
         )
     }
 }
@@ -218,6 +222,9 @@ impl fmt::Display for SealError {
                 "the cuffs of [{}] cannot be told apart laterally",
                 parts.join(", ")
             ),
+            Self::InvalidOption { option, value } => {
+                write!(formatter, "option `{option}` is outside its range: {value}")
+            }
             Self::SeatUnreachable { gap, band } => write!(
                 formatter,
                 "seated part still sits {gap:.4} from its socket, beyond the band {band:.4}"
@@ -501,43 +508,56 @@ fn validate(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Result<(), SealEr
 
 fn validate_options(options: &SealOptions) -> Result<(), SealError> {
     if !(1..=20).contains(&options.iterations) {
-        return Err(SealError::ShiftLimit {
-            vertex: 0,
-            required: f64::from(options.iterations),
-            bound: 20.0,
+        return Err(SealError::InvalidOption {
+            option: "iterations",
+            value: format!("{} (accepted 1..=20)", options.iterations),
         });
     }
     if !(1..=2).contains(&options.band) {
-        return Err(SealError::ShiftLimit {
-            vertex: 0,
-            required: f64::from(options.band),
-            bound: 2.0,
+        return Err(SealError::InvalidOption {
+            option: "band",
+            value: format!("{} (accepted 1..=2)", options.band),
         });
     }
     if !options.head_drop.is_finite() || options.head_drop < 0.0 {
-        return Err(SealError::SeatUnreachable {
-            gap: f64::from(options.head_drop),
-            band: 0.0,
+        return Err(SealError::InvalidOption {
+            option: "head_drop",
+            value: format!("{} (accepted finite, >= 0)", options.head_drop),
         });
     }
     if let Some(max_shift) = options.max_shift
         && !(max_shift.is_finite() && max_shift > 0.0)
     {
-        return Err(SealError::ShiftLimit {
-            vertex: 0,
-            required: f64::from(max_shift),
-            bound: f64::NAN,
+        return Err(SealError::InvalidOption {
+            option: "max_shift",
+            value: format!("{max_shift} (accepted finite, > 0)"),
         });
     }
     if let Some(arc_band) = options.arc_band
         && !(arc_band.is_finite() && arc_band > 0.0)
     {
-        return Err(SealError::RingTooFar {
-            gap: arc_band,
-            band: f64::NAN,
+        return Err(SealError::InvalidOption {
+            option: "arc_band",
+            value: format!("{arc_band} (accepted finite, > 0)"),
         });
     }
     Ok(())
+}
+
+/// The ring vertex with the most boundary edges and that degree: the honest
+/// witness for a ring that is not a degree-2 cycle. @req BLD-13
+fn rim_max_boundary_degree(rim: &[u32], uses: &HashMap<(u32, u32), u32>) -> (usize, u32) {
+    let mut best = (0usize, 0u32);
+    for &vertex in rim {
+        let degree = uses
+            .iter()
+            .filter(|((left, right), count)| **count == 1 && (*left == vertex || *right == vertex))
+            .count() as u32;
+        if degree > best.1 {
+            best = (vertex as usize, degree);
+        }
+    }
+    best
 }
 
 fn own_triangles(triangles: &[[u32; 3]], members: &BTreeSet<usize>) -> Vec<[u32; 3]> {
@@ -1453,16 +1473,26 @@ fn pair_rims(
         });
     }
     if !part_rims[part_rim].simple || !socket_rims[socket_rim].simple {
-        let (rim, shell) = if !part_rims[part_rim].simple {
-            (&part_rims[part_rim], &part.name)
+        let (rim, shell, members) = if !part_rims[part_rim].simple {
+            (
+                &part_rims[part_rim],
+                &part.name,
+                part.members.iter().copied().collect::<BTreeSet<usize>>(),
+            )
         } else {
-            (&socket_rims[socket_rim], &socket.name)
+            (
+                &socket_rims[socket_rim],
+                &socket.name,
+                socket.members.iter().copied().collect::<BTreeSet<usize>>(),
+            )
         };
-        let vertex = rim.vertices.first().copied().unwrap_or(0) as usize;
+        let own = own_triangles(triangles, &members);
+        let uses = edge_uses(&own);
+        let (vertex, degree) = rim_max_boundary_degree(&rim.vertices, &uses);
         return Err(SealError::RingNotSimple {
             shell: shell.clone(),
             vertex,
-            degree: 0,
+            degree,
         });
     }
     if let Some(&(_, _, second)) = pairs.get(1)
@@ -1743,11 +1773,15 @@ pub fn seal_joints(
         )?;
         let selected_collar =
             (pinch.is_some() || collar.len() != part_rim.vertices.len()).then_some(collar.len());
-        // An open collar keeps its two authored coincident endpoints; the
-        // pinch is reported, not merged (merging would isolate the endpoint).
-        let pinch_edges = if pinch.is_some() { 2usize } else { 0usize };
+        // An open collar keeps its two authored coincident endpoints, so no
+        // edges are merged; a closed collar's pinch is welded and the count is
+        // the boundary edges that merge actually removed.
+        let mut pinch_edges = 0usize;
         if let Some((from, to)) = pinch.filter(|_| collar_closed) {
+            let before = boundary_total(&edge_uses(&triangles));
             triangles = rewire_vertex(&triangles, from, to);
+            let after = boundary_total(&edge_uses(&triangles));
+            pinch_edges = before.saturating_sub(after);
         }
 
         let ring = if socket_rim.closed {
@@ -2047,20 +2081,13 @@ pub fn seal_joints(
         components_before,
         components_after,
         joints,
-        input_digest: input_digest.clone(),
+        input_digest,
         output_digest: geometry_digest(&positions, &triangles),
     };
-    let _ = &report;
     Ok(SealOutcome {
         positions,
         triangles,
-        report: SealReport {
-            components_before,
-            components_after,
-            joints: report.joints,
-            input_digest: String::new(),
-            output_digest: String::new(),
-        },
+        report,
     })
 }
 

@@ -176,5 +176,6 @@ fn render(out: &std::path::Path, outcome: &SealOutcome) -> Value {
         "triangles": outcome.triangles.len(),
         "units": "input",
         "uv": "absent",
+        "material": "not_carried",
     })
 }

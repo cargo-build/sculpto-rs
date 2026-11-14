@@ -1641,10 +1641,12 @@ pub fn shell_identities(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<S
         .iter()
         .map(|shell| PointIndex::build(shell.positions.as_slice()))
         .collect();
+    let ring_ids: Vec<Vec<usize>> = shells.iter().map(|shell| shell.boundary.clone()).collect();
     let no_ring_trees: Vec<Option<PointIndex<'_>>> = (0..shells.len()).map(|_| None).collect();
     let bodies = Bodies {
         shells: shells.as_slice(),
         ring_points: ring_points.as_slice(),
+        ring_ids: ring_ids.as_slice(),
         shell_trees: shell_trees.as_slice(),
         ring_trees: no_ring_trees.as_slice(),
         large: large.as_slice(),
