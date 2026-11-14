@@ -181,7 +181,7 @@ fn non_inverted_bake_is_unchanged() {
 }
 
 #[test]
-fn uv_and_zap_sliders_are_deferred() {
+fn uv_sliders_stay_deferred_and_zaps_plan_deletion_instead() {
     let xml = r#"<SliderSetInfo version="1">
   <SliderSet name="Body">
     <DataFolder>HIMBO</DataFolder>
@@ -209,9 +209,11 @@ fn uv_and_zap_sliders_are_deferred() {
         |_path| Ok(container(&[("BodyLean", vec![offset(0, [1.0, 0.0, 0.0])])])),
     )
     .expect("plan resolves");
+    // A zap is not deferred: it is planned as deletion. This one carries no
+    // data reference, so it plans nothing and never appears anywhere.
     let reasons: Vec<DeferredReason> = plan.deferred.iter().map(|item| item.reason).collect();
-    assert!(reasons.contains(&DeferredReason::Uv));
-    assert!(reasons.contains(&DeferredReason::Zap));
+    assert_eq!(reasons, vec![DeferredReason::Uv]);
+    assert!(plan.zaps.is_empty());
     assert_eq!(plan.sliders.len(), 1, "only the position slider applies");
 }
 

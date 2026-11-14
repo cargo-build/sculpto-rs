@@ -187,11 +187,12 @@ fn conformed_slider_follows_the_body_at_zero_and_one_hundred() {
     let fixture = Fixture::new("endpoints");
     let result = fixture.conform();
     assert_eq!(result["sliders"], json!(["Lift", "Reverse"]));
+    // The zap slider is no longer listed as deferred: zaps plan deletion in
+    // the build, so conform excludes them from the garment blocks directly.
     assert_eq!(
         result["deferred"],
         json!([
             { "name": "Texture", "reason": "uv" },
-            { "name": "Hide", "reason": "zap" },
         ])
     );
     let path = fixture.scratch.path().join("conformed.osd");

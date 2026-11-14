@@ -63,6 +63,10 @@ pub struct ConformOutcome {
 
 /// Transfer the selected body's positional sliders to the garment. @req DECL0013
 ///
+/// Zap sliders of the source set never enter the garment blocks: a garment
+/// zap preview needs the build's deletion step (`zap_indices` consumers,
+/// BLD-06/09), which a conformed `.osd` block cannot express.
+///
 /// # Errors
 /// Refuses unresolved reference blocks, malformed meshes and offsets, and
 /// data the named OSD format cannot store.
@@ -71,7 +75,7 @@ pub fn conform_sliders(params: &ConformParams) -> Result<ConformOutcome, Command
     let source = body_document(&document, params.body_nif.as_deref())?;
     let garment = PlacedShape::named(&document, &params.shape)?;
     let body = PlacedShape::named(&source, &params.body_shape)?;
-    let (plan, names, target) = conform_plan(params)?;
+    let (plan, names, target, zaps) = conform_plan(params)?;
     let cache = ProximityCache::build(
         &body.source_positions(),
         &garment.source_positions(),
@@ -88,6 +92,7 @@ pub fn conform_sliders(params: &ConformParams) -> Result<ConformOutcome, Command
     let sliders: Vec<_> = names
         .into_iter()
         .filter(|name| !deferred.contains(name.as_str()))
+        .filter(|name| !zaps.contains(name.as_str()))
         .collect();
     let active: BTreeMap<_, _> = plan
         .sliders
@@ -130,7 +135,9 @@ pub fn conform_sliders(params: &ConformParams) -> Result<ConformOutcome, Command
     })
 }
 
-fn conform_plan(params: &ConformParams) -> Result<(BakePlan, Vec<String>, String), CommandError> {
+fn conform_plan(
+    params: &ConformParams,
+) -> Result<(BakePlan, Vec<String>, String, BTreeSet<String>), CommandError> {
     let Document::Project(mut project) =
         Document::parse_file(&params.project).map_err(errors::document)?
     else {
@@ -171,6 +178,14 @@ fn conform_plan(params: &ConformParams) -> Result<(BakePlan, Vec<String>, String
         .iter()
         .map(|slider| slider.name.clone())
         .collect();
+    // Zap flags come from the set itself: a zap without data references never
+    // reaches `plan.zaps`, but it still has no garment block to transfer.
+    let zaps: BTreeSet<String> = set
+        .sliders
+        .iter()
+        .filter(|slider| slider.zap)
+        .map(|slider| slider.name.clone())
+        .collect();
     let overrides = names.iter().cloned().map(|name| (name, 100.0)).collect();
     let home = params
         .home
@@ -196,7 +211,7 @@ fn conform_plan(params: &ConformParams) -> Result<(BakePlan, Vec<String>, String
             ),
         ));
     }
-    Ok((plan, names, target))
+    Ok((plan, names, target, zaps))
 }
 
 fn garment_offsets(

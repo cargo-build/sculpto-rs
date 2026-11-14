@@ -290,6 +290,10 @@ pub struct MeshAsset {
     pub physics: Option<PhysicsRef>,
     /// Local placement inside a multi-shape bundle; `None` is the identity.
     pub transform: Option<Transform>,
+    /// Keep the shape in the file but do not display it: native `NiAVObject`
+    /// flag bit 0, set for a fully zapped shape under `KeepZappedShapes`
+    /// (BodySlideApp.cpp:4420-4421). @req BLD-01
+    pub hidden: bool,
 }
 
 /// One sparse offset in the `.tri` projection: a `u16` vertex index.
@@ -454,6 +458,15 @@ pub enum MeshError {
     DuplicatePartitionPalette { partition: PartitionId },
     /// A triangle carries the reader's unmatched-partition sentinel.
     UnmatchedPartition { triangle: usize },
+    /// A vertex-removal list is not strictly ascending (unsorted or repeated).
+    RemoveIndicesNotSorted,
+    /// A vertex-removal list names a vertex outside the arena.
+    RemoveIndexOutOfRange {
+        /// The offending index.
+        index: u16,
+        /// Number of vertices the arena holds.
+        vertices: usize,
+    },
     /// Two partition slots use the same partition id.
     DuplicatePartitionSlot { partition: PartitionId },
     /// No triangle carries a partition slot's id.
@@ -471,7 +484,7 @@ pub enum MeshError {
 /// The model keeps its existing variants so every consumer that already matches
 /// them keeps working; the finer [`SkinWeightError`] stays available at the
 /// constructor and projection boundaries.
-fn skin_weight_error(error: SkinWeightError) -> MeshError {
+pub(crate) fn skin_weight_error(error: SkinWeightError) -> MeshError {
     match error {
         SkinWeightError::PaletteIndex {
             row,
@@ -1096,6 +1109,7 @@ impl MeshAsset {
             materials: self.materials.clone(),
             physics: self.physics.clone(),
             transform: self.transform,
+            hidden: false,
         })
     }
 

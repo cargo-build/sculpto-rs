@@ -154,6 +154,7 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
                     shader: index.shader,
                 },
                 NativeTransform::IDENTITY,
+                shape.hidden,
             ),
         });
         blocks.push(Block {

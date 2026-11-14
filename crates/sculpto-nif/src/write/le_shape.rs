@@ -91,6 +91,7 @@ pub(super) fn write(
                     shader: shader_index,
                 },
                 checked.map_or(NativeTransform::IDENTITY, |scene| scene.placement),
+                asset.hidden,
             ),
         },
         Block {
@@ -176,7 +177,7 @@ pub(super) struct ShapeRefs {
 /// LE keeps the mesh on its own data block, so the shape carries references and
 /// no geometry: name, optional extra data, the paired data block, the optional
 /// skin instance and shader property.
-pub(super) fn shape_body(refs: ShapeRefs, transform: NativeTransform) -> Vec<u8> {
+pub(super) fn shape_body(refs: ShapeRefs, transform: NativeTransform, hidden: bool) -> Vec<u8> {
     let mut shape = Vec::new();
     push_i32(&mut shape, refs.name);
     push_u32(&mut shape, u32::from(refs.extra >= 0));
@@ -184,7 +185,7 @@ pub(super) fn shape_body(refs: ShapeRefs, transform: NativeTransform) -> Vec<u8>
         push_i32(&mut shape, refs.extra);
     }
     push_i32(&mut shape, -1); // controller
-    push_u32(&mut shape, 0); // flags
+    push_u32(&mut shape, u32::from(hidden)); // NiAVObject flags: bit 0 = hidden
     transform.write_av(&mut shape);
     push_i32(&mut shape, -1); // collision
     push_i32(&mut shape, refs.data);

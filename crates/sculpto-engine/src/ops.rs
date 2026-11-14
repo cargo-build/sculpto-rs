@@ -29,7 +29,8 @@ use sculpto_nif::write::header::{NifTarget, NifWriteError};
 use sculpto_nif::write::le_bundle::write_le_bundle;
 use sculpto_nif::write::se_bundle::write_se_bundle;
 use sculpto_nif::write::{
-    DroppedInfluence, InfluencePolicy, WrittenNif, write_rigged_shape, write_shape_with_policy,
+    DroppedInfluence, InfluencePolicy, WrittenNif, write_rigged_shape, write_rigged_shape_deleted,
+    write_shape_with_policy,
 };
 use sculpto_nif::{NifDocument, NifRigError, NifShape};
 
@@ -360,6 +361,8 @@ pub struct ExportPairOutcome {
     pub triangles: usize,
     /// Native lane reductions for the `_0` and `_1` files.
     pub dropped_influences: [Vec<DroppedInfluence>; 2],
+    /// Zap outcome per file (`_0`, `_1`): kept, deleted, hidden or dropped.
+    pub zap: [ZapFile; 2],
 }
 
 /// The `big`/`small` wire token, shared by `bake` and `export.pair`.
@@ -485,21 +488,49 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
     let morph_target = set.target_for_shape(&shape.name).unwrap_or(&shape.name);
     let rig = export_rig(&document, index, params.rig_template.as_deref())?;
     let source = rig.as_deref().map(|rig| (&document, rig, index));
-    let mut asset = MeshAsset::from(shape);
-    let mut encode = |plan: &BakePlan| {
+    let base = MeshAsset::from(shape);
+    let keep_zapped = set.output_file.keep_zapped_shapes;
+    // Reference order per shape: morphs, then the already-present normals and
+    // tangents, then deletion (BodySlideApp.cpp:4408-4434). Morphs move only
+    // positions, so deletion is applied to the morphed arena. @req BLD-01
+    let encode = |plan: &BakePlan| -> Result<(Option<WrittenNif>, ZapFile), CommandError> {
+        let mut asset = base.clone();
         asset.positions = plan
             .apply(morph_target, &shape.positions)
             .map_err(errors::bake)?;
-        encode_nif(&asset, target, source)
+        let Some(indices) = zap_indices_for(plan, morph_target) else {
+            return encode_nif(&asset, target, source)
+                .map(|written| (Some(written), ZapFile::Kept));
+        };
+        if keep_zapped && indices.len() == asset.positions.len() {
+            // Native keeps a fully zapped shape in the file with its hidden
+            // flag set instead of deleting it (BodySlideApp.cpp:4420-4421).
+            asset.hidden = true;
+            return encode_nif(&asset, target, source)
+                .map(|written| (Some(written), ZapFile::Hidden));
+        }
+        let removed = asset.remove_vertices(&indices).map_err(errors::mesh)?;
+        if removed.positions.is_empty() || removed.triangles.is_empty() {
+            // Fully zapped and not kept: the shape is dropped, so this
+            // endpoint writes no file (DeleteShape, BodySlideApp.cpp:4426).
+            return Ok((None, ZapFile::Dropped));
+        }
+        let zap = ZapFile::Deleted {
+            vertices: removed.positions.len(),
+            triangles: removed.triangles.len(),
+        };
+        encode_nif_deleted(&removed, target, source, &indices).map(|written| (Some(written), zap))
     };
-    let bodies = [encode(&plans[0])?, encode(&plans[1])?];
+    let [(body_0, zap_0), (body_1, zap_1)] = [encode(&plans[0])?, encode(&plans[1])?];
     let stem = pair_stem(&params.out);
     let outs = [
         PathBuf::from(format!("{}_0.nif", stem.display())),
         PathBuf::from(format!("{}_1.nif", stem.display())),
     ];
-    for (out, body) in outs.iter().zip(&bodies) {
-        std::fs::write(out, &body.bytes).map_err(|error| errors::io(out, error))?;
+    for (out, body) in outs.iter().zip([&body_0, &body_1]) {
+        if let Some(body) = body {
+            std::fs::write(out, &body.bytes).map_err(|error| errors::io(out, error))?;
+        }
     }
     Ok(ExportPairOutcome {
         out_0: outs[0].clone(),
@@ -513,8 +544,46 @@ pub fn export_pair(params: &ExportPairParams) -> Result<ExportPairOutcome, Comma
         shape: shape.name.clone(),
         vertices: shape.positions.len(),
         triangles: shape.triangles.len(),
-        dropped_influences: bodies.map(|body| body.dropped_influences),
+        dropped_influences: [body_0, body_1]
+            .map(|body| body.map_or_else(Vec::new, |body| body.dropped_influences)),
+        zap: [zap_0, zap_1],
     })
+}
+
+/// How zap sliders left the built shape in one output file. @req BLD-01
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZapFile {
+    /// No zap fired for this endpoint; the whole shape survives.
+    Kept,
+    /// Zaps deleted vertices; the counts are the surviving arena that was
+    /// written.
+    Deleted { vertices: usize, triangles: usize },
+    /// Every vertex is zapped and `KeepZappedShapes` held the shape in the
+    /// file, hidden.
+    Hidden,
+    /// Every vertex (or every triangle) is zapped and the shape was dropped;
+    /// no file was written for this endpoint.
+    Dropped,
+}
+
+impl ZapFile {
+    /// Stable wire name for the JSON surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::Deleted { .. } => "deleted",
+            Self::Hidden => "hidden",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// The zap indices one plan deletes for `target`, when it deletes any.
+fn zap_indices_for(plan: &BakePlan, target: &str) -> Option<Vec<u16>> {
+    plan.zap_indices()
+        .into_iter()
+        .find(|(name, indices)| name == target && !indices.is_empty())
+        .map(|(_, indices)| indices)
 }
 
 /// Target game version of a written NIF.
@@ -811,6 +880,18 @@ fn encode_nif(
     target: NifTarget,
     source: Option<(&NifDocument, &Rig, usize)>,
 ) -> Result<WrittenNif, CommandError> {
+    encode_nif_with_zap(asset, target, source, None)
+}
+
+/// [`encode_nif`] after zap deletion: a skinned source re-encodes through the
+/// deletion-checked rig binding, so the zapped file keeps its skeleton. @req
+/// BLD-01
+fn encode_nif_with_zap(
+    asset: &MeshAsset,
+    target: NifTarget,
+    source: Option<(&NifDocument, &Rig, usize)>,
+    deleted: Option<&[u16]>,
+) -> Result<WrittenNif, CommandError> {
     asset.validate().map_err(errors::mesh)?;
     // This LE writer has no NBT layout and refuses authored tangents. A
     // texture-ready model always carries them (the reader synthesizes them from
@@ -824,8 +905,17 @@ fn encode_nif(
             Cow::Owned(projection)
         }
     };
-    let output = match source {
-        Some((document, rig, index)) => write_rigged_shape(
+    let output = match (source, deleted) {
+        (Some((document, rig, index)), Some(deleted)) => write_rigged_shape_deleted(
+            &projected,
+            document,
+            rig,
+            index,
+            deleted,
+            target,
+            InfluencePolicy::NativeFour,
+        ),
+        (Some((document, rig, index)), None) => write_rigged_shape(
             &projected,
             document,
             rig,
@@ -833,9 +923,20 @@ fn encode_nif(
             target,
             InfluencePolicy::NativeFour,
         ),
-        None => write_shape_with_policy(&projected, target, InfluencePolicy::NativeFour),
+        (None, _) => write_shape_with_policy(&projected, target, InfluencePolicy::NativeFour),
     };
     output.map_err(errors::nif_write)
+}
+
+/// Deletion-aware [`encode_nif`]: `deleted` is the zap index list already
+/// applied to `asset`.
+fn encode_nif_deleted(
+    asset: &MeshAsset,
+    target: NifTarget,
+    source: Option<(&NifDocument, &Rig, usize)>,
+    deleted: &[u16],
+) -> Result<WrittenNif, CommandError> {
+    encode_nif_with_zap(asset, target, source, Some(deleted))
 }
 
 /// Everything `gltf.reset_weights` and `gltf.clamp_texcoord` need.

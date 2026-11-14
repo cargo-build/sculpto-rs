@@ -89,10 +89,10 @@ pub fn write_rigged_shape(
     target: NifTarget,
     policy: InfluencePolicy,
 ) -> Result<WrittenNif, NifWriteError> {
-    let source = document.shapes.get(shape).ok_or(NifWriteError::RigLayout {
-        shape,
-        reason: "shape is outside the source document",
-    })?;
+    let source = document
+        .shapes
+        .get(shape)
+        .ok_or_else(|| out_of_bounds(shape))?;
     if source.skin != asset.skin
         || source.triangles != asset.triangles
         || source.positions.len() != asset.positions.len()
@@ -102,11 +102,74 @@ pub fn write_rigged_shape(
             reason: "the export topology or skin differs from its source binding",
         });
     }
+    rigged_encode(asset, document, rig, shape, target, policy)
+}
+
+/// Write one imported skinned shape after zap deletion removed source
+/// vertices. @req BLD-01
+///
+/// `deleted` is the strictly ascending vertex list the caller removed with
+/// [`MeshAsset::remove_vertices`] after applying slider morphs. The binding
+/// gate of [`write_rigged_shape`] is replayed on the source's own deletion:
+/// the exported triangles, partitions and skin must equal what deleting
+/// `deleted` from the source produces, and only position values may differ
+/// (slider morphs). The rig, scene placement and binds still come from the
+/// source, so the zapped file keeps its skeleton exactly like native's
+/// `notifyVerticesDelete` cascade (NifFile.cpp:4411-4490).
+///
+/// # Errors
+/// Refuses a `deleted` list the source cannot express, an export whose
+/// topology or skin is anything other than the declared deletion, and every
+/// condition [`write_rigged_shape`] refuses.
+pub fn write_rigged_shape_deleted(
+    asset: &MeshAsset,
+    document: &NifDocument,
+    rig: &Rig,
+    shape: usize,
+    deleted: &[u16],
+    target: NifTarget,
+    policy: InfluencePolicy,
+) -> Result<WrittenNif, NifWriteError> {
+    let source = document
+        .shapes
+        .get(shape)
+        .ok_or_else(|| out_of_bounds(shape))?;
+    let expected = MeshAsset::from(source)
+        .remove_vertices(deleted)
+        .map_err(NifWriteError::InvalidModel)?;
+    if expected.skin != asset.skin
+        || expected.triangles != asset.triangles
+        || expected.positions.len() != asset.positions.len()
+    {
+        return Err(NifWriteError::RigLayout {
+            shape,
+            reason: "the export topology or skin differs from its source binding after the declared deletion",
+        });
+    }
+    rigged_encode(asset, document, rig, shape, target, policy)
+}
+
+/// The shared checked-scene tail of the two rigged writers.
+fn rigged_encode(
+    asset: &MeshAsset,
+    document: &NifDocument,
+    rig: &Rig,
+    shape: usize,
+    target: NifTarget,
+    policy: InfluencePolicy,
+) -> Result<WrittenNif, NifWriteError> {
     let binding = document
         .bind_rest_on(rig)
         .map_err(NifWriteError::InvalidRig)?;
     let scene = CheckedScene::new(&binding, &document.sources[shape], shape)?;
     encode(asset, target, policy, Some(&scene))
+}
+
+fn out_of_bounds(shape: usize) -> NifWriteError {
+    NifWriteError::RigLayout {
+        shape,
+        reason: "shape is outside the source document",
+    }
 }
 
 fn encode(

@@ -298,7 +298,6 @@ pub fn conform(input: &Value) -> Result<Value, CommandError> {
         .map(|slider| {
             let reason = match slider.reason {
                 sculpto_bake::DeferredReason::Uv => "uv",
-                sculpto_bake::DeferredReason::Zap => "zap",
                 sculpto_bake::DeferredReason::ClampSemantics => "clamp_semantics",
             };
             json!({ "name": slider.name, "reason": reason })
@@ -383,6 +382,8 @@ pub fn export_pair(input: &Value) -> Result<Value, CommandError> {
         "triangles": outcome.triangles,
         "dropped_influences_0": dropped_influences(&outcome.dropped_influences[0]),
         "dropped_influences_1": dropped_influences(&outcome.dropped_influences[1]),
+        "zap_0": outcome.zap[0].as_str(),
+        "zap_1": outcome.zap[1].as_str(),
     }))
 }
 

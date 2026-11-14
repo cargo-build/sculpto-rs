@@ -126,12 +126,14 @@ pub struct UnresolvedRef {
 }
 
 /// Why a slider is not applied to positions.
+///
+/// Zap sliders are never listed here: the plan resolves them into
+/// [`BakePlan::zaps`] deletion indices for the build step, so a zap is not
+/// deferred, it is planned for deletion. @req BLD-01
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredReason {
     /// UV slider: offsets belong to UV coordinates.
     Uv,
-    /// Zap slider: it removes topology instead of moving vertices.
-    Zap,
     /// Clamp/default semantics are not verified against a native build yet.
     ClampSemantics,
 }
@@ -341,15 +343,12 @@ impl BakePlan {
                 continue;
             }
             if slider.zap {
-                deferred.push(DeferredSlider {
-                    name: slider.name.clone(),
-                    reason: DeferredReason::Zap,
-                });
-                // Native collects zap indices only when the post-inversion
-                // value is positive (`vbig > 0`, BodySlideApp.cpp:5215), so a
-                // zero or negative zap deletes nothing. UV zaps never reach
-                // here: native reads them through the UV path
-                // (`bZap && !bUV`, BodySlideApp.cpp:5206).
+                // Zap sliders are not deferred: they resolve into `zaps` for
+                // the build's deletion step. Native collects zap indices only
+                // when the post-inversion value is positive (`vbig > 0`,
+                // BodySlideApp.cpp:5215), so a zero or negative zap deletes
+                // nothing. UV zaps never reach here: native reads them through
+                // the UV path (`bZap && !bUV`, BodySlideApp.cpp:5206).
                 if native_value(percent, slider.invert) > 0.0 {
                     for data in &slider.data {
                         match resolve_ref(home, set, slider, data, &mut cache, &mut load)? {

@@ -55,20 +55,24 @@ fn asset() -> MeshAsset {
     }
 }
 
-/// Hand-packed `\0DSO`: magic, version, block count, then
-/// `u8` name length, name, `u16` record count, `u16` index + three `f32`s.
-fn container_bytes() -> Vec<u8> {
+/// One named morph block: its record name and `(index, delta)` records.
+type BlockSpec<'a> = (&'a str, &'a [(u16, [f32; 3])]);
+
+/// Hand-packed `\0DSO` with as many named blocks as the caller has.
+fn container_blocks(blocks: &[BlockSpec]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"\x00DSO");
     bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.push("BodyLean".len() as u8);
-    bytes.extend_from_slice(b"BodyLean");
-    bytes.extend_from_slice(&(DELTAS.len() as u16).to_le_bytes());
-    for (index, delta) in DELTAS {
-        bytes.extend_from_slice(&index.to_le_bytes());
-        for value in delta {
-            bytes.extend_from_slice(&value.to_le_bytes());
+    bytes.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for (name, deltas) in blocks {
+        bytes.push(name.len() as u8);
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&(deltas.len() as u16).to_le_bytes());
+        for (index, delta) in *deltas {
+            bytes.extend_from_slice(&index.to_le_bytes());
+            for value in delta {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
     }
     bytes
@@ -95,6 +99,12 @@ const PRESETS: &str = r#"<SliderPresets>
 
 /// A BodySlide home with project, presets, container and the input NIF.
 fn home(tag: &str, target: NifTarget) -> (PathBuf, PathBuf) {
+    zap_home(tag, target, PROJECT, PRESETS, &[("BodyLean", &DELTAS)])
+}
+
+/// A home whose project, presets and morph blocks the caller supplies, for the
+/// zap variants.
+fn zap_home(tag: &str, target: NifTarget, project: &str, presets: &str, blocks: &[BlockSpec]) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("sculpto-c12-{tag}-{}", std::process::id()));
     let shape_data = root.join("ShapeData/Test");
     for dir in [
@@ -104,9 +114,9 @@ fn home(tag: &str, target: NifTarget) -> (PathBuf, PathBuf) {
     ] {
         std::fs::create_dir_all(dir).expect("temp home");
     }
-    std::fs::write(root.join("SliderSets/body.osp"), PROJECT).expect("project");
-    std::fs::write(root.join("SliderPresets/presets.xml"), PRESETS).expect("presets");
-    std::fs::write(shape_data.join("body.osd"), container_bytes()).expect("container");
+    std::fs::write(root.join("SliderSets/body.osp"), project).expect("project");
+    std::fs::write(root.join("SliderPresets/presets.xml"), presets).expect("presets");
+    std::fs::write(shape_data.join("body.osd"), container_blocks(blocks)).expect("container");
     let nif = shape_data.join("body.nif");
     std::fs::write(&nif, write_shape(&asset(), target).expect("input writes")).expect("input nif");
     (root, nif)
@@ -297,4 +307,190 @@ fn a_refused_pair_leaves_no_file_behind() {
     assert_eq!(value["error"]["kind"], "invalid_params");
     assert!(!root.join("refused_0.nif").exists());
     assert!(!root.join("refused_1.nif").exists());
+}
+
+/// The zap block deletes the two front cube vertices: triangles touching
+/// either die, the survivors renumber.
+const ZAP_DELTAS: [(u16, [f32; 3]); 2] = [(0, [0.5, 0.0, 0.0]), (1, [0.0, 0.5, 0.0])];
+
+/// The same block over every cube vertex: a fully zapped shape.
+const FULL_ZAP_DELTAS: [(u16, [f32; 3]); 8] = [
+    (0, [0.5, 0.0, 0.0]),
+    (1, [0.5, 0.0, 0.0]),
+    (2, [0.5, 0.0, 0.0]),
+    (3, [0.5, 0.0, 0.0]),
+    (4, [0.5, 0.0, 0.0]),
+    (5, [0.5, 0.0, 0.0]),
+    (6, [0.5, 0.0, 0.0]),
+    (7, [0.5, 0.0, 0.0]),
+];
+
+/// A `Lean` slider plus a `Cut` zap over the same container.
+fn zap_project(keep_zapped: bool) -> String {
+    let keep = match keep_zapped {
+        true => " KeepZappedShapes=\"true\"",
+        false => "",
+    };
+    format!(
+        r#"<SliderSetInfo version="1">
+  <SliderSet name="Body">
+    <DataFolder>Test</DataFolder>
+    <SourceFile>body.nif</SourceFile>
+    <OutputPath>meshes</OutputPath>
+    <OutputFile{keep}>body</OutputFile>
+    <Shape target="Body">Body</Shape>
+    <Slider name="Lean" small="0" big="100">
+      <Data target="Body" local="true">body.osd\BodyLean</Data>
+    </Slider>
+    <Slider name="Cut" small="0" big="0" zap="true">
+      <Data target="Body" local="true">body.osd\BodyCut</Data>
+    </Slider>
+  </SliderSet>
+</SliderSetInfo>"#
+    )
+}
+
+#[test]
+fn an_active_zap_deletes_vertices_and_triangles_in_its_endpoint() {
+    let (root, nif) = zap_home(
+        "zap",
+        NifTarget::Se,
+        &zap_project(false),
+        r#"<SliderPresets>
+  <Preset name="Pair" set="Body">
+    <SetSlider name="Cut" size="big" value="100"/>
+  </Preset>
+</SliderPresets>"#,
+        &[("BodyLean", &DELTAS), ("BodyCut", &ZAP_DELTAS)],
+    );
+    let value = export(&root, &nif, "zap", serde_json::json!({}));
+    assert_eq!(value["ok"], true, "{value}");
+    // The small endpoint carries no active zap: the whole shape survives.
+    assert_eq!(value["result"]["zap_0"], "kept");
+    assert_eq!(value["result"]["zap_1"], "deleted");
+    let small = shapes_of(&root.join("zap_0.nif"));
+    assert_eq!(small.positions.len(), 8);
+    assert_eq!(small.triangles.len(), 12);
+    let big = shapes_of(&root.join("zap_1.nif"));
+    // Vertices 0 and 1 die; six survive with the four triangles that never
+    // touched them, renumbered: old 2..8 become 0..6.
+    assert_eq!(big.positions.len(), 6);
+    assert_eq!(big.positions.first(), Some(&BASE[2]));
+    assert_eq!(big.positions.last(), Some(&BASE[7]));
+    assert_eq!(
+        big.triangles,
+        vec![[2, 3, 4], [2, 4, 5], [1, 5, 4], [1, 4, 0]]
+    );
+    // Lean moved only vertices 0 and 1, which the zap deleted: the survivors
+    // keep their source positions untouched.
+    assert_eq!(big.positions[0], BASE[2]);
+    assert_eq!(big.positions[5], BASE[7]);
+    std::fs::remove_dir_all(&root).expect("remove zap fixture");
+}
+
+#[test]
+fn keep_zapped_shapes_holds_a_fully_zapped_shape_hidden() {
+    // Two presets over one project: `Zapped` fires the full zap in both
+    // endpoints, `Plain` leaves it inert. Everything else is identical, so
+    // the hidden files must equal the plain files byte for byte except the
+    // one flags byte that hides the shape.
+    let (root, nif) = zap_home(
+        "zap-hidden",
+        NifTarget::Se,
+        &zap_project(true),
+        r#"<SliderPresets>
+  <Preset name="Zapped" set="Body">
+    <SetSlider name="Cut" size="small" value="100"/>
+    <SetSlider name="Cut" size="big" value="100"/>
+  </Preset>
+  <Preset name="Plain" set="Body"/>
+</SliderPresets>"#,
+        &[("BodyLean", &DELTAS), ("BodyCut", &FULL_ZAP_DELTAS)],
+    );
+    let hidden = export(
+        &root,
+        &nif,
+        "hidden",
+        serde_json::json!({ "preset": "Zapped" }),
+    );
+    assert_eq!(hidden["ok"], true, "{hidden}");
+    assert_eq!(hidden["result"]["zap_0"], "hidden");
+    assert_eq!(hidden["result"]["zap_1"], "hidden");
+    let plain = export(
+        &root,
+        &nif,
+        "plain",
+        serde_json::json!({ "preset": "Plain" }),
+    );
+    assert_eq!(plain["ok"], true, "{plain}");
+    assert_eq!(plain["result"]["zap_0"], "kept");
+    assert_eq!(plain["result"]["zap_1"], "kept");
+    for (hidden_file, plain_file) in [
+        ("hidden_0.nif", "plain_0.nif"),
+        ("hidden_1.nif", "plain_1.nif"),
+    ] {
+        let hidden_bytes = std::fs::read(root.join(hidden_file)).expect("hidden file");
+        let plain_bytes = std::fs::read(root.join(plain_file)).expect("plain file");
+        // The kept-hidden shape keeps every vertex and triangle: the only
+        // byte-level difference is the flags word's low byte. (The reader
+        // cannot be used here: the vendored importer culls hidden shapes,
+        // byroredux import/walk/mod.rs:296.)
+        let differing: Vec<usize> = hidden_bytes
+            .iter()
+            .zip(&plain_bytes)
+            .enumerate()
+            .filter_map(|(index, (a, b))| (a != b).then_some(index))
+            .collect();
+        assert_eq!(differing.len(), 1, "{hidden_file} vs {plain_file}");
+        assert_eq!(hidden_bytes[differing[0]], 1);
+        assert_eq!(plain_bytes[differing[0]], 0);
+    }
+    std::fs::remove_dir_all(&root).expect("remove hidden fixture");
+}
+
+#[test]
+fn a_fully_zapped_shape_is_dropped_from_the_file() {
+    let (root, nif) = zap_home(
+        "zap-dropped",
+        NifTarget::Se,
+        &zap_project(false),
+        r#"<SliderPresets>
+  <Preset name="Pair" set="Body">
+    <SetSlider name="Cut" size="small" value="100"/>
+    <SetSlider name="Cut" size="big" value="100"/>
+  </Preset>
+</SliderPresets>"#,
+        &[("BodyLean", &DELTAS), ("BodyCut", &FULL_ZAP_DELTAS)],
+    );
+    let value = export(&root, &nif, "dropped", serde_json::json!({}));
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["result"]["zap_0"], "dropped");
+    assert_eq!(value["result"]["zap_1"], "dropped");
+    assert!(!root.join("dropped_0.nif").exists(), "no _0 file");
+    assert!(!root.join("dropped_1.nif").exists(), "no _1 file");
+    std::fs::remove_dir_all(&root).expect("remove dropped fixture");
+}
+
+#[test]
+fn an_le_input_zap_still_writes_both_targets() {
+    // The deletion path through the LE writer: no tangents, same deletion.
+    let (root, nif) = zap_home(
+        "zap-le",
+        NifTarget::Le,
+        &zap_project(false),
+        r#"<SliderPresets>
+  <Preset name="Pair" set="Body">
+    <SetSlider name="Cut" size="big" value="100"/>
+  </Preset>
+</SliderPresets>"#,
+        &[("BodyLean", &DELTAS), ("BodyCut", &ZAP_DELTAS)],
+    );
+    let value = export(&root, &nif, "zap-le", serde_json::json!({}));
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["result"]["target"], "le");
+    assert_eq!(value["result"]["zap_1"], "deleted");
+    let big = shapes_of(&root.join("zap-le_1.nif"));
+    assert_eq!(big.positions.len(), 6);
+    assert_eq!(big.triangles.len(), 4);
+    std::fs::remove_dir_all(&root).expect("remove LE zap fixture");
 }

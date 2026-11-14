@@ -180,6 +180,8 @@ pub fn mesh(error: MeshError) -> CommandError {
         MeshError::UnmatchedPartition { .. } => {
             (ErrorKind::InvalidRequest, "mesh_unmatched_partition")
         }
+        MeshError::RemoveIndicesNotSorted => (ErrorKind::InvalidRequest, "mesh_remove_order"),
+        MeshError::RemoveIndexOutOfRange { .. } => (ErrorKind::InvalidRequest, "mesh_remove_range"),
         MeshError::DuplicatePartitionSlot { .. } => {
             (ErrorKind::InvalidRequest, "mesh_duplicate_partition_slot")
         }

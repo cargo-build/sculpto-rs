@@ -196,8 +196,9 @@ pub(super) fn body(
         push_i32(&mut body, refs.extra);
     }
     push_i32(&mut body, -1);
-    // NiAVObject: flags, transform, no collision.
-    push_u32(&mut body, 0);
+    // NiAVObject: flags (bit 0 = a kept, fully zapped shape), transform, no
+    // collision.
+    push_u32(&mut body, u32::from(asset.hidden));
     transform.write_av(&mut body);
     push_i32(&mut body, -1);
     // BSTriShape: bounding sphere, refs, vertex descriptor.
