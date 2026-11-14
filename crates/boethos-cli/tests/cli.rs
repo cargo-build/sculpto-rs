@@ -329,3 +329,14 @@ fn delete_removes_an_archive_and_its_members() {
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn delete_does_not_create_a_missing_database() {
+    let root = temp_dir("delete-missing");
+    let db = root.join("never.redb");
+    let (code, stdout, stderr) = run(&db, &["delete", "deadbeef"]);
+    assert_eq!(code, 2, "{stdout} {stderr}");
+    assert!(stderr.contains("database not indexed"), "{stderr}");
+    assert!(!db.exists(), "delete created the database");
+    let _ = fs::remove_dir_all(root);
+}

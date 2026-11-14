@@ -533,6 +533,13 @@ fn command_delete(cli: &Cli) -> Result<(), String> {
         .positionals
         .first()
         .ok_or_else(|| "delete requires an asset id".to_string())?;
+    let path = database_path(cli.db.as_deref());
+    if !path.is_file() {
+        return Err(format!(
+            "{}: database not indexed; run `boethos index --root DIR`",
+            path.display()
+        ));
+    }
     let store = open_write(cli)?;
     let asset = find_asset(&store, requested)?;
     let mut removed = 0usize;
