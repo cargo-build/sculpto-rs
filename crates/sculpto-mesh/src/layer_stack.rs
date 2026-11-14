@@ -1,19 +1,27 @@
 //! Declared garment layer stack ("burger") grading.
 //!
-//! The declared layer model replaces a name-prefix inner/outer split with an
-//! ordered manifest: every piece carries its order over the body (`1`
-//! underwear … `7` footwear) plus the exceptions that make contact legitimate —
-//! an accessory anchored to a named layer, footwear declared `under-trousers`
-//! or `over-trousers`. Contact is classified by type, never by one distance,
-//! and only two types fail a declared stack: `penetration` and
-//! `boot_mode_violation`.
+//! The declared layer model replaces a name-prefix inner/outer split with a
+//! ranked manifest: every piece carries a sparse order over the body plus the
+//! exceptions that make contact legitimate — an accessory anchored to a named
+//! layer, footwear declared `under-trousers` or `over-trousers`. Contact is
+//! classified by type, never by one distance, and only two types fail a
+//! declared stack: `penetration` and `boot_mode_violation`.
 //!
-//! Grading asks one question per declared pair: the outer piece's
-//! occlusion-aware visible depth against the inner surface, at the caller's
-//! tolerance. The classification is [`crate::check::garment_depth_report`]'s, so
-//! the stack cannot drift from `garment depth`, and a pair is only ever
-//! measured outer-against-inner, which is why an inner piece standing outside
-//! its outer layer can never become a defect here.
+//! Which layers touch is declared, not inferred: a manifest may list its
+//! layer-to-layer contacts as `pairs`, and only those are graded. Without the
+//! list every strictly lower order is a candidate, and a candidate whose pieces
+//! have disjoint bounding boxes is refused — a depth between pieces that cannot
+//! meet is a far-surface artifact of the one-sided measurement, not a defect.
+//! Orders are therefore only compared between layers a pair actually relates;
+//! unpaired pieces may share a rank, and footwear has no fixed slot.
+//!
+//! Grading asks one question per graded pair: the outer piece's occlusion-aware
+//! visible depth against the inner surface, at the caller's tolerance. The
+//! classification is [`crate::check::garment_depth_report`]'s, so the stack
+//! cannot drift from `garment depth`, and a pair is only ever measured
+//! outer-against-inner, which is why an inner piece standing outside its outer
+//! layer can never become a defect here. The declared body stays the innermost
+//! surface: every layer is graded against it whether or not `pairs` is present.
 //! @req DECL0015
 
 use std::collections::HashMap;
@@ -29,10 +37,7 @@ use crate::wrap::{FitError, Mesh};
 pub type Geometry = (Vec<[f32; 3]>, Vec<[u32; 3]>);
 
 /// Order of the body: every declared layer is graded against it.
-pub const BODY_ORDER: u8 = 0;
-
-/// Highest declared order, footwear; a layer above it has no place in the stack.
-pub const TOP_ORDER: u8 = 7;
+pub const BODY_ORDER: u32 = 0;
 
 /// How footwear relates to the trousers layer it pairs with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -62,8 +67,9 @@ impl BootMode {
 pub struct Layer {
     /// Stable name anchors and `pair` references use, and the report prints.
     pub id: String,
-    /// Order over the body: `1` innermost through `7` footwear.
-    pub order: u8,
+    /// Rank over the body: any integer above `0`, compared only between layers
+    /// a pair relates. Sparse ranks are the norm and footwear needs no slot.
+    pub order: u32,
     /// Garment OBJ, resolved against the manifest's directory.
     pub obj: PathBuf,
     /// Lower layer this accessory is declared to touch; its contact is reported
@@ -78,7 +84,7 @@ pub struct Layer {
     pub pair: Option<String>,
 }
 
-/// A declared stack: the body surface plus its ordered layers.
+/// A declared stack: the body surface plus its ranked layers.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayerStack {
@@ -86,6 +92,11 @@ pub struct LayerStack {
     /// instead, and the two must agree when both are present.
     #[serde(default)]
     pub body: Option<PathBuf>,
+    /// Layer-to-layer contacts as `[outer_id, inner_id]`; when present, only
+    /// these are graded between layers. Absent means every strictly lower
+    /// order, refused when the two pieces' bounding boxes are disjoint.
+    #[serde(default)]
+    pub pairs: Option<Vec<[String; 2]>>,
     /// Declared layers; empty is a refusal, not an empty pass.
     pub layers: Vec<Layer>,
 }
@@ -110,6 +121,14 @@ pub enum StackError {
         /// Rejected value.
         tolerance: f32,
     },
+    /// Two order-implied layers cannot touch: their bounding boxes are
+    /// disjoint, so a depth between them is a far-surface artifact.
+    Disjoint {
+        /// Implied outer layer.
+        outer: String,
+        /// Implied inner layer.
+        inner: String,
+    },
     /// The geometry of one pair could not be graded.
     Grade {
         /// Declared outer layer.
@@ -129,6 +148,10 @@ impl fmt::Display for StackError {
             Self::Tolerance { tolerance } => write!(
                 formatter,
                 "`--tolerance` must be a finite non-negative number, got `{tolerance}`"
+            ),
+            Self::Disjoint { outer, inner } => write!(
+                formatter,
+                "implied pair `{outer}` vs `{inner}`: their bounding boxes do not overlap, so a depth between them is a far-surface artifact, not a penetration; declare `pairs` for the contacts that exist"
             ),
             Self::Grade {
                 outer,
@@ -252,7 +275,7 @@ pub struct LayerGrade {
     /// Declared id.
     pub id: String,
     /// Declared order.
-    pub order: u8,
+    pub order: u32,
     /// Worst class among the pairs this layer declares as the outer piece.
     pub classification: ContactClass,
     /// Pairs this layer declares.
@@ -311,10 +334,11 @@ impl LayerStack {
 
     /// Refuse a declaration that cannot be graded.
     ///
-    /// Orders are unique and strictly above the body, which also makes a
-    /// reference cycle impossible: every `anchor` and `pair` must name a
-    /// strictly lower order, so a self reference is the only cycle a manifest
-    /// can express and it is refused here.
+    /// Every layer's rank must be above the body's. Ranks are sparse and need
+    /// not be unique: they are compared only where a pair relates two layers,
+    /// so `reference` and every declared `pairs` entry must name a strictly
+    /// lower rank. That also makes a reference cycle impossible — a self
+    /// reference is the only one a manifest can express — and it is refused.
     ///
     /// # Errors
     /// [`StackError::Declaration`] naming the first defect found.
@@ -332,26 +356,11 @@ impl LayerStack {
                     layer.id
                 )));
             }
-            if layer.order > TOP_ORDER {
-                return Err(declaration(format!(
-                    "layer `{}` declares order {}, above footwear ({TOP_ORDER})",
-                    layer.id, layer.order
-                )));
-            }
             if let Some(earlier) = self.layers[..index]
                 .iter()
                 .find(|other| other.id == layer.id)
             {
                 return Err(declaration(format!("duplicate layer id `{}`", earlier.id)));
-            }
-            if let Some(earlier) = self.layers[..index]
-                .iter()
-                .find(|other| other.order == layer.order)
-            {
-                return Err(declaration(format!(
-                    "layers `{}` and `{}` both declare order {}",
-                    earlier.id, layer.id, layer.order
-                )));
             }
         }
         for layer in &self.layers {
@@ -389,7 +398,68 @@ impl LayerStack {
                 (None, None) => {}
             }
         }
+        self.pair_indices()?;
+        if let Some(pairs) = &self.pairs {
+            for layer in &self.layers {
+                let Some(contact) = layer.anchor.as_deref().or(layer.pair.as_deref()) else {
+                    continue;
+                };
+                let listed = pairs
+                    .iter()
+                    .any(|[outer, inner]| outer == &layer.id && inner == contact);
+                if !listed {
+                    return Err(declaration(format!(
+                        "layer `{}` declares a contact with `{contact}`, but `pairs` does not list it",
+                        layer.id
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The layer indices of the declared `pairs`, refused unless every entry
+    /// names two distinct layers with the outer strictly above the inner and no
+    /// contact is listed twice.
+    fn pair_indices(&self) -> Result<Vec<(usize, usize)>, StackError> {
+        let Some(pairs) = &self.pairs else {
+            return Ok(Vec::new());
+        };
+        let mut indices = Vec::with_capacity(pairs.len());
+        for [outer, inner] in pairs {
+            let find = |id: &str| {
+                self.layers
+                    .iter()
+                    .position(|layer| layer.id == id)
+                    .ok_or_else(|| {
+                        declaration(format!(
+                            "declared pair [{outer}, {inner}] names unknown layer `{id}`"
+                        ))
+                    })
+            };
+            let (outer_index, inner_index) = (find(outer)?, find(inner)?);
+            if outer_index == inner_index {
+                return Err(declaration(format!(
+                    "declared pair [{outer}, {inner}] relates `{outer}` to itself"
+                )));
+            }
+            let (outer_order, inner_order) = (
+                self.layers[outer_index].order,
+                self.layers[inner_index].order,
+            );
+            if outer_order <= inner_order {
+                return Err(declaration(format!(
+                    "declared pair [{outer}, {inner}]: outer `{outer}` (order {outer_order}) is not above inner `{inner}` (order {inner_order})"
+                )));
+            }
+            if indices.contains(&(outer_index, inner_index)) {
+                return Err(declaration(format!(
+                    "declared pair [{outer}, {inner}] is listed twice"
+                )));
+            }
+            indices.push((outer_index, inner_index));
+        }
+        Ok(indices)
     }
 
     /// The layer `reference` names, refused unless it exists below `layer`.
@@ -435,14 +505,18 @@ pub fn resolve_body(stack: &LayerStack, selected: Option<&Path>) -> Result<PathB
 /// Grade a declared stack.
 ///
 /// `load` supplies one OBJ per distinct declared path, so the caller owns file
-/// format and the crate owns the measurement. Each layer is graded against the
-/// body and against every strictly lower layer; an accessory's pair with its
-/// anchor is reported as [`ContactClass::AccessoryContact`] and a footwear pair
-/// is graded in the direction its declared mode names.
+/// format and the crate owns the measurement. Every layer is graded against the
+/// body, which is the stack's innermost surface. Against other layers, the
+/// manifest's `pairs` select the contacts when declared; otherwise every
+/// strictly lower order is graded, and one whose bounding boxes are disjoint is
+/// refused instead of measured. An accessory's pair with its anchor is reported
+/// as [`ContactClass::AccessoryContact`] and a footwear pair is graded in the
+/// direction its declared mode names.
 ///
 /// # Errors
 /// [`StackError`] for a refused declaration, a tolerance that cannot name a
-/// bound, a failed load, or ungradable geometry.
+/// bound, a failed load, an order-implied pair that cannot touch, or ungradable
+/// geometry.
 pub fn grade<F>(
     stack: &LayerStack,
     body: &Path,
@@ -470,6 +544,23 @@ where
 
     let mut order: Vec<usize> = (0..stack.layers.len()).collect();
     order.sort_by_key(|&index| (stack.layers[index].order, index));
+    let declared = stack.pair_indices()?;
+    if stack.pairs.is_none() {
+        for &outer in &order {
+            for &inner in order
+                .iter()
+                .take_while(|&&index| stack.layers[index].order < stack.layers[outer].order)
+            {
+                let (outer_layer, inner_layer) = (&stack.layers[outer], &stack.layers[inner]);
+                if disjoint(&cache[&outer_layer.obj], &cache[&inner_layer.obj]) {
+                    return Err(StackError::Disjoint {
+                        outer: outer_layer.id.clone(),
+                        inner: inner_layer.id.clone(),
+                    });
+                }
+            }
+        }
+    }
     let body_mesh = mesh(&cache, body);
     let mut pairs = Vec::new();
     let mut layers = Vec::with_capacity(order.len());
@@ -495,10 +586,21 @@ where
         absorb(&mut grade, &row);
         pairs.push(row);
 
-        for &inner in order
-            .iter()
-            .take_while(|&&index| stack.layers[index].order < layer.order)
-        {
+        let mut inners: Vec<usize> = if stack.pairs.is_some() {
+            declared
+                .iter()
+                .filter(|&&(declared_outer, _)| declared_outer == outer)
+                .map(|&(_, inner)| inner)
+                .collect()
+        } else {
+            order
+                .iter()
+                .copied()
+                .take_while(|&index| stack.layers[index].order < layer.order)
+                .collect()
+        };
+        inners.sort_by_key(|&index| (stack.layers[index].order, index));
+        for inner in inners {
             let target = &stack.layers[inner];
             let target_mesh = mesh(&cache, &target.obj);
             let anchored = layer.anchor.as_deref() == Some(target.id.as_str());
@@ -619,6 +721,32 @@ fn mesh<'a>(cache: &'a HashMap<PathBuf, Geometry>, path: &Path) -> Mesh<'a> {
     (positions, triangles)
 }
 
+/// Axis-aligned bounds of one geometry, or `None` when it has no vertices; the
+/// grader reports an empty mesh as a geometry refusal, so the caller defers.
+fn bounds(geometry: &Geometry) -> Option<([f32; 3], [f32; 3])> {
+    let first = *geometry.0.first()?;
+    let (mut min, mut max) = (first, first);
+    for position in &geometry.0[1..] {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position[axis]);
+            max[axis] = max[axis].max(position[axis]);
+        }
+    }
+    Some((min, max))
+}
+
+/// Whether two geometries' axis-aligned boxes are disjoint on any axis. Pieces
+/// whose boxes miss each other cannot meet, whatever the nearest-triangle side
+/// says. An empty mesh is not judged here.
+fn disjoint(outer: &Geometry, inner: &Geometry) -> bool {
+    let (Some((outer_min, outer_max)), Some((inner_min, inner_max))) =
+        (bounds(outer), bounds(inner))
+    else {
+        return false;
+    };
+    (0..3).any(|axis| outer_max[axis] < inner_min[axis] || inner_max[axis] < outer_min[axis])
+}
+
 /// Build a declaration refusal.
 fn declaration(message: impl Into<String>) -> StackError {
     StackError::Declaration {
@@ -696,6 +824,19 @@ mod tests {
         LayerStack::parse_json(&text, Path::new("/fixtures/stack.json")).unwrap()
     }
 
+    fn stack_with_pairs(layers: &str, pairs: &str) -> LayerStack {
+        let text = format!(r#"{{"body": "body.obj", "pairs": {pairs}, "layers": [{layers}]}}"#);
+        LayerStack::parse_json(&text, Path::new("/fixtures/stack.json")).unwrap()
+    }
+
+    /// Grade a stack that must be refused, returning the refusal message.
+    fn refusal(stack: &LayerStack, files: &HashMap<String, Geometry>, tolerance: f32) -> String {
+        let body = resolve_body(stack, None).unwrap();
+        grade(stack, &body, tolerance, loader(files))
+            .expect_err("the stack was graded instead of refused")
+            .to_string()
+    }
+
     fn graded(
         stack: &LayerStack,
         files: &HashMap<String, Geometry>,
@@ -753,7 +894,7 @@ mod tests {
                 ("robe", "tunic"),
             ]
         );
-        let rows: Vec<(&str, u8)> = report
+        let rows: Vec<(&str, u32)> = report
             .layers
             .iter()
             .map(|layer| (layer.id.as_str(), layer.order))
@@ -799,15 +940,19 @@ mod tests {
 
     #[test]
     fn accessory_contact_is_allowed_and_reported() {
-        let anchored = stack(
+        // The accessory declares the only layer contact it has; the panty is
+        // graded against the body but never against a belt it cannot meet.
+        let anchored = stack_with_pairs(
             r#"{"id": "panty", "order": 1, "obj": "panty.obj"},
                {"id": "tunic", "order": 3, "obj": "tunic.obj"},
                {"id": "belt", "order": 6, "obj": "belt.obj", "anchor": "tunic"}"#,
+            r#"[["belt", "tunic"]]"#,
         );
-        let loose = stack(
+        let loose = stack_with_pairs(
             r#"{"id": "panty", "order": 1, "obj": "panty.obj"},
                {"id": "tunic", "order": 3, "obj": "tunic.obj"},
                {"id": "belt", "order": 6, "obj": "belt.obj"}"#,
+            r#"[["belt", "tunic"]]"#,
         );
         let files = files(&[
             ("body.obj", cube([0.0; 3], 0.4)),
@@ -829,9 +974,13 @@ mod tests {
             "{}",
             pair.visible_max
         );
-        assert_eq!(
-            row(&allowed, "belt", "panty").classification,
-            ContactClass::LayeringOk
+        assert!(
+            !allowed
+                .pairs
+                .iter()
+                .any(|pair| pair.outer == "belt" && pair.inner == "panty"),
+            "the undeclared belt/panty contact is not graded: {:?}",
+            allowed.pairs
         );
         assert_eq!(
             row(&allowed, "belt", "body").classification,
@@ -850,6 +999,132 @@ mod tests {
             row(&undeclared, "belt", "tunic").classification,
             ContactClass::Penetration
         );
+    }
+
+    #[test]
+    fn explicit_pairs_override_the_order_rule() {
+        // `cuff` sits ten units away from every other layer: the order rule
+        // would compare it with all of them and report far-surface depths.
+        let stack = stack_with_pairs(
+            r#"{"id": "panty", "order": 1, "obj": "panty.obj"},
+               {"id": "tunic", "order": 3, "obj": "tunic.obj"},
+               {"id": "robe", "order": 4, "obj": "robe.obj"},
+               {"id": "cuff", "order": 9, "obj": "cuff.obj"}"#,
+            r#"[["tunic", "panty"], ["robe", "tunic"]]"#,
+        );
+        let files = files(&[
+            ("body.obj", cube([0.0; 3], 0.4)),
+            ("panty.obj", cube([0.0; 3], 0.5)),
+            ("tunic.obj", cube([0.0; 3], 0.6)),
+            ("robe.obj", cube([0.0; 3], 0.7)),
+            ("cuff.obj", cube([10.0, 0.0, 0.0], 0.3)),
+        ]);
+        let report = graded(&stack, &files, 0.05);
+
+        assert!(report.pass, "{:?}", report.pairs);
+        let declared: Vec<(&str, &str)> = report
+            .pairs
+            .iter()
+            .map(|pair| (pair.outer.as_str(), pair.inner.as_str()))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                ("panty", "body"),
+                ("tunic", "body"),
+                ("tunic", "panty"),
+                ("robe", "body"),
+                ("robe", "tunic"),
+                ("cuff", "body"),
+            ],
+            "declared contacts plus the body, nothing implied by order"
+        );
+        // `robe` must not be graded against the panty, and `cuff` against
+        // nothing above the body: far-surface rows are gone, not excused.
+        assert!(
+            !report
+                .pairs
+                .iter()
+                .any(|pair| pair.outer == "cuff" && pair.inner != "body")
+        );
+        assert_eq!(report.layers[3].pairs, 1, "cuff: body only");
+        // The body stays the innermost surface in declared mode.
+        assert_eq!(
+            row(&report, "cuff", "body").classification,
+            ContactClass::LayeringOk
+        );
+    }
+
+    #[test]
+    fn nonoverlapping_implied_pair_is_refused() {
+        let implied = stack(
+            r#"{"id": "panty", "order": 1, "obj": "panty.obj"},
+               {"id": "cuff", "order": 2, "obj": "cuff.obj"}"#,
+        );
+        let files = files(&[
+            ("body.obj", cube([0.0; 3], 0.4)),
+            ("panty.obj", cube([0.0; 3], 0.5)),
+            ("cuff.obj", cube([10.0, 0.0, 0.0], 0.3)),
+        ]);
+        let error = refusal(&implied, &files, 0.05);
+        assert!(
+            error.contains("`cuff` vs `panty`"),
+            "the refused pair is named: {error}"
+        );
+        assert!(error.contains("bounding boxes do not overlap"), "{error}");
+
+        // The same pieces are gradable when the manifest declares the contacts
+        // that exist: the body, and nothing between them.
+        let declared = stack_with_pairs(
+            r#"{"id": "panty", "order": 1, "obj": "panty.obj"},
+               {"id": "cuff", "order": 2, "obj": "cuff.obj"}"#,
+            "[]",
+        );
+        let report = graded(&declared, &files, 0.05);
+        assert!(report.pass, "{:?}", report.pairs);
+        assert_eq!(report.pairs.len(), 2, "both layers against the body");
+    }
+
+    #[test]
+    fn sparse_orders_and_shared_ranks_are_accepted() {
+        // Footwear above the old slot, two pieces sharing a rank: both are
+        // legal because no pair relates them to a layer at the same rank.
+        let stack = stack_with_pairs(
+            r#"{"id": "trousers", "order": 2, "obj": "trousers.obj"},
+               {"id": "boots", "order": 12, "obj": "boots.obj", "mode": "over-trousers", "pair": "trousers"},
+               {"id": "left_sleeve", "order": 3, "obj": "left.obj"},
+               {"id": "right_sleeve", "order": 3, "obj": "right.obj"}"#,
+            r#"[["boots", "trousers"]]"#,
+        );
+        let files = files(&[
+            ("body.obj", cube([0.0; 3], 0.4)),
+            ("trousers.obj", cube([0.0; 3], 0.5)),
+            ("boots.obj", cube([0.0; 3], 0.6)),
+            ("left.obj", sheet(-0.52)),
+            ("right.obj", sheet(0.52)),
+        ]);
+        let report = graded(&stack, &files, 0.05);
+
+        assert!(report.pass, "{:?}", report.pairs);
+        let rows: Vec<(&str, u32)> = report
+            .layers
+            .iter()
+            .map(|layer| (layer.id.as_str(), layer.order))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("trousers", 2),
+                ("left_sleeve", 3),
+                ("right_sleeve", 3),
+                ("boots", 12),
+            ]
+        );
+        assert_eq!(
+            row(&report, "boots", "trousers").classification,
+            ContactClass::LayeringOk
+        );
+        assert_eq!(report.pairs.len(), 5, "four body rows plus one declared");
     }
 
     #[test]
@@ -915,68 +1190,105 @@ mod tests {
     #[test]
     fn malformed_manifests_are_refused() {
         let cases = [
-            (r#""layers": []"#.to_string(), "declares no layers"),
+            (r#"{"layers": []}"#.to_string(), "declares no layers"),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj"},
-                              {"id": "a", "order": 2, "obj": "b.obj"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj"},
+                              {"id": "a", "order": 2, "obj": "b.obj"}]}"#
                     .to_string(),
                 "duplicate layer id `a`",
             ),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj"},
-                              {"id": "b", "order": 1, "obj": "b.obj"}]"#
-                    .to_string(),
-                "both declare order 1",
-            ),
-            (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": "ghost"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": "ghost"}]}"#
                     .to_string(),
                 "unknown anchor `ghost`",
             ),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": "a"}]"#.to_string(),
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": "a"}]}"#
+                    .to_string(),
                 "anchors to itself",
             ),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj"},
-                              {"id": "b", "order": 2, "obj": "b.obj", "anchor": "c"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj"},
+                              {"id": "b", "order": 2, "obj": "b.obj", "anchor": "c"}]}"#
                     .to_string(),
                 "unknown anchor `c`",
             ),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj"},
-                              {"id": "b", "order": 3, "obj": "b.obj", "mode": "over-trousers"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj"},
+                              {"id": "b", "order": 3, "obj": "b.obj", "mode": "over-trousers"}]}"#
                     .to_string(),
                 "boot mode without `pair`",
             ),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj"},
-                              {"id": "b", "order": 3, "obj": "b.obj", "pair": "a"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj"},
+                              {"id": "b", "order": 3, "obj": "b.obj", "pair": "a"}]}"#
                     .to_string(),
                 "without a boot mode",
             ),
             (
-                r#""layers": [{"id": "a", "order": 0, "obj": "a.obj"}]"#.to_string(),
+                r#"{"layers": [{"id": "a", "order": 0, "obj": "a.obj"}]}"#.to_string(),
                 "which is the body",
             ),
             (
-                r#""layers": [{"id": "a", "order": 8, "obj": "a.obj"}]"#.to_string(),
-                "above footwear (7)",
-            ),
-            (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj", "colour": "red"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj", "colour": "red"}]}"#
                     .to_string(),
                 "unknown field `colour`",
             ),
             (
-                r#""layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": "b"},
-                              {"id": "b", "order": 2, "obj": "b.obj", "anchor": "a"}]"#
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": "b"},
+                              {"id": "b", "order": 2, "obj": "b.obj", "anchor": "a"}]}"#
                     .to_string(),
                 "not below it",
             ),
+            (
+                r#"{"layers": [{"id": "a", "order": 2, "obj": "a.obj"}],
+                    "pairs": [["ghost", "a"]]}"#
+                    .to_string(),
+                "names unknown layer `ghost`",
+            ),
+            (
+                r#"{"layers": [{"id": "a", "order": 2, "obj": "a.obj"}],
+                    "pairs": [["a", "ghost"]]}"#
+                    .to_string(),
+                "names unknown layer `ghost`",
+            ),
+            (
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj"},
+                              {"id": "b", "order": 2, "obj": "b.obj"}],
+                    "pairs": [["a", "b"]]}"#
+                    .to_string(),
+                "is not above inner `b`",
+            ),
+            (
+                r#"{"layers": [{"id": "a", "order": 2, "obj": "a.obj"}],
+                    "pairs": [["a", "a"]]}"#
+                    .to_string(),
+                "relates `a` to itself",
+            ),
+            (
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj"},
+                              {"id": "b", "order": 2, "obj": "b.obj"}],
+                    "pairs": [["b", "a"], ["b", "a"]]}"#
+                    .to_string(),
+                "is listed twice",
+            ),
+            (
+                r#"{"layers": [{"id": "tunic", "order": 3, "obj": "tunic.obj"},
+                              {"id": "belt", "order": 6, "obj": "belt.obj", "anchor": "tunic"}],
+                    "pairs": []}"#
+                    .to_string(),
+                "but `pairs` does not list it",
+            ),
+            (
+                r#"{"layers": [{"id": "trousers", "order": 2, "obj": "trousers.obj"},
+                              {"id": "boots", "order": 9, "obj": "boots.obj",
+                               "mode": "over-trousers", "pair": "trousers"}],
+                    "pairs": []}"#
+                    .to_string(),
+                "but `pairs` does not list it",
+            ),
         ];
-        for (layers, expected) in cases {
-            let text = format!("{{{layers}}}");
+        for (text, expected) in cases {
             let error = LayerStack::parse_json(&text, Path::new("/fixtures/stack.json"))
                 .expect_err(&format!("accepted `{text}`"))
                 .to_string();

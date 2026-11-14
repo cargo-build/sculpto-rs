@@ -197,9 +197,10 @@ garment push options:
   --json              print the per-pass report as JSON
 
 garment stack options:
-  --outfit <json>     layer manifest: body plus ordered layers, anchors and boot mode
+  --outfit <json>     layer manifest: body, ranked layers, declared pairs,
+                      accessory anchors and boot mode
   --body <obj>        body/collision surface to grade against; may come from the manifest
-  --tolerance <units> accepted visible depth for every declared pair
+  --tolerance <units> accepted visible depth for every graded pair
   --json              print the per-pair and per-layer report as JSON
 ";
 
@@ -1686,8 +1687,12 @@ fn garment_push_inner(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Grade a declared layer stack: one visible-depth verdict per declared pair,
+/// Grade a declared layer stack: one visible-depth verdict per graded pair,
 /// classified by the relation the manifest declares.
+///
+/// Every layer is graded against the declared body; between layers, the
+/// manifest's `pairs` select the contacts or, without them, every strictly
+/// lower order is graded and one whose bounding boxes are disjoint is refused.
 ///
 /// Read-only and report-only. The tolerance is the caller's and the exit code
 /// stays `0`, like `garment depth --tolerance`: the acceptance criterion is
@@ -1777,7 +1782,9 @@ fn garment_stack_inner(args: &[String]) -> Result<(), String> {
                 "outfit": manifest.display().to_string(),
                 "body": body.display().to_string(),
                 "units": "source",
-                "semantics": "each declared pair grades the outer piece's garment_depth_report visible_occluded depth against the inner surface; a boot pair is graded in the direction its declared mode names; an accessory pair with its anchor is reported, never failed; a pair is never graded inner-against-outer",
+                "selection": if stack.pairs.is_some() { "declared" } else { "implied" },
+                "declared_pairs": stack.pairs.as_ref().map(Vec::len),
+                "semantics": "every layer grades its garment_depth_report visible_occluded depth against the body; between layers only the declared `pairs` are graded, or without them every strictly lower order, and an implied pair whose bounding boxes do not overlap is refused; a boot pair is graded in the direction its declared mode names; an accessory pair with its anchor is reported, never failed; a pair is never graded inner-against-outer",
                 "tolerance": depth_number(report.tolerance),
                 "layers": layers,
                 "pairs": pairs,
@@ -1804,6 +1811,15 @@ fn garment_stack_inner(args: &[String]) -> Result<(), String> {
         report.penetrations,
         report.boot_violations
     );
+    match &stack.pairs {
+        Some(pairs) => println!(
+            "selection: {} declared layer pair(s); every layer is also graded against the body",
+            pairs.len()
+        ),
+        None => println!(
+            "selection: order-implied layer pairs; every layer is also graded against the body"
+        ),
+    }
     let width = report
         .pairs
         .iter()
@@ -1862,7 +1878,7 @@ fn garment_stack_inner(args: &[String]) -> Result<(), String> {
         );
     }
     println!(
-        "note: a pair is graded outer-against-inner only, so an inner piece outside its outer layer is never a defect; hidden = the outer piece's own surface covers the graded vertex (DECL0015) and is not graded as visible; an accessory pair with its anchor is allowed and reported; footwear is graded in its declared mode direction, and the report, not the exit code, carries the verdict"
+        "note: a pair is graded outer-against-inner only, so an inner piece outside its outer layer is never a defect; every layer is graded against the body; an order-implied layer pair whose bounding boxes are disjoint is refused instead of measured; hidden = the outer piece's own surface covers the graded vertex (DECL0015) and is not graded as visible; an accessory pair with its anchor is allowed and reported; footwear is graded in its declared mode direction, and the report, not the exit code, carries the verdict"
     );
     Ok(())
 }

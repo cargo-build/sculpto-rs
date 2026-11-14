@@ -118,6 +118,11 @@ fn json_report_grades_each_pair_against_its_inner_layer() {
     );
     assert_eq!(report["units"], "source");
     assert_eq!(report["tolerance"], 0.1);
+    assert_eq!(
+        report["selection"], "implied",
+        "no `pairs` means the order rule"
+    );
+    assert_eq!(report["declared_pairs"], serde_json::Value::Null);
     assert_eq!(report["pass"], false);
     assert_eq!(report["failures"]["penetration"], 1);
     assert_eq!(report["failures"]["boot_mode_violation"], 0);
@@ -177,12 +182,13 @@ fn text_report_prints_every_contact_type() {
     .unwrap();
     fs::write(directory.join("boots.obj"), cube_obj([3.0, 0.0, 0.0], 0.55)).unwrap();
     let manifest = r#"{"body": "body.obj",
+        "pairs": [["belt", "tunic"], ["boots", "trousers"]],
         "layers": [
             {"id": "panty", "order": 1, "obj": "panty.obj"},
             {"id": "trousers", "order": 2, "obj": "trousers.obj"},
             {"id": "tunic", "order": 3, "obj": "tunic.obj"},
             {"id": "belt", "order": 6, "obj": "belt.obj", "anchor": "tunic"},
-            {"id": "boots", "order": 7, "obj": "boots.obj",
+            {"id": "boots", "order": 9, "obj": "boots.obj",
              "mode": "over-trousers", "pair": "trousers"}
         ]}"#;
 
@@ -197,8 +203,12 @@ fn text_report_prints_every_contact_type() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("5 layers, body"), "{text}");
     assert!(
-        text.contains("pairs: 15 graded, 0 penetration, 1 boot-mode violations"),
+        text.contains("pairs: 7 graded, 0 penetration, 1 boot-mode violations"),
         "{text}"
+    );
+    assert!(
+        text.contains("selection: 2 declared layer pair(s)"),
+        "the declared selection is named: {text}"
     );
     assert!(
         text.contains("accessory_contact") && text.contains("visible 3 max 0.060000"),
@@ -210,7 +220,10 @@ fn text_report_prints_every_contact_type() {
     );
     assert!(text.contains("layering_ok"), "{text}");
     assert!(text.contains("layers:"), "{text}");
-    assert!(text.contains("order 7"), "{text}");
+    assert!(
+        text.contains("order 9"),
+        "a sparse footwear order is accepted and printed: {text}"
+    );
     assert!(
         text.contains("verdict: fail (tolerance 0.030000; 0 penetration, 1 boot-mode violation)"),
         "{text}"
@@ -281,10 +294,17 @@ fn malformed_manifests_are_refused_loudly() {
         r#"{"body": "body.obj", "layers": [{"id": "boots", "order": 7, "obj": "panty.obj", "mode": "under-trousers"}]}"#,
         &["--tolerance", "0.1"],
     );
-    let duplicate_order = stack(
+    fs::write(directory.join("cuff.obj"), cube_obj([10.0, 0.0, 0.0], 0.3)).unwrap();
+    let disjoint_implied = stack(
         &directory,
-        r#"{"body": "body.obj", "layers": [{"id": "a", "order": 1, "obj": "panty.obj"},
-                                            {"id": "b", "order": 1, "obj": "panty.obj"}]}"#,
+        r#"{"body": "body.obj", "layers": [{"id": "panty", "order": 1, "obj": "panty.obj"},
+                                            {"id": "cuff", "order": 2, "obj": "cuff.obj"}]}"#,
+        &["--tolerance", "0.1"],
+    );
+    let unknown_declared_pair = stack(
+        &directory,
+        r#"{"body": "body.obj", "pairs": [["ghost", "panty"]],
+            "layers": [{"id": "panty", "order": 1, "obj": "panty.obj"}]}"#,
         &["--tolerance", "0.1"],
     );
     let invalid_json = stack(&directory, "{\"layers\": [}", &["--tolerance", "0.1"]);
@@ -316,7 +336,8 @@ fn malformed_manifests_are_refused_loudly() {
     let cases = [
         (unknown_anchor, "unknown anchor `ghost`"),
         (boots_without_pair, "boot mode without `pair`"),
-        (duplicate_order, "both declare order 1"),
+        (disjoint_implied, "`cuff` vs `panty`"),
+        (unknown_declared_pair, "names unknown layer `ghost`"),
         (invalid_json, "invalid manifest"),
         (no_tolerance, "`--tolerance` is required"),
         (unknown_option, "unknown option `--layer`"),
