@@ -1,7 +1,7 @@
 # boethos-catalogue
 
 Asset, preset, face and hairstyle catalogue kinds for the
-[`boethos`](https://crates.io/crates/boethos) store.
+[`boethos`](../boethos) store.
 
 The crate owns the `asset` record and a read-only indexer for supplied game
 assets. It hashes regular files, lists `.7z`/`.zip`/`.rar` archives through the

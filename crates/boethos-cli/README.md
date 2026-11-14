@@ -1,10 +1,12 @@
 # boethos-cli
 
-Agent-first CLI for the [`boethos`](https://crates.io/crates/boethos) asset
-catalogue. Install the binary with:
+Agent-first CLI for the [`boethos`](../boethos) asset catalogue. Build it from
+the workspace or use the `boethos-v0.1.0` GitHub release binary:
 
 ```sh
-cargo install boethos-cli
+cargo build --release -p boethos-cli
+# or
+curl -LO https://github.com/cargo-build/sculpto-rs/releases/download/boethos-v0.1.0/boethos-0.1.0-x86_64-unknown-linux-musl
 ```
 
 The default database is `$BOETHOS_DB`, else
