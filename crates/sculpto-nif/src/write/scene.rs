@@ -133,10 +133,18 @@ impl SkinNodes {
         if let Some(checked) = checked {
             return checked.plan(start, strings);
         }
+        let bones = (0..names.len())
+            .map(|index| start + 1 + index as i32)
+            .collect::<Vec<_>>();
+        // The scene root owns the shape and every bone node: a skin instance's
+        // bone refs are names, but native tools clone the graph by walking
+        // children, so an unattached bone node loses its palette on re-export.
+        let mut children = vec![0];
+        children.extend(&bones);
         let mut nodes = vec![Node {
             name: -1,
             local: NativeTransform::IDENTITY,
-            children: vec![0],
+            children,
         }];
         nodes.extend(names.iter().map(|name| Node {
             name: strings.intern(name) as i32,
@@ -144,10 +152,8 @@ impl SkinNodes {
             children: Vec::new(),
         }));
         Ok(Self {
-            root: start + 1,
-            bones: (0..names.len())
-                .map(|index| start + 1 + index as i32)
-                .collect(),
+            root: start,
+            bones,
             nodes,
         })
     }

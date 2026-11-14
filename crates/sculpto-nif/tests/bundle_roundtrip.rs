@@ -226,7 +226,11 @@ fn se_shape_count() {
         .iter()
         .filter_map(|child| child.index())
         .collect();
-    assert_eq!(children, vec![0, 6, 12], "one root references every shape");
+    assert_eq!(
+        children,
+        vec![0, 6, 12, 17, 18, 19],
+        "the root owns every shape and every bone node"
+    );
     assert!(
         root_node.av.net.extra_data_refs.is_empty(),
         "no physics link without a sidecar"
@@ -474,7 +478,11 @@ fn le_shape_count() {
         .iter()
         .filter_map(|child| child.index())
         .collect();
-    assert_eq!(children, vec![0, 7, 14], "one root references every shape");
+    assert_eq!(
+        children,
+        vec![0, 7, 14, 20, 21, 22],
+        "the root owns every shape and every bone node"
+    );
     assert!(
         root_node.av.net.extra_data_refs.is_empty(),
         "no physics link without a sidecar"

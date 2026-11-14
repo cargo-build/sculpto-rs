@@ -93,8 +93,8 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
         .expect("a skinned shape hangs under an imported root node");
     assert_eq!(
         rig.joints().len(),
-        1,
-        "only nodes under the root are imported; the palette bone blocks are not"
+        3,
+        "the root and both attached palette bone nodes are imported"
     );
     assert_eq!(rig.roots(), &[JointId::new(0)]);
     assert!(
@@ -104,6 +104,14 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
             .is_none(),
         "this writer leaves the root node unnamed"
     );
+    assert_eq!(
+        rig.joints()
+            .iter()
+            .map(|joint| joint.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![None, Some("Root"), Some("Spine")],
+        "the palette bones hang under the root in authored order"
+    );
 
     assert_eq!(document.sources.len(), document.shapes.len());
     let source = &document.sources[0];
@@ -111,8 +119,8 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
     assert_eq!(source.local, LocalTransform::default());
     assert_eq!(
         source.skeleton_root.as_deref(),
-        Some("Root"),
-        "the skin names its first palette bone as the skeleton root"
+        None,
+        "the skin names the file's root node, which this writer leaves unnamed"
     );
     assert_eq!(
         source.global_skin,
@@ -131,7 +139,10 @@ fn a_skinned_shape_captures_the_root_graph_and_its_skin_context() {
     assert_eq!(row.weights, &[0.75, 0.25]);
     assert!(matches!(
         document.bind_rest(),
-        Err(NifRigError::Root { shape: 0, .. })
+        Err(NifRigError::MissingSource {
+            shape: 0,
+            field: "skeleton root"
+        })
     ));
 }
 
@@ -142,10 +153,10 @@ fn the_le_writer_captures_the_same_root_shape() {
 
     assert_eq!(document.bsver, 83);
     let rig = document.rig.as_ref().expect("the LE skin root is imported");
-    assert_eq!(rig.joints().len(), 1);
+    assert_eq!(rig.joints().len(), 3);
     assert_eq!(rig.roots(), &[JointId::new(0)]);
     assert_eq!(document.sources.len(), 1);
-    assert_eq!(document.sources[0].skeleton_root.as_deref(), Some("Root"));
+    assert_eq!(document.sources[0].skeleton_root.as_deref(), None);
 }
 
 #[test]

@@ -122,7 +122,11 @@ fn write(shapes: &[MeshAsset], policy: InfluencePolicy) -> Result<WrittenNif, Ni
         false => -1,
     };
 
-    let root_children: Vec<i32> = layout.iter().map(|blocks| blocks.geometry).collect();
+    // The root owns every shape and every bone node: a skin instance's bone
+    // refs name the nodes, but native tools clone and prune by walking
+    // children, so an unattached bone node loses its palette on re-export.
+    let mut root_children: Vec<i32> = layout.iter().map(|blocks| blocks.geometry).collect();
+    root_children.extend(bones.bones().iter().map(|bone| bone.block));
     let root_extra: Vec<i32> = match extra_block {
         -1 => Vec::new(),
         index => vec![index],

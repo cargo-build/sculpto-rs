@@ -158,8 +158,8 @@ fn assert_combined(scene: &NifScene, layout: &Layout) {
     );
     assert_eq!(
         instance.skeleton_root_ref.index(),
-        Some(layout.bones[0]),
-        "skeleton root is the first bone"
+        Some(layout.root),
+        "the skin names the file's root node as its skeleton root"
     );
     let bone_names: Vec<Option<&str>> = instance
         .bone_refs
@@ -171,6 +171,15 @@ fn assert_combined(scene: &NifScene, layout: &Layout) {
         })
         .collect();
     assert_eq!(bone_names, vec![Some("Root"), Some("Spine")]);
+    assert_eq!(
+        instance
+            .bone_refs
+            .iter()
+            .filter_map(|bone| bone.index())
+            .collect::<Vec<_>>(),
+        layout.bones.to_vec(),
+        "the instance references the bone nodes in palette order"
+    );
 
     let data = scene
         .get_as::<NiSkinData>(layout.skin_data)

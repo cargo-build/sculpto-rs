@@ -82,7 +82,7 @@ pub(super) struct BoneNode {
     /// String-table index of that name.
     pub(super) name_index: i32,
     /// Block index of the bone node.
-    block: i32,
+    pub(super) block: i32,
 }
 
 /// The one `NiNode` per bone name a bundle shares across its skins.
