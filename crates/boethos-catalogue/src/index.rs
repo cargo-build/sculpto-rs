@@ -1,6 +1,6 @@
 //! Read-only directory and archive indexing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,18 +13,22 @@ use crate::model::{Asset, Assets, Category, Sex, Status};
 
 const ARCHIVE_EXTENSIONS: [&str; 3] = ["7z", "zip", "rar"];
 const IGNORED_DIRS: [&str; 5] = [".git", ".jj", "__pycache__", "node_modules", "target"];
+const UNSUPPORTED_ARCHIVES: [&str; 5] = ["gz", "tar", "tgz", "xz", "bz2"];
 
 /// Indexing switches.
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
     /// Read archive members for faces, presets and projects.
     pub archive_entries: bool,
+    /// Delete rows under the root that this run did not see.
+    pub prune: bool,
 }
 
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
             archive_entries: true,
+            prune: false,
         }
     }
 }
@@ -40,13 +44,31 @@ pub struct IndexReport {
     pub members: usize,
     /// New identities.
     pub inserted: usize,
-    /// Replaced identities.
-    pub replaced: usize,
+    /// Existing identities whose record changed.
+    pub updated: usize,
+    /// Existing identities whose record was already current.
+    pub unchanged: usize,
+    /// Rows removed by `prune`.
+    pub pruned: usize,
+    /// Directory entries skipped because they are symbolic links.
+    pub symlinks: usize,
+    /// Ignored directories such as `.git` and `target`.
+    pub ignored_dirs: usize,
+    /// Non-regular, non-directory entries such as sockets and devices.
+    pub special: usize,
+    /// Paths skipped because they are not valid UTF-8.
+    pub non_utf8: usize,
+    /// Compressed archives the indexer cannot list; recorded as plain files.
+    pub unsupported_archives: usize,
     /// Per-path failures retained instead of aborting the run.
     pub errors: Vec<String>,
 }
 
 /// Index one root recursively into the store.
+///
+/// Identity is derived from the source label and the asset path, so two files
+/// with equal bytes stay distinct records and a content change updates the same
+/// record. The file digest remains in `sha256`.
 pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptions) -> IndexReport {
     let mut report = IndexReport::default();
     if !root.is_dir() {
@@ -55,17 +77,40 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
             .push(format!("{}: not a directory", root.display()));
         return report;
     }
+    // Canonical paths keep identity stable when a root is named relatively,
+    // absolutely or through a different working directory.
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = root.as_path();
     let readme_hashes = read_readme_hashes(root);
     let mut files = Vec::new();
-    walk(root, &mut files, &mut report.errors);
+    walk(root, &mut files, &mut report);
+    let mut seen = HashSet::new();
     for path in files {
+        if path.to_str().is_none() {
+            report.non_utf8 += 1;
+            report
+                .errors
+                .push(format!("{}: non-UTF-8 path skipped", path.display()));
+            continue;
+        }
         let extension = extension(&path);
         if ARCHIVE_EXTENSIONS.contains(&extension.as_str()) {
             report.archives += 1;
-            index_archive(store, &path, source, &readme_hashes, options, &mut report);
+            index_archive(
+                store,
+                &path,
+                source,
+                &readme_hashes,
+                options,
+                &mut seen,
+                &mut report,
+            );
             continue;
         }
         report.files += 1;
+        if UNSUPPORTED_ARCHIVES.contains(&extension.as_str()) {
+            report.unsupported_archives += 1;
+        }
         let category = classify(&path, &extension);
         let sha = match sha256_file(&path) {
             Ok(sha) => sha,
@@ -74,33 +119,39 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
                 continue;
             }
         };
+        let path_text = path.to_string_lossy().into_owned();
         let bytes = fs::metadata(&path).ok().map(|meta| meta.len());
         let asset = Asset {
-            id: sha.clone(),
+            id: identity(&["file", source, &path_text]),
             category,
             name: file_name(&path),
-            path: path.to_string_lossy().into_owned(),
+            path: path_text.clone(),
             source: source.to_string(),
             archive: None,
             entry: None,
             format: extension,
             sha256: Some(sha),
             bytes,
-            sex: sex_from_path(&path.to_string_lossy()),
-            family: family_from_path(&path.to_string_lossy()),
+            sex: sex_from_path(&path_text),
+            family: family_from_path(&path_text),
             tags: Vec::new(),
-            status: status_from_path(&path.to_string_lossy()),
+            status: status_from_path(&path_text),
         };
-        write(store, &asset, &mut report);
+        write(store, &asset, &mut seen, &mut report);
+    }
+    if options.prune {
+        prune(store, root, source, &seen, &mut report);
     }
     report
 }
 
-fn walk(directory: &Path, files: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
+fn walk(directory: &Path, files: &mut Vec<PathBuf>, report: &mut IndexReport) {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
-            errors.push(format!("{}: {error}", directory.display()));
+            report
+                .errors
+                .push(format!("{}: {error}", directory.display()));
             return;
         }
     };
@@ -108,26 +159,35 @@ fn walk(directory: &Path, files: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                errors.push(format!("{}: {error}", directory.display()));
+                report
+                    .errors
+                    .push(format!("{}: {error}", directory.display()));
                 continue;
             }
         };
         let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
             Err(error) => {
-                errors.push(format!("{}: {error}", path.display()));
+                report.errors.push(format!("{}: {error}", path.display()));
                 continue;
             }
         };
-        if metadata.is_dir() {
+        if file_type.is_symlink() {
+            report.symlinks += 1;
+            continue;
+        }
+        if file_type.is_dir() {
             let name = entry.file_name();
             if IGNORED_DIRS.iter().any(|ignored| name == *ignored) {
+                report.ignored_dirs += 1;
                 continue;
             }
-            walk(&path, files, errors);
-        } else if metadata.is_file() {
+            walk(&path, files, report);
+        } else if file_type.is_file() {
             files.push(path);
+        } else {
+            report.special += 1;
         }
     }
 }
@@ -138,21 +198,32 @@ fn index_archive(
     source: &str,
     readme_hashes: &HashMap<String, String>,
     options: &IndexOptions,
+    seen: &mut HashSet<String>,
     report: &mut IndexReport,
 ) {
     let name = file_name(path);
-    let sha = readme_hashes
-        .get(&name)
-        .cloned()
-        .or_else(|| sha256_file(path).ok());
-    let identity = sha
-        .clone()
-        .unwrap_or_else(|| sha256_bytes(format!("archive:{}", path.display()).as_bytes()));
+    let path_text = path.to_string_lossy().into_owned();
+    let computed = match sha256_file(path) {
+        Ok(sha) => Some(sha),
+        Err(error) => {
+            report.errors.push(error);
+            None
+        }
+    };
+    if let (Some(computed), Some(declared)) = (&computed, readme_hashes.get(&name))
+        && computed != declared
+    {
+        report.errors.push(format!(
+            "{path_text}: README hash {declared} does not match computed {computed}; using computed"
+        ));
+    }
+    let sha = computed.or_else(|| readme_hashes.get(&name).cloned());
+    let archive_id = identity(&["archive", source, &path_text]);
     let archive_asset = Asset {
-        id: identity.clone(),
+        id: archive_id.clone(),
         category: Category::Archive,
         name: name.clone(),
-        path: path.to_string_lossy().into_owned(),
+        path: path_text.clone(),
         source: source.to_string(),
         archive: None,
         entry: None,
@@ -164,7 +235,7 @@ fn index_archive(
         tags: Vec::new(),
         status: Status::Raw,
     };
-    write(store, &archive_asset, report);
+    write(store, &archive_asset, seen, report);
     if !options.archive_entries {
         return;
     }
@@ -182,7 +253,7 @@ fn index_archive(
         let Some(category) = member_category(&entry.path) else {
             continue;
         };
-        let member_identity = sha256_bytes(format!("{identity}\u{1f}{}", entry.path).as_bytes());
+        let member_identity = identity(&["member", &archive_id, &entry.path]);
         let mut tags = Vec::new();
         if let Some(crc) = &entry.crc {
             tags.push(format!("crc:{crc}"));
@@ -201,9 +272,9 @@ fn index_archive(
             id: member_identity,
             category,
             name: member_name,
-            path: format!("{}::{}", path.display(), entry.path),
+            path: format!("{path_text}::{}", entry.path),
             source: source.to_string(),
-            archive: Some(path.to_string_lossy().into_owned()),
+            archive: Some(path_text.clone()),
             entry: Some(entry.path.clone()),
             format: extension(Path::new(&entry.path)),
             sha256: None,
@@ -214,16 +285,65 @@ fn index_archive(
             status: Status::Raw,
         };
         report.members += 1;
-        write(store, &asset, report);
+        write(store, &asset, seen, report);
     }
 }
 
-fn write(store: &Store, asset: &Asset, report: &mut IndexReport) {
+fn write(store: &Store, asset: &Asset, seen: &mut HashSet<String>, report: &mut IndexReport) {
+    seen.insert(asset.id.clone());
+    match store.get::<Assets>(&asset.id) {
+        Ok(Some(existing)) if &existing == asset => {
+            report.unchanged += 1;
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            report.errors.push(format!("{}: {error}", asset.path));
+            return;
+        }
+    }
     match store.upsert::<Assets>(&asset.id, asset) {
         Ok(Put::Inserted) => report.inserted += 1,
-        Ok(Put::Replaced) => report.replaced += 1,
-        Ok(Put::Exists) => {}
+        Ok(Put::Replaced) => report.updated += 1,
+        Ok(Put::Exists) => report.unchanged += 1,
         Err(error) => report.errors.push(format!("{}: {error}", asset.path)),
+    }
+}
+
+fn prune(
+    store: &Store,
+    root: &Path,
+    source: &str,
+    seen: &HashSet<String>,
+    report: &mut IndexReport,
+) {
+    let root_text = root.to_string_lossy();
+    let root_text = root_text.trim_end_matches('/');
+    let prefix = format!("{root_text}/");
+    let rows = match store.iter_kind::<Assets>() {
+        Ok(rows) => rows,
+        Err(error) => {
+            report.errors.push(format!("{root_text}: {error}"));
+            return;
+        }
+    };
+    for (id, asset) in rows {
+        if seen.contains(&id) || asset.source != source {
+            continue;
+        }
+        let under_path = asset.path == root_text || asset.path.starts_with(&prefix);
+        let under_archive = asset
+            .archive
+            .as_deref()
+            .is_some_and(|archive| archive == root_text || archive.starts_with(&prefix));
+        if !(under_path || under_archive) {
+            continue;
+        }
+        match store.delete::<Assets>(&id) {
+            Ok(true) => report.pruned += 1,
+            Ok(false) => {}
+            Err(error) => report.errors.push(format!("{}: {error}", asset.path)),
+        }
     }
 }
 
@@ -324,7 +444,7 @@ fn family_from_path(text: &str) -> Option<String> {
             return Some(family.to_string());
         }
     }
-    // `pan` is a whole token: a path such as `pants/` must not become PAN_NPCs.
+    // `pan` is a whole token: a path such as `pants/` must not become PAN_NPCS.
     if lower
         .split(|character: char| !character.is_ascii_alphanumeric())
         .any(|token| token == "pan")
@@ -358,6 +478,10 @@ fn extension(path: &Path) -> String {
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_lowercase()
+}
+
+fn identity(parts: &[&str]) -> String {
+    sha256_bytes(parts.join("\u{1f}").as_bytes())
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

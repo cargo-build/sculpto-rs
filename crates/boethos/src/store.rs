@@ -3,7 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-use redb::{ConcurrencyMode, Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    ConcurrencyMode, Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition, WriteTransaction,
+};
 
 use crate::error::{StoreError, StoreResult};
 use crate::kind::{Kind, RecordEnvelope};
@@ -45,7 +48,12 @@ pub struct Link {
 
 /// One redb file holding typed records and links.
 pub struct Store {
-    db: Database,
+    backend: Backend,
+}
+
+enum Backend {
+    Write(Database),
+    Read(ReadOnlyDatabase),
 }
 
 impl Store {
@@ -70,7 +78,20 @@ impl Store {
             let _links = transaction.open_table(LINKS)?;
         }
         transaction.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            backend: Backend::Write(db),
+        })
+    }
+
+    /// Open an existing store for reads only.
+    ///
+    /// A missing file is an error: a read command must never create a
+    /// database that looks like an empty catalogue.
+    pub fn open_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let db = ReadOnlyDatabase::open(path)?;
+        Ok(Self {
+            backend: Backend::Read(db),
+        })
     }
 
     /// Write a record only when its identity is free.
@@ -86,7 +107,7 @@ impl Store {
     /// Read one record.
     pub fn get<K: Kind>(&self, id: &str) -> StoreResult<Option<K::Record>> {
         let key = record_key(K::NAME, id)?;
-        let transaction = self.db.begin_read()?;
+        let transaction = self.begin_read()?;
         let table = transaction.open_table(RECORDS)?;
         let Some(value) = table.get(key.as_str())? else {
             return Ok(None);
@@ -97,7 +118,7 @@ impl Store {
     /// Remove one record; reports whether it existed.
     pub fn delete<K: Kind>(&self, id: &str) -> StoreResult<bool> {
         let key = record_key(K::NAME, id)?;
-        let transaction = self.db.begin_write()?;
+        let transaction = self.begin_write()?;
         let removed = {
             let mut table = transaction.open_table(RECORDS)?;
             table.remove(key.as_str())?.is_some()
@@ -109,7 +130,7 @@ impl Store {
     /// Add a directed link; reports whether it was new.
     pub fn link(&self, from: Ref<'_>, relation: &str, to: Ref<'_>) -> StoreResult<bool> {
         let key = link_key(from, relation, to)?;
-        let transaction = self.db.begin_write()?;
+        let transaction = self.begin_write()?;
         let added = {
             let mut table = transaction.open_table(LINKS)?;
             if table.get(key.as_str())?.is_some() {
@@ -126,7 +147,7 @@ impl Store {
     /// Remove a directed link; reports whether it existed.
     pub fn unlink(&self, from: Ref<'_>, relation: &str, to: Ref<'_>) -> StoreResult<bool> {
         let key = link_key(from, relation, to)?;
-        let transaction = self.db.begin_write()?;
+        let transaction = self.begin_write()?;
         let removed = {
             let mut table = transaction.open_table(LINKS)?;
             table.remove(key.as_str())?.is_some()
@@ -142,7 +163,7 @@ impl Store {
             checked("kind", from.kind)?,
             checked("id", from.id)?
         );
-        let transaction = self.db.begin_read()?;
+        let transaction = self.begin_read()?;
         let table = transaction.open_table(LINKS)?;
         let mut links = Vec::new();
         for row in table.range(prefix.as_str()..)? {
@@ -172,7 +193,7 @@ impl Store {
     /// Every record of one kind, in identity order.
     pub fn iter_kind<K: Kind>(&self) -> StoreResult<Vec<(String, K::Record)>> {
         let prefix = format!("{}{SEPARATOR}", checked("kind", K::NAME)?);
-        let transaction = self.db.begin_read()?;
+        let transaction = self.begin_read()?;
         let table = transaction.open_table(RECORDS)?;
         let mut records = Vec::new();
         for row in table.range(prefix.as_str()..)? {
@@ -194,7 +215,7 @@ impl Store {
         {
             fs::create_dir_all(parent)?;
         }
-        let transaction = self.db.begin_read()?;
+        let transaction = self.begin_read()?;
         let table = transaction.open_table(RECORDS)?;
         let mut output = String::new();
         let mut count = 0usize;
@@ -213,6 +234,20 @@ impl Store {
         Ok(count)
     }
 
+    fn begin_read(&self) -> StoreResult<ReadTransaction> {
+        match &self.backend {
+            Backend::Write(db) => Ok(db.begin_read()?),
+            Backend::Read(db) => Ok(db.begin_read()?),
+        }
+    }
+
+    fn begin_write(&self) -> StoreResult<WriteTransaction> {
+        match &self.backend {
+            Backend::Write(db) => Ok(db.begin_write()?),
+            Backend::Read(_) => Err(StoreError::ReadOnly),
+        }
+    }
+
     fn write<K: Kind>(&self, id: &str, record: &K::Record, replace: bool) -> StoreResult<Put> {
         K::validate(record).map_err(|detail| StoreError::Validation {
             kind: K::NAME,
@@ -220,7 +255,7 @@ impl Store {
         })?;
         let key = record_key(K::NAME, id)?;
         let bytes = encode::<K>(id, record)?;
-        let transaction = self.db.begin_write()?;
+        let transaction = self.begin_write()?;
         let outcome = {
             let mut table = transaction.open_table(RECORDS)?;
             if table.get(key.as_str())?.is_some() {

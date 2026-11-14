@@ -259,3 +259,30 @@ fn version_mismatch_precedes_payload_decoding() {
     assert!(matches!(error, boethos::StoreError::VersionMismatch { .. }));
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn read_only_store_reads_and_refuses_writes() {
+    let path = temp_path("read-only");
+    let store = Store::open(&path).expect("open");
+    store
+        .insert::<Characters>("hero", &character("Hero"))
+        .expect("insert");
+    drop(store);
+    let read_only = Store::open_read_only(&path).expect("read-only");
+    assert_eq!(
+        read_only.get::<Characters>("hero").expect("get"),
+        Some(character("Hero"))
+    );
+    assert!(matches!(
+        read_only.delete::<Characters>("hero"),
+        Err(boethos::StoreError::ReadOnly)
+    ));
+    assert!(matches!(
+        read_only.insert::<Characters>("villain", &character("Villain")),
+        Err(boethos::StoreError::ReadOnly)
+    ));
+    let missing = path.with_extension("missing.redb");
+    assert!(Store::open_read_only(&missing).is_err());
+    assert!(!missing.exists());
+    let _ = std::fs::remove_file(path);
+}

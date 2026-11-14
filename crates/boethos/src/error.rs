@@ -28,6 +28,8 @@ pub enum StoreError {
         /// The rejected value.
         value: String,
     },
+    /// A write was attempted through a read-only handle.
+    ReadOnly,
     /// The stored schema version differs from the caller's.
     VersionMismatch {
         /// Family name.
@@ -66,6 +68,7 @@ impl fmt::Display for StoreError {
                     "invalid {field} {value:?}: empty or reserved separator"
                 )
             }
+            Self::ReadOnly => write!(formatter, "store is read-only"),
             Self::VersionMismatch {
                 kind,
                 found,
@@ -92,9 +95,10 @@ impl std::error::Error for StoreError {
             Self::Serde(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Utf8(error) => Some(error),
-            Self::InvalidKey { .. } | Self::VersionMismatch { .. } | Self::Validation { .. } => {
-                None
-            }
+            Self::ReadOnly
+            | Self::InvalidKey { .. }
+            | Self::VersionMismatch { .. }
+            | Self::Validation { .. } => None,
         }
     }
 }

@@ -51,6 +51,7 @@ fn classifies_and_indexes_files() {
         "fixture",
         &IndexOptions {
             archive_entries: false,
+            prune: false,
         },
     );
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -73,16 +74,18 @@ fn classifies_and_indexes_files() {
         "fixture",
         &IndexOptions {
             archive_entries: false,
+            prune: false,
         },
     );
     assert_eq!(again.inserted, 0);
-    assert_eq!(again.replaced, 8);
+    assert_eq!(again.updated, 0);
+    assert_eq!(again.unchanged, 8);
     let _ = fs::remove_file(&db);
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn content_identity_is_stable_across_paths() {
+fn equal_bytes_at_distinct_paths_stay_distinct() {
     let first = temp_dir("identity-a");
     let second = temp_dir("identity-b");
     for root in [&first, &second] {
@@ -91,16 +94,52 @@ fn content_identity_is_stable_across_paths() {
     let store = Store::open(first.with_extension("redb")).expect("store");
     let options = IndexOptions {
         archive_entries: false,
+        prune: false,
     };
     index_root(&store, &first, "a", &options);
-    let rows = store.iter_kind::<Assets>().expect("rows");
-    let before = rows[0].1.id.clone();
     index_root(&store, &second, "b", &options);
     let rows = store.iter_kind::<Assets>().expect("rows");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1.id, before);
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0].1.id, rows[1].1.id);
+    assert_eq!(rows[0].1.sha256, rows[1].1.sha256);
     let _ = fs::remove_dir_all(first);
     let _ = fs::remove_dir_all(second);
+}
+
+#[test]
+fn content_change_updates_and_prune_removes_gone_files() {
+    let root = temp_dir("prune");
+    fs::create_dir_all(root.join("presets")).expect("dirs");
+    fs::write(root.join("presets/keep.xml"), b"one").expect("write");
+    fs::write(root.join("presets/drop.xml"), b"two").expect("write");
+    let db = root.with_extension("redb");
+    let store = Store::open(&db).expect("store");
+    let options = IndexOptions {
+        archive_entries: false,
+        prune: true,
+    };
+    let first = index_root(&store, &root, "fixture", &options);
+    assert_eq!(first.inserted, 2);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    let keep = rows
+        .iter()
+        .find(|(_, asset)| asset.name == "keep.xml")
+        .expect("keep")
+        .1
+        .id
+        .clone();
+    fs::write(root.join("presets/keep.xml"), b"changed").expect("write");
+    fs::remove_file(root.join("presets/drop.xml")).expect("remove");
+    let second = index_root(&store, &root, "fixture", &options);
+    assert_eq!(second.inserted, 0);
+    assert_eq!(second.updated, 1);
+    assert_eq!(second.pruned, 1);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.id, keep);
+    assert_eq!(rows[0].1.bytes, Some(7));
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -117,6 +156,7 @@ fn family_tokens_do_not_match_substrings() {
         "fixture",
         &IndexOptions {
             archive_entries: false,
+            prune: false,
         },
     );
     let rows = store.iter_kind::<Assets>().expect("rows");
@@ -159,6 +199,7 @@ fn indexes_archive_members_end_to_end() {
         "fixture",
         &IndexOptions {
             archive_entries: true,
+            prune: false,
         },
     );
     assert_eq!(report.archives, 1);
