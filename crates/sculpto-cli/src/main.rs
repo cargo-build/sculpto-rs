@@ -117,6 +117,8 @@ garment fit options:
   --percent <number>   slider percentage for --conform
   --body-nif <path>    source body NIF for a slider or manifest fit, otherwise --nif
   --manifest <json>    fit ordinary regions and retain declared Blender Cloth geometry
+  --final-push <n>     opt-in final push-out passes over visible depth violations (1..=10)
+  --final-push-tolerance <units>  accepted visible depth for the final push-out stage
 
 garment follow options:
   --reference <obj>   original control surface
@@ -729,6 +731,16 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         .map(|value| value.parse::<f32>())
         .transpose()
         .map_err(|error| format!("invalid --percent: {error}"))?;
+    let final_push = flags
+        .get("final-push")
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|error| format!("invalid --final-push: {error}"))?;
+    let final_push_tolerance = flags
+        .get("final-push-tolerance")
+        .map(|value| value.parse::<f32>())
+        .transpose()
+        .map_err(|error| format!("invalid --final-push-tolerance: {error}"))?;
     let params = ops::FitParams {
         nif: PathBuf::from(required(&flags, "nif")?),
         shape: required(&flags, "shape")?.to_string(),
@@ -744,6 +756,8 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         manifest: flags.get("manifest").map(PathBuf::from),
         collision: flags.get("collision").map(PathBuf::from),
         collision_frame: flags.get("collision-frame").cloned(),
+        final_push,
+        final_push_tolerance,
     };
     let outcome = ops::garment_fit(&params).map_err(|error| error.to_string())?;
     println!(
@@ -780,6 +794,13 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
             "deformation: max displacement {:.6}, max edge strain {:.6}, collapsed edges {}",
             regions.max_displacement, regions.max_strain, regions.collapsed_edges,
         );
+        if let Some(report) = regions
+            .ordinary
+            .as_ref()
+            .and_then(|ordinary| ordinary.final_push.as_ref())
+        {
+            print_final_push(report);
+        }
     }
     if let (Some(pairs), Some(inside)) = (outcome.intersection_pairs, outcome.inside_after) {
         println!("obstacle contacts {pairs}, inside groups {inside}");
@@ -792,6 +813,9 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
             repair.collapsed_edges,
             repair.no_clipping_fallback_applied,
         );
+        if let Some(report) = repair.final_push.as_ref() {
+            print_final_push(report);
+        }
     }
     if let Some(collision) = &outcome.collision {
         println!(
@@ -800,6 +824,30 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Report what the opt-in fit stage measured and left.
+///
+/// The wording matches `garment push`, so a fit result and a standalone regrade
+/// of the same geometry read the same way. @req DECL0013
+fn print_final_push(report: &sculpto_mesh::wrap::repair::final_push::FinalPushReport) {
+    println!(
+        "final push: visible violations {} (max {:.6}) at tolerance {:.6} -> {} (max {:.6}) after {} of {} passes; held {}",
+        report.before_violations,
+        report.before_max,
+        report.tolerance,
+        report.violations,
+        report.max,
+        report.passes,
+        report.budget,
+        report.held
+    );
+    for pass in &report.per_pass {
+        println!(
+            "final push pass {}: moved {}, violations {}, max {:.6}",
+            pass.pass, pass.moved, pass.violations, pass.max
+        );
+    }
 }
 
 fn garment_aura_inner(args: &[String]) -> Result<(), String> {

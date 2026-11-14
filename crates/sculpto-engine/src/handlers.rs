@@ -209,6 +209,27 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
             ));
         }
     };
+    let final_push = match input.get("final_push") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|passes| u32::try_from(passes).ok())
+                .ok_or_else(|| errors::invalid("final_push", "must be a nonnegative integer"))?,
+        ),
+    };
+    let final_push_tolerance = match input.get("final_push_tolerance") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    errors::invalid("final_push_tolerance", "must be a finite number")
+                })?,
+        ),
+    };
     let params = ops::FitParams {
         nif: path(input, "nif")?,
         shape: string(input, "shape")?,
@@ -224,6 +245,8 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         manifest: checked_optional_path(input, "manifest")?,
         collision: checked_optional_path(input, "collision")?,
         collision_frame,
+        final_push,
+        final_push_tolerance,
     };
     let outcome = ops::garment_fit(&params)?;
     let follow = outcome.follow.map(|(body, garment, difference)| {

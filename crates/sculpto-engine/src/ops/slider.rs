@@ -481,6 +481,7 @@ fn finish_fit(
         relief_smoothing: 10,
         flip_rings: 0,
         opening_direction: Some([0.0, 0.0, 1.0]),
+        final_push: params.final_push()?,
         ..FitOptions::default()
     };
     let garment_mesh = (fitted.as_slice(), garment.shape.triangles.as_slice());

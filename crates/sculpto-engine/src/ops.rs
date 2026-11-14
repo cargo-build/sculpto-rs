@@ -24,6 +24,7 @@ use sculpto_gltf::sanitize::{Repair, SanitizeError};
 use sculpto_mesh::conform::Conform;
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
+use sculpto_mesh::wrap::repair::final_push::FinalPushOptions;
 use sculpto_nif::write::header::{NifTarget, NifWriteError};
 use sculpto_nif::write::le_bundle::write_le_bundle;
 use sculpto_nif::write::se_bundle::write_se_bundle;
@@ -913,6 +914,34 @@ pub struct FitParams {
     /// Declared frame of `collision`. The only supported value is
     /// `source-scene`: NIF source-scene coordinates in the OBJ display frame.
     pub collision_frame: Option<String>,
+    /// Passes the opt-in final push-out stage may run. Absent for no pass.
+    /// @req DECL0013
+    pub final_push: Option<u32>,
+    /// Accepted visible depth of the final push-out stage, in input units.
+    /// Absent for no pass; required together with `final_push`.
+    pub final_push_tolerance: Option<f32>,
+}
+
+impl FitParams {
+    /// Resolve the opt-in final push-out request.
+    ///
+    /// Half a request is refused by name instead of being read as either
+    /// extreme: a pass budget without a tolerance has no accepted depth, and a
+    /// tolerance without a budget cannot run. @req DECL0013
+    pub fn final_push(&self) -> Result<Option<FinalPushOptions>, CommandError> {
+        match (self.final_push, self.final_push_tolerance) {
+            (None, None) => Ok(None),
+            (Some(passes), Some(tolerance)) => Ok(Some(FinalPushOptions { passes, tolerance })),
+            (Some(_), None) => Err(errors::invalid(
+                "final_push_tolerance",
+                "required when `final_push` is given",
+            )),
+            (None, Some(_)) => Err(errors::invalid(
+                "final_push",
+                "required when `final_push_tolerance` is given",
+            )),
+        }
+    }
 }
 
 /// What `outfit.fit` produced.
@@ -977,6 +1006,13 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
             ErrorKind::Refused,
             "outfit_fit_collision_scope",
             "a collision surface needs a guarded fit: supply `manifest`, or a `conform`, `slider` and `percent` preview; this path measures no contact",
+        ));
+    }
+    if params.final_push.is_some() || params.final_push_tolerance.is_some() {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "outfit_fit_final_push",
+            "the final push-out stage needs a guarded fit: supply `manifest`, or a `conform`, `slider` and `percent` preview; this path grades no visible depth",
         ));
     }
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
