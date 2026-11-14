@@ -2,10 +2,10 @@
 //!
 //! The declared layer model replaces a name-prefix inner/outer split with a
 //! ranked manifest: every piece carries a sparse order over the body plus the
-//! exceptions that make contact legitimate — an accessory anchored to a named
-//! layer, footwear declared `under-trousers` or `over-trousers`. Contact is
-//! classified by type, never by one distance, and only two types fail a
-//! declared stack: `penetration` and `boot_mode_violation`.
+//! exceptions that make contact legitimate — an accessory anchored to one or
+//! more named layers, footwear declared `under-trousers` or `over-trousers`.
+//! Contact is classified by type, never by one distance, and only two types
+//! fail a declared stack: `penetration` and `boot_mode_violation`.
 //!
 //! Which layers touch is declared, not inferred: a manifest may list its
 //! layer-to-layer contacts as `pairs`, and only those are graded. Without the
@@ -72,10 +72,11 @@ pub struct Layer {
     pub order: u32,
     /// Garment OBJ, resolved against the manifest's directory.
     pub obj: PathBuf,
-    /// Lower layer this accessory is declared to touch; its contact is reported
-    /// as `accessory_contact` and never fails the stack.
-    #[serde(default)]
-    pub anchor: Option<String>,
+    /// Lower layer(s) this accessory is declared to touch: one id or a list of
+    /// ids in the manifest. Every anchored contact is reported as
+    /// `accessory_contact` and never fails the stack.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub anchor: Option<Vec<String>>,
     /// Footwear placement; requires [`Self::pair`] naming the trousers layer.
     #[serde(default)]
     pub mode: Option<BootMode>,
@@ -99,6 +100,40 @@ pub struct LayerStack {
     pub pairs: Option<Vec<[String; 2]>>,
     /// Declared layers; empty is a refusal, not an empty pass.
     pub layers: Vec<Layer>,
+}
+
+/// `anchor` in the manifest: one id or a list of ids. Both spell one anchor
+/// set, so an existing single-string manifest keeps parsing unchanged.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Ids;
+
+    impl<'de> serde::de::Visitor<'de> for Ids {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an anchor id or a list of anchor ids")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, id: &str) -> Result<Self::Value, E> {
+            Ok(vec![id.to_owned()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut ids = Vec::new();
+            while let Some(id) = seq.next_element::<String>()? {
+                ids.push(id);
+            }
+            Ok(ids)
+        }
+    }
+
+    Ok(Some(deserializer.deserialize_any(Ids)?))
 }
 
 /// Why a declaration or a grading run cannot produce a stack report.
@@ -370,7 +405,20 @@ impl LayerStack {
                     layer.id
                 )));
             }
-            if let Some(anchor) = layer.anchor.as_deref() {
+            let anchors = layer.anchor.as_deref().unwrap_or_default();
+            if layer.anchor.is_some() && anchors.is_empty() {
+                return Err(declaration(format!(
+                    "layer `{}` declares an empty `anchor`",
+                    layer.id
+                )));
+            }
+            for (position, anchor) in anchors.iter().enumerate() {
+                if anchors[..position].contains(anchor) {
+                    return Err(declaration(format!(
+                        "layer `{}` names anchor `{anchor}` twice",
+                        layer.id
+                    )));
+                }
                 let target = self.reference(layer, anchor, "anchor")?;
                 if target == layer.id {
                     return Err(declaration(format!(
@@ -401,17 +449,26 @@ impl LayerStack {
         self.pair_indices()?;
         if let Some(pairs) = &self.pairs {
             for layer in &self.layers {
-                let Some(contact) = layer.anchor.as_deref().or(layer.pair.as_deref()) else {
-                    continue;
-                };
-                let listed = pairs
+                let mut contacts: Vec<&str> = layer
+                    .anchor
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
-                    .any(|[outer, inner]| outer == &layer.id && inner == contact);
-                if !listed {
-                    return Err(declaration(format!(
-                        "layer `{}` declares a contact with `{contact}`, but `pairs` does not list it",
-                        layer.id
-                    )));
+                    .map(String::as_str)
+                    .collect();
+                if let Some(pair) = layer.pair.as_deref() {
+                    contacts.push(pair);
+                }
+                for contact in contacts {
+                    let listed = pairs
+                        .iter()
+                        .any(|[outer, inner]| outer == &layer.id && inner == contact);
+                    if !listed {
+                        return Err(declaration(format!(
+                            "layer `{}` declares a contact with `{contact}`, but `pairs` does not list it",
+                            layer.id
+                        )));
+                    }
                 }
             }
         }
@@ -509,9 +566,9 @@ pub fn resolve_body(stack: &LayerStack, selected: Option<&Path>) -> Result<PathB
 /// body, which is the stack's innermost surface. Against other layers, the
 /// manifest's `pairs` select the contacts when declared; otherwise every
 /// strictly lower order is graded, and one whose bounding boxes are disjoint is
-/// refused instead of measured. An accessory's pair with its anchor is reported
-/// as [`ContactClass::AccessoryContact`] and a footwear pair is graded in the
-/// direction its declared mode names.
+/// refused instead of measured. An accessory's pairs with its anchors are
+/// reported as [`ContactClass::AccessoryContact`] and a footwear pair is graded
+/// in the direction its declared mode names.
 ///
 /// # Errors
 /// [`StackError`] for a refused declaration, a tolerance that cannot name a
@@ -603,7 +660,10 @@ where
         for inner in inners {
             let target = &stack.layers[inner];
             let target_mesh = mesh(&cache, &target.obj);
-            let anchored = layer.anchor.as_deref() == Some(target.id.as_str());
+            let anchored = layer
+                .anchor
+                .as_deref()
+                .is_some_and(|ids| ids.iter().any(|id| id == &target.id));
             let footwear = layer.pair.as_deref() == Some(target.id.as_str());
             let kind = match (anchored, footwear) {
                 (true, _) => PairKind::Accessory,
@@ -1002,6 +1062,107 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_anchor_is_an_accessory_contact() {
+        // The brooch sits over both the robe and the cloak above it: one anchor
+        // would grade the cloak row as a penetration.
+        let anchored = stack_with_pairs(
+            r#"{"id": "robe", "order": 4, "obj": "robe.obj"},
+               {"id": "cloak", "order": 5, "obj": "cloak.obj"},
+               {"id": "brooch", "order": 6, "obj": "brooch.obj",
+                "anchor": ["robe", "cloak"]}"#,
+            r#"[["brooch", "robe"], ["brooch", "cloak"]]"#,
+        );
+        // One anchor dropped while `pairs` still lists both contacts.
+        let half = stack_with_pairs(
+            r#"{"id": "robe", "order": 4, "obj": "robe.obj"},
+               {"id": "cloak", "order": 5, "obj": "cloak.obj"},
+               {"id": "brooch", "order": 6, "obj": "brooch.obj", "anchor": "robe"}"#,
+            r#"[["brooch", "robe"], ["brooch", "cloak"]]"#,
+        );
+        let files = files(&[
+            ("body.obj", cube([0.0; 3], 0.4)),
+            ("robe.obj", cube([0.0; 3], 0.6)),
+            ("cloak.obj", cube([0.0; 3], 0.7)),
+            // Outside the body, 0.14 inside the robe and 0.24 inside the cloak.
+            ("brooch.obj", sheet(0.46)),
+        ]);
+
+        let allowed = graded(&anchored, &files, 0.05);
+        assert!(allowed.pass, "{:?}", allowed.pairs);
+        let robe = row(&allowed, "brooch", "robe");
+        assert_eq!(robe.kind, PairKind::Accessory);
+        assert_eq!(robe.classification, ContactClass::AccessoryContact);
+        assert_eq!(robe.visible, 3);
+        assert_eq!(robe.violations, 3, "reported, not hidden");
+        assert!(
+            (robe.visible_max - 0.14).abs() < 1e-5,
+            "{}",
+            robe.visible_max
+        );
+        let cloak = row(&allowed, "brooch", "cloak");
+        assert_eq!(cloak.kind, PairKind::Accessory);
+        assert_eq!(cloak.classification, ContactClass::AccessoryContact);
+        assert_eq!(cloak.visible, 3);
+        assert_eq!(cloak.violations, 3);
+        assert!(
+            (cloak.visible_max - 0.24).abs() < 1e-5,
+            "{}",
+            cloak.visible_max
+        );
+        assert_eq!(
+            row(&allowed, "brooch", "body").classification,
+            ContactClass::LayeringOk
+        );
+        assert_eq!(
+            allowed.layers[2].classification,
+            ContactClass::AccessoryContact
+        );
+        assert_eq!(allowed.layers[2].failed, 0);
+
+        // Dropping the cloak anchor reverts only that row: the declaration,
+        // not the depth, exempts, one anchor at a time.
+        let half_anchored = graded(&half, &files, 0.05);
+        assert!(!half_anchored.pass);
+        assert_eq!(
+            row(&half_anchored, "brooch", "robe").classification,
+            ContactClass::AccessoryContact
+        );
+        let dropped = row(&half_anchored, "brooch", "cloak");
+        assert_eq!(dropped.kind, PairKind::Layer);
+        assert_eq!(dropped.classification, ContactClass::Penetration);
+        assert!(
+            (dropped.visible_max - 0.24).abs() < 1e-5,
+            "{}",
+            dropped.visible_max
+        );
+    }
+
+    #[test]
+    fn single_string_anchor_parses_and_grades_like_the_list() {
+        let single = stack_with_pairs(
+            r#"{"id": "robe", "order": 4, "obj": "robe.obj"},
+               {"id": "brooch", "order": 6, "obj": "brooch.obj", "anchor": "robe"}"#,
+            r#"[["brooch", "robe"]]"#,
+        );
+        let listed = stack_with_pairs(
+            r#"{"id": "robe", "order": 4, "obj": "robe.obj"},
+               {"id": "brooch", "order": 6, "obj": "brooch.obj", "anchor": ["robe"]}"#,
+            r#"[["brooch", "robe"]]"#,
+        );
+        assert_eq!(single, listed, "both spellings parse to one declaration");
+        let files = files(&[
+            ("body.obj", cube([0.0; 3], 0.4)),
+            ("robe.obj", cube([0.0; 3], 0.6)),
+            ("brooch.obj", sheet(0.46)),
+        ]);
+        assert_eq!(
+            graded(&single, &files, 0.05),
+            graded(&listed, &files, 0.05),
+            "both spellings grade identically"
+        );
+    }
+
+    #[test]
     fn explicit_pairs_override_the_order_rule() {
         // `cuff` sits ten units away from every other layer: the order rule
         // would compare it with all of them and report far-surface depths.
@@ -1239,6 +1400,31 @@ mod tests {
                               {"id": "b", "order": 2, "obj": "b.obj", "anchor": "a"}]}"#
                     .to_string(),
                 "not below it",
+            ),
+            (
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": 5}]}"#.to_string(),
+                "expected an anchor id or a list of anchor ids",
+            ),
+            (
+                r#"{"layers": [{"id": "a", "order": 1, "obj": "a.obj", "anchor": []}]}"#
+                    .to_string(),
+                "declares an empty `anchor`",
+            ),
+            (
+                r#"{"layers": [{"id": "b", "order": 2, "obj": "b.obj"},
+                              {"id": "c", "order": 6, "obj": "c.obj", "anchor": ["b", "b"]}],
+                   "pairs": [["c", "b"]]}"#
+                    .to_string(),
+                "names anchor `b` twice",
+            ),
+            (
+                r#"{"layers": [{"id": "b", "order": 4, "obj": "b.obj"},
+                              {"id": "c", "order": 5, "obj": "c.obj"},
+                              {"id": "d", "order": 6, "obj": "d.obj",
+                               "anchor": ["b", "c"]}],
+                   "pairs": [["d", "b"]]}"#
+                    .to_string(),
+                "declares a contact with `c`, but `pairs` does not list it",
             ),
             (
                 r#"{"layers": [{"id": "a", "order": 2, "obj": "a.obj"}],
