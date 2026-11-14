@@ -38,6 +38,7 @@ pub mod delta_conform;
 pub mod garment;
 pub mod intake;
 pub mod intake_gltf;
+pub mod joint_seal;
 pub mod layer_stack;
 pub mod mask;
 pub mod outfit;

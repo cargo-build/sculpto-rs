@@ -20,6 +20,7 @@ pub mod obj;
 pub mod ops;
 mod parts;
 pub mod rules;
+mod seal;
 
 /// A stable command identifier.
 ///
@@ -37,6 +38,8 @@ pub enum CommandId {
     Bake,
     /// Audit attached body parts against their sockets; read-only.
     BodyAuditParts,
+    /// Seal open joint rims (neck, wrists) into one watertight, smoothed seam.
+    BodySealJoints,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,
     /// Fit an ordered layer stack against the accumulated obstacle surface.
@@ -82,6 +85,7 @@ impl CommandId {
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
             CommandId::BodyAuditParts => "body.audit_parts",
+            CommandId::BodySealJoints => "body.seal_joints",
             CommandId::OutfitFit => "outfit.fit",
             CommandId::OutfitStackFit => "outfit.stack_fit",
             CommandId::OutfitConform => "outfit.conform",
@@ -282,6 +286,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: parts::schema,
         handler: parts::audit,
+    },
+    Spec {
+        id: CommandId::BodySealJoints,
+        summary: "Seal open joint rims (neck, wrists) by bridging the paired rings, merging coincident copies and smoothing the seam; report the measured boundary counts.",
+        mutates: true,
+        stub: false,
+        schema: seal::schema,
+        handler: seal::seal,
     },
     Spec {
         id: CommandId::OutfitFit,

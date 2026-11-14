@@ -45,6 +45,8 @@ commands:
   export-tri [options]  write sparse morph targets as a Skyrim `.tri` slider file
   body audit-parts [options]
                         audit attached body parts against their sockets (read-only)
+  body seal-joints --body <obj> --out <obj> --joint <part>:<socket>[:seat]
+                        seal open joint rims (neck, wrists); report boundary counts
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
   outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
                  --presets <xml> --preset <name> --set <name> --out <osd>
@@ -120,6 +122,18 @@ body audit-parts options (read-only: measures, never writes or corrects):
                       part shells, as shipped
   --part <obj>        replacement part OBJ audited against the body's own
                       sockets; the shipped copy stays the baseline (repeatable)
+
+body seal-joints options:
+  --body <obj>        multi-part body OBJ (torso + head/hand shells)
+  --out <obj>         output OBJ with the sealed seams
+  --joint <p>:<s>[:seat]  declared joint: part shell, socket shell, optional seat
+  --iterations <n>    Laplacian passes (default 2)
+  --band <n>          ring distance that may move (default 1)
+  --max-shift <units> hard displacement bound per vertex
+  --arc-band <units>  candidate-rim proximity band (derived when absent)
+  --head-drop <units> explicit vertical seat of the part shell before pairing (default 0)
+  --no-smooth         bridge only, no Laplacian smoothing
+  --weld-coincident   merge exactly coincident boundary copies beyond the pinch
 
 garment fit options:
   --nif <path>         garment NIF
@@ -244,6 +258,9 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "export-tri" => export_tri(rest),
         [command, action, rest @ ..] if command == "body" && action == "audit-parts" => {
             body_audit_parts(rest)
+        }
+        [command, action, rest @ ..] if command == "body" && action == "seal-joints" => {
+            body_seal_joints(rest)
         }
         [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
             outfit_inspect(rest)
@@ -485,6 +502,101 @@ fn body_audit_parts(args: &[String]) -> ExitCode {
     };
     let input = serde_json::json!({ "body": body, "parts": parts });
     run::dispatch_payload("body.audit_parts", &input)
+}
+
+fn body_seal_joints(args: &[String]) -> ExitCode {
+    let mut body: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut joints: Vec<String> = Vec::new();
+    let mut iterations: Option<u32> = None;
+    let mut band: Option<u32> = None;
+    let mut max_shift: Option<f32> = None;
+    let mut arc_band: Option<f64> = None;
+    let mut head_drop: Option<f32> = None;
+    let mut smooth: Option<bool> = None;
+    let mut weld_coincident: Option<bool> = None;
+    let mut iter = args.iter();
+    while let Some(key) = iter.next() {
+        let reject = |message: String| -> ExitCode {
+            eprintln!("body seal-joints: {message}");
+            ExitCode::from(2)
+        };
+        let Some(name) = key.strip_prefix("--") else {
+            return reject(format!("unexpected argument `{key}`"));
+        };
+        if name == "no-smooth" {
+            smooth = Some(false);
+            continue;
+        }
+        if name == "weld-coincident" {
+            weld_coincident = Some(true);
+            continue;
+        }
+        let Some(value) = iter.next() else {
+            return reject(format!("`--{name}` needs a value"));
+        };
+        match name {
+            "body" => body = Some(value.clone()),
+            "out" => out = Some(value.clone()),
+            "joint" => joints.push(value.clone()),
+            "iterations" => match value.parse() {
+                Ok(parsed) => iterations = Some(parsed),
+                Err(_) => return reject(format!("`--iterations` is not an integer: {value}")),
+            },
+            "band" => match value.parse() {
+                Ok(parsed) => band = Some(parsed),
+                Err(_) => return reject(format!("`--band` is not an integer: {value}")),
+            },
+            "max-shift" => match value.parse() {
+                Ok(parsed) => max_shift = Some(parsed),
+                Err(_) => return reject(format!("`--max-shift` is not a number: {value}")),
+            },
+            "arc-band" => match value.parse() {
+                Ok(parsed) => arc_band = Some(parsed),
+                Err(_) => return reject(format!("`--arc-band` is not a number: {value}")),
+            },
+            "head-drop" => match value.parse() {
+                Ok(parsed) => head_drop = Some(parsed),
+                Err(_) => return reject(format!("`--head-drop` is not a number: {value}")),
+            },
+            other => return reject(format!("unknown option `--{other}`")),
+        }
+    }
+    let Some(body) = body else {
+        eprintln!("body seal-joints: `--body` is required");
+        return ExitCode::from(2);
+    };
+    let Some(out) = out else {
+        eprintln!("body seal-joints: `--out` is required");
+        return ExitCode::from(2);
+    };
+    if joints.is_empty() {
+        eprintln!("body seal-joints: at least one `--joint <part>:<socket>` is required");
+        return ExitCode::from(2);
+    }
+    let mut parsed = Vec::new();
+    for joint in joints {
+        let mut pieces = joint.split(':');
+        let (Some(part), Some(socket)) = (pieces.next(), pieces.next()) else {
+            eprintln!("body seal-joints: `--joint {joint}` is not <part>:<socket>[:seat]");
+            return ExitCode::from(2);
+        };
+        let seat = matches!(pieces.next(), Some("seat"));
+        parsed.push(serde_json::json!({ "part": part, "socket": socket, "seat": seat }));
+    }
+    let input = serde_json::json!({
+        "body": body,
+        "out": out,
+        "joints": parsed,
+        "iterations": iterations,
+        "band": band,
+        "max_shift": max_shift,
+        "arc_band": arc_band,
+        "head_drop": head_drop,
+        "smooth": smooth,
+        "weld_coincident": weld_coincident,
+    });
+    run::dispatch_payload("body.seal_joints", &input)
 }
 
 fn outfit_inspect(args: &[String]) -> ExitCode {

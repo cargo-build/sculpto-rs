@@ -1012,7 +1012,16 @@ fn classify(
         // a class inferred from an invented position.
         return PartClass::Attached;
     };
-    // 1. Coincident onto the torso: a leg, authored or separated past the
+    let Some((min, max, band)) = bands else {
+        return PartClass::Attached;
+    };
+    let height = ring_centroid[*axis];
+    // 1. Top band: the head. A collar arc that is partly coincident with the
+    //    torso still belongs to the head, so this rule runs before the leg rule.
+    if height >= max - band {
+        return PartClass::Head;
+    }
+    // 2. Coincident onto the torso: a leg, authored or separated past the
     //    classification band but still facing its socket.
     if torso.is_some_and(|torso| {
         summaries
@@ -1020,14 +1029,6 @@ fn classify(
             .any(|summary| summary.partner == torso && summary.coincident_kind(ring_size))
     }) {
         return PartClass::Leg;
-    }
-    let Some((min, max, band)) = bands else {
-        return PartClass::Attached;
-    };
-    let height = ring_centroid[*axis];
-    // 2. Top band: the head.
-    if height >= max - band {
-        return PartClass::Head;
     }
     // 3. Nearest cross-family slotted partner: the ankle slot reaches a leg,
     //    the shoulder slot reaches the torso.
@@ -1588,6 +1589,162 @@ impl Shell {
             .map(|&vertex| self.position_of(vertex))
             .collect()
     }
+}
+
+/// One shell's members, measured class and report name: the identity view the
+/// joint seal pairs shells by. Built by the same classifier and name pool the
+/// audit uses, so a declared joint name cannot drift from `body.audit_parts`.
+/// @req BLD-13
+pub struct ShellIdentity {
+    /// Global vertex ids of the shell.
+    pub members: Vec<usize>,
+    /// Measured class; [`PartClass::Torso`] for the socket owner and every
+    /// shell below the part-size floor.
+    pub class: PartClass,
+    /// Report name, as `body.audit_parts` prints it.
+    pub name: String,
+}
+
+/// Classify a multi-part body and return every shell's identity, in shell
+/// discovery order. Read-only: nothing is written and no vertex moves.
+/// @req BLD-13
+pub fn shell_identities(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<ShellIdentity> {
+    let groups = component_groups(positions, triangles);
+    let shells: Vec<Shell> = groups
+        .iter()
+        .filter_map(|group| Shell::new(positions, triangles, group))
+        .collect();
+    let large: Vec<usize> = shells
+        .iter()
+        .enumerate()
+        .filter(|(_, shell)| shell.vertices.len() >= MIN_PART_VERTICES)
+        .map(|(index, _)| index)
+        .collect();
+    let torso = large.iter().copied().max_by(|&left, &right| {
+        volume(shells[left].positions.as_slice())
+            .total_cmp(&volume(shells[right].positions.as_slice()))
+            .then_with(|| {
+                shells[left]
+                    .vertices
+                    .len()
+                    .cmp(&shells[right].vertices.len())
+            })
+    });
+    let axis = up_axis(positions);
+    let bands = torso.map(|index| {
+        let (min, max) = extent(shells[index].positions.as_slice(), axis);
+        let band = f64::from(max - min) * HEIGHT_BAND;
+        (f64::from(min), f64::from(max), band)
+    });
+    let ring_points: Vec<Vec<[f32; 3]>> = shells.iter().map(Shell::ring_positions_owned).collect();
+    let shell_trees: Vec<PointIndex<'_>> = shells
+        .iter()
+        .map(|shell| PointIndex::build(shell.positions.as_slice()))
+        .collect();
+    let no_ring_trees: Vec<Option<PointIndex<'_>>> = (0..shells.len()).map(|_| None).collect();
+    let bodies = Bodies {
+        shells: shells.as_slice(),
+        ring_points: ring_points.as_slice(),
+        shell_trees: shell_trees.as_slice(),
+        ring_trees: no_ring_trees.as_slice(),
+        large: large.as_slice(),
+    };
+    let mut analyses: Vec<PartAnalysis> = Vec::new();
+    for &index in &large {
+        if Some(index) == torso {
+            continue;
+        }
+        let summaries: Vec<PartnerSummary> = bodies
+            .large
+            .iter()
+            .copied()
+            .filter(|&other| other != index)
+            .map(|partner| {
+                summarize(
+                    partner,
+                    bodies.shells[index].positions.as_slice(),
+                    bodies.ring_points[index].as_slice(),
+                    bodies.shells[partner].positions.as_slice(),
+                    &bodies.shell_trees[partner],
+                )
+            })
+            .collect();
+        analyses.push(PartAnalysis {
+            shell: index,
+            class: PartClass::Attached,
+            summaries,
+            seams: Vec::new(),
+        });
+    }
+    let mut union: Families = large.iter().map(|&index| (index, index)).collect();
+    for analysis in &analyses {
+        for summary in analysis.summaries.iter().filter(|summary| summary.near > 0) {
+            let left = family_root(&union, analysis.shell);
+            let right = family_root(&union, summary.partner);
+            if left != right {
+                union.insert(right, left);
+            }
+        }
+    }
+    let families: Families = union
+        .keys()
+        .copied()
+        .map(|shell| (shell, family_root(&union, shell)))
+        .collect();
+    let planar: Vec<usize> = (0..3).filter(|candidate| *candidate != axis).collect();
+    let spans: Vec<f64> = planar
+        .iter()
+        .map(|&candidate| {
+            let (low, high) = extent(positions, candidate);
+            f64::from(high - low)
+        })
+        .collect();
+    let lateral = if spans[0] >= spans[1] {
+        planar[0]
+    } else {
+        planar[1]
+    };
+    let layout = Layout {
+        torso,
+        axis,
+        lateral,
+        bands,
+        families: &families,
+    };
+    for analysis in &mut analyses {
+        analysis.class = classify(
+            bodies.shells[analysis.shell].ring_centroid(),
+            bodies.shells[analysis.shell].boundary.len(),
+            analysis.summaries.as_slice(),
+            families[&analysis.shell],
+            &layout,
+        );
+    }
+    let mut names: Vec<String> = vec![String::new(); shells.len()];
+    if let Some(torso_index) = torso {
+        names[torso_index] = "torso".to_string();
+    }
+    let torso_center =
+        torso.map(|index| mean_over(&shells[index].vertices, |&global| positions[global]));
+    let mut pool = NamePool::default();
+    for analysis in &analyses {
+        names[analysis.shell] = pool.assign(
+            bodies.shells[analysis.shell].ring_centroid(),
+            analysis.class,
+            axis,
+            torso_center,
+        );
+    }
+    (0..shells.len())
+        .map(|index| ShellIdentity {
+            members: shells[index].vertices.clone(),
+            class: analyses
+                .iter()
+                .find(|analysis| analysis.shell == index)
+                .map_or(PartClass::Torso, |analysis| analysis.class),
+            name: names[index].clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
