@@ -111,6 +111,35 @@ fn ring(value: &joint_seal::RingFacts) -> Value {
     })
 }
 
+fn smoothing_row(smoothing: &joint_seal::SmoothingReport) -> Value {
+    json!({
+        "enabled": smoothing.enabled,
+        "iterations": smoothing.iterations,
+        "factor": smoothing.factor,
+        "band": smoothing.band,
+        "max_shift": smoothing.max_shift,
+        "max_displacement": smoothing.max_displacement,
+        "changed_vertices": smoothing.changed_vertices,
+        "changed_outside_band": smoothing.changed_outside_band,
+        "max_dihedral_before_deg": smoothing.max_dihedral_before_deg,
+        "max_dihedral_after_deg": smoothing.max_dihedral_after_deg,
+        "flipped_triangles": smoothing.flipped_triangles,
+    })
+}
+
+fn seat_row(seat: &joint_seal::SeatReport) -> Value {
+    json!({
+        "head_drop": seat.head_drop,
+        "scale": seat.scale,
+        "rotation": seat.rotation,
+        "translation": seat.translation,
+        "gap": seat.gap,
+        "rms": seat.rms,
+        "max_residual": seat.max_residual,
+        "plane_dev": seat.plane_dev,
+    })
+}
+
 fn joint_row(joint: &JointReport) -> Value {
     json!({
         "joint": joint.joint,
@@ -141,25 +170,9 @@ fn joint_row(joint: &JointReport) -> Value {
         "min_bridge_area": joint.min_bridge_area,
         "max_aspect": joint.max_aspect,
         "merged_duplicates": joint.merged_duplicates,
-        "seat": joint.seat.as_ref().map(|seat| json!({
-            "head_drop": seat.head_drop,
-            "scale": seat.scale,
-            "translation": seat.translation,
-            "gap": seat.gap,
-        })),
-        "smoothing": {
-            "enabled": joint.smoothing.enabled,
-            "iterations": joint.smoothing.iterations,
-            "factor": joint.smoothing.factor,
-            "band": joint.smoothing.band,
-            "max_shift": joint.smoothing.max_shift,
-            "max_displacement": joint.smoothing.max_displacement,
-            "changed_vertices": joint.smoothing.changed_vertices,
-            "changed_outside_band": joint.smoothing.changed_outside_band,
-            "max_dihedral_before_deg": joint.smoothing.max_dihedral_before_deg,
-            "max_dihedral_after_deg": joint.smoothing.max_dihedral_after_deg,
-            "flipped_triangles": joint.smoothing.flipped_triangles,
-        },
+        "handedness": joint.handedness,
+        "seat": joint.seat.as_ref().map(seat_row),
+        "smoothing": smoothing_row(&joint.smoothing),
     })
 }
 

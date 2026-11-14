@@ -15,22 +15,28 @@
 //! Nothing moves during the weld. A caller may declare an explicit
 //! [`SealOptions::head_drop`] seat step (translation only, separately
 //! reported, default 0 — the measured fixture head is already seated) or a
-//! seated hands joint (the span/perimeter scale and per-cuff translation;
-//! the measured rotation and cross-side seat are still pending). Smoothing
-//! moves only the bridge band plus `band` rings of
+//! seated hands joint: the wrist seat solves a per-side similarity
+//! (scale, rotation, translation) from a correspondence-ordered Kabsch/Umeyama
+//! fit between the cuff ring and the extracted wrist cycle, pairs the two
+//! sides by correspondence cost (a warn, never a refusal, when the ring
+//! geometry cannot tell a swap), welds the rims' exactly coincident twins and
+//! then smooths. Smoothing moves only the bridge band plus `band` rings of
 //! neighbours, under a bound that refuses rather than clips.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-use crate::aura::{extent, up_axis};
+use crate::aura::up_axis;
 use crate::classify::component_groups;
 use crate::parts::{self, PartClass, ShellIdentity};
 
 /// Default displacement bound for the smoothing as a fraction of the socket
-/// ring's mean radius (Bijin: 0.62 × 3.76 ≈ 2.33 units; the measured drop-2
-/// smoothing needs 2.2537). @req BLD-13
-pub const SEAL_MAX_SHIFT_RATIO: f64 = 0.62;
+/// ring's mean radius (measured needs: neck 2.2537 at radius 3.76 = 0.60;
+/// Bijin wrists with the socket side frozen: 1.3654 at 8 passes, 1.6363 at
+/// the default 12 passes, radius 2.135 = 0.77 — and 2.6169 before the
+/// weld). 0.80 covers every measured case while still refusing the
+/// unwelded runaway seam. @req BLD-13
+pub const SEAL_MAX_SHIFT_RATIO: f64 = 0.80;
 /// Default pairing band as a fraction of the socket ring's perimeter
 /// (Bijin: 0.1 × 24.39 ≈ 2.44 units, holding the authored 0.32..0.72 collar
 /// gap and excluding the next loop pair above 6).
@@ -45,9 +51,13 @@ pub const DEFAULT_BAND: u32 = 2;
 pub const AMBIGUITY_GAP: f64 = 0.15;
 /// Uniform Laplacian factor per smoothing pass.
 pub const SMOOTH_LAMBDA: f32 = 0.5;
-/// Accepted relative difference between the wrist-span scale and the
-/// cuff-perimeter scale of a seated joint.
-pub const SEAT_SCALE_TOLERANCE: f64 = 0.01;
+/// Accepted max correspondence residual of a seated joint, as a fraction of
+/// the wrist cycle's mean radius (measured correct seat needs 0.146 on the
+/// Bijin wrists; 0.25 leaves headroom without accepting a mis-scaled seat).
+pub const SEAT_RESIDUAL_RATIO: f64 = 0.25;
+/// Two cuff→socket assignments this close in fit are indistinguishable: the
+/// winner stands but the report warns instead of claiming a side.
+pub const SEAT_ASSIGNMENT_MARGIN: f64 = 0.10;
 /// Why the unique-position collar wins over the proximity arc; printed in
 /// every joint row so the choice is auditable. @req BLD-13
 pub const SEAM_CHOICE: &str = "proximity arc (29 v with coincident ends); the full 86-v loop is not a neck ring and its slit duplicates are never bridged";
@@ -94,7 +104,9 @@ pub enum SealError {
         required: f64,
         bound: f64,
     },
-    /// The wrist-span and cuff-perimeter scales of a seated joint disagree.
+    /// The cuff or wrist correspondence of a seated joint is degenerate (an
+    /// all-coincident ring); the span field carries the solved scale when one
+    /// exists.
     ScaleMismatch { span: f64, perimeter: f64 },
     /// A seated part would land on the opposite side's socket.
     WristCrossPair { part: String, socket: String },
@@ -211,7 +223,7 @@ impl fmt::Display for SealError {
             ),
             Self::ScaleMismatch { span, perimeter } => write!(
                 formatter,
-                "wrist-span scale {span:.4} disagrees with cuff-perimeter scale {perimeter:.4} beyond {SEAT_SCALE_TOLERANCE:.4}"
+                "the seated correspondence is degenerate (solved scale {span:.4}, residual scale {perimeter:.4}); cuff and wrist rings must hold three distinct positions"
             ),
             Self::WristCrossPair { part, socket } => write!(
                 formatter,
@@ -313,10 +325,19 @@ pub struct SeatReport {
     /// Uniform scale applied by a seated hands joint (1.0 when the parts
     /// already share the socket frame).
     pub scale: f64,
+    /// Row-major similarity rotation; identity for a translation-only seat.
+    pub rotation: [[f64; 3]; 3],
     /// Translation of the part onto its socket, in input units.
     pub translation: [f64; 3],
     /// Residual part-to-socket gap after the seat.
     pub gap: f64,
+    /// RMS of the correspondence residuals the similarity was solved from.
+    pub rms: f64,
+    /// Max correspondence residual, input units.
+    pub max_residual: f64,
+    /// Max seated-cuff deviation from the wrist plane: the falsifying check
+    /// a scale+translate-only seat fails (measured 1.95 vs 0.097 on Bijin).
+    pub plane_dev: f64,
 }
 
 /// The smoothing block of one joint's report.
@@ -415,6 +436,9 @@ pub struct JointReport {
     pub max_aspect: f64,
     /// Exactly coincident boundary vertices merged beyond the pinch.
     pub merged_duplicates: usize,
+    /// Cross-side pairing verdict of a seated group: decisive, undecided
+    /// (warn: ring geometry cannot detect a swap), or n/a for single parts.
+    pub handedness: &'static str,
     /// The seat steps, when any ran.
     pub seat: Option<SeatReport>,
     /// The smoothing block.
@@ -1549,17 +1573,582 @@ fn pair_rims(
     Ok((part_rims, socket_rims, part_rim, socket_rim))
 }
 
-/// Solve and apply the seated hands groups: a uniform scale from wrist span
-/// and cuff perimeter, then a per-cuff translation. Only part vertices
-/// move; the socket never does. @req BLD-13
+/// One side's solved similarity seat: every part vertex moves by
+/// `p' = scale · (rotation · p) + translation`. @req BLD-13
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SeatSimilarity {
+    scale: f64,
+    /// Row-major; det = +1 (Umeyama reflection sign forced to +1).
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    /// RMS and max of the correspondence residuals, input units.
+    rms: f64,
+    max_residual: f64,
+}
+
+/// One seated joint's solved data the seal loop consumes: the report plus the
+/// extracted cycles to bridge. @req BLD-13
+struct SeatedJoint {
+    report: SeatReport,
+    /// Chosen socket wrist cycle, in boundary-walk order.
+    wrist_cycle: Vec<u32>,
+    /// Chosen part cuff cycle, in boundary-walk order.
+    cuff_cycle: Vec<u32>,
+    handedness: &'static str,
+}
+
+/// One-sided Jacobi SVD of a 3×3 matrix: `a = u · diag(s) · vᵀ` with the
+/// singular values sorted descending. Deterministic, no allocation-heavy
+/// paths; the seat solve is a fixed 3×3 problem. @req BLD-13
+fn svd3(a: [[f64; 3]; 3]) -> ([[f64; 3]; 3], [f64; 3], [[f64; 3]; 3]) {
+    let mut u = a;
+    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..32 {
+        let mut off = 0.0f64;
+        for (p, q) in [(0, 1), (0, 2), (1, 2)] {
+            let (mut alpha, mut beta, mut gamma) = (0.0f64, 0.0f64, 0.0f64);
+            for row in &u {
+                alpha += row[p] * row[p];
+                beta += row[q] * row[q];
+                gamma += row[p] * row[q];
+            }
+            off = off.max(gamma.abs() / (alpha.sqrt() * beta.sqrt()).max(1e-300));
+            if gamma.abs() <= 1e-15 * (alpha * beta).sqrt().max(1e-300) {
+                continue;
+            }
+            let zeta = (beta - alpha) / (2.0 * gamma);
+            let t = zeta.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt());
+            let c = (1.0 + t * t).sqrt().recip();
+            let s = c * t;
+            for row in 0..3 {
+                let (up, uq) = (u[row][p], u[row][q]);
+                u[row][p] = c * up - s * uq;
+                u[row][q] = s * up + c * uq;
+                let (vp, vq) = (v[row][p], v[row][q]);
+                v[row][p] = c * vp - s * vq;
+                v[row][q] = s * vp + c * vq;
+            }
+        }
+        if off <= 1e-14 {
+            break;
+        }
+    }
+    let mut s = [0.0f64; 3];
+    for column in 0..3 {
+        s[column] = u
+            .iter()
+            .map(|row| row[column] * row[column])
+            .sum::<f64>()
+            .sqrt();
+    }
+    // One-sided Jacobi leaves the left vectors unnormalized: each column of
+    // u is its singular vector times its singular value.
+    for column in 0..3 {
+        if s[column] > 0.0 {
+            for row in u.iter_mut() {
+                row[column] /= s[column];
+            }
+        }
+    }
+    // v currently holds the same rotations as u; a = u · diag — vᵀ rows are
+    // the rotated identity columns, so a = u · diag(s) · vᵀ.
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|left, right| s[*right].total_cmp(&s[*left]));
+    let mut u_sorted = [[0.0f64; 3]; 3];
+    let mut v_sorted = [[0.0f64; 3]; 3];
+    let mut s_sorted = [0.0f64; 3];
+    for (slot, column) in order.iter().enumerate() {
+        for (sorted, unsorted) in u_sorted.iter_mut().zip(&u) {
+            sorted[slot] = unsorted[*column];
+        }
+        for (sorted, unsorted) in v_sorted.iter_mut().zip(&v) {
+            sorted[slot] = unsorted[*column];
+        }
+        s_sorted[slot] = s[*column];
+    }
+    // Planar degeneracy: a ring's covariance has a null singular value, and
+    // Jacobi leaves that direction arbitrary — an exact planar fit could
+    // send the ring's axis sideways. Complete both bases with the cross
+    // product of the first two columns so the plane normal maps onto the
+    // plane normal and both bases stay rotations.
+    if s_sorted[2] <= 1e-9 * s_sorted[0].max(1e-300) {
+        for matrix in [&mut u_sorted, &mut v_sorted] {
+            let cross = [
+                matrix[1][0] * matrix[2][1] - matrix[2][0] * matrix[1][1],
+                matrix[2][0] * matrix[0][1] - matrix[0][0] * matrix[2][1],
+                matrix[0][0] * matrix[1][1] - matrix[1][0] * matrix[0][1],
+            ];
+            for row in 0..3 {
+                matrix[row][2] = cross[row];
+            }
+        }
+    }
+    (u_sorted, s_sorted, v_sorted)
+}
+
+fn mat3_mul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0f64; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            out[row][column] = (0..3).map(|k| a[row][k] * b[k][column]).sum();
+        }
+    }
+    out
+}
+
+fn mat3_det(a: [[f64; 3]; 3]) -> f64 {
+    a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+}
+
+/// Closed-form Umeyama similarity from `source[i] ↔ target[i]` (least
+/// squares over s > 0, R ∈ SO(3), t). Deterministic. Refuses a degenerate
+/// (all-coincident) source or target set. @req BLD-13
+fn solve_similarity(source: &[[f64; 3]], target: &[[f64; 3]]) -> Result<SeatSimilarity, SealError> {
+    let n = source.len().min(target.len());
+    if n < 3 {
+        return Err(SealError::ScaleMismatch {
+            span: f64::NAN,
+            perimeter: f64::NAN,
+        });
+    }
+    let mean = |points: &[[f64; 3]]| -> [f64; 3] {
+        let mut centre = [0.0f64; 3];
+        for point in points.iter().take(n) {
+            for lane in 0..3 {
+                centre[lane] += point[lane];
+            }
+        }
+        centre.map(|lane| lane / n as f64)
+    };
+    let source_mean = mean(source);
+    let target_mean = mean(target);
+    let mut cov = [[0.0f64; 3]; 3];
+    let mut source_var = 0.0f64;
+    for (src, dst) in source.iter().zip(target).take(n) {
+        let ds = [
+            src[0] - source_mean[0],
+            src[1] - source_mean[1],
+            src[2] - source_mean[2],
+        ];
+        let dt = [
+            dst[0] - target_mean[0],
+            dst[1] - target_mean[1],
+            dst[2] - target_mean[2],
+        ];
+        source_var += ds.iter().map(|lane| lane * lane).sum::<f64>();
+        for row in 0..3 {
+            for column in 0..3 {
+                cov[row][column] += ds[row] * dt[column];
+            }
+        }
+    }
+    cov = cov.map(|row| row.map(|lane| lane / n as f64));
+    source_var /= n as f64;
+    if source_var <= 1e-12 || source_var.is_nan() {
+        return Err(SealError::ScaleMismatch {
+            span: f64::NAN,
+            perimeter: f64::NAN,
+        });
+    }
+    let (u, s, v) = svd3(cov);
+    let vt = [
+        [v[0][0], v[1][0], v[2][0]],
+        [v[0][1], v[1][1], v[2][1]],
+        [v[0][2], v[1][2], v[2][2]],
+    ];
+    let sign = if mat3_det(mat3_mul(u, vt)) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let d = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, sign]];
+    // The least-squares map source→source is the transpose of U·D·Vᵀ
+    // (validated against the measured Bijin seat: the raw product mirrors
+    // the in-plane alignment and triples the residual).
+    let rotation = {
+        let product = mat3_mul(u, mat3_mul(d, vt));
+        [
+            [product[0][0], product[1][0], product[2][0]],
+            [product[0][1], product[1][1], product[2][1]],
+            [product[0][2], product[1][2], product[2][2]],
+        ]
+    };
+    let scale = (s[0] + s[1] + s[2] * sign) / source_var;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(SealError::ScaleMismatch {
+            span: scale,
+            perimeter: f64::NAN,
+        });
+    }
+    let translation = [
+        target_mean[0]
+            - scale
+                * (rotation[0][0] * source_mean[0]
+                    + rotation[0][1] * source_mean[1]
+                    + rotation[0][2] * source_mean[2]),
+        target_mean[1]
+            - scale
+                * (rotation[1][0] * source_mean[0]
+                    + rotation[1][1] * source_mean[1]
+                    + rotation[1][2] * source_mean[2]),
+        target_mean[2]
+            - scale
+                * (rotation[2][0] * source_mean[0]
+                    + rotation[2][1] * source_mean[1]
+                    + rotation[2][2] * source_mean[2]),
+    ];
+    let mut residuals = Vec::with_capacity(n);
+    for (src, dst) in source.iter().zip(target).take(n) {
+        let seated = [
+            scale * (rotation[0][0] * src[0] + rotation[0][1] * src[1] + rotation[0][2] * src[2])
+                + translation[0],
+            scale * (rotation[1][0] * src[0] + rotation[1][1] * src[1] + rotation[1][2] * src[2])
+                + translation[1],
+            scale * (rotation[2][0] * src[0] + rotation[2][1] * src[1] + rotation[2][2] * src[2])
+                + translation[2],
+        ];
+        residuals.push(distance64(seated, *dst));
+    }
+    let rms = residuals.iter().map(|r| r * r).sum::<f64>().sqrt() / (n as f64).sqrt();
+    let max_residual = residuals.iter().copied().fold(0.0, f64::max);
+    Ok(SeatSimilarity {
+        scale,
+        rotation,
+        translation,
+        rms,
+        max_residual,
+    })
+}
+
+/// An orthonormal frame (n, u, v) of a ring's Newell plane.
+fn ring_frame(ring: &[u32], positions: &[[f32; 3]]) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let normal = newell_normal(ring, positions);
+    let seed = if normal[0].abs() < 0.9 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let dot = normal.iter().zip(seed).map(|(n, s)| n * s).sum::<f64>();
+    let u = [
+        seed[0] - dot * normal[0],
+        seed[1] - dot * normal[1],
+        seed[2] - dot * normal[2],
+    ];
+    let length = u.iter().map(|lane| lane * lane).sum::<f64>().sqrt();
+    let u = u.map(|lane| lane / length.max(1e-300));
+    let v = [
+        normal[1] * u[2] - normal[2] * u[1],
+        normal[2] * u[0] - normal[0] * u[2],
+        normal[0] * u[1] - normal[1] * u[0],
+    ];
+    (normal, u, v)
+}
+
+/// The ring's plane basis with the normal signed away from the shell's local
+/// bulk: among the shell's vertices within two mean radii of the ring centre,
+/// the sparser side is outward (measured on the Bijin wrists, 0100).
+fn outward_frame(
+    ring: &[u32],
+    positions: &[[f32; 3]],
+    members: &BTreeSet<usize>,
+) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let (normal, u, v) = ring_frame(ring, positions);
+    let centre = centroid_of(ring, positions);
+    let radius_mean = ring
+        .iter()
+        .map(|&vertex| distance(point_of(positions, vertex), centre.map(|lane| lane as f32)))
+        .sum::<f64>()
+        / ring.len().max(1) as f64;
+    let mut balance = 0i64;
+    for &vertex in members {
+        let point = point_of(positions, vertex as u32);
+        let height = normal
+            .iter()
+            .zip(point)
+            .map(|(n, p)| n * f64::from(p))
+            .sum::<f64>()
+            - normal.iter().zip(centre).map(|(n, c)| n * c).sum::<f64>();
+        if height.abs() <= 2.0 * radius_mean {
+            balance += i64::from(height > 0.0) - i64::from(height < 0.0);
+        }
+    }
+    if balance > 0 {
+        (
+            [-normal[0], -normal[1], -normal[2]],
+            [-u[0], -u[1], -u[2]],
+            [-v[0], -v[1], -v[2]],
+        )
+    } else {
+        (normal, u, v)
+    }
+}
+
+/// The normalized in-plane cost of pairing two rings: both centred, scaled to
+/// unit mean radius and put on the target's plane basis; the cheapest cyclic
+/// shift over both walk directions scores Σ dist². Scale- and
+/// rotation-invariant by construction, so it runs pre-seat. @req BLD-13
+fn normalized_pair_cost(source: &[u32], target: &[u32], positions: &[[f32; 3]]) -> f64 {
+    let (normal, u, v) = ring_frame(target, positions);
+    let project = |ring: &[u32]| -> Vec<[f64; 3]> {
+        let centre = centroid_of(ring, positions);
+        let radius = ring
+            .iter()
+            .map(|&vertex| distance(point_of(positions, vertex), centre.map(|lane| lane as f32)))
+            .sum::<f64>()
+            / ring.len().max(1) as f64;
+        ring.iter()
+            .map(|&vertex| {
+                let point = point_of(positions, vertex);
+                let d = [
+                    f64::from(point[0]) - centre[0],
+                    f64::from(point[1]) - centre[1],
+                    f64::from(point[2]) - centre[2],
+                ];
+                let scale = 1.0 / radius.max(1e-300);
+                [
+                    scale * (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]),
+                    scale * (d[0] * v[0] + d[1] * v[1] + d[2] * v[2]),
+                    scale * (d[0] * normal[0] + d[1] * normal[1] + d[2] * normal[2]),
+                ]
+            })
+            .collect()
+    };
+    let source_pts = project(source);
+    let target_pts = project(target);
+    let n = source_pts.len();
+    let m = target_pts.len();
+    if n == 0 || m == 0 {
+        return f64::INFINITY;
+    }
+    let mut best = f64::INFINITY;
+    for flip in [false, true] {
+        for shift in 0..m {
+            let mut cost = 0.0;
+            for k in 0..n {
+                let at = if flip { n - 1 - k } else { k };
+                let other = target_pts[(shift + k) % m];
+                cost += (0..3)
+                    .map(|lane| (source_pts[at][lane] - other[lane]).powi(2))
+                    .sum::<f64>();
+            }
+            best = best.min(cost / n as f64);
+        }
+    }
+    best
+}
+
+/// The cuff→wrist correspondence: both rings centred, scaled to unit mean
+/// radius and put on the wrist cycle's plane basis; every cyclic shift in
+/// both walk directions is scored by Σ dist²; the cheapest (cost, shift,
+/// forward) wins. Returns the point arrays in correspondence order plus the
+/// flip flag. @req BLD-13
+fn order_correspondence(
+    cuff: &[u32],
+    wrist: &[u32],
+    positions: &[[f32; 3]],
+) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, bool) {
+    let points_of = |ring: &[u32]| -> Vec<[f64; 3]> {
+        ring.iter()
+            .map(|&vertex| point_of(positions, vertex).map(f64::from))
+            .collect()
+    };
+    let cuff_pts = points_of(cuff);
+    let wrist_pts = points_of(wrist);
+    let n = cuff.len();
+    let m = wrist.len();
+    let mut best: Option<(f64, usize, bool)> = None;
+    for flip in [false, true] {
+        for shift in 0..m {
+            let mut cost = 0.0;
+            for k in 0..n.min(m) {
+                let at = if flip { n - 1 - k } else { k };
+                let a = cuff_pts[at];
+                let b = wrist_pts[(shift + k) % m];
+                cost += (0..3).map(|lane| (a[lane] - b[lane]).powi(2)).sum::<f64>();
+            }
+            let key = (
+                cost, shift, flip, // forward first on ties
+            );
+            if best.is_none() || key < best.expect("checked") {
+                best = Some(key);
+            }
+        }
+    }
+    let (_, shift, flip) = best.unwrap_or((0.0, 0, false));
+    let order: Vec<usize> = if flip {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    let source: Vec<[f64; 3]> = order.iter().map(|&k| cuff_pts[k]).collect();
+    let target: Vec<[f64; 3]> = (0..n.min(m)).map(|k| wrist_pts[(shift + k) % m]).collect();
+    (source, target, flip)
+}
+
+/// The socket shell's candidate joint cycles: the shell's boundary graph is
+/// merged at exactly coincident positions (bit-exact `position_key`) and
+/// split at every vertex whose merged boundary degree is not 2 (the slit
+/// pinches); each result is an ordered [`Rim`]. Returns the cycles and the
+/// merged-copy count. Bijin torso measured: 258 boundary edges → cycles
+/// 30/30/26/10/10. @req BLD-13
+fn socket_cycles(
+    triangles: &[[u32; 3]],
+    members: &BTreeSet<usize>,
+    positions: &[[f32; 3]],
+) -> (Vec<Rim>, usize) {
+    let own = own_triangles(triangles, members);
+    let mut uses: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut direction: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    for triangle in &own {
+        let [a, b, c] = *triangle;
+        for (left, right) in [(a, b), (b, c), (c, a)] {
+            let key = (left.min(right), left.max(right));
+            *uses.entry(key).or_default() += 1;
+            direction.insert(key, (left, right));
+        }
+    }
+    // Directed boundary edges with multiplicity, in a deterministic order.
+    let mut edges: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    for (key, count) in &uses {
+        if *count == 1 {
+            let (left, right) = direction[key];
+            *edges.entry((left, right)).or_default() += 1;
+        }
+    }
+    // Coincidence groups over the boundary vertices, ordered by vertex id:
+    // a pass arriving at one twin leaves through the next-by-id twin's
+    // out-edge, which closes the spliced opening and chains the exterior.
+    let mut groups: BTreeMap<[u32; 3], Vec<u32>> = BTreeMap::new();
+    for &(from, to) in edges.keys() {
+        for vertex in [from, to] {
+            let key = position_key(point_of(positions, vertex));
+            let group = groups.entry(key).or_default();
+            if !group.contains(&vertex) {
+                group.push(vertex);
+            }
+        }
+    }
+    let merged: usize = groups.values().map(|group| group.len() - 1).sum();
+    // A pass arriving at one twin leaves through the other twin's out-edge,
+    // which closes the spliced opening and chains the exterior. Splices
+    // create exactly two copies (measured: 877≡861 on the Bijin torso);
+    // larger coincident groups keep the plain walk — the residual gate
+    // refuses any seam that would misuse them.
+    let next_in_group = |vertex: u32| -> Option<u32> {
+        let key = position_key(point_of(positions, vertex));
+        let group = groups.get(&key)?;
+        if group.len() != 2 {
+            return None;
+        }
+        if group[0] == vertex {
+            group.get(1).copied()
+        } else {
+            group.first().copied()
+        }
+    };
+    let take_out = |edges: &mut BTreeMap<(u32, u32), u32>, from: u32| -> Option<u32> {
+        let target = edges.range((from, u32::MIN)..(from, u32::MAX)).next()?.0.1;
+        let count = edges.get_mut(&(from, target))?;
+        *count -= 1;
+        if *count == 0 {
+            edges.remove(&(from, target));
+        }
+        Some(target)
+    };
+    let mut rims: Vec<Rim> = Vec::new();
+    while let Some((&(start, _), _)) = edges.iter().next() {
+        let mut vertices: Vec<u32> = Vec::new();
+        let mut visited: BTreeSet<u32> = BTreeSet::new();
+        let mut current = start;
+        let mut closed = false;
+        loop {
+            if visited.contains(&current) {
+                closed = current == start || vertices.first() == Some(&current);
+                break;
+            }
+            visited.insert(current);
+            vertices.push(current);
+            let Some(arrival) = take_out(&mut edges, current) else {
+                break;
+            };
+            let leave = next_in_group(arrival).unwrap_or(arrival);
+            if leave == current {
+                break;
+            }
+            current = leave;
+        }
+        rims.push(Rim {
+            vertices,
+            simple: true,
+            closed,
+        });
+    }
+    rims.sort_by_key(|rim| rim.vertices.first().copied().unwrap_or(u32::MAX));
+    (rims, merged)
+}
+
+/// Merge exactly coincident boundary vertex pairs of ONE joint's two rims
+/// (the run's closing twins and slit pinches), rewiring every non-rim twin
+/// onto the rim vertex so the cycles' vertex lists stay valid; returns the
+/// merged pair count. Scoped to the paired rims — never a whole-shell merge.
+/// @req BLD-13
+fn weld_joint_rims(
+    triangles: &mut Vec<[u32; 3]>,
+    ring: &[u32],
+    collar: &[u32],
+    positions: &[[f32; 3]],
+) -> usize {
+    let rim_keys: BTreeMap<[u32; 3], u32> = ring
+        .iter()
+        .chain(collar)
+        .map(|&vertex| (position_key(point_of(positions, vertex)), vertex))
+        .collect();
+    let boundary: BTreeSet<u32> = edge_uses(triangles)
+        .into_iter()
+        .filter(|(_, count)| *count == 1)
+        .flat_map(|(edge, _)| [edge.0, edge.1])
+        .collect();
+    let mut identity: HashMap<u32, u32> = HashMap::new();
+    for vertex in boundary {
+        let key = position_key(point_of(positions, vertex));
+        if let Some(&kept) = rim_keys.get(&key)
+            && kept != vertex
+        {
+            identity.insert(vertex, kept);
+        }
+    }
+    let merged = identity.len();
+    if merged > 0 {
+        *triangles = triangles
+            .iter()
+            .map(|triangle| triangle.map(|vertex| *identity.get(&vertex).unwrap_or(&vertex)))
+            .filter(|triangle| {
+                triangle[0] != triangle[1]
+                    && triangle[1] != triangle[2]
+                    && triangle[0] != triangle[2]
+            })
+            .collect();
+    }
+    merged
+}
+
+/// Solve and apply the seated hands groups: extract the socket shell's joint
+/// cycles, pair them to the parts' cuff cycles by normalized correspondence
+/// cost (a warn when the assignment is not decisive), solve each side's
+/// similarity (Kabsch/Umeyama over every correspondence candidate, keeping
+/// the bulk-outward orientation), apply it and report. Only part vertices
+/// (plus their exact-coincident twins) move; the socket never does.
+/// @req BLD-13
 fn seat_groups(
     positions: &mut [[f32; 3]],
     triangles: &[[u32; 3]],
     identities: &[ShellIdentity],
     requests: &[JointRequest],
-    arc_band_ratio: f64,
-) -> Result<Vec<Option<SeatReport>>, SealError> {
-    let mut reports: Vec<Option<SeatReport>> = requests.iter().map(|_| None).collect();
+    _arc_band_ratio: f64,
+) -> Result<Vec<Option<SeatedJoint>>, SealError> {
+    let mut seated: Vec<Option<SeatedJoint>> = requests.iter().map(|_| None).collect();
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     for (index, request) in requests.iter().enumerate() {
         if !request.seat {
@@ -1574,22 +2163,8 @@ fn seat_groups(
         }
     }
     if groups.is_empty() {
-        return Ok(reports);
+        return Ok(seated);
     }
-    let axis = up_axis(positions);
-    let planar: Vec<usize> = (0..3).filter(|candidate| *candidate != axis).collect();
-    let spans: Vec<f64> = planar
-        .iter()
-        .map(|&candidate| {
-            let (low, high) = extent(positions, candidate);
-            f64::from(high - low)
-        })
-        .collect();
-    let lateral = if spans[0] >= spans[1] {
-        planar[0]
-    } else {
-        planar[1]
-    };
     for (_, members) in &groups {
         let shell_of = |name: &str| -> &ShellIdentity {
             identities
@@ -1597,66 +2172,66 @@ fn seat_groups(
                 .find(|shell| shell.name == name)
                 .expect("resolved earlier")
         };
-        let rims_of = |part: &ShellIdentity,
-                       socket: &ShellIdentity,
-                       positions: &[[f32; 3]]|
-         -> Result<(Rim, Rim, f64), SealError> {
-            let band = options_band(triangles, positions, part, socket, arc_band_ratio);
-            let (part_rims, socket_rims, part_at, socket_at) =
-                pair_rims(part, socket, triangles, positions, band)?;
-            let gap = rim_gap(
-                &part_rims[part_at].vertices,
-                &socket_rims[socket_at].vertices,
-                positions,
-            )
-            .0;
-            Ok((
-                part_rims[part_at].clone(),
-                socket_rims[socket_at].clone(),
-                gap,
-            ))
-        };
-        let mut measurements = Vec::new();
-        for &index in members {
-            let request = &requests[index];
-            let part = shell_of(&request.part);
-            let socket = shell_of(&request.socket);
-            let (cuff, wrist, gap) = rims_of(part, socket, positions)?;
-            measurements.push((
-                index,
-                centroid_of(&cuff.vertices, positions),
-                centroid_of(&wrist.vertices, positions),
-                wrist.perimeter(positions) / cuff.perimeter(positions),
-                gap,
-            ));
-        }
-        let scale_span = (measurements.len() == 2)
-            .then(|| {
-                let wrist_span = distance64(measurements[0].2, measurements[1].2);
-                let cuff_span = distance64(measurements[0].1, measurements[1].1);
-                (cuff_span > 1e-9).then_some(wrist_span / cuff_span)
+        let socket = shell_of(&requests[members[0]].socket);
+        let socket_members: BTreeSet<usize> = socket.members.iter().copied().collect();
+        let (cycles, _) = socket_cycles(triangles, &socket_members, positions);
+        let candidates: Vec<&Rim> = cycles
+            .iter()
+            .filter(|rim| {
+                rim.closed && {
+                    let keys: BTreeSet<[u32; 3]> = rim
+                        .vertices
+                        .iter()
+                        .map(|&vertex| position_key(point_of(positions, vertex)))
+                        .collect();
+                    keys.len() >= 3
+                }
             })
-            .flatten();
-        let scale_perimeter =
-            measurements.iter().map(|m| m.3).sum::<f64>() / measurements.len() as f64;
-        if let Some(span) = scale_span
-            && (span - scale_perimeter).abs() / span > SEAT_SCALE_TOLERANCE
-        {
-            return Err(SealError::ScaleMismatch {
-                span,
-                perimeter: scale_perimeter,
+            .collect();
+        if candidates.is_empty() {
+            return Err(SealError::RingAbsent {
+                shells: vec![socket.name.clone()],
             });
         }
-        let scale = scale_span.unwrap_or(scale_perimeter);
-        if !(scale.is_finite() && scale > 0.0) {
-            return Err(SealError::ScaleMismatch {
-                span: scale_span.unwrap_or(f64::NAN),
-                perimeter: scale_perimeter,
+        // Each member's part cycles, with the coincidence-aware cuff candidate
+        // scored by normalized shape cost against the socket candidates.
+        let mut part_cycles: Vec<Vec<Rim>> = Vec::with_capacity(members.len());
+        for &index in members {
+            let part = shell_of(&requests[index].part);
+            let part_members: BTreeSet<usize> = part.members.iter().copied().collect();
+            let (mut cycles, _) = socket_cycles(triangles, &part_members, positions);
+            // Three vertices, not three unique positions: an all-coincident
+            // cuff ring stays a candidate so the similarity solve refuses it
+            // by wire code instead of the absent-ring path.
+            cycles.retain(|rim| rim.closed && rim.vertices.len() >= 3);
+            if cycles.is_empty() {
+                return Err(SealError::RingAbsent {
+                    shells: vec![requests[index].part.clone()],
+                });
+            }
+            cycles.sort_by(|left, right| {
+                let cost_left = candidates
+                    .iter()
+                    .map(|cycle| normalized_pair_cost(&left.vertices, &cycle.vertices, positions))
+                    .fold(f64::INFINITY, f64::min);
+                let cost_right = candidates
+                    .iter()
+                    .map(|cycle| normalized_pair_cost(&right.vertices, &cycle.vertices, positions))
+                    .fold(f64::INFINITY, f64::min);
+                cost_left
+                    .total_cmp(&cost_right)
+                    .then_with(|| right.vertices.len().cmp(&left.vertices.len()))
             });
+            part_cycles.push(cycles);
         }
-        if measurements.len() == 2 {
-            let cuff_sides = [measurements[0].1[lateral], measurements[1].1[lateral]];
-            if (cuff_sides[0] - cuff_sides[1]).abs() < 1e-6 {
+        // Degenerate pairing: two cuffs at the same place cannot be told
+        // apart laterally even in principle.
+        if members.len() == 2 {
+            let centres: Vec<[f64; 3]> = part_cycles
+                .iter()
+                .map(|cycles| centroid_of(&cycles[0].vertices, positions))
+                .collect();
+            if distance64(centres[0], centres[1]) < 1e-6 {
                 return Err(SealError::HandednessAmbiguous {
                     parts: members
                         .iter()
@@ -1664,44 +2239,340 @@ fn seat_groups(
                         .collect(),
                 });
             }
-            let wrist_sides = [measurements[0].2[lateral], measurements[1].2[lateral]];
-            let cross = (cuff_sides[0] - wrist_sides[0]).signum()
-                != (cuff_sides[1] - wrist_sides[1]).signum()
-                || (cuff_sides[0] > cuff_sides[1]) != (wrist_sides[0] > wrist_sides[1]);
-            if cross {
-                return Err(SealError::WristCrossPair {
-                    part: requests[members[0]].part.clone(),
-                    socket: requests[members[0]].socket.clone(),
-                });
-            }
         }
-        for (at, &(index, cuff_centre, wrist_centre, _, _)) in measurements.iter().enumerate() {
-            let request = &requests[index];
-            let part = shell_of(&request.part);
-            let socket = shell_of(&request.socket);
-            let scaled = cuff_centre.map(|lane| lane * scale);
-            let translation = [
-                wrist_centre[0] - scaled[0],
-                wrist_centre[1] - scaled[1],
-                wrist_centre[2] - scaled[2],
-            ];
-            for &vertex in &part.members {
-                for lane in 0..3 {
-                    positions[vertex][lane] =
-                        positions[vertex][lane] * scale as f32 + translation[lane] as f32;
+        // Aggregate socket-candidate cost over the members' best cuff cycle;
+        // the n cheapest cycles are the assignment pool.
+        let wanted = members.len();
+        let mut ranked: Vec<(f64, usize)> = candidates
+            .iter()
+            .enumerate()
+            .map(|(at, cycle)| {
+                let cost: f64 = part_cycles
+                    .iter()
+                    .map(|cycles| {
+                        cycles
+                            .iter()
+                            .map(|cuff| {
+                                normalized_pair_cost(&cuff.vertices, &cycle.vertices, positions)
+                            })
+                            .fold(f64::INFINITY, f64::min)
+                    })
+                    .sum();
+                (cost, at)
+            })
+            .collect();
+        ranked.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        if ranked.len() < wanted {
+            return Err(SealError::RingAbsent {
+                shells: vec![socket.name.clone()],
+            });
+        }
+        let pool: Vec<usize> = ranked.iter().take(wanted).map(|&(_, at)| at).collect();
+        if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+            eprintln!(
+                "seat: socket `{}` cycles={} pool={:?} ranked={:?}",
+                socket.name,
+                cycles.len(),
+                pool,
+                ranked
+                    .iter()
+                    .map(|(cost, at)| (format!("{cost:.3}"), candidates[*at].vertices.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Every bijection member→cycle is scored by the summed RMS of its
+        // best bulk-outward similarity solves; the cheapest wins outright
+        // (warn when the runner-up is within SEAT_ASSIGNMENT_MARGIN).
+        let permutations = permutations_of(&pool);
+        #[allow(clippy::type_complexity)]
+        let mut scored: Vec<(f64, &Vec<usize>, Vec<Option<SeatSolved>>)> = Vec::new();
+        for assignment in &permutations {
+            let mut total = 0.0;
+            let mut solved: Vec<Option<SeatSolved>> = Vec::with_capacity(members.len());
+            for (slot, &index) in members.iter().enumerate() {
+                let part = shell_of(&requests[index].part);
+                let part_members: BTreeSet<usize> = part.members.iter().copied().collect();
+                let best = best_similarity(
+                    &part_cycles[slot],
+                    candidates[assignment[slot]],
+                    positions,
+                    &part_members,
+                    &socket_members,
+                )?;
+                match best {
+                    Some(solved_one) => {
+                        total += solved_one.similarity.rms;
+                        solved.push(Some(solved_one));
+                    }
+                    None => {
+                        total = f64::INFINITY;
+                        solved.push(None);
+                    }
                 }
             }
-            let (_, wrist_rim, gap) = rims_of(part, socket, positions)?;
-            reports[index] = Some(SeatReport {
-                head_drop: 0.0,
-                scale,
-                translation,
-                gap,
+            scored.push((total, assignment, solved));
+        }
+        scored.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.first().cmp(&right.1.first()))
+        });
+        if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+            for (score, assignment, solved) in &scored {
+                eprintln!(
+                    "seat: assignment {:?} score={score:.4} solved={:?}",
+                    assignment,
+                    solved
+                        .iter()
+                        .map(|one| one
+                            .as_ref()
+                            .map(|s| (format!("{:.4}", s.similarity.rms), s.cuff.len())))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let (best_score, best_assignment, best_solved) = scored.remove(0);
+        let decisive = scored.first().is_none_or(|(runner, _, _)| {
+            (runner - best_score).max(0.0) / runner.max(1e-300) >= SEAT_ASSIGNMENT_MARGIN
+        });
+        let handedness = if members.len() < 2 {
+            "n/a: one seated part per socket"
+        } else if decisive {
+            "decisive: correspondence cost separates the assignments"
+        } else {
+            "undecided: ring geometry cannot detect a swap; verify by sheet"
+        };
+
+        for (slot, &index) in members.iter().enumerate() {
+            let part = shell_of(&requests[index].part);
+            let Some(SeatSolved { similarity, cuff }) = best_solved[slot].as_ref() else {
+                return Err(SealError::SeatUnreachable {
+                    gap: f64::NAN,
+                    band: 0.0,
+                });
+            };
+            let cycle = candidates[best_assignment[slot]];
+            let wrist_centre = centroid_of(&cycle.vertices, positions);
+            let radius_mean = cycle
+                .vertices
+                .iter()
+                .map(|&vertex| {
+                    distance(
+                        point_of(positions, vertex),
+                        wrist_centre.map(|lane| lane as f32),
+                    )
+                })
+                .sum::<f64>()
+                / cycle.vertices.len() as f64;
+            if similarity.max_residual > SEAT_RESIDUAL_RATIO * radius_mean {
+                return Err(SealError::SeatUnreachable {
+                    gap: similarity.max_residual,
+                    band: SEAT_RESIDUAL_RATIO * radius_mean,
+                });
+            }
+            // Apply: part vertices plus their exact-coincident twins outside
+            // the part move together so the seat never tears a pair apart.
+            let part_members: BTreeSet<usize> = part.members.iter().copied().collect();
+            let part_keys: BTreeSet<[u32; 3]> = part_members
+                .iter()
+                .map(|&vertex| position_key(positions[vertex]))
+                .collect();
+            for (vertex, position) in positions.iter_mut().enumerate() {
+                let moves =
+                    part_members.contains(&vertex) || part_keys.contains(&position_key(*position));
+                if !moves {
+                    continue;
+                }
+                let point = position.map(f64::from);
+                let seated = [
+                    similarity.scale
+                        * (similarity.rotation[0][0] * point[0]
+                            + similarity.rotation[0][1] * point[1]
+                            + similarity.rotation[0][2] * point[2])
+                        + similarity.translation[0],
+                    similarity.scale
+                        * (similarity.rotation[1][0] * point[0]
+                            + similarity.rotation[1][1] * point[1]
+                            + similarity.rotation[1][2] * point[2])
+                        + similarity.translation[1],
+                    similarity.scale
+                        * (similarity.rotation[2][0] * point[0]
+                            + similarity.rotation[2][1] * point[1]
+                            + similarity.rotation[2][2] * point[2])
+                        + similarity.translation[2],
+                ];
+                *position = seated.map(|lane| lane as f32);
+            }
+            // Post-seat measurements: gap along the seam, and the falsifying
+            // plane deviation of the seated cuff against the wrist plane.
+            let (normal, _, _) = outward_frame(&cycle.vertices, positions, &socket_members);
+            let mut plane_dev = 0.0f64;
+            for &vertex in cuff {
+                let height = normal
+                    .iter()
+                    .zip(point_of(positions, vertex))
+                    .map(|(n, p)| n * f64::from(p))
+                    .sum::<f64>()
+                    - normal
+                        .iter()
+                        .zip(wrist_centre)
+                        .map(|(n, c)| n * c)
+                        .sum::<f64>();
+                plane_dev = plane_dev.max(height.abs());
+            }
+            let gap = rim_gap(cuff, &cycle.vertices, positions).0;
+            seated[index] = Some(SeatedJoint {
+                report: SeatReport {
+                    head_drop: 0.0,
+                    scale: similarity.scale,
+                    rotation: similarity.rotation,
+                    translation: similarity.translation,
+                    gap,
+                    rms: similarity.rms,
+                    max_residual: similarity.max_residual,
+                    plane_dev,
+                },
+                wrist_cycle: cycle.vertices.clone(),
+                cuff_cycle: cuff.to_vec(),
+                handedness,
             });
-            let _ = (at, wrist_rim);
         }
     }
-    Ok(reports)
+    Ok(seated)
+}
+
+/// One member's winning similarity solve plus the cycle it came from.
+struct SeatSolved {
+    similarity: SeatSimilarity,
+    cuff: Vec<u32>,
+}
+
+/// The best seatable similarity between one part's cycles and one socket
+/// cycle: every part cycle × walk direction × cyclic shift is solved; the
+/// solve must put the part's bulk on the socket cycle's outward side, and the
+/// cheapest (rms, shift, forward) wins. `Ok(None)` when no orientation
+/// passes; `Err` only when every correspondence of every part cycle is
+/// degenerate (an all-coincident ring). @req BLD-13
+fn best_similarity(
+    part_cycles: &[Rim],
+    cycle: &Rim,
+    positions: &[[f32; 3]],
+    part_members: &BTreeSet<usize>,
+    socket_members: &BTreeSet<usize>,
+) -> Result<Option<SeatSolved>, SealError> {
+    let (normal, _, _) = outward_frame(&cycle.vertices, positions, socket_members);
+    let centre = centroid_of(&cycle.vertices, positions);
+    let mut best: Option<(SeatSimilarity, Vec<u32>)> = None;
+    let mut attempted = 0usize;
+    let mut solved_once = false;
+    let mut degenerate: Option<SealError> = None;
+    // One candidate's solve, gated on the seated part hanging on the
+    // socket's outward side (measured +12.9 correct vs −12.9 inverted on
+    // Bijin; fingertips 16.3 below the wrist vs 12 above).
+    let mut evaluate =
+        |cuff: &Rim, source: &[[f64; 3]], target: &[[f64; 3]]| -> Result<(), SealError> {
+            attempted += 1;
+            let similarity = match solve_similarity(source, target) {
+                Ok(similarity) => similarity,
+                Err(error @ SealError::ScaleMismatch { .. }) => {
+                    degenerate = Some(error);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            solved_once = true;
+            // Whole-part bulk probe: the seated part's centroid must sit on
+            // the socket cycle's outward side.
+            let mut mean = [0.0f64; 3];
+            for &vertex in part_members {
+                let point = positions[vertex].map(f64::from);
+                for (lane, lane_sum) in mean.iter_mut().enumerate() {
+                    let at = similarity.scale
+                        * (similarity.rotation[lane][0] * point[0]
+                            + similarity.rotation[lane][1] * point[1]
+                            + similarity.rotation[lane][2] * point[2])
+                        + similarity.translation[lane];
+                    *lane_sum += at;
+                }
+            }
+            let mean = mean.map(|lane| lane / part_members.len().max(1) as f64);
+            let seated_bulk: f64 = normal
+                .iter()
+                .zip(mean.iter().zip(centre.iter()))
+                .map(|(n_lane, (m, c))| n_lane * (m - c))
+                .sum();
+            if seated_bulk <= 0.0 {
+                return Ok(());
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(won, _)| similarity.rms < won.rms)
+            {
+                best = Some((similarity, cuff.vertices.clone()));
+            }
+            Ok(())
+        };
+    for cuff in part_cycles {
+        let n = cuff.vertices.len();
+        let m = cycle.vertices.len();
+        if n.min(m) < 3 || n != m {
+            continue;
+        }
+        // The normalized-cost correspondence is the natural first
+        // candidate; the sweep below guards it with every shift and both
+        // walk directions, keeping the first on exact ties.
+        let (ordered, target, _) = order_correspondence(&cuff.vertices, &cycle.vertices, positions);
+        evaluate(cuff, &ordered, &target)?;
+        for flip in [false, true] {
+            for shift in 0..m {
+                let order: Vec<usize> = if flip {
+                    (0..n).rev().collect()
+                } else {
+                    (0..n).collect()
+                };
+                let source: Vec<[f64; 3]> = order
+                    .iter()
+                    .map(|&k| point_of(positions, cuff.vertices[k]).map(f64::from))
+                    .collect();
+                let target: Vec<[f64; 3]> = (0..n)
+                    .map(|k| point_of(positions, cycle.vertices[(shift + k) % m]).map(f64::from))
+                    .collect();
+                evaluate(cuff, &source, &target)?;
+            }
+        }
+    }
+    if attempted > 0
+        && !solved_once
+        && let Some(error) = degenerate
+    {
+        return Err(error);
+    }
+    Ok(best.map(|(similarity, vertices)| SeatSolved {
+        similarity,
+        cuff: vertices,
+    }))
+}
+
+/// All orderings of `pool` (n! for n elements; the seat pool is small).
+fn permutations_of(pool: &[usize]) -> Vec<Vec<usize>> {
+    let mut out = vec![Vec::new()];
+    for &value in pool {
+        let mut next = Vec::with_capacity(out.len() * (out.first().map_or(1, Vec::len) + 1));
+        for prefix in &out {
+            for at in 0..=prefix.len() {
+                let mut extended = prefix.clone();
+                extended.insert(at, value);
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    out
 }
 
 fn options_band(
@@ -1763,7 +2634,7 @@ pub fn seal_joints(
 
     let mut positions: Vec<[f32; 3]> = positions.to_vec();
     let mut triangles: Vec<[u32; 3]> = triangles.to_vec();
-    let seat_reports = seat_groups(
+    let seated = seat_groups(
         &mut positions,
         &triangles,
         &identities,
@@ -1813,52 +2684,139 @@ pub fn seal_joints(
         let arc_band_used = options.arc_band.unwrap_or_else(|| {
             options_band(&triangles, &positions, part, socket, SEAL_ARC_BAND_RATIO)
         });
-        let (part_rims, socket_rims, part_rim_at, socket_rim_at) =
-            pair_rims(part, socket, &triangles, &positions, arc_band_used)?;
-        let socket_rim = &socket_rims[socket_rim_at];
-        let part_rim = &part_rims[part_rim_at];
-        let socket_facts = rim_facts(&socket_rim.vertices, &positions, socket_rim.closed);
-        let part_facts = rim_facts(&part_rim.vertices, &positions, part_rim.closed);
-
-        // The collar: the unique-position opening of the compound loop.
-        let (collar, collar_closed, pinch) = extract_arc(
-            part_rim,
-            &socket_rim.vertices,
-            &authored_positions,
-            arc_band_used,
-        )?;
-        let selected_collar =
-            (pinch.is_some() || collar.len() != part_rim.vertices.len()).then_some(collar.len());
-        // An open collar keeps its two authored coincident endpoints, so no
-        // edges are merged; a closed collar's pinch is welded and the count is
-        // the boundary edges that merge actually removed.
-        let mut pinch_edges = 0usize;
-        if let Some((from, to)) = pinch.filter(|_| collar_closed) {
-            let before = boundary_total(&edge_uses(&triangles));
-            triangles = rewire_vertex(&triangles, from, to);
-            let after = boundary_total(&edge_uses(&triangles));
-            pinch_edges = before.saturating_sub(after);
+        // Seated joints bridge the extracted cycles directly: the wrist
+        // cycle against the seated cuff cycle, after the wrist-scoped
+        // coincidence weld. The discovery rim walk and collar extraction are
+        // the unseated path.
+        enum JointRims {
+            Seated {
+                ring: Vec<u32>,
+                collar: Vec<u32>,
+                merged: usize,
+            },
+            Discovered {
+                socket_rim: Rim,
+                part_rim: Rim,
+                collar: Vec<u32>,
+                collar_closed: bool,
+                merged: usize,
+            },
         }
-
-        let ring = if socket_rim.closed {
-            cut_ring_at(&socket_rim.vertices, collar[0], &positions)
+        let joint_rims = if let Some(seat) = seated[index].as_ref() {
+            let merged = weld_joint_rims(
+                &mut triangles,
+                &seat.wrist_cycle,
+                &seat.cuff_cycle,
+                &positions,
+            );
+            let ring = cut_ring_at(&seat.wrist_cycle, seat.cuff_cycle[0], &positions);
+            JointRims::Seated {
+                ring,
+                collar: seat.cuff_cycle.clone(),
+                merged,
+            }
         } else {
-            socket_rim.vertices.clone()
+            let (part_rims, socket_rims, part_rim_at, socket_rim_at) =
+                pair_rims(part, socket, &triangles, &positions, arc_band_used)?;
+            let socket_rim = socket_rims[socket_rim_at].clone();
+            let part_rim = part_rims[part_rim_at].clone();
+            let (collar, collar_closed, pinch) = extract_arc(
+                &part_rim,
+                &socket_rim.vertices,
+                &authored_positions,
+                arc_band_used,
+            )?;
+            // An open collar keeps its two authored coincident endpoints, so
+            // no edges are merged; a closed collar's pinch is welded and the
+            // count is the boundary edges that merge actually removed.
+            let mut merged = 0usize;
+            if let Some((from, to)) = pinch.filter(|_| collar_closed) {
+                let before = boundary_total(&edge_uses(&triangles));
+                triangles = rewire_vertex(&triangles, from, to);
+                let after = boundary_total(&edge_uses(&triangles));
+                merged = before.saturating_sub(after);
+            }
+            JointRims::Discovered {
+                socket_rim,
+                part_rim,
+                collar,
+                collar_closed,
+                merged,
+            }
         };
+        let (
+            ring,
+            collar,
+            collar_closed,
+            pinch_edges,
+            socket_facts,
+            part_facts,
+            part_rim,
+            socket_edges_before,
+        ) = match joint_rims {
+            JointRims::Seated {
+                ring,
+                collar,
+                merged,
+            } => {
+                let socket_facts = rim_facts(&ring, &positions, true);
+                let part_facts = rim_facts(&collar, &positions, true);
+                let before = ring.len();
+                (
+                    ring,
+                    collar,
+                    true,
+                    merged,
+                    socket_facts,
+                    part_facts,
+                    None,
+                    before,
+                )
+            }
+            JointRims::Discovered {
+                socket_rim,
+                part_rim,
+                collar,
+                collar_closed,
+                merged,
+            } => {
+                let socket_facts = rim_facts(&socket_rim.vertices, &positions, socket_rim.closed);
+                let part_facts = rim_facts(&part_rim.vertices, &positions, part_rim.closed);
+                let ring = if socket_rim.closed {
+                    cut_ring_at(&socket_rim.vertices, collar[0], &positions)
+                } else {
+                    socket_rim.vertices.clone()
+                };
+                let before = socket_rim.edges().len();
+                (
+                    ring,
+                    collar,
+                    collar_closed,
+                    merged,
+                    socket_facts,
+                    part_facts,
+                    Some(part_rim),
+                    before,
+                )
+            }
+        };
+        let selected_collar = (pinch_edges > 0
+            || collar.len() != part_rim.as_ref().map_or(0, |rim| rim.vertices.len()))
+        .then_some(collar.len());
         // Gap facts belong to the seam actually bridged, not the whole
         // compound loop with its mouth slit far above the collar.
         let (gap_min, gap_mean, gap_max) = rim_gap(&collar, &ring, &positions);
 
         if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
             eprintln!(
-                "seal: ring={} collar={} closed={} band={:.3} gap={:.3}..{:.3} pinch={}",
+                "seal: ring={} collar={} closed={} band={:.3} gap={:.3}..{:.3} pinch_edges={}",
                 ring.len(),
                 collar.len(),
                 collar_closed,
                 arc_band_used,
                 gap_min,
                 gap_max,
-                pinch.is_some()
+                pinch_edges
             );
         }
         // Build the bridge; a same-sense rim pair retries the reversed
@@ -1924,7 +2882,7 @@ pub fn seal_joints(
                 edge: (ring[0], collar[0]),
             });
         };
-        let boundary_ring_before = socket_rim.edges().len();
+        let boundary_ring_before = socket_edges_before;
         let collar_rim = Rim {
             vertices: collar.clone(),
             simple: true,
@@ -1954,7 +2912,12 @@ pub fn seal_joints(
         // Watertightness on the rims and the joint shells, measured on the
         // extended mesh.
         let uses_after = edge_uses(&triangles);
-        let boundary_ring_after = socket_rim
+        let ring_rim = Rim {
+            vertices: ring.clone(),
+            simple: true,
+            closed: true,
+        };
+        let boundary_ring_after = ring_rim
             .edges()
             .into_iter()
             .filter(|edge| uses_after.get(edge) == Some(&1))
@@ -1999,6 +2962,17 @@ pub fn seal_joints(
                 eligible.extend(next.iter().copied());
                 frontier = next;
             }
+            // A seated wrist weld merges pinch twins whose non-rim boundary
+            // neighbours (the authored arm slit) now hang off the ring, and
+            // the socket side is authored anatomy: the band may reach
+            // through them but only ever moves the seated part's own
+            // vertices, or the smoothing would re-open authored openings
+            // and reshape the sparse arm mesh around the seam.
+            if seated[index].is_some() {
+                let part_vertices: BTreeSet<u32> =
+                    part.members.iter().map(|&vertex| vertex as u32).collect();
+                eligible.retain(|vertex| part_vertices.contains(vertex));
+            }
             let (moved, max_displacement, changed, changed_outside) = smooth_band(
                 &positions,
                 &adjacency,
@@ -2029,9 +3003,10 @@ pub fn seal_joints(
             positions = moved;
         }
 
-        // The head-drop seat record, re-measured after the drop.
-        let seat = match (&seat_reports[index], options.head_drop > 0.0) {
-            (Some(report), _) => Some(*report),
+        // The seat record: the solved similarity when the joint seated, the
+        // head-drop translation when only a drop ran.
+        let seat = match (seated[index].as_ref(), options.head_drop > 0.0) {
+            (Some(seated), _) => Some(seated.report),
             (None, true) => {
                 let band = options.arc_band.unwrap_or_else(|| {
                     options_band(&triangles, &positions, part, socket, SEAL_ARC_BAND_RATIO)
@@ -2039,7 +3014,7 @@ pub fn seal_joints(
                 let (_, socket_rims_now, _, socket_at) =
                     pair_rims(part, socket, &triangles, &positions, band)?;
                 let gap = rim_gap(
-                    &part_rim.vertices,
+                    part_rim.as_ref().map_or(&collar, |rim| &rim.vertices),
                     &socket_rims_now[socket_at].vertices,
                     &positions,
                 )
@@ -2047,12 +3022,16 @@ pub fn seal_joints(
                 Some(SeatReport {
                     head_drop: f64::from(options.head_drop),
                     scale: 1.0,
+                    rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                     translation: {
                         let mut t = [0.0f64; 3];
                         t[axis] = -f64::from(options.head_drop);
                         t
                     },
                     gap,
+                    rms: 0.0,
+                    max_residual: 0.0,
+                    plane_dev: 0.0,
                 })
             }
             _ => None,
@@ -2071,8 +3050,14 @@ pub fn seal_joints(
             })
             .collect();
         let remaining = match selected_collar {
+            Some(_) if seated[index].is_some() => "none on this joint".to_string(),
             Some(_) => "part rim keeps its coincident seam-cut edges open".to_string(),
             None => "none on this joint".to_string(),
+        };
+        let correspondence = if seated[index].is_some() {
+            "kabsch_umeyama"
+        } else {
+            "monotone_dp"
         };
         joints.push(JointReport {
             joint: format!("{}:{}", request.part, request.socket),
@@ -2086,7 +3071,7 @@ pub fn seal_joints(
             gap_mean,
             gap_max,
             arc_band_used,
-            correspondence: "monotone_dp",
+            correspondence,
             bridge_triangles: bridge.len(),
             edges_consumed: [
                 ring.len(),
@@ -2113,6 +3098,7 @@ pub fn seal_joints(
                 .fold(f64::INFINITY, f64::min),
             max_aspect: areas.iter().map(|area| area.1).fold(0.0, f64::max),
             merged_duplicates: 0,
+            handedness: seated[index].as_ref().map_or("", |seat| seat.handedness),
             seat,
             smoothing,
             untouched,
@@ -2472,18 +3458,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "hands seat pending: measured scale/rotation/cross-side in 0080/0100/0140"]
     fn wrist_pair_seats_scales_and_bridges() {
-        // Torso with two 10-v wrist rings at ±X; two hand shells with 10-v
-        // cuffs at ±0.5 (a normalized-scale analog). The seat must solve the
-        // scale and bridge 10 ↔ 10 → 20 triangles per wrist.
+        // Torso with two 10-v wrist rings at ±X; two hand stubs with 10-v
+        // cuffs at ±0.5 hanging away from the sockets (bulk on the outward
+        // side). Each stub seats onto its nearest wrist tube: scale 50.0,
+        // rotation ≈ identity, translation ±1 on X, then bridges 10 ↔ 10 →
+        // 20 triangles per wrist with both boundary counts at 0.
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut triangles: Vec<[u32; 3]> = Vec::new();
+        // A capped tube open at `z_bottom`. The wrist tubes are one unit
+        // tall so their own wall sits inside the outward-normal bulk window
+        // (2 × mean ring radius) of the open ring.
         let push_ring = |positions: &mut Vec<[f32; 3]>,
                          triangles: &mut Vec<[u32; 3]>,
                          centre: [f32; 3],
                          radius: f32,
-                         z: f32|
+                         z_bottom: f32,
+                         height: f32|
          -> (u32, u32) {
             let base = positions.len() as u32;
             for k in 0..10usize {
@@ -2491,7 +3482,7 @@ mod tests {
                 positions.push([
                     centre[0] + radius * angle.cos(),
                     centre[1] + radius * angle.sin(),
-                    z,
+                    z_bottom,
                 ]);
             }
             for k in 0..10usize {
@@ -2499,7 +3490,7 @@ mod tests {
                 positions.push([
                     centre[0] + radius * 0.9 * angle.cos(),
                     centre[1] + radius * 0.9 * angle.sin(),
-                    z + 4.0,
+                    z_bottom + height,
                 ]);
             }
             let bottom: Vec<u32> = (0..10u32).map(|k| base + k).collect();
@@ -2508,16 +3499,32 @@ mod tests {
             triangles.extend(cap(&top));
             (base, base + 10)
         };
-        // Torso: a tall box-ish shell with two wrist tubes at ±X.
-        let (neck_bottom, _) =
-            push_ring(&mut positions, &mut triangles, [0.0, 0.0, 0.0], 2.0, 10.0);
-        let _ = neck_bottom;
-        let (wrist_l_bottom, _) =
-            push_ring(&mut positions, &mut triangles, [26.0, 0.0, 4.0], 1.0, 4.0);
-        let (wrist_r_bottom, _) =
-            push_ring(&mut positions, &mut triangles, [-26.0, 0.0, 4.0], 1.0, 4.0);
-        let _ = (wrist_l_bottom, wrist_r_bottom);
-        // Hands: two small shells with 10-v cuffs at ±0.5, scaled ~52×.
+        let _ = push_ring(
+            &mut positions,
+            &mut triangles,
+            [0.0, 0.0, 0.0],
+            2.0,
+            10.0,
+            4.0,
+        );
+        let _ = push_ring(
+            &mut positions,
+            &mut triangles,
+            [26.0, 0.0, 4.0],
+            1.0,
+            4.0,
+            1.0,
+        );
+        let _ = push_ring(
+            &mut positions,
+            &mut triangles,
+            [-26.0, 0.0, 4.0],
+            1.0,
+            4.0,
+            1.0,
+        );
+        // Hands: two small shells with 10-v cuffs at ±0.5, hanging below the
+        // cuff plane so the seated bulk lands on the socket's outward side.
         let hand = |positions: &mut Vec<[f32; 3]>, triangles: &mut Vec<[u32; 3]>, side: f32| {
             let base = positions.len() as u32;
             for k in 0..10usize {
@@ -2526,7 +3533,7 @@ mod tests {
             }
             for k in 0..10usize {
                 let angle = k as f32 * (std::f32::consts::TAU / 10.0);
-                positions.push([side + 0.018 * angle.cos(), 0.018 * angle.sin(), 4.05]);
+                positions.push([side + 0.018 * angle.cos(), 0.018 * angle.sin(), 3.95]);
             }
             let bottom: Vec<u32> = (0..10u32).map(|k| base + k).collect();
             let top: Vec<u32> = (10..20u32).map(|k| base + k).collect();
@@ -2535,36 +3542,346 @@ mod tests {
         };
         hand(&mut positions, &mut triangles, 0.5);
         hand(&mut positions, &mut triangles, -0.5);
-        let requests = vec![
-            JointRequest {
-                part: "attached".into(),
-                socket: "torso".into(),
+        // Resolve shells geometrically: the stubs are the shells whose open
+        // ring is tiny (radius ~0.02), the wrist tubes carry radius ~1.0.
+        let identities = parts::shell_identities(&positions, &triangles);
+        let ring_radius = |shell: &parts::ShellIdentity| -> (f64, [f64; 3]) {
+            let members: BTreeSet<usize> = shell.members.iter().copied().collect();
+            let rims = shell_rims(&triangles, &members);
+            let rim = rims.first().expect("each fixture shell has a rim");
+            let centre = centroid_of(&rim.vertices, &positions);
+            let radius = rim
+                .vertices
+                .iter()
+                .map(|&vertex| {
+                    distance(point_of(&positions, vertex), centre.map(|lane| lane as f32))
+                })
+                .sum::<f64>()
+                / rim.vertices.len() as f64;
+            (radius, centre)
+        };
+        let stubs: Vec<&parts::ShellIdentity> = identities
+            .iter()
+            .filter(|shell| shell.name != "torso" && ring_radius(shell).0 < 0.5)
+            .collect();
+        let tubes: Vec<&parts::ShellIdentity> = identities
+            .iter()
+            .filter(|shell| shell.name != "torso" && ring_radius(shell).0 >= 0.5)
+            .collect();
+        assert_eq!(stubs.len(), 2, "two hand stubs");
+        assert_eq!(tubes.len(), 2, "two wrist tubes");
+        let nearest_tube = |stub: &parts::ShellIdentity| -> &parts::ShellIdentity {
+            let (_, stub_centre) = ring_radius(stub);
+            tubes
+                .iter()
+                .copied()
+                .min_by(|left, right| {
+                    let probe = |shell: &parts::ShellIdentity| {
+                        distance64(ring_radius(shell).1, stub_centre)
+                    };
+                    probe(left).total_cmp(&probe(right))
+                })
+                .expect("a nearest tube")
+        };
+        let requests: Vec<JointRequest> = stubs
+            .iter()
+            .map(|stub| JointRequest {
+                part: stub.name.clone(),
+                socket: nearest_tube(stub).name.clone(),
                 seat: true,
-            };
-            2
-        ];
-        let outcome = seal_joints(&positions, &triangles, &requests, &SealOptions::default());
-        // The synthetic naming may not resolve; the seat path is exercised
-        // when it does. Assert by outcome kind.
-        match outcome {
-            Ok(outcome) => {
-                assert!(
-                    outcome
-                        .report
-                        .joints
-                        .iter()
-                        .all(|joint| joint.boundary_arc_after == 0)
-                );
-            }
-            Err(error) => {
-                assert!(
-                    matches!(
-                        error,
-                        SealError::JointUnknown { .. } | SealError::RingAbsent { .. }
-                    ),
-                    "{error}"
-                );
-            }
+            })
+            .collect();
+        // The exact seat leaves the rims coincident, so the smoothing pass
+        // collapses the doubled band; allow that displacement here.
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions {
+                max_shift: Some(4.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("both wrists seat and bridge");
+        assert_eq!(outcome.report.joints.len(), 2);
+        let rotation_angle = |rotation: &[[f64; 3]; 3]| -> f64 {
+            let trace = rotation[0][0] + rotation[1][1] + rotation[2][2];
+            ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+        };
+        for (joint, stub) in outcome.report.joints.iter().zip(&stubs) {
+            let (_, stub_centre) = ring_radius(stub);
+            let seat = joint.seat.expect("the joint seated");
+            let expected_scale = 50.0;
+            assert!(
+                (seat.scale - expected_scale).abs() < 1e-3,
+                "scale {}",
+                seat.scale
+            );
+            assert!(
+                rotation_angle(&seat.rotation) < 1.0,
+                "rotation {:?}",
+                seat.rotation
+            );
+            let side = stub_centre[0].signum();
+            assert!(
+                (seat.translation[0] - side).abs() < 1e-3,
+                "translation {:?}",
+                seat.translation
+            );
+            assert!(seat.rms < 1e-5, "rms {}", seat.rms);
+            assert!(seat.max_residual < 1e-4, "max {}", seat.max_residual);
+            assert!(seat.plane_dev < 1e-4, "plane_dev {}", seat.plane_dev);
+            assert_eq!(joint.bridge_triangles, 20, "10 + 10 closed rims");
+            assert_eq!(joint.edges_consumed, [10, 10]);
+            assert_eq!(joint.boundary_ring_after, 0);
+            assert_eq!(joint.boundary_arc_after, 0);
+            assert_eq!(joint.pinch_edges, 0, "clean rings have no twins");
+            assert_eq!(joint.handedness, "n/a: one seated part per socket");
+            assert!(joint.smoothing.max_displacement <= f64::from(joint.smoothing.max_shift));
         }
+        // The untouched centre tube stays its own component.
+        assert_eq!(outcome.report.components_after, 3);
+        assert_eq!(outcome.triangles.len(), triangles.len() + 40);
+    }
+
+    #[test]
+    fn coincident_cuffs_refuse_handedness() {
+        // One socket tube, two hand stubs at the identical position: the
+        // cuffs cannot be told apart laterally even in principle.
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        let (bottom, top): (Vec<u32>, Vec<u32>) = {
+            let base = positions.len() as u32;
+            for k in 0..10usize {
+                let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+                positions.push([26.0 + angle.cos(), angle.sin(), 4.0]);
+            }
+            for k in 0..10usize {
+                let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+                positions.push([26.0 + 0.9 * angle.cos(), 0.9 * angle.sin(), 8.0]);
+            }
+            let bottom: Vec<u32> = (0..10u32).map(|k| base + k).collect();
+            let top: Vec<u32> = (10..20u32).map(|k| base + k).collect();
+            triangles.extend(prism(&bottom, &top));
+            triangles.extend(cap(&top));
+            (bottom, top)
+        };
+        let _ = (bottom, top);
+        for _ in 0..2 {
+            let base = positions.len() as u32;
+            for k in 0..10usize {
+                let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+                positions.push([0.5 + 0.02 * angle.cos(), 0.02 * angle.sin(), 4.0]);
+            }
+            for k in 0..10usize {
+                let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+                positions.push([0.5 + 0.018 * angle.cos(), 0.018 * angle.sin(), 3.95]);
+            }
+            let cuff: Vec<u32> = (0..10u32).map(|k| base + k).collect();
+            let tip: Vec<u32> = (10..20u32).map(|k| base + k).collect();
+            triangles.extend(prism(&cuff, &tip));
+            triangles.extend(cap(&tip));
+        }
+        let identities = parts::shell_identities(&positions, &triangles);
+        let socket = identities
+            .iter()
+            .find(|shell| shell.members.len() == 20 && shell.members[0] < 20)
+            .expect("the tube shell");
+        let stubs: Vec<&parts::ShellIdentity> = identities
+            .iter()
+            .filter(|shell| shell.members[0] >= 20)
+            .collect();
+        assert_eq!(stubs.len(), 2);
+        let requests: Vec<JointRequest> = stubs
+            .iter()
+            .map(|stub| JointRequest {
+                part: stub.name.clone(),
+                socket: socket.name.clone(),
+                seat: true,
+            })
+            .collect();
+        let error =
+            seal_joints(&positions, &triangles, &requests, &SealOptions::default()).unwrap_err();
+        assert_eq!(error.code(), "seal_handedness_ambiguous", "{error}");
+    }
+
+    #[test]
+    fn coincident_cuff_ring_refuses_scale() {
+        // A hand stub whose cuff ring collapses to one position: the
+        // correspondence is degenerate and the solve refuses by wire code.
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        let base = positions.len() as u32;
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([26.0 + angle.cos(), angle.sin(), 4.0]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([26.0 + 0.9 * angle.cos(), 0.9 * angle.sin(), 8.0]);
+        }
+        let bottom: Vec<u32> = (0..10u32).map(|k| base + k).collect();
+        let top: Vec<u32> = (10..20u32).map(|k| base + k).collect();
+        triangles.extend(prism(&bottom, &top));
+        triangles.extend(cap(&top));
+        // A stub whose whole cuff ring sits at one position: the boundary
+        // is a clean 10-cycle geometrically collapsed to a point.
+        let spike = positions.len() as u32;
+        for _ in 0..10usize {
+            positions.push([0.5, 0.0, 4.0]); // all cuff vertices coincide
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([0.5 + 0.02 * angle.cos(), 0.02 * angle.sin(), 3.95]);
+        }
+        let cuff: Vec<u32> = (0..10u32).map(|k| spike + k).collect();
+        let tip: Vec<u32> = (10..20u32).map(|k| spike + k).collect();
+        triangles.extend(prism(&cuff, &tip));
+        triangles.extend(cap(&tip));
+        let identities = parts::shell_identities(&positions, &triangles);
+        let tube = identities
+            .iter()
+            .find(|shell| shell.members[0] < 20)
+            .expect("the tube");
+        let spike_shell = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 20)
+            .expect("the spike shell");
+        let error = seal_joints(
+            &positions,
+            &triangles,
+            &[JointRequest {
+                part: spike_shell.name.clone(),
+                socket: tube.name.clone(),
+                seat: true,
+            }],
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "seal_scale_mismatch", "{error}");
+    }
+
+    #[test]
+    fn capped_socket_refuses_ring_absent() {
+        // The socket tube is capped at both ends: it has no boundary cycle
+        // to seat onto.
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        let base = positions.len() as u32;
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([26.0 + angle.cos(), angle.sin(), 4.0]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([26.0 + 0.9 * angle.cos(), 0.9 * angle.sin(), 8.0]);
+        }
+        let bottom: Vec<u32> = (0..10u32).map(|k| base + k).collect();
+        let top: Vec<u32> = (10..20u32).map(|k| base + k).collect();
+        triangles.extend(prism(&bottom, &top));
+        triangles.extend(cap(&top));
+        triangles.extend(cap(&bottom)); // closed socket
+        let spike = positions.len() as u32;
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([0.5 + 0.02 * angle.cos(), 0.02 * angle.sin(), 4.0]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([0.5 + 0.018 * angle.cos(), 0.018 * angle.sin(), 3.95]);
+        }
+        let cuff: Vec<u32> = (0..10u32).map(|k| spike + k).collect();
+        let tip: Vec<u32> = (10..20u32).map(|k| spike + k).collect();
+        triangles.extend(prism(&cuff, &tip));
+        triangles.extend(cap(&tip));
+        let identities = parts::shell_identities(&positions, &triangles);
+        let tube = identities
+            .iter()
+            .find(|shell| shell.members[0] < 20)
+            .expect("the tube");
+        let stub = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 20)
+            .expect("the stub");
+        let error = seal_joints(
+            &positions,
+            &triangles,
+            &[JointRequest {
+                part: stub.name.clone(),
+                socket: tube.name.clone(),
+                seat: true,
+            }],
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "seal_ring_absent", "{error}");
+    }
+
+    #[test]
+    fn compound_socket_loop_refuses_by_residual() {
+        // The socket's whole boundary is one slit tube wall (both rings in a
+        // single walk, no coincident twins): the cycle is compound, the
+        // correspondence fits it beyond the residual gate and the seat
+        // refuses with measurements instead of welding a wrong ring.
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        // A 4-gon tube wall open along one side: one closed 10-vertex walk.
+        let bottom: Vec<u32> = (0..4u32).collect();
+        let top: Vec<u32> = (4..8u32).collect();
+        for k in 0..4usize {
+            let angle = k as f32 * (std::f32::consts::FRAC_PI_2);
+            positions.push([26.0 + angle.cos(), angle.sin(), 4.0]);
+        }
+        for k in 0..4usize {
+            let angle = k as f32 * (std::f32::consts::FRAC_PI_2);
+            positions.push([26.0 + 0.9 * angle.cos(), 0.9 * angle.sin(), 8.0]);
+        }
+        for k in 0..4usize {
+            let next = (k + 1) % 4;
+            triangles.push([bottom[k], bottom[next], top[next]]);
+            triangles.push([bottom[k], top[next], top[k]]);
+        }
+        // The matching wall is missing on purpose: the boundary is the
+        // single compound walk through both rings and the slit.
+        let spike = positions.len() as u32;
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([0.5 + 0.02 * angle.cos(), 0.02 * angle.sin(), 4.0]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([0.5 + 0.018 * angle.cos(), 0.018 * angle.sin(), 3.95]);
+        }
+        let cuff: Vec<u32> = (0..10u32).map(|k| spike + k).collect();
+        let tip: Vec<u32> = (10..20u32).map(|k| spike + k).collect();
+        triangles.extend(prism(&cuff, &tip));
+        triangles.extend(cap(&tip));
+        let identities = parts::shell_identities(&positions, &triangles);
+        let tube = identities
+            .iter()
+            .find(|shell| shell.members[0] < 8)
+            .expect("the wall shell");
+        let stub = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 8)
+            .expect("the stub");
+        let error = seal_joints(
+            &positions,
+            &triangles,
+            &[JointRequest {
+                part: stub.name.clone(),
+                socket: tube.name.clone(),
+                seat: true,
+            }],
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SealError::SeatUnreachable { .. } | SealError::RingAbsent { .. }
+            ),
+            "compound loop must refuse, got {error}"
+        );
     }
 }
