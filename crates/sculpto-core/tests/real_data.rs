@@ -210,6 +210,45 @@ fn morph_containers_decode() {
     assert!(offsets > 0);
 }
 
+/// One real preset XML, opt-in: set `SCULPTO_PRESET_XML_FIXTURE` to its path.
+///
+/// Guards authored ranges the structural sweep over `SliderPresets/` above
+/// never sees, because that home may not carry them (e.g. a percentage beyond
+/// ±100 that native BodySlide accepts and applies verbatim).
+#[test]
+fn real_preset_file_keeps_authored_ranges() {
+    let Some(path) = std::env::var_os("SCULPTO_PRESET_XML_FIXTURE").map(PathBuf::from) else {
+        eprintln!("skipping: set SCULPTO_PRESET_XML_FIXTURE to a real SliderPresets XML");
+        return;
+    };
+    let Document::Presets(presets) =
+        Document::parse_file(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    else {
+        panic!("{} is not a preset collection", path.display());
+    };
+    let mut beyond = 0usize;
+    for preset in &presets {
+        for value in &preset.values {
+            assert!(
+                value.percent.is_finite(),
+                "{}: preset `{}` slider `{}` is not finite",
+                path.display(),
+                preset.name,
+                value.slider
+            );
+            if value.percent.abs() > 100.0 {
+                beyond += 1;
+            }
+        }
+    }
+    eprintln!(
+        "parsed {} presets, {beyond} values beyond ±100 from {}",
+        presets.len(),
+        path.display()
+    );
+    assert!(!presets.is_empty());
+}
+
 fn collect_containers(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

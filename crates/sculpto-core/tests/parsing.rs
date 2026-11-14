@@ -91,13 +91,38 @@ fn unknown_size_token_is_rejected() {
 }
 
 #[test]
-fn out_of_range_percentage_is_rejected() {
-    let error = Document::parse_str(
-        r#"<SliderPresets><Preset name="P"><SetSlider name="A" size="big" value="101"/></Preset></SliderPresets>"#,
+fn melissa_value_beyond_one_hundred_parses_authored() {
+    // `Natural & Realistic Bodies - Melissa.xml:53` carries
+    // `BreastsTogether big=120`; native BodySlide builds that file, so the
+    // authored value must survive verbatim, neither refused nor clamped.
+    let document = Document::parse_str(
+        r#"<SliderPresets><Preset name="Natural &amp; Realistic Bodies - Melissa" set="CBBE 3BBB Body Amazing"><SetSlider name="BreastsTogether" size="big" value="120"/></Preset></SliderPresets>"#,
         "inline.xml",
     )
-    .expect_err("percent above 100 must fail");
+    .expect("native accepts percentages beyond ±100");
+    let Document::Presets(presets) = document else {
+        panic!("expected presets")
+    };
+    let value = &presets[0].values[0];
+    assert_eq!(value.slider, "BreastsTogether");
+    assert_eq!(value.percent, 120.0);
+    assert!((value.fraction() - 1.2).abs() < 1e-6);
+}
+
+#[test]
+fn non_numeric_preset_value_refuses_by_name() {
+    let error = Document::parse_str(
+        r#"<SliderPresets><Preset name="P"><SetSlider name="BreastsTogether" size="big" value="together"/></Preset></SliderPresets>"#,
+        "inline.xml",
+    )
+    .expect_err("a non-numeric value must refuse");
     assert_eq!(error.kind(), ErrorKind::InvalidValue);
+    let message = error.to_string();
+    assert!(
+        message.contains("SetSlider[name=BreastsTogether]"),
+        "refusal must name the slider: {message}"
+    );
+    assert!(message.contains("is not a number"), "{message}");
 }
 
 #[test]

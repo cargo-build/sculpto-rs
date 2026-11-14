@@ -42,7 +42,9 @@ pub struct PresetValue {
     pub slider: String,
     /// Endpoint this value drives.
     pub size: SliderSize,
-    /// Authored percentage in `-100.0..=100.0`; negative values invert the slider.
+    /// Authored percentage. Native reads any finite value (divide by 100, no
+    /// range bound), so percentages beyond ±100 are legal and amplify past the
+    /// authored endpoints; negative values invert the slider.
     pub percent: f32,
 }
 
@@ -147,15 +149,11 @@ impl Preset {
             )
             .with_path(origin)
         })?;
+        // Native parses `value` as an unbounded float and applies it verbatim
+        // (SliderPresets.cpp `FloatAttribute("value") / 100.0f`;
+        // BodySlideApp.cpp:5184), so percentages beyond ±100 are legal;
+        // f32_attr still refuses malformed and non-finite values.
         let percent = f32_attr(node, "value", 0.0).map_err(|e| e.with_path(origin))?;
-        if !(-100.0..=100.0).contains(&percent) {
-            return Err(Error::new(
-                ErrorKind::InvalidValue,
-                element_path(node),
-                format!("value `{percent}` is outside -100..=100"),
-            )
-            .with_path(origin));
-        }
         Ok(PresetValue {
             slider,
             size,

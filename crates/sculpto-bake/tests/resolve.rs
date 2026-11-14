@@ -92,6 +92,22 @@ fn preset_value_scales_the_offset() {
 }
 
 #[test]
+fn value_beyond_one_hundred_applies_authored_not_clamped() {
+    // Native feeds the authored percentage straight into the diff
+    // multiplication (BodySlideApp.cpp:5184), so 120 percent scales by 1.2.
+    let plan = resolve(
+        &preset(r#"<SetSlider name="Lean" size="big" value="120"/>"#),
+        &home("over-hundred"),
+        vec![("BodyLean", vec![offset(1, [1.0, 0.0, 0.0])])],
+    );
+    assert_eq!(plan.sliders[0].percent, 120.0);
+    let out = plan
+        .apply("Body", &[[0.0; 3], [0.0; 3], [0.0; 3]])
+        .expect("applies");
+    assert_eq!(out[1], [1.2, 0.0, 0.0]);
+}
+
+#[test]
 fn omitted_preset_value_uses_the_endpoint_default() {
     let plan = resolve(
         &preset(""),
