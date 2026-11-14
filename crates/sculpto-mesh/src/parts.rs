@@ -1243,7 +1243,6 @@ mod tests {
     use super::*;
 
     const SIDES: usize = 8;
-    const TORSO: std::ops::Range<usize> = 0..16;
     const LEG: std::ops::Range<usize> = 16..32;
     const FOOT: std::ops::Range<usize> = 32..48;
     const HEAD: std::ops::Range<usize> = 48..64;
@@ -1464,7 +1463,7 @@ mod tests {
             positions: yawed.as_slice(),
             triangles: head_triangles.as_slice(),
         }];
-        let report = audit(&positions, &triangles, &overrides.as_slice()).unwrap();
+        let report = audit(&positions, &triangles, overrides.as_slice()).unwrap();
         assert_eq!(report.refusals.len(), 1, "{:?}", report.refusals);
         let refusal = &report.refusals[0];
         assert_eq!(refusal.code, RefusalCode::HeadCoverage);
@@ -1502,7 +1501,7 @@ mod tests {
             positions: head_positions.as_slice(),
             triangles: head_triangles.as_slice(),
         }];
-        let error = audit(&positions, &triangles, &overrides.as_slice()).unwrap_err();
+        let error = audit(&positions, &triangles, overrides.as_slice()).unwrap_err();
         assert!(matches!(
             error,
             PartsError::UnmatchedOverride { index: 0, .. }
