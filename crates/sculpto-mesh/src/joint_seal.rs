@@ -1347,29 +1347,75 @@ fn smooth_band(
 ) -> Result<(Vec<[f32; 3]>, f64, usize, usize), SealError> {
     // The four-part tuple is the smoothing result the report consumes whole.
     let mut current = positions.to_vec();
-    for _ in 0..iterations {
-        let candidates: Vec<(u32, [f32; 3])> = eligible
-            .iter()
-            .map(|&vertex| {
-                let neighbours = &adjacency[vertex as usize];
-                let count = neighbours.len().max(1);
-                let mut mean = [0.0f32; 3];
-                for neighbour in neighbours {
-                    for axis in 0..3 {
-                        mean[axis] += current[*neighbour as usize][axis];
-                    }
-                }
-                let mean = mean.map(|lane| lane / count as f32);
-                let moved = std::array::from_fn(|axis| {
-                    current[vertex as usize][axis]
-                        + SMOOTH_LAMBDA * (mean[axis] - current[vertex as usize][axis])
-                });
-                (vertex, moved)
-            })
-            .collect();
-        for (vertex, moved) in candidates {
-            current[vertex as usize] = moved;
+    // Authored coincident copies are one surface point (seam-cut slits and
+    // sliver twins). Smoothing them independently opens the slits, so every
+    // exact-coincident group moves by one shared delta; a group touching a
+    // non-eligible vertex is frozen whole to keep `changed_outside_band == 0`.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut by_key: HashMap<[u32; 3], Vec<usize>> = HashMap::new();
+        for (vertex, position) in positions.iter().enumerate() {
+            by_key
+                .entry(position_key(*position))
+                .or_default()
+                .push(vertex);
         }
+        groups.extend(by_key.into_values());
+    }
+    let mut carried: BTreeSet<u32> = BTreeSet::new();
+    for _ in 0..iterations {
+        let mut next = current.clone();
+        for &vertex in eligible {
+            let neighbours = &adjacency[vertex as usize];
+            let count = neighbours.len().max(1);
+            let mut mean = [0.0f32; 3];
+            for neighbour in neighbours {
+                for axis in 0..3 {
+                    mean[axis] += current[*neighbour as usize][axis];
+                }
+            }
+            let mean = mean.map(|lane| lane / count as f32);
+            let at = vertex as usize;
+            for axis in 0..3 {
+                next[at][axis] =
+                    current[at][axis] + SMOOTH_LAMBDA * (mean[axis] - current[at][axis]);
+            }
+        }
+        // Equality projection: coincident copies are one authored point, so
+        // after each Laplacian step the group is averaged back together. The
+        // fixed point satisfies the constraint while each side keeps its own
+        // neighbourhood pull, which averaging deltas loses.
+        for group in &groups {
+            let moving: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|&vertex| eligible.contains(&(vertex as u32)))
+                .collect();
+            if moving.is_empty() {
+                continue;
+            }
+            if moving.len() != group.len() {
+                carried.extend(
+                    group
+                        .iter()
+                        .copied()
+                        .filter(|&vertex| !eligible.contains(&(vertex as u32)))
+                        .map(|vertex| vertex as u32),
+                );
+            }
+            let count = group.len() as f32;
+            let mut mean = [0.0f32; 3];
+            for &vertex in group {
+                for axis in 0..3 {
+                    mean[axis] += next[vertex][axis];
+                }
+            }
+            let mean = mean.map(|lane| lane / count);
+            for &vertex in group {
+                next[vertex] = mean;
+            }
+        }
+        current = next;
     }
     let mut max_displacement = 0.0f64;
     let mut changed = 0usize;
@@ -1378,7 +1424,7 @@ fn smooth_band(
         let shift = distance(*before, *after);
         if shift > 0.0 {
             changed += 1;
-            if !eligible.contains(&(vertex as u32)) {
+            if !eligible.contains(&(vertex as u32)) && !carried.contains(&(vertex as u32)) {
                 changed_outside += 1;
             }
         }
@@ -1744,9 +1790,21 @@ pub fn seal_joints(
             let drop = [0.0f32, 0.0, 0.0].map(|_| 0.0);
             let mut translation = drop;
             translation[axis] = -options.head_drop;
-            for &vertex in &part.members {
-                for lane in 0..3 {
-                    positions[vertex][lane] += translation[lane];
+            // Exact-coincident vertices outside the part (the authored sliver
+            // triangles) belong to the same surface: carry them with it so the
+            // seat never tears a coincident pair apart.
+            let part_members: BTreeSet<usize> = part.members.iter().copied().collect();
+            let part_keys: BTreeSet<[u32; 3]> = part_members
+                .iter()
+                .map(|&vertex| position_key(authored_positions[vertex]))
+                .collect();
+            for (vertex, authored) in authored_positions.iter().enumerate() {
+                let in_part = part_members.contains(&vertex);
+                let twin = !in_part && part_keys.contains(&position_key(*authored));
+                if in_part || twin {
+                    for lane in 0..3 {
+                        positions[vertex][lane] += translation[lane];
+                    }
                 }
             }
         }
@@ -1761,8 +1819,6 @@ pub fn seal_joints(
         let part_rim = &part_rims[part_rim_at];
         let socket_facts = rim_facts(&socket_rim.vertices, &positions, socket_rim.closed);
         let part_facts = rim_facts(&part_rim.vertices, &positions, part_rim.closed);
-        let (gap_min, gap_mean, gap_max) =
-            rim_gap(&part_rim.vertices, &socket_rim.vertices, &positions);
 
         // The collar: the unique-position opening of the compound loop.
         let (collar, collar_closed, pinch) = extract_arc(
@@ -1789,6 +1845,9 @@ pub fn seal_joints(
         } else {
             socket_rim.vertices.clone()
         };
+        // Gap facts belong to the seam actually bridged, not the whole
+        // compound loop with its mouth slit far above the collar.
+        let (gap_min, gap_mean, gap_max) = rim_gap(&collar, &ring, &positions);
 
         if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
             eprintln!(
