@@ -83,6 +83,11 @@ pub struct Layer {
     /// Trousers layer [`Self::mode`] is declared against.
     #[serde(default)]
     pub pair: Option<String>,
+    /// Destination of this layer's fitted OBJ in a stack fit; resolved against
+    /// the manifest's directory, and its parent directory is created when
+    /// missing. Grading ignores it.
+    #[serde(default)]
+    pub out: Option<PathBuf>,
 }
 
 /// A declared stack: the body surface plus its ranked layers.
@@ -362,6 +367,9 @@ impl LayerStack {
         }
         for layer in &mut stack.layers {
             resolve(&mut layer.obj);
+            if let Some(out) = layer.out.as_mut() {
+                resolve(out);
+            }
         }
         stack.validate()?;
         Ok(stack)

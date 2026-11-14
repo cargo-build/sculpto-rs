@@ -1447,7 +1447,10 @@ pub fn garment_depth_report(garment: Mesh<'_>, body: Mesh<'_>) -> Result<DepthRe
 /// vertex's own triangles sit behind the contact; the own-triangle exception
 /// matters when the contact point falls on a body edge or vertex and the vertex
 /// is laterally offset.
-fn occlusion_hides_vertex(
+/// The occlusion half of [`DepthProbe`]'s vertex classification (the DECL0015
+/// contact-point rule), shared with the accumulated-surface grader so a
+/// layered contact cannot drift from [`garment_depth_report`]'s rule.
+pub(crate) fn occlusion_hides_vertex(
     surface: &SurfaceIndex,
     garment_faces: &[[u32; 3]],
     contact: [f32; 3],
@@ -1495,7 +1498,7 @@ fn mean_of(samples: &[f32]) -> f32 {
 
 /// Unit face normal, or `None` for a degenerate triangle that cannot name a
 /// side.
-fn unit_triangle_normal(corners: [[f32; 3]; 3]) -> Option<[f64; 3]> {
+pub(crate) fn unit_triangle_normal(corners: [[f32; 3]; 3]) -> Option<[f64; 3]> {
     let a = corners[0].map(f64::from);
     let normal = cross64(
         sub64(corners[1].map(f64::from), a),

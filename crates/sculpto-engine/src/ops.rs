@@ -40,12 +40,14 @@ use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, wr
 
 mod head;
 mod slider;
+mod stack_fit;
 pub use head::{
     AssignedShape, BodiesConfig, BodyDescriptor, CheckStatus, CompatibilityCheck,
     CompatibilityReport, RoleBundle, head_compatibility, load_bodies_config, load_shape,
     resolve_default_head,
 };
 pub use slider::{ConformOutcome, ConformParams, conform_sliders};
+pub use stack_fit::{ObstacleProvenance, StackFitOutcome, StackFitParams, StackFitStep, stack_fit};
 
 /// A source NIF and its optional authored outfit declaration.
 #[derive(Debug, Clone, JsonSchema)]

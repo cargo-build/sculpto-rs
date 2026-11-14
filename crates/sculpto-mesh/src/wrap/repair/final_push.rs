@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::accumulated_surface::AccumulatedSurface;
 use crate::check::{OCCLUSION_EPSILON, VisibleDepth, visible_depths};
 use crate::mask::VertexMask;
 use crate::surface_util::coincident_groups;
@@ -121,10 +122,54 @@ pub fn final_push(
     options.validate()?;
     validate_geometry(garment, obstacle)?;
     validate_lengths(garment.0.len(), lock, fit, false)?;
+    let mut measure = |positions: &[[f32; 3]]| -> Result<Measurement, FitError> {
+        measure(positions, garment.1, obstacle, options.tolerance)
+    };
+    run_passes(garment, lock, fit, options, &mut measure)
+}
+
+/// [`final_push`] over an [`AccumulatedSurface`]: the same bounded pass loop,
+/// measured by the accumulated surface's outermost-member rule instead of one
+/// obstacle mesh, so a layer pushed over body-plus-layers grades every vertex
+/// against the member it actually crossed.
+///
+/// # Errors
+/// Refuses what [`final_push`] refuses, plus the accumulated surface's own
+/// grading refusals.
+pub fn final_push_layered(
+    garment: Mesh<'_>,
+    accumulated: &AccumulatedSurface,
+    lock: Option<&VertexMask>,
+    fit: &FitOptions,
+    options: &FinalPushOptions,
+) -> Result<(Vec<[f32; 3]>, FinalPushReport), FitError> {
+    options.validate()?;
+    validate_geometry(garment, accumulated.obstacle())?;
+    validate_lengths(garment.0.len(), lock, fit, false)?;
+    let mut measure = |positions: &[[f32; 3]]| -> Result<Measurement, FitError> {
+        let graded = accumulated.layered_visible_depths((positions, garment.1))?;
+        Ok(measurement_of(
+            graded.into_iter().map(|layered| layered.depth).collect(),
+            options.tolerance,
+        ))
+    };
+    run_passes(garment, lock, fit, options, &mut measure)
+}
+
+/// The bounded pass loop shared by [`final_push`] and [`final_push_layered`].
+type Measure<'a> = &'a mut dyn FnMut(&[[f32; 3]]) -> Result<Measurement, FitError>;
+
+fn run_passes(
+    garment: Mesh<'_>,
+    lock: Option<&VertexMask>,
+    fit: &FitOptions,
+    options: &FinalPushOptions,
+    measure: Measure<'_>,
+) -> Result<(Vec<[f32; 3]>, FinalPushReport), FitError> {
     let groups = Movement::new(garment.0, fit.weld_distance);
     let held = groups.held(lock, &fit.rigid_parts);
     let mut positions = garment.0.to_vec();
-    let mut measurement = measure(&positions, garment.1, obstacle, options.tolerance)?;
+    let mut measurement = measure(&positions)?;
     let before_violations = measurement.violations.len();
     let before_max = measurement.max;
     let mut per_pass = Vec::new();
@@ -141,7 +186,7 @@ pub fn final_push(
             break;
         }
         passes += 1;
-        measurement = measure(&positions, garment.1, obstacle, options.tolerance)?;
+        measurement = measure(&positions)?;
         per_pass.push(FinalPushPass {
             pass: passes,
             moved,
@@ -178,6 +223,17 @@ struct Measurement {
     max: f32,
 }
 
+/// Fold one graded set into a [`Measurement`] at `tolerance`.
+fn measurement_of(graded: Vec<VisibleDepth>, tolerance: f32) -> Measurement {
+    let max = graded.iter().map(|graded| graded.depth).fold(0.0, f32::max);
+    let mut violations: Vec<VisibleDepth> = graded
+        .into_iter()
+        .filter(|graded| graded.depth > tolerance)
+        .collect();
+    violations.sort_by(|a, b| b.depth.total_cmp(&a.depth).then(a.vertex.cmp(&b.vertex)));
+    Measurement { violations, max }
+}
+
 /// Grade the current geometry; the comparison is
 /// [`crate::check::DepthReport::visible_verdict`]'s.
 fn measure(
@@ -187,13 +243,7 @@ fn measure(
     tolerance: f32,
 ) -> Result<Measurement, FitError> {
     let graded = visible_depths((positions, faces), obstacle)?;
-    let max = graded.iter().map(|graded| graded.depth).fold(0.0, f32::max);
-    let mut violations: Vec<VisibleDepth> = graded
-        .into_iter()
-        .filter(|graded| graded.depth > tolerance)
-        .collect();
-    violations.sort_by(|a, b| b.depth.total_cmp(&a.depth).then(a.vertex.cmp(&b.vertex)));
-    Ok(Measurement { violations, max })
+    Ok(measurement_of(graded, tolerance))
 }
 
 /// Move each free weld group by its deepest violation's push.

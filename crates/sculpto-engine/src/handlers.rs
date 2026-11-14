@@ -31,6 +31,11 @@ pub fn fit_schema() -> Value {
     schema_for::<ops::FitParams>()
 }
 
+/// Schema derived from the typed `outfit.stack_fit` parameters.
+pub fn stack_fit_schema() -> Value {
+    schema_for::<ops::StackFitParams>()
+}
+
 /// Schema for the authored garment slider conformance command.
 pub fn conform_schema() -> Value {
     schema_for::<ops::ConformParams>()
@@ -282,6 +287,36 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         result["collision"] = json!(collision);
     }
     Ok(result)
+}
+
+pub fn stack_fit(input: &Value) -> Result<Value, CommandError> {
+    let tolerance = match input.get("tolerance") {
+        None | Some(Value::Null) => {
+            return Err(missing("tolerance"));
+        }
+        Some(value) => value
+            .as_f64()
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| errors::invalid("tolerance", "must be a finite number"))?,
+    };
+    let passes = match input.get("passes") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|passes| u32::try_from(passes).ok())
+                .filter(|passes| *passes > 0)
+                .ok_or_else(|| errors::invalid("passes", "must be a positive integer"))?,
+        ),
+    };
+    let params = ops::StackFitParams {
+        manifest: path(input, "manifest")?,
+        tolerance,
+        body: checked_optional_path(input, "body")?,
+        passes,
+    };
+    Ok(ops::stack_fit(&params)?.to_json())
 }
 
 pub fn conform(input: &Value) -> Result<Value, CommandError> {

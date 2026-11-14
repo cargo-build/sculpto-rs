@@ -39,6 +39,8 @@ pub enum CommandId {
     BodyAuditParts,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,
+    /// Fit an ordered layer stack against the accumulated obstacle surface.
+    OutfitStackFit,
     /// Write garment offsets for an authored body slider set.
     OutfitConform,
     /// Report the source shapes and the cloth selection.
@@ -81,6 +83,7 @@ impl CommandId {
             CommandId::Bake => "bake",
             CommandId::BodyAuditParts => "body.audit_parts",
             CommandId::OutfitFit => "outfit.fit",
+            CommandId::OutfitStackFit => "outfit.stack_fit",
             CommandId::OutfitConform => "outfit.conform",
             CommandId::OutfitInspect => "outfit.inspect",
             CommandId::OutfitOffsets => "outfit.offsets",
@@ -289,6 +292,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::fit,
     },
     Spec {
+        id: CommandId::OutfitStackFit,
+        summary: "Fit an ordered layer stack against the accumulated body-plus-layers obstacle.",
+        mutates: true,
+        stub: false,
+        schema: handlers::stack_fit_schema,
+        handler: handlers::stack_fit,
+    },
+    Spec {
         id: CommandId::OutfitConform,
         summary: "Conform authored body sliders and write one garment OSD.",
         mutates: true,
@@ -493,6 +504,7 @@ mod tests {
         for id in [
             "bake",
             "outfit.fit",
+            "outfit.stack_fit",
             "outfit.inspect",
             "outfit.offsets",
             "outfit.place",

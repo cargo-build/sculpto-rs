@@ -49,6 +49,8 @@ commands:
   outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
                  --presets <xml> --preset <name> --set <name> --out <osd>
                  [--body-nif <path>] [--home <path>]
+  outfit stack-fit --outfit <layers.json> [--body <obj>] --tolerance <units>
+                   [--passes <n>] [--json]
   garment fit [options] bind a garment to its authored body, then fit it to a bake
   garment follow [options] transport render positions through a deformed control
   garment aura [options] press a garment onto the body's cross-section aura
@@ -215,6 +217,13 @@ garment stack options:
   --body <obj>        body/collision surface to grade against; may come from the manifest
   --tolerance <units> accepted visible depth for every graded pair
   --json              print the per-pair and per-layer report as JSON
+
+outfit stack-fit options:
+  --outfit <json>     the same layer manifest; each layer may declare `out`
+  --body <obj>        body/collision surface to dress over; may come from the manifest
+  --tolerance <units> accepted visible depth for every push and graded pair
+  --passes <n>        per-layer push budget, 1..=10 (4)
+  --json              print the per-step provenance and pair report as JSON
 ";
 
 fn main() -> ExitCode {
@@ -241,6 +250,9 @@ fn main() -> ExitCode {
         }
         [command, action, rest @ ..] if command == "outfit" && action == "conform" => {
             outfit_conform(rest)
+        }
+        [command, action, rest @ ..] if command == "outfit" && action == "stack-fit" => {
+            outfit_stack_fit(rest)
         }
         [command, rest @ ..] if command == "garment" => garment(rest),
         [command, rest @ ..] if command == "run" => run::run(rest),
@@ -536,6 +548,140 @@ fn outfit_conform(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Dress the declared stack layer by layer: every layer is pushed against the
+/// accumulated obstacle of the body plus the fitted layers below it, then the
+/// fitted outputs are graded by the `garment stack` pair rule.
+///
+/// One frame, like `garment push`: the OBJs' own coordinates, so the reported
+/// numbers repeat on a re-grade of the written files. A layer that cannot be
+/// fitted is a typed refusal naming the pair; a stack that fits but contacts
+/// illegally is a reported failed verdict, and the report, not the exit code,
+/// carries it.
+fn outfit_stack_fit(args: &[String]) -> ExitCode {
+    match outfit_stack_fit_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("outfit stack-fit: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn outfit_stack_fit_inner(args: &[String]) -> Result<(), String> {
+    let mut json = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let flags = parse_flags(&rest)?;
+    if let Some(key) = flags
+        .keys()
+        .find(|key| !matches!(key.as_str(), "outfit" | "body" | "tolerance" | "passes"))
+    {
+        return Err(format!("unknown option `--{key}`"));
+    }
+    let manifest = PathBuf::from(required(&flags, "outfit")?);
+    let tolerance = flag_tolerance(&flags)?
+        .ok_or("`--tolerance` is required: it states the accepted visible depth")?;
+    let passes = match flags.get("passes") {
+        None => None,
+        Some(value) => Some(
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("`--passes` must be a whole number, got `{value}`"))?,
+        ),
+    };
+    let outcome = ops::stack_fit(&ops::StackFitParams {
+        manifest,
+        tolerance,
+        body: flags.get("body").map(PathBuf::from),
+        passes,
+    })
+    .map_err(|error| error.to_string())?;
+    if json {
+        println!("{}", outcome.to_json());
+        return Ok(());
+    }
+    println!(
+        "{}: {} layers over {}, tolerance {:.6}, pass budget {}, units: source",
+        outcome.manifest.display(),
+        outcome.steps.len(),
+        outcome.body.display(),
+        outcome.tolerance,
+        outcome.passes
+    );
+    for step in &outcome.steps {
+        println!(
+            "  step order {:<3} {:<12} obstacle {} ({} v / {} t, fnv1a64 {}) -> {}",
+            step.order,
+            step.layer,
+            step.obstacle.surface,
+            step.obstacle.vertices,
+            step.obstacle.triangles,
+            step.obstacle.digest,
+            step.out.display()
+        );
+        println!(
+            "    fit: {} violation(s) (max {:.6}) -> {} (max {:.6}) in {} pass(es); held {}",
+            step.push.before_violations,
+            step.push.before_max,
+            step.push.violations,
+            step.push.max,
+            step.push.passes,
+            step.push.held
+        );
+        let contacts: Vec<String> = step
+            .contact_breakdown
+            .iter()
+            .map(|(id, count)| format!("{id} {count}"))
+            .collect();
+        println!("    graded contact: {}", contacts.join(", "));
+    }
+    println!(
+        "pairs: {} graded, {} penetration, {} boot-mode violations",
+        outcome.stack.pairs.len(),
+        outcome.stack.penetrations,
+        outcome.stack.boot_violations
+    );
+    let width = outcome
+        .stack
+        .pairs
+        .iter()
+        .map(|pair| pair.outer.len().max(pair.inner.len()))
+        .max()
+        .unwrap_or(0);
+    for pair in &outcome.stack.pairs {
+        println!(
+            "  {:<width$} vs {:<width$} {:<20} visible {} max {:.6}, violations {}",
+            pair.outer,
+            pair.inner,
+            pair.classification.id(),
+            pair.visible,
+            pair.visible_max,
+            pair.violations
+        );
+    }
+    if outcome.stack.pass {
+        println!(
+            "verdict: pass (tolerance {:.6}; no penetration, no boot-mode violation)",
+            outcome.tolerance
+        );
+    } else {
+        println!(
+            "verdict: fail (tolerance {:.6}; {} penetration, {} boot-mode violation)",
+            outcome.tolerance, outcome.stack.penetrations, outcome.stack.boot_violations
+        );
+    }
+    println!(
+        "note: layer k is pushed against accumulated[body, fitted layers 1..k-1], never the nude body silently; the step row names the obstacle and counts graded vertices per member; the fitted files are then graded by the `garment stack` pair rule, and the report, not the exit code, carries the verdict"
+    );
+    Ok(())
 }
 
 fn bake(args: &[String]) -> ExitCode {

@@ -25,6 +25,7 @@
 //! point at, with typed refusals for a misplaced head, foot or opened seam and
 //! plain open-socket reports when no part ships.
 
+pub mod accumulated_surface;
 pub mod actor;
 pub mod aura;
 pub mod check;
