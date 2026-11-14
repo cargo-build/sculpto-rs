@@ -66,6 +66,14 @@ body_min = float(cfg.get("body_min", "0.002"))
 self_collision = int(cfg.get("self_collision", 1))
 quality = int(cfg.get("quality", 10))
 ground = int(cfg.get("ground", 0))
+frame_end_mode = cfg.get("frame_end_mode", "action")
+write_body_frames = int(cfg.get("body_frames", 0))
+pin_policy = cfg.get("pin_policy", "explicit")
+pin_height = float(cfg.get("pin_height", "0.85"))
+pin_band = float(cfg.get("pin_band", "0.10"))
+if pin_policy == "component_top":
+    pin_components = 1
+    pin_component_band = pin_band
 os.makedirs(out_dir, exist_ok=True)
 
 scene = bpy.context.scene
@@ -88,6 +96,21 @@ bpy.context.view_layer.objects.active = garment
 bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 garment.name = "SculptoGarment0"
 uv_layer = garment.data.uv_layers.active
+
+# The policy names the anchor; the numbers come from its parameters. The old
+# absolute `pin_z` stays for explicit reproductions.
+if pin_policy == "waist":
+    pin_z = max((garment.matrix_world @ v.co).z for v in garment.data.vertices)
+elif pin_policy == "shoulder":
+    body_z = [(body.matrix_world @ v.co).z for v in body.data.vertices]
+    pin_z = min(body_z) + pin_height * (max(body_z) - min(body_z))
+elif pin_policy == "component_top":
+    # The per-component band below is the only anchor; no global z line.
+    pin_z = float("inf")
+elif pin_policy == "explicit":
+    pass
+else:
+    raise SystemExit(f"unsupported pin_policy={pin_policy}")
 
 pinned = [
     v.index for v in garment.data.vertices if (garment.matrix_world @ v.co).z >= pin_z
@@ -174,7 +197,10 @@ collision.collision_quality = 4
 modifier.point_cache.frame_start = 0
 modifier.point_cache.frame_end = frame_end_cap
 
-frame_end = min(int(action.frame_range[1]), frame_end_cap)
+if frame_end_mode == "scene":
+    frame_end = frame_end_cap
+else:
+    frame_end = min(int(action.frame_range[1]), frame_end_cap)
 scene.frame_start = 0
 scene.frame_end = frame_end
 
@@ -199,6 +225,8 @@ report = {
         "body_distance_min": body_min, "ground": bool(ground),
     },
     "frame_range": [0, frame_end],
+    "frame_end_mode": frame_end_mode,
+    "pin_policy": pin_policy,
     "frames": {},
 }
 
@@ -214,6 +242,17 @@ start = time.time()
 for frame in range(0, frame_end + 1):
     scene.frame_set(frame)
     depsgraph = bpy.context.evaluated_depsgraph_get()
+    if write_body_frames and frame in samples:
+        body_eval = body.evaluated_get(depsgraph)
+        body_mesh = body_eval.to_mesh()
+        body_sim = [body.matrix_world @ vertex.co for vertex in body_mesh.vertices]
+        write_obj(
+            os.path.join(out_dir, f"body_{frame}.obj"),
+            body_sim,
+            body_mesh.polygons,
+            None,
+        )
+        body_eval.to_mesh_clear()
     evaluated = garment.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh()
     sim = [garment.matrix_world @ vertex.co for vertex in mesh.vertices]

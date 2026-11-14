@@ -5,6 +5,7 @@
 //! same parser the adapters will use.
 
 mod actor;
+mod blender;
 mod garment_control;
 mod garment_uv;
 mod mcp;
@@ -74,6 +75,8 @@ commands:
   garment control-separate [options] apply the declared bounded local contact repair
   garment control-cuts [options] validate declared source-opening cuts and print the plan
   garment uv-check [options] qualify triangle-corner UV area and atlas bounds
+  blender cloth-bake --request <json> [options]
+                        run the pinned Blender cloth bake and validate its artifacts
   run --cmd <id>        dispatch one command id and print its JSON envelope
   commands [--json]     list every command id with its mutation class
   mcp                   serve the MCP surface (JSON-RPC 2.0 over stdio)
@@ -306,6 +309,7 @@ fn main() -> ExitCode {
             outfit_stack_fit(rest)
         }
         [command, rest @ ..] if command == "garment" => garment(rest),
+        [command, rest @ ..] if command == "blender" => blender::run(rest),
         [command, rest @ ..] if command == "run" => run::run(rest),
         [command, rest @ ..] if command == "commands" => run::commands(rest),
         [command] if command == "mcp" => mcp::serve(),

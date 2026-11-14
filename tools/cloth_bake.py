@@ -66,6 +66,8 @@ collider_margin = float(cfg.get("collider_margin", 0.0))
 edge_contacts = int(cfg.get("edge_contacts", 0))
 collision_radius = float(cfg.get("collision_radius", 0.004))
 sample = int(cfg.get("sample", 10))
+frame_end_mode = cfg.get("frame_end_mode", "action")
+write_body_frames = int(cfg.get("body_frames", 0))
 
 # `system_resource` resolves directories; file paths must be joined on.
 ASSETS = os.path.join(
@@ -275,10 +277,16 @@ for shell in shells:
 
 # --- clip + settle pre-roll ------------------------------------------------
 armature.animation_data.action = action
-frame_end = min(int(action.frame_range[1]), frame_end_cap)
+if frame_end_mode == "scene":
+    # Cycle modifiers extend playback past the action's keyframe range; the
+    # caller explicitly requested a longer bake.
+    frame_end = frame_end_cap
+else:
+    frame_end = min(int(action.frame_range[1]), frame_end_cap)
 scene.frame_start = 0
 scene.frame_end = frame_end
 report["frame_range"] = [scene.frame_start, frame_end]
+report["frame_end_mode"] = frame_end_mode
 
 # --- simulate (XPBD simulation zones need sequential stepping) ------------
 start = time.time()
@@ -315,6 +323,17 @@ report["qualify"] = {shell.name: {"worst_min_distance": 9.9, "inside_any_frame":
 qualify = report["qualify"]
 for frame in range(scene.frame_start, frame_end + 1):
     scene.frame_set(frame)
+    if write_body_frames and frame in samples:
+        body_eval = body.evaluated_get(depsgraph)
+        body_mesh = body_eval.to_mesh()
+        body_sim = [body.matrix_world @ v.co for v in body_mesh.vertices]
+        write_obj(
+            os.path.join(out_dir, f"body_{frame}.obj"),
+            body_sim,
+            body_mesh.polygons,
+            None,
+        )
+        body_eval.to_mesh_clear()
     if frame not in samples:
         # Qualification runs on every frame even when no OBJ is written.
         for shell in shells:

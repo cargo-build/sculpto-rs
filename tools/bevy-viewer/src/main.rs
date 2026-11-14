@@ -2,6 +2,7 @@
 //! (morph animation), render an offscreen frame, save it as PNG, exit.
 //! Also provides `--headless --report --glb <path>` count reporting for consumer acceptance.
 use bevy::asset::RenderAssetUsages;
+use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::mesh::morph::{MorphWeights, MAX_MORPH_WEIGHTS};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -59,6 +60,7 @@ pub struct CountReport {
 struct ViewerConfig {
     report_mode: bool,
     debug_scene: bool,
+    interactive: bool,
     asset_file: String,
 }
 
@@ -66,6 +68,7 @@ struct CliOptions {
     report: bool,
     headless: bool,
     debug_scene: bool,
+    interactive: bool,
     glb_path: Option<String>,
     units: usize,
     bench: bool,
@@ -78,6 +81,7 @@ fn parse_args() -> CliOptions {
         report: std::env::var("SCULPTO_VIEWER_REPORT").is_ok(),
         headless: std::env::var("SCULPTO_VIEWER_HEADLESS").is_ok(),
         debug_scene: std::env::var("SCULPTO_VIEWER_DEBUG_SCENE").is_ok(),
+        interactive: std::env::var("SCULPTO_VIEWER_INTERACTIVE").is_ok(),
         glb_path: std::env::var("SCULPTO_VIEWER_GLB")
             .ok()
             .or_else(|| std::env::var("SCULPTO_VIEWER_ASSET").ok()),
@@ -90,6 +94,7 @@ fn parse_args() -> CliOptions {
             "--report" => options.report = true,
             "--headless" => options.headless = true,
             "--debug-scene" => options.debug_scene = true,
+            "--interactive" => options.interactive = true,
             "--bench" => options.bench = true,
             "--uncapped" => options.uncapped = true,
             "--glb" => {
@@ -150,6 +155,7 @@ fn main() {
     let config = ViewerConfig {
         report_mode: options.report,
         debug_scene: options.debug_scene,
+        interactive: options.interactive,
         asset_file,
     };
     let asset_plugin = AssetPlugin {
@@ -157,22 +163,40 @@ fn main() {
         ..Default::default()
     };
 
-    App::new()
-        .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(interval))
-        .insert_resource(Units(options.units))
-        .insert_resource(Bench(options.bench))
-        .insert_resource(config)
-        .add_plugins(
+    let mut app = App::new();
+    if options.interactive {
+        app.add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
-                    primary_window: None,
-                    primary_cursor_options: None,
-                    exit_condition: bevy::window::ExitCondition::DontExit,
-                    close_when_requested: false,
+                    primary_window: Some(Window {
+                        title: "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset"
+                            .to_string(),
+                        resolution: (1280, 900).into(),
+                        ..default()
+                    }),
+                    ..default()
                 })
                 .set(ImagePlugin::default())
                 .set(asset_plugin),
-        )
+        );
+    } else {
+        app.add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(interval))
+            .add_plugins(
+                DefaultPlugins
+                    .set(WindowPlugin {
+                        primary_window: None,
+                        primary_cursor_options: None,
+                        exit_condition: bevy::window::ExitCondition::DontExit,
+                        close_when_requested: false,
+                    })
+                    .set(ImagePlugin::default())
+                    .set(asset_plugin),
+            );
+    }
+
+    app.insert_resource(Units(options.units))
+        .insert_resource(Bench(options.bench))
+        .insert_resource(config)
         .register_type::<Transform>()
         .register_type::<GlobalTransform>()
         .register_type::<bevy::transform::components::TransformTreeChanged>()
@@ -203,7 +227,10 @@ fn main() {
         .register_type::<ViewVisibility>()
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(GlobalAmbientLight {
-            brightness: env_f32("SCULPTO_VIEWER_AMBIENT", 0.0),
+            brightness: env_f32(
+                "SCULPTO_VIEWER_AMBIENT",
+                if options.interactive { 120.0 } else { 0.0 },
+            ),
             ..default()
         })
         .add_systems(Startup, setup)
@@ -216,6 +243,7 @@ fn main() {
                 benchmark,
                 debug_scene,
                 debug_playback,
+                orbit_controls,
             ),
         )
         .run();
@@ -242,23 +270,28 @@ fn setup(
     units: Res<Units>,
     config: Res<ViewerConfig>,
 ) {
-    let mut image = Image::new(
-        Extent3d {
-            width: 960,
-            height: 900,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        vec![0; 960 * 900 * 4],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
-        | bevy::render::render_resource::TextureUsages::COPY_SRC
-        | bevy::render::render_resource::TextureUsages::COPY_DST
-        | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
-    let handle = images.add(image);
-    commands.insert_resource(Target(handle.clone()));
+    let mut target_handle = None;
+    if !config.interactive {
+        let mut image = Image::new(
+            Extent3d {
+                width: 960,
+                height: 900,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            vec![0; 960 * 900 * 4],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage =
+            bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+                | bevy::render::render_resource::TextureUsages::COPY_SRC
+                | bevy::render::render_resource::TextureUsages::COPY_DST
+                | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+        let handle = images.add(image);
+        commands.insert_resource(Target(handle.clone()));
+        target_handle = Some(handle);
+    }
     if config.debug_scene {
         let at_cap = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS], None).is_ok();
         let over_cap = MorphWeights::new(vec![0.0; MAX_MORPH_WEIGHTS + 1], None)
@@ -281,12 +314,16 @@ fn setup(
     } else {
         (Vec3::new(2.2, 1.3, 2.8), Vec3::new(0.0, 0.9, 0.0))
     };
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
         bevy::core_pipeline::tonemapping::Tonemapping::None,
-        bevy::camera::RenderTarget::Image(handle.into()),
         Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
+    if let Some(handle) = target_handle {
+        camera.insert(bevy::camera::RenderTarget::Image(handle.into()));
+    } else {
+        commands.insert_resource(OrbitCamera::looking_at(camera_eye, camera_target));
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: 10_000.0,
@@ -294,6 +331,17 @@ fn setup(
         },
         Transform::from_xyz(3.0, 5.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+    if config.interactive {
+        // A second, weaker fill from the opposite side keeps the garment's
+        // back faces readable while the orbit camera moves.
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 3_000.0,
+                ..default()
+            },
+            Transform::from_xyz(-3.0, 2.0, -2.5).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+    }
 
     let gltf_handle: Handle<bevy::gltf::Gltf> = asset_server.load(config.asset_file.clone());
     commands.insert_resource(GltfRoot(gltf_handle));
@@ -328,6 +376,99 @@ fn setup(
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Orbit state for the interactive review window.
+///
+/// `looking_at` seeds the state from the same eye/target the headless camera
+/// uses, so the first interactive frame matches the captured review view.
+#[derive(Resource)]
+struct OrbitCamera {
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    home: (Vec3, f32, f32, f32),
+}
+
+impl OrbitCamera {
+    fn looking_at(eye: Vec3, target: Vec3) -> Self {
+        let offset = eye - target;
+        let distance = offset.length().max(0.2);
+        let yaw = offset.x.atan2(offset.z);
+        let pitch = (offset.y / distance).asin();
+        Self {
+            target,
+            yaw,
+            pitch,
+            distance,
+            home: (target, yaw, pitch, distance),
+        }
+    }
+
+    fn reset(&mut self) {
+        let (target, yaw, pitch, distance) = self.home;
+        self.target = target;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.distance = distance;
+    }
+}
+
+/// Interactive-only orbit camera: LMB drag orbits, RMB drag pans, wheel zooms,
+/// R resets. It never runs in the headless capture path.
+fn orbit_controls(
+    config: Res<ViewerConfig>,
+    orbit: Option<ResMut<OrbitCamera>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut motion: MessageReader<MouseMotion>,
+    mut wheel: MessageReader<MouseWheel>,
+    mut cameras: Query<&mut Transform, With<Camera3d>>,
+) {
+    if !config.interactive {
+        return;
+    }
+    let Some(mut orbit) = orbit else {
+        return;
+    };
+
+    let mut delta = Vec2::ZERO;
+    for event in motion.read() {
+        delta += event.delta;
+    }
+    let mut zoom = 0.0;
+    for event in wheel.read() {
+        zoom += match event.unit {
+            bevy::input::mouse::MouseScrollUnit::Line => event.y,
+            bevy::input::mouse::MouseScrollUnit::Pixel => event.y / 50.0,
+        };
+    }
+
+    if keys.just_pressed(KeyCode::KeyR) {
+        orbit.reset();
+    }
+    if buttons.pressed(MouseButton::Left) {
+        orbit.yaw -= delta.x * 0.005;
+        orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
+    }
+    if buttons.pressed(MouseButton::Right) {
+        let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+        let right = rotation * Vec3::X;
+        let up = rotation * Vec3::Y;
+        let pan_scale = orbit.distance * 0.0015;
+        orbit.target += (-right * delta.x + up * delta.y) * pan_scale;
+    }
+    if zoom.abs() > f32::EPSILON {
+        orbit.distance = (orbit.distance * (1.0 - zoom * 0.12)).clamp(0.2, 30.0);
+    }
+
+    let Ok(mut transform) = cameras.single_mut() else {
+        return;
+    };
+    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+    transform.translation = orbit.target + rotation * Vec3::Z * orbit.distance;
+    transform.look_at(orbit.target, Vec3::Y);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -481,7 +622,7 @@ fn parse_series(spec: &str) -> Option<(u32, u32, u32)> {
 #[allow(clippy::too_many_arguments)]
 fn capture_once(
     config: Res<ViewerConfig>,
-    target: Res<Target>,
+    target: Option<Res<Target>>,
     bench: Res<Bench>,
     mut frames: Local<u32>,
     mut captured: Local<bool>,
@@ -489,9 +630,12 @@ fn capture_once(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if bench.0 || config.report_mode || config.debug_scene {
+    if bench.0 || config.report_mode || config.debug_scene || config.interactive {
         return;
     }
+    let Some(target) = target else {
+        return;
+    };
     *frames += 1;
     if *frames < 240 {
         return;

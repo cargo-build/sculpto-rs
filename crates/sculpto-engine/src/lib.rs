@@ -37,6 +37,8 @@ pub enum CommandId {
     CommandsList,
     /// Resolve a slider preset into offsets and apply it to a source NIF.
     Bake,
+    /// Run a pinned Blender cloth bake and return its validated result.
+    BlenderClothBake,
     /// Build the prepared body from declared parts and seal its joints.
     BodyAssemble,
     /// Audit attached body parts against their sockets; read-only.
@@ -91,6 +93,7 @@ impl CommandId {
             CommandId::Version => "version",
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
+            CommandId::BlenderClothBake => "blender.cloth_bake",
             CommandId::BodyAssemble => "body.assemble",
             CommandId::BodyAuditParts => "body.audit_parts",
             CommandId::BodySealJoints => "body.seal_joints",
@@ -288,6 +291,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: handlers::bake_schema,
         handler: handlers::bake,
+    },
+    Spec {
+        id: CommandId::BlenderClothBake,
+        summary: "Run one pinned Blender cloth bake and return its validated result.",
+        mutates: true,
+        stub: false,
+        schema: handlers::blender_cloth_bake_schema,
+        handler: handlers::blender_cloth_bake,
     },
     Spec {
         id: CommandId::BodyAssemble,
@@ -549,6 +560,7 @@ mod tests {
         assert!(dispatch("version", &Value::Null).is_ok());
         for id in [
             "bake",
+            "blender.cloth_bake",
             "outfit.fit",
             "outfit.stack_fit",
             "outfit.dress",

@@ -91,8 +91,44 @@ pub fn glb_file_schema() -> Value {
     schema_for::<ops::GlbFileParams>()
 }
 
+/// Schema of the versioned Blender cloth-bake request.
+pub fn blender_cloth_bake_schema() -> Value {
+    sculpto_blender::request_schema()
+}
+
 fn schema_for<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).expect("schema serialises")
+}
+
+/// Run one pinned Blender cloth bake and return its validated result.
+pub fn blender_cloth_bake(input: &Value) -> Result<Value, CommandError> {
+    let request: sculpto_blender::ClothBakeRequest = serde_json::from_value(input.clone())
+        .map_err(|error| {
+            CommandError::new(
+                ErrorKind::InvalidRequest,
+                "request_json",
+                format!("cloth-bake request does not match the schema: {error}"),
+            )
+        })?;
+    let outcome = sculpto_blender::run(request).map_err(|error| {
+        let kind = match error.kind() {
+            sculpto_blender::BlenderErrorKind::InvalidRequest
+            | sculpto_blender::BlenderErrorKind::InvalidParams => ErrorKind::InvalidParams,
+            sculpto_blender::BlenderErrorKind::NotFound => ErrorKind::NotFound,
+            sculpto_blender::BlenderErrorKind::Refused => ErrorKind::Refused,
+            sculpto_blender::BlenderErrorKind::Environment
+            | sculpto_blender::BlenderErrorKind::Timeout
+            | sculpto_blender::BlenderErrorKind::Io => ErrorKind::Io,
+        };
+        CommandError::new(kind, error.code(), error.message().to_string())
+    })?;
+    serde_json::to_value(&outcome.result).map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidParams,
+            "result_json",
+            format!("cannot serialize the bake result: {error}"),
+        )
+    })
 }
 
 pub fn version(_input: &Value) -> Result<Value, CommandError> {

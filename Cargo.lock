@@ -602,11 +602,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sculpto-blender"
+version = "0.2.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "sculpto-cli"
 version = "0.2.0"
 dependencies = [
  "gltf",
  "sculpto-bake",
+ "sculpto-blender",
  "sculpto-core",
  "sculpto-engine",
  "sculpto-mesh",
@@ -632,6 +643,7 @@ dependencies = [
  "glam 0.34.3",
  "schemars",
  "sculpto-bake",
+ "sculpto-blender",
  "sculpto-core",
  "sculpto-gltf",
  "sculpto-mesh",
