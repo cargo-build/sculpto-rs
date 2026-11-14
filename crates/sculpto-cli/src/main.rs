@@ -1012,13 +1012,20 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         outcome.offset_max
     );
     if let Some(provenance) = &outcome.provenance {
+        // The embedded-reference digest covers position bytes, not the NIF file;
+        // say so, because `sha256sum <nif>` cannot reproduce it.
+        let digest_domain = match provenance.reference_source {
+            "embedded_nif" => " (embedded position bytes)",
+            _ => "",
+        };
         println!(
-            "reference: {} `{}` ({} vertices / {} triangles), sha256 {}",
+            "reference: {} `{}` ({} vertices / {} triangles), sha256 {}{}",
             provenance.reference_source,
             provenance.reference_path.display(),
             provenance.reference_vertices,
             provenance.reference_triangles,
-            provenance.reference_body_sha256
+            provenance.reference_body_sha256,
+            digest_domain
         );
         match provenance.target_triangles {
             Some(triangles) => println!(
@@ -1036,6 +1043,9 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
             ),
         }
         println!("transport: {}", provenance.transport_method);
+        if let Some(range) = provenance.normal_offset_range {
+            println!("normal_offset_range: [{:.6}, {:.6}]", range[0], range[1]);
+        }
     }
     if let Some((body, garment, difference)) = outcome.follow {
         println!(

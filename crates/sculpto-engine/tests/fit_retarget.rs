@@ -255,7 +255,8 @@ fn reference_target_topology_mismatch_names_both_counts() {
     assert!(message.contains("4 vertices / 2 triangles"), "{message}");
     assert!(message.contains("3 vertices / 1 triangles"), "{message}");
 
-    // Same vertex count, different ordered triangles.
+    // Same vertex count, different ordered triangles: the refusal must name the
+    // ordering difference, not repeat identical counts on both sides.
     let retri = fixture.path("retri.obj");
     obj::write_obj(&retri, &quad(0.0), &[[0, 1, 3], [1, 2, 3]]).expect("retri body");
     let error = fit(
@@ -266,7 +267,13 @@ fn reference_target_topology_mismatch_names_both_counts() {
     .expect_err("triangle mismatch must refuse");
     assert_eq!(error.code(), "reference_target_topology_mismatch");
     let message = error.to_string();
-    assert!(message.contains("2 triangles"), "{message}");
+    assert!(
+        message.contains("ordered triangle lists differ"),
+        "{message}"
+    );
+    assert!(message.contains("first at index 0"), "{message}");
+    assert!(message.contains("[0, 1, 2]"), "{message}");
+    assert!(message.contains("[0, 1, 3]"), "{message}");
 }
 
 /// Without `--body-ref` the legacy topology refusal names the conversion path.
@@ -303,6 +310,7 @@ fn provenance_rows_and_transport_in_both_modes() {
     assert_eq!(legacy["reference_triangles"], 2);
     assert_eq!(legacy["target_vertices"], 4);
     assert_eq!(legacy["target_triangles"], Value::Null);
+    assert_eq!(legacy["normal_offset_range"], Value::Null);
     assert_eq!(legacy["reference_path"], scene.nif.display().to_string());
     assert_eq!(legacy["target_body_sha256"], file_sha256(&scene.morphed));
     assert_eq!(
@@ -334,6 +342,89 @@ fn provenance_rows_and_transport_in_both_modes() {
         retarget["reference_body_sha256"],
         retarget["target_body_sha256"]
     );
+    // The garment quad sits 0.5 above the reference plane along +z, so every
+    // signed normal offset is exactly 0.5.
+    assert_eq!(retarget["normal_offset_range"], json!([0.5, 0.5]));
+}
+
+/// The binding must use the external `--body-ref`, not the embedded body shape or
+/// the target: a reference geometrically distinct from both changes the output.
+#[test]
+fn retarget_binds_the_external_reference_not_the_embedded_body() {
+    let fixture = Fixture::new();
+    let scene = scene(&fixture);
+
+    // A 2x-scaled reference: same topology as the embedded Body and the target,
+    // but different geometry, so binding to the wrong control source is visible.
+    let scaled: Vec<[f32; 3]> = quad(0.0)
+        .iter()
+        .map(|[x, y, z]| [x * 2.0, y * 2.0, *z])
+        .collect();
+    let scaled_ref = fixture.path("scaled-reference.obj");
+    obj::write_obj(&scaled_ref, &scaled, &quad_triangles()).expect("scaled reference");
+
+    // Hold the target fixed; only the reference changes between the two fits.
+    let target = &scene.identity;
+    let out_unscaled = fixture.path("out-unscaled.obj");
+    fit(
+        &fixture,
+        &scene,
+        json!({ "body": target, "body_ref": scene.reference, "out": out_unscaled }),
+    )
+    .expect("unscaled reference fit");
+    let out_scaled = fixture.path("out-scaled.obj");
+    fit(
+        &fixture,
+        &scene,
+        json!({ "body": target, "body_ref": scaled_ref, "out": out_scaled }),
+    )
+    .expect("scaled reference fit");
+
+    let unscaled = positions(&out_unscaled);
+    let scaled_positions = positions(&out_scaled);
+    assert_ne!(
+        unscaled, scaled_positions,
+        "the output must change with the reference, not stay on the embedded body"
+    );
+
+    // Garment vertex 2 [2,2,0.5] binds at in-plane (0,0.5) on the 2x reference and
+    // lands at [1,1,0.5] on the unscaled target; binding to the embedded/unscaled
+    // body would instead leave it at [2,2,0.5].
+    let v2 = scaled_positions[2];
+    assert!(
+        (v2[0] - 1.0).abs() < 1e-5 && (v2[1] - 1.0).abs() < 1e-5 && (v2[2] - 0.5).abs() < 1e-5,
+        "expected the scaled-reference transport [1,1,0.5], got {v2:?}"
+    );
+    assert!(
+        (unscaled[2][0] - 2.0).abs() < 1e-5,
+        "the unscaled reference should keep vertex 2 at x=2"
+    );
+}
+
+/// Swapping reference and target must be refused, not fit: a control source that
+/// conflated the two would transport instead of refusing the ordered-list mismatch.
+#[test]
+fn swapped_reference_and_target_are_refused_not_fit() {
+    let fixture = Fixture::new();
+    let scene = scene(&fixture);
+    let retri = fixture.path("retri.obj");
+    obj::write_obj(&retri, &quad(0.0), &[[0, 1, 3], [1, 2, 3]]).expect("retri body");
+    let never = fixture.path("never.obj");
+
+    for (reference, body) in [(&scene.reference, &retri), (&retri, &scene.reference)] {
+        let error = fit(
+            &fixture,
+            &scene,
+            json!({ "body": body, "body_ref": reference, "out": never }),
+        )
+        .expect_err("swapped control sources must refuse");
+        assert_eq!(error.code(), "reference_target_topology_mismatch");
+        assert!(
+            error.to_string().contains("ordered triangle lists differ"),
+            "{error}"
+        );
+        assert!(!never.exists(), "a refused retarget left a file behind");
+    }
 }
 
 /// Missing garment and body shapes are refused with the available list.

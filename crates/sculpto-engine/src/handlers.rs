@@ -298,6 +298,7 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
         result["target_vertices"] = json!(provenance.target_vertices);
         result["target_triangles"] = json!(provenance.target_triangles);
         result["transport_method"] = json!(provenance.transport_method);
+        result["normal_offset_range"] = json!(provenance.normal_offset_range);
     }
     Ok(result)
 }

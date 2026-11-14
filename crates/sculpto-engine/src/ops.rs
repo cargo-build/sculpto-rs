@@ -1299,6 +1299,10 @@ pub struct FitProvenance {
     pub target_triangles: Option<usize>,
     /// `nearest_vertex_offset` or `surface_triangle_frame`.
     pub transport_method: &'static str,
+    /// Signed normal-offset range of the garment against the reference control
+    /// surface, from the triangle-frame binding; `None` on the legacy transport,
+    /// which stores no normal frame. @req DECL0013
+    pub normal_offset_range: Option<[f64; 2]>,
 }
 
 /// The collision surface a fit actually measured against.
@@ -1418,6 +1422,7 @@ fn fit_legacy(
         target_vertices: body.len(),
         target_triangles: None,
         transport_method: "nearest_vertex_offset",
+        normal_offset_range: None,
     };
     Ok(FitOutcome {
         out: params.out.clone(),
@@ -1446,16 +1451,30 @@ fn fit_retarget(
     let (reference, reference_triangles) = read_obj_surface(reference_path)?;
     let (body, body_triangles) = read_obj_surface(&params.body)?;
     if reference.len() != body.len() || reference_triangles != body_triangles {
+        let mut message = format!(
+            "reference body has {} vertices / {} triangles, but target body has {} vertices / {} triangles",
+            reference.len(),
+            reference_triangles.len(),
+            body.len(),
+            body_triangles.len()
+        );
+        // Equal counts mean the ordered triangle lists differ; name the first
+        // divergent triangle so the refusal is actionable, not self-contradictory.
+        if reference.len() == body.len() && reference_triangles.len() == body_triangles.len() {
+            let first = reference_triangles
+                .iter()
+                .zip(body_triangles.iter())
+                .position(|(reference, target)| reference != target)
+                .expect("equal counts with differing lists have a first difference");
+            message.push_str(&format!(
+                "; ordered triangle lists differ (first at index {first}: reference {:?}, target {:?})",
+                reference_triangles[first], body_triangles[first]
+            ));
+        }
         return Err(CommandError::new(
             ErrorKind::Refused,
             "reference_target_topology_mismatch",
-            format!(
-                "reference body has {} vertices / {} triangles, but target body has {} vertices / {} triangles",
-                reference.len(),
-                reference_triangles.len(),
-                body.len(),
-                body_triangles.len()
-            ),
+            message,
         ));
     }
     let binding = SurfaceBinding::bind(&garment.positions, &reference, &reference_triangles)
@@ -1483,6 +1502,7 @@ fn fit_retarget(
         target_vertices: body.len(),
         target_triangles: Some(body_triangles.len()),
         transport_method: "surface_triangle_frame",
+        normal_offset_range: Some(binding.normal_offset_range()),
     };
     Ok(FitOutcome {
         out: params.out.clone(),

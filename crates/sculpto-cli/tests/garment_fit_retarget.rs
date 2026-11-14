@@ -142,6 +142,7 @@ fn body_ref_fits_without_body_shape_and_identity_is_exact() {
         "{stdout}"
     );
     assert!(stdout.contains("sha256 "), "{stdout}");
+    assert!(stdout.contains("normal_offset_range:"), "{stdout}");
 
     let authored = fixture.path("authored.obj");
     let (ok, _, stderr) = run(&[
@@ -168,7 +169,7 @@ fn retarget_differs_from_legacy_argv() {
     let scene = scene(&fixture);
 
     let legacy = fixture.path("legacy.obj");
-    let (ok, _, stderr) = run(&[
+    let (ok, legacy_stdout, stderr) = run(&[
         "garment",
         "fit",
         "--nif",
@@ -183,6 +184,11 @@ fn retarget_differs_from_legacy_argv() {
         legacy.to_str().expect("out"),
     ]);
     assert!(ok, "legacy fit failed: {stderr}");
+    // The embedded-reference digest covers position bytes, not the NIF file.
+    assert!(
+        legacy_stdout.contains("(embedded position bytes)"),
+        "{legacy_stdout}"
+    );
 
     let retarget = fixture.path("retarget.obj");
     let (ok, _, stderr) = run(&[
