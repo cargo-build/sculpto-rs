@@ -18,6 +18,7 @@ pub mod errors;
 mod handlers;
 pub mod obj;
 pub mod ops;
+mod parts;
 pub mod rules;
 
 /// A stable command identifier.
@@ -34,6 +35,8 @@ pub enum CommandId {
     CommandsList,
     /// Resolve a slider preset into offsets and apply it to a source NIF.
     Bake,
+    /// Audit attached body parts against their sockets; read-only.
+    BodyAuditParts,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,
     /// Write garment offsets for an authored body slider set.
@@ -76,6 +79,7 @@ impl CommandId {
             CommandId::Version => "version",
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
+            CommandId::BodyAuditParts => "body.audit_parts",
             CommandId::OutfitFit => "outfit.fit",
             CommandId::OutfitConform => "outfit.conform",
             CommandId::OutfitInspect => "outfit.inspect",
@@ -267,6 +271,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: handlers::bake_schema,
         handler: handlers::bake,
+    },
+    Spec {
+        id: CommandId::BodyAuditParts,
+        summary: "Audit attached body parts against their sockets: slot, coverage and coincident-seam residuals per part, with open sockets reported; read-only.",
+        mutates: false,
+        stub: false,
+        schema: parts::schema,
+        handler: parts::audit,
     },
     Spec {
         id: CommandId::OutfitFit,

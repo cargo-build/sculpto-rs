@@ -43,6 +43,8 @@ commands:
   export-obj [options]  read a NIF and write one shape as an OBJ
   export-nif [options]  re-encode NIF shapes for a Skyrim target (one shape or a bundle)
   export-tri [options]  write sparse morph targets as a Skyrim `.tri` slider file
+  body audit-parts [options]
+                        audit attached body parts against their sockets (read-only)
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
   outfit conform --nif <path> --shape <name> --body-shape <name> --project <osp>
                  --presets <xml> --preset <name> --set <name> --out <osd>
@@ -110,6 +112,12 @@ export-nif options:
 export-tri options:
   --spec <json>      morph document: `shape`, `vertex_count` and `morphs`
   --out <path>       output `.tri`
+
+body audit-parts options (read-only: measures, never writes or corrects):
+  --body <obj>        multi-part body OBJ: the torso shell plus its attached
+                      part shells, as shipped
+  --part <obj>        replacement part OBJ audited against the body's own
+                      sockets; the shipped copy stays the baseline (repeatable)
 
 garment fit options:
   --nif <path>         garment NIF
@@ -225,6 +233,9 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
         [command, rest @ ..] if command == "export-nif" => export_nif(rest),
         [command, rest @ ..] if command == "export-tri" => export_tri(rest),
+        [command, action, rest @ ..] if command == "body" && action == "audit-parts" => {
+            body_audit_parts(rest)
+        }
         [command, action, rest @ ..] if command == "outfit" && action == "inspect" => {
             outfit_inspect(rest)
         }
@@ -431,6 +442,37 @@ fn required<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a s
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| format!("`--{name}` is required"))
+}
+
+/// `body audit-parts`: read-only socket audit; `--part` repeats, so the flags
+/// are parsed here instead of through the single-value [`parse_flags`].
+fn body_audit_parts(args: &[String]) -> ExitCode {
+    let mut body: Option<String> = None;
+    let mut parts: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(key) = iter.next() {
+        let reject = |message: String| -> ExitCode {
+            eprintln!("body audit-parts: {message}");
+            ExitCode::from(2)
+        };
+        let Some(name) = key.strip_prefix("--") else {
+            return reject(format!("unexpected argument `{key}`"));
+        };
+        let Some(value) = iter.next() else {
+            return reject(format!("`--{name}` needs a value"));
+        };
+        match name {
+            "body" => body = Some(value.clone()),
+            "part" => parts.push(value.clone()),
+            other => return reject(format!("unknown option `--{other}`")),
+        }
+    }
+    let Some(body) = body else {
+        eprintln!("body audit-parts: `--body` is required");
+        return ExitCode::from(2);
+    };
+    let input = serde_json::json!({ "body": body, "parts": parts });
+    run::dispatch_payload("body.audit_parts", &input)
 }
 
 fn outfit_inspect(args: &[String]) -> ExitCode {

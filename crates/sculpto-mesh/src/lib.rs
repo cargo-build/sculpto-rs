@@ -20,7 +20,10 @@
 //! adds the measured gates: triangle-pair intersections that vertex-inside
 //! counting cannot see. [`layer_stack`](layer_stack) grades a declared outfit
 //! as an ordered stack: per-pair contact classified by type, with accessory
-//! anchors and the footwear mode as the declared exceptions.
+//! anchors and the footwear mode as the declared exceptions. [`parts`](parts)
+//! adds the socket audit: attached body parts measured against the shells they
+//! point at, with typed refusals for a misplaced head, foot or opened seam and
+//! plain open-socket reports when no part ships.
 
 pub mod actor;
 pub mod aura;
@@ -37,6 +40,7 @@ pub mod intake_gltf;
 pub mod layer_stack;
 pub mod mask;
 pub mod outfit;
+pub mod parts;
 mod point_query;
 pub mod rig;
 pub mod seam;
