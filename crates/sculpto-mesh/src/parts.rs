@@ -62,6 +62,30 @@ pub const HEIGHT_BAND: f64 = 0.15;
 /// An override part file matches a shipped part by ring-centroid distance;
 /// measured witness transforms displace ring centroids by at most ~2.
 pub const OVERRIDE_MATCH_MAX: f64 = 6.0;
+/// Two shells are associated when a part-ring vertex sits within this band of
+/// the partner shell: every authored seam (0.0..0.8) associates, a seam
+/// displaced up to ~2 still associates, and the next shell past a slot starts
+/// ~5.7 away (sole to leg).
+pub const SOCKET_ASSOCIATION: f64 = 2.0;
+/// A pair whose association reaches this fraction of the part's ring reads as
+/// an authored coincident seam even after separation: measured coincident arcs
+/// cover 31/82, 223/386, 24/24 and 72/175 of their rings (38-100%), while
+/// slot-facing arcs cover at most 8.5% (foot to leg) and 9% (head to torso).
+pub const ASSOCIATION_FRACTION: f64 = 0.3;
+/// Rings smaller than this are all-arc by construction (the synthetic ankle
+/// ring is 8 of 8 vertices), so their pairs read as slots unless directly
+/// coincident; the smallest real ring that needs the fraction test is 24.
+pub const KIND_RING_FLOOR: usize = 12;
+/// Minimum associated vertices for the fraction test, below the smallest
+/// real coincident arc (24 toe-cap vertices) and above incidental touches.
+pub const KIND_ASSOCIATED_FLOOR: usize = 6;
+/// Lateral head-placement bound: the lateral-axis component of the offset
+/// between the part's ring centroid and the socket arc's centroid. The
+/// authored exact-Bijin head sits on the sagittal plane, so the component is
+/// ~0.0-0.1; a 1.0-unit lateral translation — the operator's original head
+/// defect — moves it 1:1 and must refuse. Yaw about the ring centroid keeps
+/// the centroid fixed, so the measured yaw floor survives.
+pub const HEAD_OFFSET_MAX: f64 = 0.5;
 
 /// How a part meets its socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,10 +152,16 @@ pub enum RefusalCode {
     HeadSlot,
     /// Head coverage above the authored baseline plus slack.
     HeadCoverage,
+    /// Head ring centroid laterally off its socket arc.
+    HeadOffset,
     /// Foot slot minimum below the measured floor.
     FootSlot,
     /// An authored-coincident seam has no coincident ring vertices left.
     SeamOpen,
+    /// A part's ring still faces its socket, but the coincidence is gone and
+    /// no slot remains within the healthy band: the seam separated past the
+    /// classification band.
+    SocketLost,
 }
 
 impl RefusalCode {
@@ -140,8 +170,10 @@ impl RefusalCode {
         match self {
             Self::HeadSlot => "part_head_slot",
             Self::HeadCoverage => "part_head_coverage",
+            Self::HeadOffset => "part_head_offset",
             Self::FootSlot => "part_foot_slot",
             Self::SeamOpen => "part_seam_open",
+            Self::SocketLost => "part_socket_lost",
         }
     }
 }
@@ -169,19 +201,31 @@ impl fmt::Display for PartRefusal {
                 "{}: slot_min {:.4} outside [{}, {}] (socket {})",
                 self.part, self.observed, HEAD_SLOT_MIN, HEAD_SLOT_MAX, self.socket
             ),
-            RefusalCode::HeadCoverage | RefusalCode::FootSlot => write!(
-                formatter,
-                "{}: {} {:.4} {} (socket {})",
-                self.part,
-                self.metric_name(),
-                self.observed,
-                self.bound,
-                self.socket
-            ),
+            RefusalCode::HeadCoverage | RefusalCode::HeadOffset | RefusalCode::FootSlot => {
+                write!(
+                    formatter,
+                    "{}: {} {:.4} {} (socket {})",
+                    self.part,
+                    self.metric_name(),
+                    self.observed,
+                    self.bound,
+                    self.socket
+                )
+            }
             RefusalCode::SeamOpen => write!(
                 formatter,
                 "{}: {} of {} ring vertices coincide with {} (within {})",
                 self.part, self.observed, self.bound, self.socket, COINCIDENT_EPS
+            ),
+            RefusalCode::SocketLost => write!(
+                formatter,
+                "{}: {} of {} ring vertices lie within {} of {} but none coincident (within {})",
+                self.part,
+                self.observed,
+                self.bound,
+                SOCKET_ASSOCIATION,
+                self.socket,
+                COINCIDENT_EPS
             ),
         }
     }
@@ -192,6 +236,7 @@ impl PartRefusal {
     fn metric_name(&self) -> &'static str {
         match self.code {
             RefusalCode::HeadCoverage => "coverage",
+            RefusalCode::HeadOffset => "lateral offset",
             _ => "slot_min",
         }
     }
@@ -215,8 +260,14 @@ pub struct SeamRow {
     pub ring_max: f64,
     /// Part-ring vertices within [`COINCIDENT_EPS`] of the socket shell.
     pub coincident: usize,
+    /// Part-ring vertices within [`SEAM_CLASSIFY_EPS`] of the socket shell:
+    /// the classification-band count the seam-open rule requires.
+    pub near: usize,
     /// Farthest selected socket-arc vertex to part-ring distance.
     pub coverage: f64,
+    /// Planar (perpendicular to the up axis) distance between the part's ring
+    /// centroid and the socket arc's centroid; the head's translation witness.
+    pub offset: f64,
     /// The part's strongest coincident correspondence (most near vertices);
     /// the seam-open rule fires here, so incidental proximity between family
     /// shells never refuses.
@@ -238,6 +289,9 @@ pub struct PartRow {
     pub seams: Vec<SeamRow>,
     /// `ok`, or the wire code of the refusal that fired.
     pub verdict: &'static str,
+    /// Why the row carries no measurement, when that is the case: a closed
+    /// shell has no ring seam, which is stated instead of implied.
+    pub note: Option<String>,
 }
 
 /// A boundary chain no part points at: the socket exists, the part does not.
@@ -432,14 +486,18 @@ impl Shell {
         self.positions[self.local[&global]]
     }
 
-    /// Ring centroid in input frame coordinates.
-    fn ring_centroid(&self) -> [f64; 3] {
+    /// Ring centroid in input frame coordinates; `None` for a closed shell,
+    /// whose boundary is empty and whose position would be invented.
+    fn ring_centroid(&self) -> Option<[f64; 3]> {
         let ring: Vec<[f32; 3]> = self
             .boundary
             .iter()
             .map(|&vertex| self.position_of(vertex))
             .collect();
-        mean_positions(ring.as_slice())
+        match ring.is_empty() {
+            true => None,
+            false => Some(mean_positions(ring.as_slice())),
+        }
     }
 }
 
@@ -526,6 +584,23 @@ struct PartnerSummary {
     coincident: usize,
     /// Ring vertices within [`SEAM_CLASSIFY_EPS`]: the classification band.
     near: usize,
+    /// Ring vertices within [`SOCKET_ASSOCIATION`] of the partner shell: the
+    /// displacement-tolerant correspondence count.
+    associated: usize,
+}
+
+impl PartnerSummary {
+    /// Whether this pair reads as an authored coincident seam: direct
+    /// classification (vertices within 0.15), or the displacement-tolerant
+    /// arc signature — the association covering the measured coincident-arc
+    /// fraction of a ring large enough to carry one. Small all-arc rings
+    /// cannot carry the fraction test and read as slots.
+    fn coincident_kind(&self, ring: usize) -> bool {
+        self.near > 0
+            || (ring >= KIND_RING_FLOOR
+                && self.associated >= KIND_ASSOCIATED_FLOOR
+                && self.associated as f64 >= ASSOCIATION_FRACTION * ring as f64)
+    }
 }
 
 /// One part's measured class and seams, before refusal evaluation.
@@ -664,9 +739,26 @@ pub fn audit(
         .copied()
         .map(|shell| (shell, family_root(&union, shell)))
         .collect();
+    // The lateral axis is the torso's wider planar axis: a humanoid body is
+    // wider than it is deep, so this is the axis a sideways head translation
+    // moves along.
+    let planar: Vec<usize> = (0..3).filter(|candidate| *candidate != axis).collect();
+    let spans: Vec<f64> = planar
+        .iter()
+        .map(|&candidate| {
+            let (low, high) = extent(positions, candidate);
+            f64::from(high - low)
+        })
+        .collect();
+    let lateral = if spans[0] >= spans[1] {
+        planar[0]
+    } else {
+        planar[1]
+    };
     let layout = Layout {
         torso,
         axis,
+        lateral,
         bands,
         families: &families,
     };
@@ -683,7 +775,8 @@ pub fn audit(
 
     // Names come after classification: bilateral classes take an L/R suffix
     // from the ring centroid's offset against the torso centroid (L marks the
-    // +X side), and repeated class names gain a counter.
+    // +X side), and repeated class names gain a counter. The rule is
+    // deterministic: shell discovery order, class, side, counter.
     let mut names: Vec<String> = vec![String::new(); shells.len()];
     if let Some(torso_index) = torso {
         names[torso_index] = "torso".to_string();
@@ -699,11 +792,20 @@ pub fn audit(
             torso_center,
         );
     }
+    let partner_ring_sizes: HashMap<usize, usize> = large
+        .iter()
+        .map(|&index| (index, bodies.ring_points[index].len()))
+        .collect();
     for analysis in &mut analyses {
+        let part = PartSide {
+            shell: &bodies.shells[analysis.shell],
+            tree: &bodies.shell_trees[analysis.shell],
+            family: families[&analysis.shell],
+        };
         analysis.seams = seam_rows(
             analysis.summaries.as_slice(),
-            families[&analysis.shell],
-            &families,
+            &part,
+            &layout,
             &bodies,
             names.as_slice(),
             bodies.ring_points[analysis.shell].as_slice(),
@@ -721,8 +823,33 @@ pub fn audit(
     let mut row_of_shell: HashMap<usize, usize> = HashMap::new();
     for analysis in &analyses {
         let name = names[analysis.shell].clone();
-        let (verdict, refusals) =
-            refusals_for(analysis.class, &name, &analysis.seams, &analysis.seams);
+        let mut refusals = refusals_for(analysis.class, &name, &analysis.seams, &analysis.seams).1;
+        let (verdict, note) = if analysis.seams.is_empty() {
+            // A closed shell carries no ring seam: state it instead of
+            // implying a verified seam.
+            refusals.clear();
+            (
+                "unmeasured",
+                Some("closed shell: no ring seam to measure".to_string()),
+            )
+        } else {
+            if let Some(lost) = socket_lost_refusal(
+                &name,
+                bodies.ring_points[analysis.shell].len(),
+                analysis.summaries.as_slice(),
+                names.as_slice(),
+                &partner_ring_sizes,
+            ) {
+                refusals.push(lost);
+            }
+            (
+                refusals
+                    .first()
+                    .map(|refusal| refusal.code.wire_code())
+                    .unwrap_or("ok"),
+                None,
+            )
+        };
         row_of_shell.insert(analysis.shell, report.parts.len());
         report.parts.push(PartRow {
             name,
@@ -731,6 +858,7 @@ pub fn audit(
             overridden: false,
             seams: analysis.seams.clone(),
             verdict,
+            note,
         });
         report.refusals.extend(refusals);
     }
@@ -765,7 +893,7 @@ pub fn audit(
     apply_overrides(
         overrides,
         &bodies,
-        &families,
+        &layout,
         names.as_slice(),
         &mut report,
         &row_of_shell,
@@ -793,6 +921,7 @@ fn summarize(
     let mut ring_max = 0.0f64;
     let mut coincident = 0usize;
     let mut near = 0usize;
+    let mut associated = 0usize;
     for &position in ring_positions {
         let nearest = partner_tree.nearest(position);
         let candidate = distance(position, partner_positions[nearest]);
@@ -800,6 +929,7 @@ fn summarize(
         ring_max = ring_max.max(candidate);
         coincident += (candidate <= COINCIDENT_EPS) as usize;
         near += (candidate <= SEAM_CLASSIFY_EPS) as usize;
+        associated += (candidate <= SOCKET_ASSOCIATION) as usize;
     }
     PartnerSummary {
         partner,
@@ -808,6 +938,7 @@ fn summarize(
         ring_max,
         coincident,
         near,
+        associated,
     }
 }
 
@@ -828,10 +959,12 @@ fn family_root(families: &Families, mut shell: usize) -> usize {
 }
 
 /// Shared layout context for classification: the socket owner, the detected up
-/// axis with the torso's height bands, and the coincident families.
+/// axis and lateral axis with the torso's height bands, and the coincident
+/// families.
 struct Layout<'a> {
     torso: Option<usize>,
     axis: usize,
+    lateral: usize,
     bands: Option<(f64, f64, f64)>,
     families: &'a Families,
 }
@@ -840,7 +973,7 @@ struct Layout<'a> {
 /// order so a coincident leg never falls into the bottom-band foot rules and
 /// the head wins its band before the shoulder-slot arm rule.
 fn classify(
-    ring_centroid: [f64; 3],
+    ring_centroid: Option<[f64; 3]>,
     ring_size: usize,
     summaries: &[PartnerSummary],
     own_family: usize,
@@ -851,12 +984,19 @@ fn classify(
         axis,
         bands,
         families,
+        ..
     } = layout;
-    // 1. Coincident onto the torso: a leg.
+    let Some(ring_centroid) = ring_centroid else {
+        // A closed shell carries no ring seam; the row states that instead of
+        // a class inferred from an invented position.
+        return PartClass::Attached;
+    };
+    // 1. Coincident onto the torso: a leg, authored or separated past the
+    //    classification band but still facing its socket.
     if torso.is_some_and(|torso| {
         summaries
             .iter()
-            .any(|summary| summary.partner == torso && summary.near > 0)
+            .any(|summary| summary.partner == torso && summary.coincident_kind(ring_size))
     }) {
         return PartClass::Leg;
     }
@@ -873,7 +1013,7 @@ fn classify(
     let slotted = summaries
         .iter()
         .filter(|summary| {
-            summary.near == 0
+            !summary.coincident_kind(ring_size)
                 && families
                     .get(&summary.partner)
                     .copied()
@@ -902,10 +1042,18 @@ fn classify(
 
 /// Full seam rows: every classified-coincident partner plus the nearest slotted
 /// one, with the socket arc and coverage measured for each.
+/// The audited part side: its shell, nearest-vertex tree and family — the same
+/// inputs whether the shell is shipped or an override.
+struct PartSide<'a> {
+    shell: &'a Shell,
+    tree: &'a PointIndex<'a>,
+    family: usize,
+}
+
 fn seam_rows(
     summaries: &[PartnerSummary],
-    own_family: usize,
-    families: &Families,
+    part: &PartSide<'_>,
+    layout: &Layout<'_>,
     bodies: &Bodies<'_>,
     names: &[String],
     part_ring_positions: &[[f32; 3]],
@@ -913,9 +1061,13 @@ fn seam_rows(
     if part_ring_positions.is_empty() {
         return Vec::new();
     }
+    let ring = part_ring_positions.len();
+    let families = layout.families;
+    let lateral = layout.lateral;
+    let own_family = part.family;
     let coincident: Vec<&PartnerSummary> = summaries
         .iter()
-        .filter(|summary| summary.near > 0)
+        .filter(|summary| summary.coincident_kind(ring))
         .collect();
     // The seam-open rule fires on the strongest coincident correspondence
     // only: a rolled seam stays the part's nearest family shell, while
@@ -933,7 +1085,7 @@ fn seam_rows(
     if let Some(slotted) = summaries
         .iter()
         .filter(|summary| {
-            summary.near == 0
+            !summary.coincident_kind(ring)
                 && families
                     .get(&summary.partner)
                     .copied()
@@ -957,24 +1109,41 @@ fn seam_rows(
                         bodies.ring_points[partner].as_slice(),
                         bodies.ring_trees[partner].as_ref(),
                     );
+                    let offset = chain_offset(
+                        part.shell,
+                        part.tree,
+                        &bodies.shells[partner],
+                        &bodies.shell_trees[partner],
+                        lateral,
+                    );
                     SeamRow {
                         socket: names[partner].clone(),
-                        kind: match summary.near > 0 {
+                        kind: match summary.coincident_kind(ring) {
                             true => SeamKind::Coincident,
                             false => SeamKind::Slotted,
                         },
-                        ring: part_ring_positions.len(),
+                        ring,
                         socket_ring,
                         slot_min: summary.slot_min,
                         ring_min: summary.ring_min,
                         ring_max: summary.ring_max,
                         coincident: summary.coincident,
+                        near: summary.near,
                         coverage,
+                        offset,
                         primary: Some(partner) == primary,
                     }
                 })
         })
         .collect()
+}
+
+/// Lateral offset of one centroid against another: the component on the
+/// lateral axis. A rigid lateral translation moves it 1:1; movement along the
+/// up axis or the facing axis does not count, and a yaw about the ring
+/// centroid leaves the centroid in place.
+fn lateral_offset(a: [f64; 3], b: [f64; 3], lateral: usize) -> f64 {
+    (a[lateral] - b[lateral]).abs()
 }
 
 /// Socket-arc selection and coverage: the socket ring vertices within
@@ -1015,17 +1184,71 @@ fn measure_coverage(
     (arc.len(), coverage)
 }
 
-/// Assigns unique report names; a repeated class name gains a counter.
+/// The boundary chain of `shell` whose vertices come nearest to `other`, with
+/// its centroid: the chain pair that faces a seam.
+fn nearest_chain(
+    shell: &Shell,
+    other_positions: &[[f32; 3]],
+    other_tree: &PointIndex<'_>,
+) -> Option<([f64; 3], f64)> {
+    shell
+        .chains
+        .iter()
+        .map(|chain| {
+            let min = chain
+                .vertices
+                .iter()
+                .map(|&vertex| {
+                    let point = shell.position_of(vertex);
+                    let nearest = other_tree.nearest(point);
+                    distance(point, other_positions[nearest])
+                })
+                .fold(f64::INFINITY, f64::min);
+            let centroid = mean_over(&chain.vertices, |&global| shell.position_of(global));
+            (centroid, min)
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+/// Lateral offset between the two chains that face each other across a seam:
+/// the part's nearest boundary chain and the partner's nearest boundary chain.
+/// Both chain centroids sit on the seam's axis when the seam is authored, so
+/// the authored offset is small, while a lateral translation of the part moves
+/// its chain centroid 1:1. A yaw about the ring centroid leaves it in place.
+fn chain_offset(
+    part_shell: &Shell,
+    part_tree: &PointIndex<'_>,
+    partner_shell: &Shell,
+    partner_tree: &PointIndex<'_>,
+    lateral: usize,
+) -> f64 {
+    match (
+        nearest_chain(part_shell, partner_shell.positions.as_slice(), partner_tree),
+        nearest_chain(partner_shell, part_shell.positions.as_slice(), part_tree),
+    ) {
+        (Some((part_centroid, _)), Some((partner_centroid, _))) => {
+            lateral_offset(part_centroid, partner_centroid, lateral)
+        }
+        _ => 0.0,
+    }
+}
+
+/// Assigns unique report names; a repeated class name gains a counter. The
+/// derivation is deterministic — class, side, occurrence counter, shell
+/// discovery order — so identical inputs produce identical names.
 #[derive(Default)]
 struct NamePool {
     used: HashMap<String, usize>,
 }
 
 impl NamePool {
-    /// Name one shell from its class and side against the torso centroid.
+    /// Name one shell from its class and side against the torso centroid; a
+    /// closed shell (no ring centroid) takes no side suffix. The rule is
+    /// deterministic: class first, side second, per-class occurrence counters
+    /// in shell discovery order — identical inputs produce identical names.
     fn assign(
         &mut self,
-        ring_centroid: [f64; 3],
+        ring_centroid: Option<[f64; 3]>,
         class: PartClass,
         axis: usize,
         torso_center: Option<[f64; 3]>,
@@ -1034,9 +1257,9 @@ impl NamePool {
             .into_iter()
             .find(|candidate| *candidate != axis)
             .unwrap_or(0);
-        let offset = match torso_center {
-            Some(center) => ring_centroid[plane] - center[plane],
-            None => 0.0,
+        let offset = match (ring_centroid, torso_center) {
+            (Some(centroid), Some(center)) => centroid[plane] - center[plane],
+            _ => 0.0,
         };
         let base = match class {
             bilateral @ (PartClass::Foot | PartClass::Leg | PartClass::Arm | PartClass::Sole) => {
@@ -1087,6 +1310,15 @@ fn refusals_for(
                         bound: format!("[{HEAD_SLOT_MIN}, {HEAD_SLOT_MAX}]"),
                     });
                 }
+                if seam.offset > HEAD_OFFSET_MAX {
+                    refusals.push(PartRefusal {
+                        code: RefusalCode::HeadOffset,
+                        part: name.to_string(),
+                        socket: socket.to_string(),
+                        observed: seam.offset,
+                        bound: format!("above {HEAD_OFFSET_MAX}"),
+                    });
+                }
                 if let Some(authored) = baseline
                     .iter()
                     .find(|row| row.socket == socket && row.kind == SeamKind::Slotted)
@@ -1121,7 +1353,11 @@ fn refusals_for(
             }
             _ => {}
         }
-        if seam.kind == SeamKind::Coincident && seam.primary && seam.coincident == 0 {
+        if seam.kind == SeamKind::Coincident
+            && seam.primary
+            && seam.near > 0
+            && seam.coincident == 0
+        {
             refusals.push(PartRefusal {
                 code: RefusalCode::SeamOpen,
                 part: name.to_string(),
@@ -1138,12 +1374,73 @@ fn refusals_for(
     (verdict, refusals)
 }
 
+/// The separation witness: a part whose ring still faces a socket shell —
+/// the association covers the measured coincident-arc fraction — but which
+/// carries neither a coincident vertex nor an intact seam. Fired in addition
+/// to the seam-open rule so a seam separated past the classification band is
+/// refused by its own name and authored socket instead of silently passing.
+///
+/// The binding is the partner the part's ring most faces (most associated
+/// vertices; ties prefer the larger ring, then the lower index — deterministic
+/// for identical inputs). A healthy slotted part never trips it: its facing
+/// arc covers well under the measured 30% fraction.
+fn socket_lost_refusal(
+    name: &str,
+    ring: usize,
+    summaries: &[PartnerSummary],
+    names: &[String],
+    partner_ring_sizes: &HashMap<usize, usize>,
+) -> Option<PartRefusal> {
+    let intact = summaries
+        .iter()
+        .any(|summary| summary.coincident_kind(ring) && summary.coincident > 0);
+    if intact {
+        return None;
+    }
+    // A seam separated inside the classification band already refuses through
+    // the seam-open rule; the separation witness covers the band's outside.
+    let rolled = summaries.iter().any(|summary| {
+        summary.coincident_kind(ring) && summary.near > 0 && summary.coincident == 0
+    });
+    if rolled {
+        return None;
+    }
+    let binding = summaries
+        .iter()
+        .filter(|summary| {
+            ring >= KIND_RING_FLOOR
+                && summary.associated >= KIND_ASSOCIATED_FLOOR
+                && summary.associated as f64 >= ASSOCIATION_FRACTION * ring as f64
+        })
+        .min_by(|left, right| {
+            right
+                .associated
+                .cmp(&left.associated)
+                .then_with(|| {
+                    partner_ring_sizes
+                        .get(&right.partner)
+                        .cmp(&partner_ring_sizes.get(&left.partner))
+                })
+                .then_with(|| left.partner.cmp(&right.partner))
+        })?;
+    if binding.near > 0 {
+        return None;
+    }
+    Some(PartRefusal {
+        code: RefusalCode::SocketLost,
+        part: name.to_string(),
+        socket: names[binding.partner].clone(),
+        observed: binding.associated as f64,
+        bound: ring.to_string(),
+    })
+}
+
 /// Audit override part files against the body's own sockets; the shipped shell
 /// keeps its name, class and coverage baseline, the metrics come from the file.
 fn apply_overrides(
     overrides: &[PartOverride<'_>],
     bodies: &Bodies<'_>,
-    families: &Families,
+    layout: &Layout<'_>,
     names: &[String],
     report: &mut PartAudit,
     row_of_shell: &HashMap<usize, usize>,
@@ -1155,17 +1452,22 @@ fn apply_overrides(
         else {
             return Err(PartsError::EmptyInput);
         };
-        // The file's ring centroid locates the shipped part it replaces.
-        let centroid = shell.ring_centroid();
+        // The file's ring centroid locates the shipped part it replaces; a
+        // closed override carries no ring and matches nothing.
+        let Some(centroid) = shell.ring_centroid() else {
+            return Err(PartsError::UnmatchedOverride {
+                index: file_index,
+                nearest: f64::INFINITY,
+            });
+        };
         let nearest = row_of_shell
             .keys()
             .copied()
             .filter(|index| !replaced.contains(index))
-            .map(|index| {
-                (
-                    index,
-                    distance64(centroid, bodies.shells[index].ring_centroid()),
-                )
+            .filter_map(|index| {
+                bodies.shells[index]
+                    .ring_centroid()
+                    .map(|target| (index, distance64(centroid, target)))
             })
             .min_by(|left, right| left.1.total_cmp(&right.1));
         let Some((target, gap)) = nearest else {
@@ -1192,6 +1494,7 @@ fn apply_overrides(
         let name = report.parts[row_index].name.clone();
         let baseline = report.parts[row_index].seams.clone();
         let part_ring = shell.ring_positions_owned();
+        let override_tree = PointIndex::build(shell.positions.as_slice());
         let summaries: Vec<PartnerSummary> = bodies
             .large
             .iter()
@@ -1207,10 +1510,15 @@ fn apply_overrides(
                 )
             })
             .collect();
+        let part = PartSide {
+            shell: &shell,
+            tree: &override_tree,
+            family: layout.families[&target],
+        };
         let seams = seam_rows(
             summaries.as_slice(),
-            families[&target],
-            families,
+            &part,
+            layout,
             bodies,
             names,
             part_ring.as_slice(),
@@ -1221,6 +1529,10 @@ fn apply_overrides(
         row.seams = seams;
         row.verdict = verdict;
         row.vertices = shell.vertices.len();
+        row.note = match row.seams.is_empty() {
+            true => Some("closed shell: no ring seam to measure".to_string()),
+            false => None,
+        };
         report.refusals.retain(|refusal| refusal.part != name);
         report.refusals.extend(refusals);
     }
@@ -1380,7 +1692,11 @@ mod tests {
             ]
         );
         let leg = &report.parts[0];
-        assert_eq!(leg.seams.len(), 2, "coincident torso plus slotted foot");
+        assert_eq!(
+            leg.seams.len(),
+            3,
+            "torso and foot coincident arcs, head slot"
+        );
         assert_eq!(leg.seams[0].kind, SeamKind::Coincident);
         assert_eq!(leg.seams[0].socket, "torso");
         assert_eq!(leg.seams[0].coincident, SIDES);
@@ -1524,5 +1840,73 @@ mod tests {
             audit(&broken, &triangles, &[]),
             Err(PartsError::NonFinite { vertex: 0 })
         ));
+    }
+
+    #[test]
+    fn lateral_head_shift_refuses_with_the_measured_offset() {
+        let (mut positions, triangles) = fixture();
+        map_range(&mut positions, HEAD, |[x, y, z]| [x + 1.0, y, z]);
+        let report = audit(&positions, &triangles, &[]).unwrap();
+        let refusal = code_of(&report, RefusalCode::HeadOffset).expect("offset refusal");
+        assert_eq!(refusal.part, "head");
+        assert_eq!(refusal.socket, "torso");
+        assert!((refusal.observed - 1.0).abs() < 1e-2, "{refusal}");
+        assert!(refusal.observed > HEAD_OFFSET_MAX, "{refusal}");
+        assert!(refusal.to_string().contains("head"));
+        // The auditor's finding, locked: a 1.0-unit lateral slide keeps the
+        // slot minimum inside the window (≈1.15), so the offset witness is
+        // the catcher for exactly this class.
+        assert!(code_of(&report, RefusalCode::HeadSlot).is_none());
+    }
+
+    #[test]
+    fn separated_leg_keeps_its_name_and_names_its_socket() {
+        let (mut positions, triangles) = fixture();
+        map_range(&mut positions, LEG, |[x, y, z]| [x, y, z + 0.3]);
+        let report = audit(&positions, &triangles, &[]).unwrap();
+        let leg = report.parts.first().expect("leg row first");
+        assert_eq!(leg.name, "leg", "the displaced leg keeps its own name");
+        assert_eq!(leg.class, PartClass::Leg);
+        let lost = code_of(&report, RefusalCode::SocketLost).expect("separation refusal");
+        assert_eq!(lost.part, "leg");
+        assert_eq!(lost.socket, "torso", "the authored socket is named");
+        assert!((lost.observed - 8.0).abs() < 1e-6, "{lost}");
+        assert_eq!(lost.bound, "16");
+        // The unmodified foot still refuses its own squeezed slot, against the
+        // leg's stable name instead of a renamed neighbour.
+        let foot_slot = code_of(&report, RefusalCode::FootSlot).expect("foot refusal");
+        assert_eq!(foot_slot.part, "foot");
+        assert_eq!(foot_slot.socket, "leg");
+        assert!((foot_slot.observed - 0.2236).abs() < 1e-2, "{foot_slot}");
+    }
+
+    #[test]
+    fn closed_shell_part_states_its_unmeasured_verdict() {
+        let (mut positions, mut triangles) = fixture();
+        // A capped prism floating clear of the body: no boundary, no seam.
+        let base = positions.len();
+        positions.extend(
+            ring(1.4, 14.0)
+                .into_iter()
+                .map(|[x, y, z]| [x + 30.0, y, z]),
+        );
+        positions.extend(
+            ring(1.4, 15.6)
+                .into_iter()
+                .map(|[x, y, z]| [x + 30.0, y, z]),
+        );
+        triangles.extend(prism(base, base + SIDES));
+        triangles.extend(cap(base + SIDES));
+        triangles.extend(cap(base));
+        let report = audit(&positions, &triangles, &[]).unwrap();
+        assert_eq!(report.refusals, Vec::new());
+        let closed = report.parts.last().expect("closed shell row");
+        assert_eq!(closed.class, PartClass::Attached);
+        assert!(closed.seams.is_empty(), "{:?}", closed.seams);
+        assert_eq!(closed.verdict, "unmeasured");
+        assert_eq!(
+            closed.note.as_deref(),
+            Some("closed shell: no ring seam to measure")
+        );
     }
 }

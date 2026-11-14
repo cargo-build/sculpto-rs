@@ -21,19 +21,18 @@ fn ring(radius: f64, z: f64) -> Vec<[f64; 3]> {
 
 /// Write the synthetic four-shell body: torso (rings z 4 and 11), leg (top ring
 /// coincident with the torso bottom), foot (ring over capped bottom), head
-/// (loop over capped top), with the whole head optionally dropped by `head_drop`.
-/// Vertex order: torso rings, leg rings, foot rings, head rings; faces follow
-/// as four prism groups then the foot and head caps. The body is designed
-/// Z-up and written in the OBJ display frame (`[x, z, -y]`), the convention
+/// (loop over capped top), with the whole head optionally dropped by
+/// `head_drop` and the foot by `foot_drop`. The body is designed Z-up and
+/// written in the OBJ display frame (`[x, z, -y]`), the convention
 /// `read_obj_surface` converts back to source.
-fn body_obj(head_drop: f64) -> String {
+fn body_obj(head_drop: f64, foot_drop: f64) -> String {
     let rings = [
         ring(2.0, 4.0),
         ring(2.0, 11.0),
         ring(2.0, 4.0),
         ring(0.9, 1.0),
-        ring(1.0, 1.5),
-        ring(0.8, 0.0),
+        ring(1.0, 1.5 + foot_drop),
+        ring(0.8, 0.0 + foot_drop),
         ring(2.0, 11.8 + head_drop),
         ring(1.4, 13.6 + head_drop),
     ];
@@ -69,9 +68,9 @@ fn body_obj(head_drop: f64) -> String {
     text
 }
 
-fn write_body(tag: &str, head_drop: f64) -> PathBuf {
+fn write_body(tag: &str, head_drop: f64, foot_drop: f64) -> PathBuf {
     let path = std::env::temp_dir().join(format!("sculpto-bld11-{tag}-{}.obj", std::process::id()));
-    std::fs::write(&path, body_obj(head_drop)).expect("fixture written");
+    std::fs::write(&path, body_obj(head_drop, foot_drop)).expect("fixture written");
     path
 }
 
@@ -124,7 +123,7 @@ fn registry_lists_the_read_only_audit() {
 
 #[test]
 fn correct_body_accepts_and_reports_parts() {
-    let path = write_body("accept", 0.0);
+    let path = write_body("accept", 0.0, 0.0);
     let out = dispatch(
         "body.audit_parts",
         &json!({ "body": path.display().to_string() }),
@@ -141,7 +140,7 @@ fn correct_body_accepts_and_reports_parts() {
 
 #[test]
 fn a_dropped_head_is_refused_by_name_with_the_measured_slot() {
-    let path = write_body("drop", -0.5);
+    let path = write_body("drop", -0.5, 0.0);
     let error = dispatch(
         "body.audit_parts",
         &json!({ "body": path.display().to_string() }),
@@ -161,7 +160,7 @@ fn a_dropped_head_is_refused_by_name_with_the_measured_slot() {
 fn an_override_part_file_is_judged_against_the_shipped_baseline() {
     // The shipped body carries the correct head; the override yaw-rotates the
     // neck ring 15 degrees, which breaks the coverage ceiling only.
-    let shipped = write_body("baseline", 0.0);
+    let shipped = write_body("baseline", 0.0, 0.0);
     let override_path =
         std::env::temp_dir().join(format!("sculpto-bld11-override-{}.obj", std::process::id()));
     std::fs::write(&override_path, head_override_obj(15.0)).expect("override written");
@@ -181,4 +180,44 @@ fn an_override_part_file_is_judged_against_the_shipped_baseline() {
         "{}",
         error.message()
     );
+}
+
+#[test]
+fn a_refused_audit_keeps_every_refusal_in_the_message() {
+    let path = write_body("twodef", -0.5, -0.3);
+    let error = dispatch(
+        "body.audit_parts",
+        &json!({ "body": path.display().to_string() }),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert!(error.message().contains("head"), "{}", error.message());
+    assert!(error.message().contains("foot"), "{}", error.message());
+    assert!(
+        !error.message().contains("+1 more"),
+        "every refusal is spelled out: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn strict_false_returns_the_full_report_with_the_refusals() {
+    let path = write_body("report", -0.5, 0.0);
+    let out = dispatch(
+        "body.audit_parts",
+        &json!({
+            "body": path.display().to_string(),
+            "strict": false,
+        }),
+    )
+    .expect("the report mode carries the outcome");
+    assert_eq!(out["verdict"], "refuse");
+    let refusals = out["refusals"].as_array().expect("typed refusals");
+    assert!(!refusals.is_empty());
+    assert_eq!(refusals[0]["code"], "part_head_slot");
+    let parts = out["parts"]
+        .as_array()
+        .expect("per-part rows stay reachable");
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[2]["verdict"], "part_head_slot");
 }

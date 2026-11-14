@@ -19,6 +19,11 @@ struct Params {
     /// Replacement part OBJs audited against the body's own sockets; each file
     /// is one part and the shipped copy stays the measurement baseline.
     parts: Option<Vec<PathBuf>>,
+    /// Refuse (the default) or report: with `strict: false` the command
+    /// returns the full per-part report with `verdict: "refuse"` and the
+    /// typed `refusals` list instead of an error, so the measured rows stay
+    /// reachable when a part fails.
+    strict: Option<bool>,
 }
 
 pub(crate) fn schema() -> Value {
@@ -42,19 +47,27 @@ pub(crate) fn audit(input: &Value) -> Result<Value, CommandError> {
         })
         .collect();
     let report = parts::audit(&positions, &triangles, &overrides).map_err(parts_error)?;
-    if let Some(refusal) = report.refusals.first() {
-        let extra = report.refusals.len() - 1;
-        let message = match extra {
-            0 => refusal.to_string(),
-            more => format!("{refusal}; +{more} more"),
-        };
-        return Err(CommandError::new(
-            ErrorKind::Refused,
-            refusal.code.wire_code(),
-            message,
-        ));
+    let strict = params.strict.unwrap_or(true);
+    if report.refusals.is_empty() {
+        return Ok(render(&report));
     }
-    Ok(render(&report))
+    if !strict {
+        // The measured rows and every typed refusal stay reachable exactly
+        // when a part fails; the verdict says so.
+        return Ok(render(&report));
+    }
+    let message = report
+        .refusals
+        .iter()
+        .map(|refusal| refusal.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let first = report.refusals.first().expect("refusals checked");
+    Err(CommandError::new(
+        ErrorKind::Refused,
+        first.code.wire_code(),
+        message,
+    ))
 }
 
 fn parts_error(error: parts::PartsError) -> CommandError {
@@ -72,9 +85,24 @@ fn parts_error(error: parts::PartsError) -> CommandError {
     CommandError::new(kind, code, error.to_string())
 }
 
-/// The success report; a refused audit never reaches this, so the verdict here
-/// is always `accept`.
+/// The full report; with `strict: false` it is also the refusal payload, so
+/// `verdict` distinguishes accept from refuse and `refusals` carries the
+/// typed entries.
 fn render(report: &parts::PartAudit) -> Value {
+    let refusals: Vec<Value> = report
+        .refusals
+        .iter()
+        .map(|refusal| {
+            json!({
+                "code": refusal.code.wire_code(),
+                "part": refusal.part,
+                "socket": refusal.socket,
+                "observed": refusal.observed,
+                "bound": refusal.bound,
+                "message": refusal.to_string(),
+            })
+        })
+        .collect();
     let parts: Vec<Value> = report
         .parts
         .iter()
@@ -92,7 +120,9 @@ fn render(report: &parts::PartAudit) -> Value {
                         "ring_min": seam.ring_min,
                         "ring_max": seam.ring_max,
                         "coincident": seam.coincident,
+                        "near": seam.near,
                         "coverage": seam.coverage,
+                        "offset": seam.offset,
                     })
                 })
                 .collect();
@@ -103,6 +133,7 @@ fn render(report: &parts::PartAudit) -> Value {
                 "override": part.overridden,
                 "seams": seams,
                 "verdict": part.verdict,
+                "note": part.note,
             })
         })
         .collect();
@@ -124,6 +155,7 @@ fn render(report: &parts::PartAudit) -> Value {
         "torso": report.torso,
         "parts": parts,
         "open_sockets": open_sockets,
+        "refusals": refusals,
         "verdict": report.verdict(),
     })
 }
