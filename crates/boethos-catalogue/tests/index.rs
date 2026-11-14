@@ -178,6 +178,12 @@ fn indexes_archive_members_end_to_end() {
     fs::write(root.join("SliderPresets/Test.xml"), b"<SliderPresets/>").expect("write");
     fs::create_dir_all(root.join("FaceGeom/skyrim.esm")).expect("dirs");
     fs::write(root.join("FaceGeom/skyrim.esm/0001.NIF"), b"NIF").expect("write");
+    fs::create_dir_all(root.join("meshes/actors/character/hair")).expect("dirs");
+    fs::write(
+        root.join("meshes/actors/character/hair/hair01.nif"),
+        b"HAIR",
+    )
+    .expect("write");
     let status = std::process::Command::new("7z")
         .current_dir(&root)
         .args([
@@ -186,12 +192,14 @@ fn indexes_archive_members_end_to_end() {
             "pack.7z",
             "SliderPresets/Test.xml",
             "FaceGeom/skyrim.esm/0001.NIF",
+            "meshes/actors/character/hair/hair01.nif",
         ])
         .status()
         .expect("7z");
     assert!(status.success(), "7z could not create the fixture archive");
     fs::remove_dir_all(root.join("SliderPresets")).expect("remove");
     fs::remove_dir_all(root.join("FaceGeom")).expect("remove");
+    fs::remove_dir_all(root.join("meshes")).expect("remove");
     let store = Store::open(root.with_extension("redb")).expect("store");
     let report = index_root(
         &store,
@@ -203,7 +211,7 @@ fn indexes_archive_members_end_to_end() {
         },
     );
     assert_eq!(report.archives, 1);
-    assert_eq!(report.members, 2, "{:?}", report.errors);
+    assert_eq!(report.members, 3, "{:?}", report.errors);
     let rows = store.iter_kind::<Assets>().expect("rows");
     assert!(
         rows.iter()
@@ -212,6 +220,10 @@ fn indexes_archive_members_end_to_end() {
     assert!(
         rows.iter()
             .any(|(_, asset)| asset.category == Category::Preset)
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, asset)| asset.category == Category::Hair)
     );
     let _ = fs::remove_file(root.with_extension("redb"));
     let _ = fs::remove_dir_all(root);

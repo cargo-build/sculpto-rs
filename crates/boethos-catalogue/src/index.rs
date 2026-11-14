@@ -411,8 +411,9 @@ fn member_category(path: &str, archive_name: &str) -> Option<Category> {
     }
     // Supplied hair packs keep meshes under a `hair`/`hairdos` token or, like
     // KS Hairdos, directly under an archive whose name carries the token.
+    let mesh_member = text.starts_with("meshes/") || text.contains("/meshes/");
     if text.ends_with(".nif")
-        && text.contains("/meshes/")
+        && mesh_member
         && (has_hair_token(&text) || has_hair_token(&archive_name.to_lowercase()))
     {
         return Some(Category::Hair);

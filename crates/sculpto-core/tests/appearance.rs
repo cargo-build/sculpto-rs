@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use boethos_catalogue::{Asset, Category, Sex, Status};
 use sculpto_core::appearance::{
-    AppearanceCatalogue, AppearanceError, FaceApplication, FaceRace, load_appearance_catalogue,
+    AppearanceCatalogue, AppearanceError, FaceApplication, FaceRace, HeadRig,
+    load_appearance_catalogue,
 };
 
 fn asset(id: &str, category: Category, name: &str, entry: Option<&str>, sex: Option<Sex>) -> Asset {
@@ -318,9 +319,15 @@ fn real_catalogue_pins_stable_counts_and_refusals() {
         other => panic!("unexpected error: {other}"),
     }
 
-    assert_eq!(
-        catalogue.hairstyles.len(),
-        0,
-        "hair members are not indexed yet; see the catalogue gap record"
+    assert!(
+        !catalogue.hairstyles.is_empty(),
+        "hair members are indexed for the supplied packs"
+    );
+    assert!(
+        catalogue
+            .hairstyles
+            .iter()
+            .all(|hair| hair.rig == HeadRig::SkyrimHumanHead && hair.name.ends_with(".nif")),
+        "every hair record is a static human-head NIF"
     );
 }
