@@ -270,7 +270,7 @@ pub(super) fn preview(params: &FitParams) -> Result<FitOutcome, CommandError> {
     let document = read_nif(&params.nif)?;
     let source = body_document(&document, params.body_nif.as_deref())?;
     let garment = PlacedShape::named(&document, &params.shape)?;
-    let body = PlacedShape::named(&source, &params.body_shape)?;
+    let body = PlacedShape::named(&source, params.required_body_shape()?)?;
     let target = target_positions(params, &body)?;
     let block_name = block_name(&garment.shape.name, name);
     let data = MorphContainer::parse_file(container).map_err(errors::document)?;
@@ -303,7 +303,7 @@ pub(super) fn fit_regions(params: &FitParams) -> Result<FitOutcome, CommandError
     let document = read_nif(&params.nif)?;
     let source = body_document(&document, params.body_nif.as_deref())?;
     let garment = PlacedShape::named(&document, &params.shape)?;
-    let body = PlacedShape::named(&source, &params.body_shape)?;
+    let body = PlacedShape::named(&source, params.required_body_shape()?)?;
     let target = target_positions(params, &body)?;
     finish_fit(
         params,
@@ -570,6 +570,7 @@ fn finish_fit(
         regions,
         repair,
         collision: collision.as_ref().map(CollisionSurface::scope),
+        provenance: None,
     })
 }
 

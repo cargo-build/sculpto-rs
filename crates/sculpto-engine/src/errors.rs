@@ -18,6 +18,7 @@ use sculpto_mesh::delta_conform::DeltaConformError;
 use sculpto_mesh::garment::GarmentRuleError;
 use sculpto_mesh::intake_gltf::{DefectOverLimit, IntakeError};
 use sculpto_mesh::outfit::OutfitError;
+use sculpto_mesh::surface::SurfaceError;
 use sculpto_nif::NifError;
 use sculpto_nif::TriError;
 use sculpto_nif::write::header::NifWriteError;
@@ -269,6 +270,22 @@ pub fn conform(error: ConformError) -> CommandError {
         ConformError::EmptyGarment => (ErrorKind::InvalidParams, "empty_garment"),
         ConformError::EmptyReference => (ErrorKind::InvalidParams, "empty_reference"),
         ConformError::Topology { .. } => (ErrorKind::Refused, "topology_mismatch"),
+    };
+    CommandError::new(kind, code, error.to_string())
+}
+
+/// A surface binding bind or apply was refused.
+pub fn surface(error: SurfaceError) -> CommandError {
+    let (kind, code) = match &error {
+        SurfaceError::EmptyGarment => (ErrorKind::InvalidParams, "empty_render_surface"),
+        SurfaceError::EmptyControl => (ErrorKind::InvalidParams, "empty_control"),
+        SurfaceError::NonFinite { .. } => (ErrorKind::InvalidParams, "nonfinite_geometry"),
+        SurfaceError::InvalidIndex { .. } => (ErrorKind::InvalidParams, "invalid_triangle_index"),
+        SurfaceError::CollapsedTriangle { .. } => (ErrorKind::InvalidParams, "collapsed_triangle"),
+        SurfaceError::TopologyMismatch => {
+            (ErrorKind::Refused, "reference_target_topology_mismatch")
+        }
+        SurfaceError::MissingTriangle { .. } => (ErrorKind::Refused, "uncovered_garment_vertices"),
     };
     CommandError::new(kind, code, error.to_string())
 }

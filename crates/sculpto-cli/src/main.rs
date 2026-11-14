@@ -895,7 +895,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 }
 
 fn garment(args: &[String]) -> ExitCode {
-    let usage = "usage: sculpto garment fit --nif <path> --shape <name> --body-shape <name> --body <obj> --out <obj> [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+    let usage = "usage: sculpto garment fit --nif <path> --shape <name> [--body-shape <name>] --body <obj> --out <obj> [--body-ref <obj>] [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
        sculpto garment push --body <obj> --garment <obj> --tolerance <units> --out <obj> [--passes <n>] [--json]
        sculpto garment stack --outfit <layers.json> [--body <obj>] --tolerance <units> [--json]
@@ -985,9 +985,10 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
     let params = ops::FitParams {
         nif: PathBuf::from(required(&flags, "nif")?),
         shape: required(&flags, "shape")?.to_string(),
-        body_shape: required(&flags, "body-shape")?.to_string(),
+        body_shape: flags.get("body-shape").cloned(),
         body: PathBuf::from(required(&flags, "body")?),
         out: PathBuf::from(required(&flags, "out")?),
+        body_ref: flags.get("body-ref").map(PathBuf::from),
         body_after: flags.get("body-after").map(PathBuf::from),
         out_after: flags.get("out-after").map(PathBuf::from),
         conform: flags.get("conform").map(PathBuf::from),
@@ -1010,6 +1011,32 @@ fn garment_fit_inner(args: &[String]) -> Result<(), String> {
         outcome.offset_mean,
         outcome.offset_max
     );
+    if let Some(provenance) = &outcome.provenance {
+        println!(
+            "reference: {} `{}` ({} vertices / {} triangles), sha256 {}",
+            provenance.reference_source,
+            provenance.reference_path.display(),
+            provenance.reference_vertices,
+            provenance.reference_triangles,
+            provenance.reference_body_sha256
+        );
+        match provenance.target_triangles {
+            Some(triangles) => println!(
+                "target: `{}` ({} vertices / {} triangles), sha256 {}",
+                provenance.target_path.display(),
+                provenance.target_vertices,
+                triangles,
+                provenance.target_body_sha256
+            ),
+            None => println!(
+                "target: `{}` ({} vertices, positions-only), sha256 {}",
+                provenance.target_path.display(),
+                provenance.target_vertices,
+                provenance.target_body_sha256
+            ),
+        }
+        println!("transport: {}", provenance.transport_method);
+    }
     if let Some((body, garment, difference)) = outcome.follow {
         println!(
             "follow (bound vertices): body moved {:.6}, garment moved {:.6}, max difference {:.9}",

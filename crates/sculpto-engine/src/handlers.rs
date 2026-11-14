@@ -243,9 +243,10 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
     let params = ops::FitParams {
         nif: path(input, "nif")?,
         shape: string(input, "shape")?,
-        body_shape: string(input, "body_shape")?,
+        body_shape: optional_string(input, "body_shape"),
         body: path(input, "body")?,
         out: path(input, "out")?,
+        body_ref: checked_optional_path(input, "body_ref")?,
         body_after: optional_path(input, "body_after"),
         out_after: optional_path(input, "out_after"),
         conform: checked_optional_path(input, "conform")?,
@@ -285,6 +286,18 @@ pub fn fit(input: &Value) -> Result<Value, CommandError> {
     }
     if let Some(collision) = outcome.collision {
         result["collision"] = json!(collision);
+    }
+    if let Some(provenance) = outcome.provenance {
+        result["reference_source"] = json!(provenance.reference_source);
+        result["reference_path"] = json!(provenance.reference_path.display().to_string());
+        result["reference_body_sha256"] = json!(provenance.reference_body_sha256);
+        result["reference_vertices"] = json!(provenance.reference_vertices);
+        result["reference_triangles"] = json!(provenance.reference_triangles);
+        result["target_path"] = json!(provenance.target_path.display().to_string());
+        result["target_body_sha256"] = json!(provenance.target_body_sha256);
+        result["target_vertices"] = json!(provenance.target_vertices);
+        result["target_triangles"] = json!(provenance.target_triangles);
+        result["transport_method"] = json!(provenance.transport_method);
     }
     Ok(result)
 }

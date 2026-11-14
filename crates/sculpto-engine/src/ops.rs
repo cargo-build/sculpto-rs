@@ -22,9 +22,10 @@ use sculpto_core::rig::Rig;
 use sculpto_core::rig::template::{TemplateRoots, complete_family_rig};
 use sculpto_core::{SliderSize, document::Document};
 use sculpto_gltf::sanitize::{Repair, SanitizeError};
-use sculpto_mesh::conform::Conform;
+use sculpto_mesh::conform::{Conform, ConformError};
 use sculpto_mesh::intake_gltf::{DefectLimits, TopologyDefects, read_raw};
 use sculpto_mesh::outfit::{OutfitManifest, ShapeInfo, ShapeReport, census};
+use sculpto_mesh::surface::SurfaceBinding;
 use sculpto_mesh::wrap::repair::final_push::FinalPushOptions;
 use sculpto_nif::write::header::{NifTarget, NifWriteError};
 use sculpto_nif::write::le_bundle::write_le_bundle;
@@ -36,7 +37,9 @@ use sculpto_nif::write::{
 use sculpto_nif::{NifDocument, NifRigError, NifShape, TriFile};
 
 use crate::errors;
-use crate::obj::{pick_shape, pick_shape_index, read_obj_positions, write_obj, write_obj_uv};
+use crate::obj::{
+    pick_shape, pick_shape_index, read_obj_positions, read_obj_surface, write_obj, write_obj_uv,
+};
 
 mod head;
 mod slider;
@@ -1144,12 +1147,17 @@ pub struct FitParams {
     pub nif: PathBuf,
     /// Garment shape.
     pub shape: String,
-    /// Body shape inside the same NIF, the authored reference.
-    pub body_shape: String,
+    /// Body shape inside the same NIF, the authored reference. Required unless
+    /// `body_ref` supplies an external reference on the plain fit path.
+    pub body_shape: Option<String>,
     /// Morphed body OBJ.
     pub body: PathBuf,
     /// Output OBJ.
     pub out: PathBuf,
+    /// External reference body OBJ with the target body's topology. When given,
+    /// the garment binds to this control surface in triangle frames instead of
+    /// the embedded `body_shape`, so a culled NIF body no longer locks the fit.
+    pub body_ref: Option<PathBuf>,
     /// Optional second body for the follow measurement.
     pub body_after: Option<PathBuf>,
     /// Output for the follow measurement.
@@ -1179,6 +1187,35 @@ pub struct FitParams {
 }
 
 impl FitParams {
+    /// The embedded body shape name the legacy and guarded paths bind to.
+    ///
+    /// `body_ref` replaces the embedded reference on the plain path only; every
+    /// other path still needs the named shape.
+    pub fn required_body_shape(&self) -> Result<&str, CommandError> {
+        self.body_shape.as_deref().ok_or_else(|| {
+            CommandError::new(
+                ErrorKind::InvalidParams,
+                "missing_field",
+                "`body_shape` is required when `body_ref` is absent",
+            )
+        })
+    }
+
+    /// Whether a guarded, preview or follow stage is requested.
+    fn guarded_request(&self) -> bool {
+        self.conform.is_some()
+            || self.slider.is_some()
+            || self.percent.is_some()
+            || self.body_nif.is_some()
+            || self.manifest.is_some()
+            || self.collision.is_some()
+            || self.collision_frame.is_some()
+            || self.final_push.is_some()
+            || self.final_push_tolerance.is_some()
+            || self.body_after.is_some()
+            || self.out_after.is_some()
+    }
+
     /// Resolve the opt-in final push-out request.
     ///
     /// Half a request is refused by name instead of being read as either
@@ -1211,9 +1248,10 @@ pub struct FitOutcome {
     pub reference: String,
     /// Vertices written.
     pub vertices: usize,
-    /// Mean offset against the reference.
+    /// Mean authored offset against the reference, nearest-vertex metric in
+    /// both transports.
     pub offset_mean: f32,
-    /// Largest offset.
+    /// Largest authored offset against the reference.
     pub offset_max: f32,
     /// Follow measurement when a second body was given.
     pub follow: Option<(f32, f32, f32)>,
@@ -1227,6 +1265,40 @@ pub struct FitOutcome {
     pub repair: Option<sculpto_mesh::wrap::repair::FitRepairReport>,
     /// The caller-declared collision scope that was measured, when one was given.
     pub collision: Option<CollisionScope>,
+    /// Binding provenance of the plain fit path; guarded paths report their
+    /// binding through `regions`/`repair` instead.
+    pub provenance: Option<FitProvenance>,
+}
+
+/// Which control surface a plain fit bound to, and how it was transported.
+///
+/// `reference_body_sha256` digests the reference geometry that built the
+/// binding: the embedded shape's position bytes for `embedded_nif`, the
+/// reference OBJ file bytes for `external_reference`. `target_body_sha256` is
+/// always the target OBJ file bytes.
+#[derive(Debug, Clone)]
+pub struct FitProvenance {
+    /// `embedded_nif` or `external_reference`.
+    pub reference_source: &'static str,
+    /// File the reference geometry was read from.
+    pub reference_path: PathBuf,
+    /// SHA-256 of the reference geometry (embedded positions or OBJ file bytes).
+    pub reference_body_sha256: String,
+    /// Reference control surface vertices.
+    pub reference_vertices: usize,
+    /// Reference control surface triangles.
+    pub reference_triangles: usize,
+    /// Target body OBJ.
+    pub target_path: PathBuf,
+    /// SHA-256 of the target body file bytes.
+    pub target_body_sha256: String,
+    /// Target body vertices.
+    pub target_vertices: usize,
+    /// Target body triangles; `None` on the positions-only legacy transport,
+    /// which never reads target faces.
+    pub target_triangles: Option<usize>,
+    /// `nearest_vertex_offset` or `surface_triangle_frame`.
+    pub transport_method: &'static str,
 }
 
 /// The collision surface a fit actually measured against.
@@ -1246,7 +1318,19 @@ pub struct CollisionScope {
 }
 
 /// Bind a garment to its authored body and apply the bind to a morphed body.
+///
+/// With `body_ref` the garment binds to an external reference control surface in
+/// triangle frames ([`SurfaceBinding`]) and transports onto the target body, so a
+/// culled NIF body no longer locks the fit. Without it the legacy embedded-shape
+/// [`Conform`] runs unchanged.
 pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
+    if params.body_ref.is_some() && params.guarded_request() {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "outfit_fit_body_ref_scope",
+            "`body_ref` retargets the plain fit only; drop `manifest`, `conform`/`slider`/`percent`, `body_nif`, `collision`, `final_push` and `body_after`/`out_after` to use it",
+        ));
+    }
     if params.conform.is_some()
         || params.slider.is_some()
         || params.percent.is_some()
@@ -1273,12 +1357,41 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
     }
     let bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
-    let garment = pick_shape(&document.shapes, Some(&params.shape))?;
-    let reference = pick_shape(&document.shapes, Some(&params.body_shape))?;
+    let garment = fit_shape(&document.shapes, &params.shape, "missing_shape", "shape")?;
+    match &params.body_ref {
+        Some(reference_path) => fit_retarget(params, garment, reference_path),
+        None => fit_legacy(params, &document, garment),
+    }
+}
+
+/// The legacy single-NIF conform: bind to the embedded body shape, apply to the
+/// morphed body. Unchanged geometry; only provenance and the topology hint are new.
+fn fit_legacy(
+    params: &FitParams,
+    document: &NifDocument,
+    garment: &NifShape,
+) -> Result<FitOutcome, CommandError> {
+    let body_shape = params.required_body_shape()?;
+    let reference = fit_shape(
+        &document.shapes,
+        body_shape,
+        "missing_body_shape",
+        "body shape",
+    )?;
     let body = read_obj_positions(&params.body)?;
     let conform =
         Conform::bind(&garment.positions, &reference.positions).map_err(errors::conform)?;
-    let fitted = conform.apply(&body).map_err(errors::conform)?;
+    let fitted = conform.apply(&body).map_err(|error| match error {
+        ConformError::Topology { expected, actual } => CommandError::new(
+            ErrorKind::Refused,
+            "topology_mismatch",
+            format!(
+                "target body has {actual} vertices, but NIF shape `{}` has {expected}; supply --body-ref with matching base body topology",
+                reference.name
+            ),
+        ),
+        other => errors::conform(other),
+    })?;
     write_obj(&params.out, &fitted, &garment.triangles)
         .map_err(|error| errors::io(&params.out, error))?;
     let mut follow = None;
@@ -1294,6 +1407,18 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         let measured = conform.follow(&body, &after).map_err(errors::conform)?;
         follow = Some((measured.body, measured.garment, measured.difference));
     }
+    let provenance = FitProvenance {
+        reference_source: "embedded_nif",
+        reference_path: params.nif.clone(),
+        reference_body_sha256: positions_sha256(&reference.positions),
+        reference_vertices: reference.positions.len(),
+        reference_triangles: reference.triangles.len(),
+        target_path: params.body.clone(),
+        target_body_sha256: file_sha256(&params.body)?,
+        target_vertices: body.len(),
+        target_triangles: None,
+        transport_method: "nearest_vertex_offset",
+    };
     Ok(FitOutcome {
         out: params.out.clone(),
         garment: garment.name.clone(),
@@ -1307,7 +1432,121 @@ pub fn garment_fit(params: &FitParams) -> Result<FitOutcome, CommandError> {
         regions: None,
         repair: None,
         collision: None,
+        provenance: Some(provenance),
     })
+}
+
+/// Retarget the garment binding onto an external reference control surface, then
+/// transport it onto the target body with triangle frames.
+fn fit_retarget(
+    params: &FitParams,
+    garment: &NifShape,
+    reference_path: &Path,
+) -> Result<FitOutcome, CommandError> {
+    let (reference, reference_triangles) = read_obj_surface(reference_path)?;
+    let (body, body_triangles) = read_obj_surface(&params.body)?;
+    if reference.len() != body.len() || reference_triangles != body_triangles {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "reference_target_topology_mismatch",
+            format!(
+                "reference body has {} vertices / {} triangles, but target body has {} vertices / {} triangles",
+                reference.len(),
+                reference_triangles.len(),
+                body.len(),
+                body_triangles.len()
+            ),
+        ));
+    }
+    let binding = SurfaceBinding::bind(&garment.positions, &reference, &reference_triangles)
+        .map_err(errors::surface)?;
+    let fitted = binding
+        .apply(&body, &body_triangles)
+        .map_err(errors::surface)?;
+    write_obj(&params.out, &fitted, &garment.triangles)
+        .map_err(|error| errors::io(&params.out, error))?;
+    // Authored-thickness provenance only; the transport above is the triangle
+    // frame, never this nearest-vertex conform.
+    let offsets = Conform::bind(&garment.positions, &reference).map_err(errors::conform)?;
+    let reference_name = reference_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| reference_path.display().to_string());
+    let provenance = FitProvenance {
+        reference_source: "external_reference",
+        reference_path: reference_path.to_path_buf(),
+        reference_body_sha256: file_sha256(reference_path)?,
+        reference_vertices: reference.len(),
+        reference_triangles: reference_triangles.len(),
+        target_path: params.body.clone(),
+        target_body_sha256: file_sha256(&params.body)?,
+        target_vertices: body.len(),
+        target_triangles: Some(body_triangles.len()),
+        transport_method: "surface_triangle_frame",
+    };
+    Ok(FitOutcome {
+        out: params.out.clone(),
+        garment: garment.name.clone(),
+        reference: reference_name,
+        vertices: fitted.len(),
+        offset_mean: offsets.offset_mean(),
+        offset_max: offsets.offset_max(),
+        follow: None,
+        intersection_pairs: None,
+        inside_after: None,
+        regions: None,
+        repair: None,
+        collision: None,
+        provenance: Some(provenance),
+    })
+}
+
+/// A named fit shape, refused with the available list when the NIF lacks it.
+fn fit_shape<'a>(
+    shapes: &'a [NifShape],
+    name: &str,
+    code: &'static str,
+    label: &str,
+) -> Result<&'a NifShape, CommandError> {
+    shapes
+        .iter()
+        .find(|shape| shape.name == name)
+        .ok_or_else(|| {
+            let available: Vec<&str> = shapes.iter().map(|shape| shape.name.as_str()).collect();
+            CommandError::new(
+                ErrorKind::NotFound,
+                code,
+                format!(
+                    "{label} `{name}` not found in NIF; available: [{}]",
+                    available.join(", ")
+                ),
+            )
+        })
+}
+
+/// SHA-256 of a file's bytes, hex-encoded.
+fn file_sha256(path: &Path) -> Result<String, CommandError> {
+    let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// SHA-256 of embedded reference geometry (little-endian position bytes).
+fn positions_sha256(positions: &[[f32; 3]]) -> String {
+    let mut bytes = Vec::with_capacity(positions.len() * 12);
+    for [x, y, z] in positions {
+        bytes.extend_from_slice(&x.to_le_bytes());
+        bytes.extend_from_slice(&y.to_le_bytes());
+        bytes.extend_from_slice(&z.to_le_bytes());
+    }
+    sha256_hex(&bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Everything `intake.check` needs.

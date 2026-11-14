@@ -742,8 +742,10 @@ fn fit_tool_error_codes_match_the_command_surface() {
         "body": &triangle_body, "out": &never,
     });
     // Request, expected code, expected kind, the `sculpto run` exit code.
+    // The shape refusal carries the FIT-11 `missing_shape` code and the
+    // available list; kind and exit are the legacy NotFound semantics.
     for (arguments, code, kind, exit) in [
-        (unknown_shape, "not_found", "not_found", 2),
+        (unknown_shape, "missing_shape", "not_found", 2),
         (wrong_topology, "topology_mismatch", "refused", 1),
     ] {
         let cli = Command::new(env!("CARGO_BIN_EXE_sculpto"))

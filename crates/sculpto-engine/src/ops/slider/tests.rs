@@ -96,7 +96,8 @@ fn collision_scope_and_output_respect_nonidentity_placement() {
     let mut params = FitParams {
         nif: garment_path,
         shape: "Garment".into(),
-        body_shape: "Body".into(),
+        body_shape: Some("Body".into()),
+        body_ref: None,
         body: body_path,
         out: fixture.0.join("fitted.obj"),
         body_after: None,
@@ -230,7 +231,8 @@ fn final_push_scene(fixture: &Fixture) -> FitParams {
     FitParams {
         nif: garment_path,
         shape: "Garment".into(),
-        body_shape: "Body".into(),
+        body_shape: Some("Body".into()),
+        body_ref: None,
         body: body_obj,
         out: fixture.0.join("fitted.obj"),
         body_after: None,
@@ -258,7 +260,8 @@ fn guarded_fit(
     )
     .expect("body document");
     let garment = PlacedShape::named(&document, &params.shape).expect("placed garment");
-    let body = PlacedShape::named(&body_doc, &params.body_shape).expect("placed body");
+    let body = PlacedShape::named(&body_doc, params.required_body_shape().expect("body shape"))
+        .expect("placed body");
     let target = target_positions(params, &body).expect("target positions");
     let outcome = finish_fit(
         params,
