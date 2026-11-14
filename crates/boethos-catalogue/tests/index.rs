@@ -228,3 +228,62 @@ fn indexes_archive_members_end_to_end() {
     let _ = fs::remove_file(root.with_extension("redb"));
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn classifies_extracted_underwear_as_tagged_outfit() {
+    let root = temp_dir("garment-tags");
+    fs::write(root.join("female-cbbe-bra.obj"), b"bra").expect("write");
+    fs::write(root.join("female-3ba-panty.obj"), b"panty").expect("write");
+    fs::write(root.join("femalebody_0.nif"), b"body").expect("write");
+    let db = root.with_extension("redb");
+    let store = Store::open(&db).expect("store");
+    let report = index_root(
+        &store,
+        &root,
+        "underwear-extract",
+        &IndexOptions {
+            archive_entries: false,
+            prune: false,
+        },
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    let row = |name: &str| {
+        rows.iter()
+            .find(|(_, asset)| asset.name == name)
+            .map(|(_, asset)| asset)
+            .expect(name)
+    };
+    let bra = row("female-cbbe-bra.obj");
+    assert_eq!(bra.category, Category::Outfit);
+    assert_eq!(bra.sex, Some(boethos_catalogue::Sex::Female));
+    assert_eq!(bra.family.as_deref(), Some("cbbe"));
+    for tag in [
+        "wear:underwear",
+        "wear:top",
+        "garment:bra",
+        "fit:tight",
+        "layer:inner",
+    ] {
+        assert!(bra.tags.contains(&tag.to_string()), "{tag}: {:?}", bra.tags);
+    }
+    let panty = row("female-3ba-panty.obj");
+    assert_eq!(panty.category, Category::Outfit);
+    assert_eq!(panty.family.as_deref(), Some("3ba"));
+    for tag in [
+        "wear:underwear",
+        "wear:bottom",
+        "garment:panty",
+        "fit:tight",
+        "layer:inner",
+    ] {
+        assert!(
+            panty.tags.contains(&tag.to_string()),
+            "{tag}: {:?}",
+            panty.tags
+        );
+    }
+    assert_eq!(row("femalebody_0.nif").category, Category::Body);
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}

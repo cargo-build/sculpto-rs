@@ -340,3 +340,40 @@ fn delete_does_not_create_a_missing_database() {
     assert!(!db.exists(), "delete created the database");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn garment_tags_filter_extracted_underwear() {
+    let root = temp_dir("garment-tags");
+    fs::write(root.join("female-cbbe-bra.obj"), b"bra").expect("write");
+    fs::write(root.join("female-3ba-panty.obj"), b"panty").expect("write");
+    let db = root.with_extension("redb");
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--root",
+            root.to_str().expect("root"),
+            "--source",
+            "underwear-extract",
+            "--no-archives",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = run(&db, &["list", "--category", "outfit"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.lines().count(), 3, "{stdout}");
+    let (code, stdout, stderr) = run(
+        &db,
+        &["list", "--tag", "wear:underwear", "--tag", "sex:female"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.lines().count(), 3, "{stdout}");
+    assert!(stdout.contains("female-cbbe-bra.obj"), "{stdout}");
+    assert!(stdout.contains("female-3ba-panty.obj"), "{stdout}");
+    let (code, stdout, stderr) = run(&db, &["list", "--tag", "wear:bottom", "--tag", "fit:tight"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.lines().count(), 2, "{stdout}");
+    assert!(stdout.contains("female-3ba-panty.obj"), "{stdout}");
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}

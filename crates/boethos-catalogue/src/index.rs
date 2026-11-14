@@ -15,6 +15,53 @@ const ARCHIVE_EXTENSIONS: [&str; 3] = ["7z", "zip", "rar"];
 const IGNORED_DIRS: [&str; 5] = [".git", ".jj", "__pycache__", "node_modules", "target"];
 const UNSUPPORTED_ARCHIVES: [&str; 5] = ["gz", "tar", "tgz", "xz", "bz2"];
 
+/// Controlled garment-type tags. A garment may carry several of them.
+const GARMENT_WORD_TAGS: &[(&str, &[&str])] = &[
+    (
+        "wear:underwear",
+        &[
+            "bra",
+            "panty",
+            "panties",
+            "briefs",
+            "underwear",
+            "undergarment",
+        ],
+    ),
+    ("wear:top", &["bra", "shirt", "blouse", "top", "vest"]),
+    (
+        "wear:bottom",
+        &["shorts", "short", "pants", "trousers", "skirt", "panty"],
+    ),
+    ("wear:onepiece", &["dress", "robe", "gown", "jumpsuit"]),
+    ("wear:shoes", &["boots", "shoes", "sandals", "heels"]),
+    ("wear:headwear", &["helmet", "hat", "hood", "circlet"]),
+    (
+        "wear:armor",
+        &["armor", "armour", "cuirass", "plate", "mail"],
+    ),
+    ("wear:sport", &["sport", "athletic", "training", "gym"]),
+    (
+        "wear:accessory",
+        &["gloves", "belt", "cape", "cloak", "necklace", "ring"],
+    ),
+];
+
+/// Exact garment-part tags; unlike `wear:*`, these name the piece.
+const GARMENT_PART_TAGS: &[(&str, &[&str])] = &[
+    ("garment:bra", &["bra"]),
+    ("garment:panty", &["panty", "panties", "briefs"]),
+    ("garment:shorts", &["shorts", "short"]),
+    ("garment:dress", &["dress", "gown"]),
+    ("garment:robe", &["robe"]),
+    ("garment:boots", &["boots"]),
+    ("garment:helmet", &["helmet"]),
+];
+
+const TIGHT_TOKENS: [&str; 8] = [
+    "bra", "panty", "panties", "briefs", "shorts", "short", "leggings", "tights",
+];
+
 /// Indexing switches.
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
@@ -111,7 +158,9 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
         if UNSUPPORTED_ARCHIVES.contains(&extension.as_str()) {
             report.unsupported_archives += 1;
         }
-        let category = classify(&path, &extension);
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative_text = relative.to_string_lossy();
+        let category = classify(relative, &extension);
         let sha = match sha256_file(&path) {
             Ok(sha) => sha,
             Err(error) => {
@@ -132,10 +181,10 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
             format: extension,
             sha256: Some(sha),
             bytes,
-            sex: sex_from_path(&path_text),
-            family: family_from_path(&path_text),
-            tags: Vec::new(),
-            status: status_from_path(&path_text),
+            sex: sex_from_path(&relative_text),
+            family: family_from_path(&relative_text),
+            tags: garment_tags(&relative_text, category),
+            status: status_from_path(&relative_text),
         };
         write(store, &asset, &mut seen, &mut report);
     }
@@ -261,6 +310,9 @@ fn index_archive(
         if entry.path.to_lowercase().contains("facegeom") {
             tags.push("facegeom".to_string());
         }
+        tags.extend(garment_tags(&format!("{name} {}", entry.path), category));
+        tags.sort();
+        tags.dedup();
         let member_name = {
             let mut parts = entry.path.rsplit('/').take(2).collect::<Vec<_>>();
             parts.reverse();
@@ -368,7 +420,11 @@ fn classify(path: &Path, extension: &str) -> Category {
         if text.contains("body") || text.contains("baseshape") {
             return Category::Body;
         }
-        if text.contains("clothes") || text.contains("armor") || text.contains("outfit") {
+        if has_garment_token(&text)
+            || text.contains("clothes")
+            || text.contains("armor")
+            || text.contains("outfit")
+        {
             return Category::Outfit;
         }
     }
@@ -424,6 +480,62 @@ fn member_category(path: &str, archive_name: &str) -> Option<Category> {
 fn has_hair_token(text: &str) -> bool {
     text.split(|character: char| !character.is_ascii_alphanumeric())
         .any(|token| token.starts_with("hair"))
+}
+
+fn garment_tags(text: &str, category: Category) -> Vec<String> {
+    if category != Category::Outfit {
+        return Vec::new();
+    }
+    let lower = text.to_lowercase();
+    let tokens: HashSet<&str> = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut tags: Vec<String> = Vec::new();
+    for (tag, words) in GARMENT_WORD_TAGS {
+        if words.iter().any(|word| tokens.contains(word)) {
+            tags.push((*tag).to_string());
+        }
+    }
+    for (tag, words) in GARMENT_PART_TAGS {
+        if words.iter().any(|word| tokens.contains(word)) {
+            tags.push((*tag).to_string());
+        }
+    }
+    if TIGHT_TOKENS.iter().any(|word| tokens.contains(word)) {
+        tags.push("fit:tight".to_string());
+    }
+    if let Some(sex) = sex_from_context(text) {
+        tags.push(format!("sex:{}", sex.as_str()));
+    }
+    if let Some(family) = family_from_path(text)
+        && matches!(family.as_str(), "cbbe" | "3ba" | "himbo")
+    {
+        tags.push(format!("body:{family}"));
+    }
+    if tags.iter().any(|tag| tag == "wear:underwear") {
+        tags.push("layer:inner".to_string());
+    } else if tags
+        .iter()
+        .any(|tag| tag == "wear:top" || tag == "wear:bottom")
+    {
+        tags.push("layer:mid".to_string());
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn has_garment_token(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let tokens: HashSet<&str> = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    GARMENT_WORD_TAGS
+        .iter()
+        .chain(GARMENT_PART_TAGS.iter())
+        .any(|(_, words)| words.iter().any(|word| tokens.contains(word)))
 }
 
 fn sex_from_path(text: &str) -> Option<Sex> {
