@@ -3,7 +3,7 @@
 //! construction defect, or split the parts. Open boundaries at collar, cuffs
 //! and hem are normal cloth, not defects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::aura::{Segment, extent, plane_axes, up_axis};
 use crate::classify::{ClassifyError, component_groups, major_components};
@@ -227,8 +227,10 @@ pub fn audit(
 }
 
 /// Boundary loops: edges used by exactly one triangle, chained through shared
-/// vertices. Wire edges (a dangling vertex) close into their own group.
-fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Opening> {
+/// vertices. Wire edges (a dangling vertex) close into their own group. The
+/// walk order is a pure function of the mesh: the loop partition is stable
+/// across runs, so a caller can compare two inventories of the same topology.
+pub(crate) fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Opening> {
     let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
     for [a, b, c] in triangles {
         for (left, right) in [(a, b), (b, c), (c, a)] {
@@ -240,7 +242,7 @@ fn boundary_loops(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<Opening
             *counts.entry(key).or_default() += 1;
         }
     }
-    let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut adjacency: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for ((left, right), count) in counts {
         if count == 1 {
             adjacency.entry(left).or_default().push(right);

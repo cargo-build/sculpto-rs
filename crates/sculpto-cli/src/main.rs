@@ -75,6 +75,9 @@ commands:
   garment control-separate [options] apply the declared bounded local contact repair
   garment control-cuts [options] validate declared source-opening cuts and print the plan
   garment uv-check [options] qualify triangle-corner UV area and atlas bounds
+  mesh densify --in <obj> --out <obj> [--cuts <n>] [--smooth-iterations <n>]
+                 [--smooth-max-shift <units>] [--report <json>]
+                        neutral diagnostic densify; boundaries and parts stay, not a fit result
   blender cloth-bake --request <json> [options]
                         run the pinned Blender cloth bake and validate its artifacts
   run --cmd <id>        dispatch one command id and print its JSON envelope
@@ -278,6 +281,14 @@ outfit stack-fit options:
   --tolerance <units> accepted visible depth for every push and graded pair
   --passes <n>        per-layer push budget, 1..=10 (4)
   --json              print the per-step provenance and pair report as JSON
+
+mesh densify options:
+  --in <obj>            OBJ mesh to densify; parts stay separate components
+  --out <obj>           densified OBJ, same frame as the input
+  --cuts <n>            midpoint subdivision rounds 0..=2 (default 1)
+  --smooth-iterations <n>  interior Laplacian passes 0..=20; boundary loops never move (default 0)
+  --smooth-max-shift <units>  hard cumulative displacement bound; exceeded refuses, never clips
+  --report <json>       also write the JSON report (counts, parts, boundary drift)
 ";
 
 fn main() -> ExitCode {
@@ -318,6 +329,9 @@ fn main() -> ExitCode {
             outfit_stack_fit(rest)
         }
         [command, rest @ ..] if command == "garment" => garment(rest),
+        [command, action, rest @ ..] if command == "mesh" && action == "densify" => {
+            mesh_densify(rest)
+        }
         [command, rest @ ..] if command == "blender" => blender::run(rest),
         [command, rest @ ..] if command == "run" => run::run(rest),
         [command, rest @ ..] if command == "commands" => run::commands(rest),
@@ -777,6 +791,48 @@ fn outfit_stack_fit(args: &[String]) -> ExitCode {
         Err(error) => {
             eprintln!("outfit stack-fit: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Neutral diagnostic densify: parse the flags into the registry payload and
+/// dispatch, so argv and `run --cmd` answer with the same envelope.
+fn mesh_densify(args: &[String]) -> ExitCode {
+    fn number<T: std::str::FromStr>(raw: Option<&String>, flag: &str) -> Result<Option<T>, String> {
+        raw.map(|value| {
+            value
+                .parse::<T>()
+                .map_err(|_| format!("`--{flag}` is not a valid number: {value}"))
+        })
+        .transpose()
+    }
+
+    let parsed = parse_flags(args).and_then(|flags| {
+        if let Some(key) = flags.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "in" | "out" | "cuts" | "smooth-iterations" | "smooth-max-shift" | "report"
+            )
+        }) {
+            return Err(format!("unknown option `--{key}`"));
+        }
+        let cuts = number::<u32>(flags.get("cuts"), "cuts")?;
+        let smooth_iterations = number::<u32>(flags.get("smooth-iterations"), "smooth-iterations")?;
+        let smooth_max_shift = number::<f32>(flags.get("smooth-max-shift"), "smooth-max-shift")?;
+        Ok(serde_json::json!({
+            "in": required(&flags, "in")?,
+            "out": required(&flags, "out")?,
+            "cuts": cuts,
+            "smooth_iterations": smooth_iterations,
+            "smooth_max_shift": smooth_max_shift,
+            "report": flags.get("report"),
+        }))
+    });
+    match parsed {
+        Ok(input) => run::dispatch_payload("mesh.densify", &input),
+        Err(error) => {
+            eprintln!("mesh densify: {error}");
+            ExitCode::from(2)
         }
     }
 }

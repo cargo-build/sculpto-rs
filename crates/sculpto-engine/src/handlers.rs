@@ -44,6 +44,11 @@ pub fn dress_schema() -> Value {
     schema_for::<ops::DressParams>()
 }
 
+/// Schema derived from the typed `mesh.densify` parameters.
+pub fn mesh_densify_schema() -> Value {
+    schema_for::<ops::DensifyParams>()
+}
+
 /// Schema for the authored garment slider conformance command.
 pub fn conform_schema() -> Value {
     schema_for::<ops::ConformParams>()
@@ -729,6 +734,19 @@ pub fn dress(input: &Value) -> Result<Value, CommandError> {
         report: checked_optional_path(input, "report")?,
     };
     Ok(ops::dress_garment(&params)?.to_json())
+}
+
+/// The neutral densify diagnostic: no fit vocabulary, and the report says so.
+pub fn mesh_densify(input: &Value) -> Result<Value, CommandError> {
+    let params = ops::DensifyParams {
+        r#in: path(input, "in")?,
+        out: path(input, "out")?,
+        cuts: optional_u32(input, "cuts")?,
+        smooth_iterations: optional_u32(input, "smooth_iterations")?,
+        smooth_max_shift: optional_f32(input, "smooth_max_shift")?,
+        report: checked_optional_path(input, "report")?,
+    };
+    Ok(ops::densify_mesh(&params)?.to_json())
 }
 
 pub fn conform(input: &Value) -> Result<Value, CommandError> {

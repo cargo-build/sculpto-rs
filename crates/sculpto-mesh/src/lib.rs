@@ -35,6 +35,7 @@ pub mod conform;
 pub mod contact_morph;
 pub mod control;
 pub mod delta_conform;
+pub mod densify;
 pub mod dress;
 pub mod garment;
 pub mod intake;

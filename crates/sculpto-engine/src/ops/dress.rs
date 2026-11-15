@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sculpto_mesh::dress::{DressError, DressParams as SolveParams, MAX_CUTS, dress};
 use sculpto_mesh::wrap::repair::final_push::{FinalPushOptions, FinalPushReport};
 
-use crate::obj::{ObjError, read_obj_mesh, write_obj};
+use crate::obj::{ObjError, display_to_source, read_obj_mesh, write_obj};
 use crate::{CommandError, ErrorKind, errors};
 
 /// Everything `outfit.dress` needs.
@@ -191,8 +191,15 @@ pub fn dress_garment(params: &DressParams) -> Result<DressOutcome, CommandError>
     if let Some(parent) = params.out.parent() {
         fs::create_dir_all(parent).map_err(|error| errors::io(parent, error))?;
     }
-    write_obj(&params.out, &to_source(&positions), &triangles)
-        .map_err(|error| errors::io(&params.out, error))?;
+    write_obj(
+        &params.out,
+        &positions
+            .iter()
+            .map(|&point| display_to_source(point))
+            .collect::<Vec<_>>(),
+        &triangles,
+    )
+    .map_err(|error| errors::io(&params.out, error))?;
     let outcome = DressOutcome {
         out: params.out.clone(),
         body: params.body.clone(),
@@ -335,7 +342,7 @@ fn solve_refused(error: &DressError) -> CommandError {
     CommandError::new(kind, code, error.to_string())
 }
 
-fn obj_error(field: &str, path: &Path, error: &ObjError) -> CommandError {
+pub(crate) fn obj_error(field: &str, path: &Path, error: &ObjError) -> CommandError {
     match error {
         ObjError::Io(message) => CommandError::new(
             ErrorKind::Io,
@@ -353,10 +360,4 @@ fn obj_error(field: &str, path: &Path, error: &ObjError) -> CommandError {
             format!("{field} `{}`: {error}", path.display()),
         ),
     }
-}
-
-/// Inverse of the `(x, z, -y)` display conversion `write_obj` applies, so the
-/// file keeps the exact coordinates the solve measured.
-fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
-    positions.iter().map(|[x, y, z]| [*x, -*z, *y]).collect()
 }

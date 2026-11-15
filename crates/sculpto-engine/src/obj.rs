@@ -413,7 +413,7 @@ fn obj_error(error: ObjError) -> CommandError {
 
 /// Source NIF positions are Z-up; every OBJ here uses the `(x, z, -y)` display
 /// frame, so this is the one conversion between them.
-fn display_to_source([x, y, z]: [f32; 3]) -> [f32; 3] {
+pub(crate) fn display_to_source([x, y, z]: [f32; 3]) -> [f32; 3] {
     [x, -z, y]
 }
 

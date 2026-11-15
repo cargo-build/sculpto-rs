@@ -48,6 +48,7 @@ use crate::obj::{
 
 mod dress;
 mod head;
+mod mesh_densify;
 mod slider;
 mod stack_fit;
 pub use dress::{DressMeasurements, DressOutcome, DressParams, dress_garment};
@@ -56,6 +57,7 @@ pub use head::{
     CompatibilityReport, RoleBundle, SkinTextureSet, apply_default_skin, head_compatibility,
     load_bodies_config, load_shape, resolve_default_head,
 };
+pub use mesh_densify::{DensifyOutcome, DensifyParams, densify_mesh};
 pub use slider::{ConformOutcome, ConformParams, conform_sliders};
 pub use stack_fit::{ObstacleProvenance, StackFitOutcome, StackFitParams, StackFitStep, stack_fit};
 

@@ -75,6 +75,8 @@ pub enum CommandId {
     ExportPair,
     /// Audit a raw garment export and report its topology defect counts.
     IntakeCheck,
+    /// Densify a mesh as a neutral diagnostic; not a fit result.
+    MeshDensify,
     /// Export an asset as a NIF.
     ExportNif,
     /// Re-encode all or selected NIF shapes into one multi-shape bundle.
@@ -114,6 +116,7 @@ impl CommandId {
             CommandId::ExportObj => "export.obj",
             CommandId::ExportPair => "export.pair",
             CommandId::IntakeCheck => "intake.check",
+            CommandId::MeshDensify => "mesh.densify",
             CommandId::ExportNif => "export.nif",
             CommandId::ExportBundle => "export.bundle",
             CommandId::ExportTri => "export.tri",
@@ -448,6 +451,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::intake_check,
     },
     Spec {
+        id: CommandId::MeshDensify,
+        summary: "Neutral diagnostic densify: midpoint subdivision with boundaries and parts preserved, optional interior smoothing that never moves a boundary loop; not a fit result.",
+        mutates: true,
+        stub: false,
+        schema: handlers::mesh_densify_schema,
+        handler: handlers::mesh_densify,
+    },
+    Spec {
         id: CommandId::ExportNif,
         summary: "Export an asset as a Skyrim NIF.",
         mutates: true,
@@ -589,6 +600,7 @@ mod tests {
             "export.bundle",
             "export.tri",
             "intake.check",
+            "mesh.densify",
             "gltf.reset_weights",
             "gltf.clamp_texcoord",
         ] {
