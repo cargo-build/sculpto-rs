@@ -185,6 +185,55 @@ fn an_unreached_vertex_with_no_fallback_refuses_with_its_measure() {
 }
 
 #[test]
+fn a_palette_slot_is_not_a_rig_index() {
+    // The palette keeps only weighted bones and their ancestors, so its slots do
+    // not line up with the rig's joints. A joint the palette skips sits far above
+    // both, where a slot read as a joint index would win.
+    let joint = |name: &str, parent: Option<u32>, translation: [f32; 3]| Joint {
+        name: Some(name.into()),
+        parent: parent.map(JointId::new),
+        rest: LocalTransform {
+            translation,
+            ..Default::default()
+        },
+    };
+    let rig = Rig::new(
+        vec![
+            joint("Root", None, [0.0, 0.0, 0.0]),
+            joint("Skipped", Some(0), [0.0, 0.0, 50.0]),
+            joint("Torso", Some(0), [0.0, 0.0, 1.0]),
+            joint("Head", Some(2), [0.0, 0.0, 5.0]),
+        ],
+        RigFrame::SourceZUp,
+    )
+    .expect("a valid source graph");
+    let palette = vec!["Root".to_string(), "Torso".to_string(), "Head".to_string()];
+    let (body_positions, body_triangles) = body();
+    let rows = body_rows();
+    let (positions, triangles) = part();
+    let bound = PartBinder::new(
+        &rig,
+        &palette,
+        &[1, 2],
+        BodySurface {
+            positions: &body_positions,
+            triangles: &body_triangles,
+            rows: &rows,
+        },
+        0,
+    )
+    .bind(&positions, &triangles, 3.0)
+    .expect("the portable part binds");
+    for (vertex, row) in bound.rows().iter().enumerate().skip(6) {
+        assert_eq!(
+            row.get("Head"),
+            Some(&1.0),
+            "vertex {vertex} must bind to the head joint by name, got {row:?}"
+        );
+    }
+}
+
+#[test]
 fn the_nearest_fallback_bone_wins() {
     // With both the torso and the head declared, the far rows still prefer the
     // head, whose origin is nearer to them than the torso's.

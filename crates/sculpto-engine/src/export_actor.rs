@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 
 use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
 use sculpto_core::rig::rest::{RestBinding, SkinRestSource};
-use sculpto_core::rig::{JointId, Rig, RigFrame};
+use sculpto_core::rig::{Rig, RigFrame};
 use sculpto_gltf::review::{BODY_COLOR, hex, palette as review_palette, smooth_normals};
 use sculpto_gltf::{Clip, PartMaterial, write_partitioned_rigged_glb};
 use sculpto_mesh::actor::Actor;
@@ -949,13 +949,20 @@ impl<'a> PartBinder<'a> {
         }
 
         // The fallback row: one rigid influence from the nearest declared bone.
+        // A palette slot is not a rig index (the palette keeps only the bones a
+        // vertex weights and their ancestors), so the origin is resolved through
+        // the name the slot carries.
         let origins: Vec<DVec3> = self
             .fallback
             .iter()
             .map(|slot| {
+                let joint = self
+                    .rig
+                    .joint_by_name(&self.palette[*slot])
+                    .expect("a palette bone is a rig joint");
                 let world = self
                     .rig
-                    .rest_world(JointId::new(*slot as u32))
+                    .rest_world(joint)
                     .expect("a palette joint has a rest world");
                 DVec3::new(world[3][0], world[3][1], world[3][2])
             })
