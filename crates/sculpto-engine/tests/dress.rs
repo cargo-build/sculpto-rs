@@ -210,8 +210,8 @@ fn configured_underwear_dresses_onto_the_exact_bijin_body() {
             if name == "panty" { 25 } else { 99 }
         );
         assert!(
-            report["pokes_after"].as_u64().unwrap() <= 10,
-            "{name} keeps at most a handful of unrepaired pokes: {}",
+            report["pokes_after"].as_u64().unwrap() == 0,
+            "{name} must leave no body poke: {}",
             report["pokes_after"]
         );
 

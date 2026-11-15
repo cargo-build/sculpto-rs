@@ -43,7 +43,7 @@ pub struct DressParams {
     /// Registration rounds interleaved with the contact solve, `0..=3`; `0`
     /// runs the contact solve only.
     pub rounds: Option<u32>,
-    /// Body-poke repair rounds per contact iteration; `0` leaves pokes alone.
+    /// Body-poke repair rounds per contact pass; `0` leaves pokes alone.
     pub poke_passes: Option<u32>,
     /// Accepted visible depth for the bounded final push-out stage; absent
     /// runs no final push.

@@ -239,6 +239,66 @@ fn a_body_spike_through_a_garment_facet_is_pushed_out() {
     body_triangles.truncate(body_triangles.len());
 }
 
+/// A smooth mound: a grid patch raised by a Gaussian, so every normal tilts
+/// toward the cloth above it.
+fn mound(cells: usize, half: f32, height: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let (mut positions, triangles) = patch(cells, 0.0, half);
+    for position in &mut positions {
+        let (x, y) = (position[0], position[1]);
+        position[2] = height * (-(x * x + y * y) / 0.8).exp();
+    }
+    (positions, triangles)
+}
+
+#[test]
+fn a_body_mound_through_a_garment_facet_is_removed_by_the_repair() {
+    // The shape the supplied bra hits: a garment facet far coarser than the
+    // body curvature under it, so the body crosses the facet while every
+    // garment vertex stays in the declared band. Each repair round ends with a
+    // contact pass that reopens part of the crossing, so the repair converges
+    // over rounds rather than in one, and the requirement is a zero count.
+    let body = mound(8, 2.0, 0.6);
+    let garment = patch(1, 0.1, 0.8);
+    let (dressed, _, report) = dress(
+        (&garment.0, &garment.1),
+        (&body.0, &body.1),
+        &DressParams {
+            cuts: 0,
+            rounds: 0,
+            relax: 0.0,
+            ..DressParams::default()
+        },
+    )
+    .expect("the mound fixture dresses with the default repair budget");
+    assert!(report.pokes_before > 0, "the fixture must start poking");
+    assert_eq!(
+        report.pokes_after, 0,
+        "the default budget has to leave no body poke: {} -> {}",
+        report.pokes_before, report.pokes_after
+    );
+    assert_eq!(
+        report.max_floating_gap, 0.0,
+        "the lift stays inside the band"
+    );
+    assert_eq!(report.max_penetration, 0.0);
+    let peak = dressed
+        .iter()
+        .map(|position| position[2])
+        .fold(f32::MIN, f32::max);
+    assert!(
+        peak > 0.6,
+        "the facet has to clear the mound instead of folding over it: peak {peak}"
+    );
+    let lowest = dressed
+        .iter()
+        .map(|position| position[2])
+        .fold(f32::MAX, f32::min);
+    assert!(
+        lowest >= DressParams::default().contact - 1e-4,
+        "no vertex sank below the contact standoff: {lowest}"
+    );
+}
+
 #[test]
 fn the_band_parameters_are_refused_by_name() {
     let body = patch(2, 0.0, 1.0);

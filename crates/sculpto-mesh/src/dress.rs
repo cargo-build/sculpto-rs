@@ -92,6 +92,12 @@ pub struct DressParams {
     /// runs the contact solve only.
     pub rounds: u32,
     /// Body-poke repair rounds per contact pass; `0` leaves pokes alone.
+    ///
+    /// A round ends with a contact pass, and that pull reopens part of the
+    /// crossings a push just closed, so the repair converges over rounds rather
+    /// than in one: the supplied 926-face bra needs about a dozen rounds on the
+    /// Bijin and 3BA bodies. The loop stops as soon as a round ends with no
+    /// hits, so the budget costs nothing on a garment that does not poke.
     pub poke_passes: u32,
     /// Opt-in bounded final push-out over graded visible depth. `None` runs no
     /// pass and measures nothing; accepting a visible depth is the caller's
@@ -109,7 +115,7 @@ impl Default for DressParams {
             max_step: 1.0,
             relax: 0.2,
             rounds: 2,
-            poke_passes: 4,
+            poke_passes: 16,
             final_push: None,
         }
     }
@@ -729,29 +735,13 @@ fn resolve(
         if hits.is_empty() {
             break;
         }
-        // One garment triangle can be crossed by many body vertices — a breast
-        // meets the same cup facet through a whole ring of them. Each triangle
-        // moves once per round by its deepest poke, not once per hit: summing
-        // the pushes launches the facet out of the garment.
-        let mut deepest: std::collections::BTreeMap<usize, (usize, f32)> = BTreeMap::new();
-        for (vertex, hit, depth) in hits {
-            let entry = deepest.entry(hit.triangle).or_insert((vertex, depth));
-            if depth > entry.1 {
-                *entry = (vertex, depth);
-            }
-        }
-        for (triangle, (vertex, depth)) in deepest {
-            let step = (depth + params.clearance).min(params.max_step);
-            let displacement = scale(obstacle.normals[vertex], step);
-            for corner in triangles[triangle] {
-                let corner = corner as usize;
-                positions[corner] = add(positions[corner], displacement);
-                moved_of[corner] = true;
-                max_move = max_move.max(step);
-            }
-        }
+        let pushed = push_pokes(obstacle, positions, triangles, moved_of, params, &hits);
+        max_move = max_move.max(pushed);
         converged = false;
     }
+    // The loop above ends every round with a contact pass, so leaving it with
+    // no hits is the repair's own convergence test: a facet that a later pull
+    // reopens shows up again here, and the pass budget is what bounds it.
     let band = measure(obstacle, positions, triangles, params);
     Solved {
         iterations,
@@ -761,6 +751,49 @@ fn resolve(
         max_penetration: band.max_penetration,
         pokes: obstacle.poke_hits((positions, triangles)).len(),
     }
+}
+
+/// Push every crossed garment triangle out once by its deepest poke, and
+/// return the largest displacement applied.
+///
+/// One garment triangle can be crossed by many body vertices — a breast meets
+/// the same cup facet through a whole ring of them. Each triangle moves once by
+/// its deepest poke, not once per hit: summing the pushes launches the facet
+/// out of the garment.
+fn push_pokes(
+    obstacle: &Obstacle<'_>,
+    positions: &mut [[f32; 3]],
+    triangles: &[[u32; 3]],
+    moved_of: &mut [bool],
+    params: &DressParams,
+    hits: &[(usize, crate::check::RayHit, f32)],
+) -> f32 {
+    let mut deepest: BTreeMap<usize, (usize, f32)> = BTreeMap::new();
+    for &(vertex, hit, depth) in hits {
+        let entry = deepest.entry(hit.triangle).or_insert((vertex, depth));
+        if depth > entry.1 {
+            *entry = (vertex, depth);
+        }
+    }
+    let mut largest = 0.0f32;
+    for (triangle, (vertex, depth)) in deepest {
+        // Clear the crossing by the contact standoff, not by the declared
+        // clearance: a lift of `depth + clearance` ends above the band, the next
+        // pull then returns the facet to the clearance, and the poke opens
+        // again — the repair and the pull cancel each other round after round.
+        // A lift of `depth + contact` lands inside the band, so the pull leaves
+        // it alone and the crossing stays closed.
+        let margin = params.contact.max(PULL_MARGIN);
+        let step = (depth + margin).min(params.max_step);
+        let displacement = scale(obstacle.normals[vertex], step);
+        for corner in triangles[triangle] {
+            let corner = corner as usize;
+            positions[corner] = add(positions[corner], displacement);
+            moved_of[corner] = true;
+        }
+        largest = largest.max(step);
+    }
+    largest
 }
 
 /// Even out the garment's own surface without leaving its standoff: one
