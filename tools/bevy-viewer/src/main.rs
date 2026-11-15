@@ -4,6 +4,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::mesh::morph::{MorphWeights, MAX_MORPH_WEIGHTS};
+use bevy::mesh::skinning::SkinnedMesh;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -102,6 +103,27 @@ struct RigMode {
 /// Materials flattened by the flat mode, so switching back restores them.
 #[derive(Resource, Default)]
 struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
+
+/// `B` shows the skeleton through a semi-transparent body. Enabled at start by
+/// `SCULPTO_VIEWER_SKELETON=1` so a headless capture can prove the mode.
+#[derive(Resource, Clone, Copy, Default)]
+struct SkelMode {
+    on: bool,
+}
+
+/// Pooled overlay entities: bones and joints are spawned once, then moved to
+/// the live joint positions every frame. Spawning per frame cost more than the
+/// review mode is worth.
+#[derive(Resource, Default)]
+struct SkelPool {
+    built: bool,
+    joints: Vec<Entity>,
+    bones: Vec<Entity>,
+}
+
+/// Actor materials made translucent by the skeleton mode, restored on toggle.
+#[derive(Resource, Default)]
+struct GlassRestore(Vec<AssetId<StandardMaterial>>);
 
 /// Marks a spawned review model so the turntable can rotate it while the key
 /// light stays fixed in world space — that is what makes the shading and the
@@ -267,7 +289,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: format!(
-                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, H help",
+                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, H help",
                             config.status
                         ),
                         resolution: (1280, 900).into(),
@@ -310,6 +332,11 @@ fn main() {
         .insert_resource(RigMode {
             three_point: std::env::var("SCULPTO_VIEWER_THREE_POINT").is_ok(),
         })
+        .insert_resource(SkelMode {
+            on: std::env::var("SCULPTO_VIEWER_SKELETON").is_ok(),
+        })
+        .insert_resource(SkelPool::default())
+        .insert_resource(GlassRestore::default())
         .insert_resource(Units(options.units))
         .insert_resource(Bench(options.bench))
         .insert_resource(config)
@@ -366,6 +393,9 @@ fn main() {
                 toggle_flat,
                 apply_flat_mode,
                 toggle_rig,
+                toggle_skeleton,
+                apply_skeleton_mode,
+                draw_skeleton,
                 apply_review_visibility,
                 character_controls,
                 apply_character_pose,
@@ -448,6 +478,187 @@ fn toggle_rig(
 ) {
     if config.interactive && keys.just_pressed(KeyCode::Digit3) {
         rig.three_point = !rig.three_point;
+    }
+}
+
+#[derive(Component)]
+struct SkelJoint;
+
+#[derive(Component)]
+struct SkelBone;
+
+/// `B` toggles the skeleton overlay; the body turns translucent so the bones
+/// read through it without hiding the surface they drive.
+fn toggle_skeleton(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut skel: ResMut<SkelMode>,
+) {
+    if config.interactive && keys.just_pressed(KeyCode::KeyB) {
+        skel.on = !skel.on;
+    }
+}
+
+/// Alpha the actor materials while the overlay is on and restore them after.
+/// glTF materials stream in after startup, so the "on" branch runs every frame.
+fn apply_skeleton_mode(
+    skel: Res<SkelMode>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut restore: ResMut<GlassRestore>,
+    actors: Query<
+        &MeshMaterial3d<StandardMaterial>,
+        (Without<ReviewGround>, Without<SkelJoint>, Without<SkelBone>),
+    >,
+) {
+    if skel.on {
+        for handle in &actors {
+            let id = handle.id();
+            if restore.0.contains(&id) {
+                continue;
+            }
+            if let Some(mut material) = materials.get_mut(id) {
+                material.base_color = material.base_color.with_alpha(0.16);
+                material.alpha_mode = AlphaMode::Blend;
+                restore.0.push(id);
+            }
+        }
+    } else if !restore.0.is_empty() {
+        for id in restore.0.drain(..) {
+            if let Some(mut material) = materials.get_mut(id) {
+                material.base_color = material.base_color.with_alpha(1.0);
+                material.alpha_mode = AlphaMode::Opaque;
+            }
+        }
+    }
+}
+
+/// Build the overlay once, then move it to the live joint positions every frame:
+/// a sphere per joint and a cylinder from each joint to its parent bone.
+fn draw_skeleton(
+    mut commands: Commands,
+    skel: Res<SkelMode>,
+    mut pool: ResMut<SkelPool>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    nodes: Query<(Entity, &Name, &GlobalTransform, Option<&ChildOf>)>,
+    skins: Query<&SkinnedMesh>,
+    mut overlay: Query<(&mut Transform, &mut Visibility), Or<(With<SkelJoint>, With<SkelBone>)>>,
+) {
+    if !pool.built {
+        let joint_mesh = meshes.add(Sphere::new(0.007));
+        let bone_mesh = meshes.add(Cylinder::new(0.003, 1.0));
+        let joint_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.82, 0.15),
+            unlit: true,
+            ..default()
+        });
+        let bone_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.15, 0.95, 1.0),
+            unlit: true,
+            ..default()
+        });
+        for _ in 0..160 {
+            pool.joints.push(
+                commands
+                    .spawn((
+                        Mesh3d(joint_mesh.clone()),
+                        MeshMaterial3d(joint_material.clone()),
+                        Transform::default(),
+                        Visibility::Hidden,
+                        SkelJoint,
+                    ))
+                    .id(),
+            );
+            pool.bones.push(
+                commands
+                    .spawn((
+                        Mesh3d(bone_mesh.clone()),
+                        MeshMaterial3d(bone_material.clone()),
+                        Transform::default(),
+                        Visibility::Hidden,
+                        SkelBone,
+                    ))
+                    .id(),
+            );
+        }
+        pool.built = true;
+    }
+    let is_bone = |name: &str| {
+        (name.starts_with("NPC ") || name.starts_with("CME ") || name.starts_with("mixamorig"))
+            && !name.ends_with("Mesh")
+    };
+    // Only joints the skin actually drives, plus their ancestors: the SSE
+    // skeleton also carries tail, wing and HDT bones that sit metres outside a
+    // humanoid body and hide the real chain.
+    let mut driven: std::collections::HashSet<Entity> = std::collections::HashSet::new();
+    for skin in &skins {
+        driven.extend(skin.joints.iter().copied());
+    }
+    let parents: std::collections::HashMap<Entity, Option<Entity>> = nodes
+        .iter()
+        .map(|(entity, _, _, parent)| (entity, parent.map(|p| p.parent())))
+        .collect();
+    let mut frontier: Vec<Entity> = driven.iter().copied().collect();
+    while let Some(current) = frontier.pop() {
+        if let Some(Some(parent)) = parents.get(&current) {
+            if driven.insert(*parent) {
+                frontier.push(*parent);
+            }
+        }
+    }
+    let mut bones: Vec<(Entity, Vec3, Option<Entity>)> = Vec::new();
+    for (entity, name, transform, parent) in &nodes {
+        if is_bone(name.as_str()) && driven.contains(&entity) {
+            bones.push((entity, transform.translation(), parent.map(|p| p.parent())));
+        }
+    }
+    if !skel.on {
+        for entity in pool.joints.iter().chain(pool.bones.iter()) {
+            if let Ok((_, mut visibility)) = overlay.get_mut(*entity) {
+                *visibility = Visibility::Hidden;
+            }
+        }
+        return;
+    }
+    let positions: std::collections::HashMap<Entity, Vec3> = bones
+        .iter()
+        .map(|(entity, position, _)| (*entity, *position))
+        .collect();
+    for (index, (_, position, parent)) in bones.iter().enumerate() {
+        if let Some(entity) = pool.joints.get(index) {
+            if let Ok((mut transform, mut visibility)) = overlay.get_mut(*entity) {
+                transform.translation = *position;
+                transform.rotation = Quat::IDENTITY;
+                transform.scale = Vec3::ONE;
+                *visibility = Visibility::Inherited;
+            }
+        }
+        let Some(entity) = pool.bones.get(index) else {
+            continue;
+        };
+        let target = parent.and_then(|parent| positions.get(&parent)).copied();
+        if let (Some(start), Ok((mut transform, mut visibility))) =
+            (target, overlay.get_mut(*entity))
+        {
+            let delta = *position - start;
+            let length = delta.length().max(1e-5);
+            transform.translation = start + delta * 0.5;
+            transform.rotation = Quat::from_rotation_arc(Vec3::Y, delta / length);
+            transform.scale = Vec3::new(1.0, length, 1.0);
+            *visibility = Visibility::Inherited;
+        } else if let Ok((_, mut visibility)) = overlay.get_mut(*entity) {
+            *visibility = Visibility::Hidden;
+        }
+    }
+    for entity in pool
+        .joints
+        .iter()
+        .skip(bones.len())
+        .chain(pool.bones.iter().skip(bones.len()))
+    {
+        if let Ok((_, mut visibility)) = overlay.get_mut(*entity) {
+            *visibility = Visibility::Hidden;
+        }
     }
 }
 
@@ -703,7 +914,7 @@ fn setup(
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB move key light",
                     "0 idle · 1 walk",
-                    "R reset · L lit/flat · 3 three-point rig · H hide help",
+                    "R reset · L lit/flat · 3 three-point rig · B bones · H hide help",
                 ] {
                     card.spawn((
                         Text::new(line),
