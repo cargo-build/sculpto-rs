@@ -250,7 +250,7 @@ fn main() {
     app.insert_resource(FlatFlipped::default())
         .insert_resource(Turntable {
             enabled: std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
-            yaw: 0.0,
+            yaw: env_f32("SCULPTO_VIEWER_TURNTABLE_YAW", 0.0),
             pitch: 0.0,
         })
         .insert_resource(FlatMode(config.flat))
@@ -541,9 +541,10 @@ fn setup(
             _ => unreachable!(),
         };
     }
-    if config.interactive {
-        // A matte ground receives the key's shadow. It is interactive-only so
-        // the archived headless captures stay on the black review backdrop.
+    if config.interactive || std::env::var("SCULPTO_VIEWER_GROUND").is_ok() {
+        // A matte ground receives the key's shadow. It is off in the archived
+        // headless captures unless `SCULPTO_VIEWER_GROUND` asks for the shadow
+        // proof, so the contact-sheet backdrop stays black.
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(4.0, 0.02, 4.0))),
             MeshMaterial3d(materials.add(StandardMaterial {
