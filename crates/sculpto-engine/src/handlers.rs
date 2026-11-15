@@ -279,6 +279,16 @@ pub fn bake(input: &Value) -> Result<Value, CommandError> {
             sliders.insert(name.clone(), percent as f32);
         }
     }
+    let coverage = match input.get("coverage") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(token)) => Some(token.clone()),
+        Some(_) => {
+            return Err(errors::invalid(
+                "coverage",
+                "must be the string `clothed` or `nude`",
+            ));
+        }
+    };
     let params = ops::BakeParams {
         project: path(input, "project")?,
         presets: path(input, "presets")?,
@@ -290,6 +300,7 @@ pub fn bake(input: &Value) -> Result<Value, CommandError> {
         shape: optional_string(input, "shape"),
         home: optional_path(input, "home"),
         sliders,
+        coverage,
     };
     let outcome = ops::bake(&params)?;
     Ok(json!({
@@ -299,6 +310,11 @@ pub fn bake(input: &Value) -> Result<Value, CommandError> {
         "sliders": outcome.sliders,
         "unresolved": outcome.unresolved,
         "deferred": outcome.deferred,
+        "coverage": {
+            "state": outcome.coverage.as_str(),
+            "slider": sculpto_bake::COVERAGE_SLIDER,
+            "percent": outcome.coverage_percent,
+        },
     }))
 }
 

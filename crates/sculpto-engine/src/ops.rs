@@ -16,7 +16,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{CommandError, ErrorKind};
+use sculpto_bake::BakeError;
 use sculpto_bake::BakePlan;
+use sculpto_bake::CoverageState;
 use sculpto_core::mesh::{MeshAsset, TextureSlot};
 use sculpto_core::rig::Rig;
 use sculpto_core::rig::template::{TemplateRoots, complete_family_rig};
@@ -320,6 +322,13 @@ pub struct BakeParams {
     pub home: Option<PathBuf>,
     /// Slider overrides in percent.
     pub sliders: BTreeMap<String, f32>,
+    /// Coverage state of the body: `clothed` hides the chest anatomy through
+    /// the set's authored coverage morph (`NipBGone=100`, an explicit override
+    /// for that slider wins with its own value); `nude` keeps the preset
+    /// values. Absent defaults to `clothed` when the set carries the morph,
+    /// and bakes as authored otherwise — an explicit `clothed` on a set
+    /// without the morph is refused, never silently nude.
+    pub coverage: Option<String>,
 }
 
 /// What `bake` produced.
@@ -337,6 +346,10 @@ pub struct BakeOutcome {
     pub unresolved: usize,
     /// Sliders deliberately deferred.
     pub deferred: usize,
+    /// Coverage state the bake ended in.
+    pub coverage: CoverageState,
+    /// Effective coverage morph percent when coverage applied.
+    pub coverage_percent: Option<f32>,
 }
 
 /// Resolve a preset and write the morphed shape as an OBJ.
@@ -373,14 +386,54 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
             .ok_or_else(|| errors::invalid("home", "cannot derive the BodySlide home; pass it"))?
             .to_path_buf(),
     };
-    let plan =
-        BakePlan::resolve_overrides(&project, preset, &params.set, size, &home, &params.sliders)
-            .map_err(errors::bake)?;
     let set = project
         .sets
         .iter()
         .find(|set| set.name == params.set)
         .ok_or_else(|| errors::not_found("set", &params.set))?;
+    let requested = match params.coverage.as_deref() {
+        None => None,
+        Some(token) => Some(
+            sculpto_bake::Coverage::parse(token)
+                .ok_or_else(|| errors::invalid("coverage", "must be `clothed` or `nude`"))?,
+        ),
+    };
+    let mut overrides = params.sliders.clone();
+    let (coverage, coverage_percent) =
+        sculpto_bake::apply_coverage(set, requested, &mut overrides).map_err(errors::bake)?;
+    let plan = BakePlan::resolve_overrides(&project, preset, &params.set, size, &home, &overrides)
+        .map_err(errors::bake)?;
+    if coverage_percent.is_some_and(|percent| percent != 0.0)
+        && !plan
+            .sliders
+            .iter()
+            .any(|slider| slider.name == sculpto_bake::COVERAGE_SLIDER)
+    {
+        // The set declares the morph, but the plan did not take it: either the
+        // morph data stayed unresolved or the slider class is deferred (UV,
+        // clamp, zap). A clothed body that lost its coverage morph is the
+        // silent miss this refuses. @req BODY-01
+        let detail = if plan
+            .unresolved
+            .iter()
+            .any(|reference| reference.slider == sculpto_bake::COVERAGE_SLIDER)
+        {
+            "unresolved morph data"
+        } else if plan
+            .deferred
+            .iter()
+            .any(|slider| slider.name == sculpto_bake::COVERAGE_SLIDER)
+        {
+            "deferred slider class"
+        } else {
+            "not planned"
+        };
+        return Err(errors::bake(BakeError::CoverageUnapplied {
+            set: set.name.clone(),
+            slider: sculpto_bake::COVERAGE_SLIDER.to_string(),
+            detail: detail.to_string(),
+        }));
+    }
     let source = match &params.source {
         Some(source) => source.clone(),
         None => home
@@ -402,6 +455,8 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
         sliders: plan.sliders.len(),
         unresolved: plan.unresolved.len(),
         deferred: plan.deferred.len(),
+        coverage,
+        coverage_percent,
     })
 }
 

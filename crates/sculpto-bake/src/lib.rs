@@ -103,6 +103,125 @@ pub struct PlannedZap {
     pub indices: Vec<u16>,
 }
 
+/// The authored non-destructive nipple-coverage morph. @req BODY-01
+///
+/// CBBE and 3BA ship this body-side position slider as the morph twin of the
+/// NeverNude `NippleZap`: it flattens the nipple cap into the breast without
+/// deleting any vertex, so the nude state stays one slider value away instead
+/// of a destroyed patch. The name is the product-wide agent contract: authored
+/// CBBE/3BA data already carries it, and any family without it (Bijin, Mike)
+/// authors its coverage block under the same slider name.
+pub const COVERAGE_SLIDER: &str = "NipBGone";
+
+/// Percent the clothed state applies the coverage morph at. @req BODY-01
+pub const CLOTHED_COVERAGE_PERCENT: f32 = 100.0;
+
+/// Whether a body build hides the chest anatomy. @req BODY-01
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// Hide the anatomy through the set's coverage morph. An explicit caller
+    /// override for [`COVERAGE_SLIDER`] wins with its own value, so partial
+    /// coverage stays expressible through the plain slider surface.
+    Clothed,
+    /// Show the anatomy: keep the authored preset values (Isla keeps her 32),
+    /// with no implicit coverage override. Explicit slider overrides still
+    /// apply.
+    Nude,
+}
+
+impl Coverage {
+    /// Parse the argv/wire token.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "clothed" => Some(Self::Clothed),
+            "nude" => Some(Self::Nude),
+            _ => None,
+        }
+    }
+
+    /// The argv/wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clothed => "clothed",
+            Self::Nude => "nude",
+        }
+    }
+}
+
+/// Coverage state a bake ended in, for reporting. @req BODY-01
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageState {
+    /// The coverage morph was applied (implicit default or explicit request).
+    Clothed,
+    /// Explicit nude: preset values, no implicit override.
+    Nude,
+    /// The set carries no coverage morph and none was required; the bake is
+    /// neither clothed nor an explicit nude.
+    Unauthored,
+}
+
+impl CoverageState {
+    /// The report token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clothed => "clothed",
+            Self::Nude => "nude",
+            Self::Unauthored => "unauthored",
+        }
+    }
+}
+
+/// Resolve the coverage request against the set and merge the resulting
+/// override. @req BODY-01
+///
+/// The implicit default is clothed wherever the set carries the coverage
+/// morph: the standard bodies ship covered and nude is the explicit toggle.
+/// A set without the morph has no coverage to apply, so the default bakes it
+/// as authored ([`CoverageState::Unauthored`]) — batch parity over outfit and
+/// male sets stays possible. An explicit [`Coverage::Clothed`] is a required
+/// value, not a wish: a set that does not author the morph is refused instead
+/// of silently baking a visible body.
+///
+/// Returns the state to report and, when coverage applies, the effective
+/// percent for [`COVERAGE_SLIDER`] (a caller override value when one was
+/// supplied, otherwise [`CLOTHED_COVERAGE_PERCENT`], which is also inserted
+/// into `overrides`).
+///
+/// # Errors
+/// Refuses an explicit clothed request when the set lacks the coverage morph.
+pub fn apply_coverage(
+    set: &SliderSet,
+    requested: Option<Coverage>,
+    overrides: &mut BTreeMap<String, f32>,
+) -> Result<(CoverageState, Option<f32>), BakeError> {
+    let authored = set
+        .sliders
+        .iter()
+        .any(|slider| slider.name == COVERAGE_SLIDER);
+    match requested {
+        Some(Coverage::Nude) => Ok((CoverageState::Nude, None)),
+        explicit_clothed => {
+            if !authored {
+                return match explicit_clothed {
+                    Some(_) => Err(BakeError::CoverageSliderAbsent {
+                        set: set.name.clone(),
+                        slider: COVERAGE_SLIDER.to_string(),
+                    }),
+                    None => Ok((CoverageState::Unauthored, None)),
+                };
+            }
+            let percent = match overrides.get(COVERAGE_SLIDER) {
+                Some(explicit) => *explicit,
+                None => {
+                    overrides.insert(COVERAGE_SLIDER.to_string(), CLOTHED_COVERAGE_PERCENT);
+                    CLOTHED_COVERAGE_PERCENT
+                }
+            };
+            Ok((CoverageState::Clothed, Some(percent)))
+        }
+    }
+}
+
 /// Why a `Data` reference could not be joined to an offset block.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedReason {
@@ -176,6 +295,26 @@ pub enum BakeError {
         /// Set name the caller asked for.
         name: String,
     },
+    /// An explicitly clothed bake found no coverage morph in the set: the
+    /// required coverage value cannot be honoured, and silently baking a
+    /// visible body would hide the miss. @req BODY-01
+    CoverageSliderAbsent {
+        /// Set that was required to carry the coverage morph.
+        set: String,
+        /// Coverage slider name that was required.
+        slider: String,
+    },
+    /// A clothed bake resolved, but the coverage morph never reached the plan
+    /// (unresolved morph data or a deferred slider class), so the output would
+    /// be a visible body reported as covered. @req BODY-01
+    CoverageUnapplied {
+        /// Set whose coverage morph did not apply.
+        set: String,
+        /// Coverage slider that did not reach the plan.
+        slider: String,
+        /// Where the slider ended up instead.
+        detail: String,
+    },
     /// A container existed but failed to parse.
     Container {
         /// Container path.
@@ -200,6 +339,20 @@ impl fmt::Display for BakeError {
             Self::SetNotResolved { name } => {
                 write!(f, "the project contains no slider set named `{name}`")
             }
+            Self::CoverageSliderAbsent { set, slider } => write!(
+                f,
+                "slider set `{set}` carries no coverage slider `{slider}`; a clothed bake \
+                 requires the morph, so bake `coverage=nude` or a set that authors it"
+            ),
+            Self::CoverageUnapplied {
+                set,
+                slider,
+                detail,
+            } => write!(
+                f,
+                "coverage slider `{slider}` of set `{set}` did not reach the plan ({detail}); \
+                 a clothed bake cannot silently output a visible body"
+            ),
             Self::Container { path, source } => write!(f, "{}: {source}", path.display()),
             Self::IndexOutOfBounds {
                 slider,
@@ -651,5 +804,97 @@ mod tests {
         assert_eq!(out[2], [2.0, 1.5, 2.0]);
         assert_eq!(out[0], [0.0; 3]);
         std::fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    /// A CBBE/3BA-style set: one ordinary slider plus the authored coverage
+    /// morph the clothed default looks for.
+    const COVERAGE_PROJECT: &str = r#"<SliderSetInfo version="1">
+  <SliderSet name="Covered Body">
+    <DataFolder>Covered</DataFolder>
+    <SourceFile>body.nif</SourceFile>
+    <OutputPath>meshes</OutputPath>
+    <OutputFile>body</OutputFile>
+    <Shape target="Body">Body</Shape>
+    <Slider name="Lean" small="0" big="0">
+      <Data target="Body" local="true">body.bsd</Data>
+    </Slider>
+    <Slider name="NipBGone" small="0" big="0">
+      <Data target="Body" local="true">cover.bsd</Data>
+    </Slider>
+  </SliderSet>
+</SliderSetInfo>"#;
+
+    fn set_of(document: &str) -> SliderSet {
+        let Document::Project(mut project) = Document::parse_str(document, "inline.osp").unwrap()
+        else {
+            panic!("expected a project");
+        };
+        project.sets.pop().expect("one set")
+    }
+
+    #[test]
+    fn default_coverage_applies_the_authored_morph_at_full_value() {
+        let set = set_of(COVERAGE_PROJECT);
+        let mut overrides = BTreeMap::new();
+        let (state, percent) = apply_coverage(&set, None, &mut overrides).expect("default");
+        assert_eq!(state, CoverageState::Clothed);
+        assert_eq!(percent, Some(CLOTHED_COVERAGE_PERCENT));
+        assert_eq!(
+            overrides.get(COVERAGE_SLIDER),
+            Some(&CLOTHED_COVERAGE_PERCENT),
+            "the default override is merged for the resolver"
+        );
+    }
+
+    #[test]
+    fn explicit_nude_keeps_the_authored_values() {
+        let set = set_of(COVERAGE_PROJECT);
+        let mut overrides = BTreeMap::new();
+        let (state, percent) = apply_coverage(&set, Some(Coverage::Nude), &mut overrides)
+            .expect("explicit nude is always satisfiable");
+        assert_eq!(state, CoverageState::Nude);
+        assert_eq!(percent, None);
+        assert!(
+            overrides.is_empty(),
+            "nude must not touch any slider, Isla keeps her authored 32"
+        );
+    }
+
+    #[test]
+    fn explicit_slider_value_wins_over_the_clothed_default() {
+        let set = set_of(COVERAGE_PROJECT);
+        let mut overrides = BTreeMap::from([(COVERAGE_SLIDER.to_string(), 37.0)]);
+        let (state, percent) =
+            apply_coverage(&set, Some(Coverage::Clothed), &mut overrides).expect("merges");
+        assert_eq!(state, CoverageState::Clothed);
+        assert_eq!(percent, Some(37.0));
+        assert_eq!(overrides.get(COVERAGE_SLIDER), Some(&37.0));
+    }
+
+    #[test]
+    fn explicit_clothed_without_the_morph_is_a_typed_refusal() {
+        let set = set_of(PROJECT);
+        let mut overrides = BTreeMap::new();
+        let error = apply_coverage(&set, Some(Coverage::Clothed), &mut overrides)
+            .expect_err("a set without the morph cannot honour clothed");
+        assert!(matches!(
+            error,
+            BakeError::CoverageSliderAbsent { ref set, ref slider }
+                if set == "Body" && slider == COVERAGE_SLIDER
+        ));
+        assert!(
+            overrides.is_empty(),
+            "a refused request must not leave a half-merged override"
+        );
+    }
+
+    #[test]
+    fn default_without_the_morph_bakes_as_authored() {
+        let set = set_of(PROJECT);
+        let mut overrides = BTreeMap::new();
+        let (state, percent) = apply_coverage(&set, None, &mut overrides).expect("default");
+        assert_eq!(state, CoverageState::Unauthored);
+        assert_eq!(percent, None);
+        assert!(overrides.is_empty());
     }
 }

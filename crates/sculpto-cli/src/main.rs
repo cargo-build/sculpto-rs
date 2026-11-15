@@ -93,6 +93,13 @@ bake options:
   --shape <name>     shape to bake (defaults to the largest)
   --home <dir>       BodySlide home (defaults to the project\'s grandparent)
   --slider N=V       override one slider percentage (repeatable)
+  --coverage <clothed|nude>
+                     chest-coverage state of the body: clothed applies the
+                     set\'s authored coverage morph (NipBGone=100; an explicit
+                     --slider for it wins), nude keeps the preset values.
+                     Default clothed when the set carries the morph; a set
+                     without it bakes as authored unless clothed is explicit
+                     (then refused)
   --out <obj>        output path
 
 batch options:
@@ -915,6 +922,14 @@ fn bake_inner(args: &[String]) -> Result<(), String> {
         }
         index += 2;
     }
+    let coverage = match flags.get("coverage") {
+        None => None,
+        Some(token) => Some(
+            sculpto_bake::Coverage::parse(token)
+                .map(|coverage| coverage.as_str().to_string())
+                .ok_or_else(|| "`--coverage` expects clothed or nude".to_string())?,
+        ),
+    };
     let params = ops::BakeParams {
         project: PathBuf::from(required(&flags, "project")?),
         presets: PathBuf::from(required(&flags, "presets")?),
@@ -926,16 +941,26 @@ fn bake_inner(args: &[String]) -> Result<(), String> {
         shape: flags.get("shape").cloned(),
         home: flags.get("home").map(PathBuf::from),
         sliders,
+        coverage,
     };
     let outcome = ops::bake(&params).map_err(|error| error.to_string())?;
+    let coverage = match outcome.coverage_percent {
+        Some(percent) => format!(
+            "{} ({s}={percent})",
+            outcome.coverage.as_str(),
+            s = sculpto_bake::COVERAGE_SLIDER
+        ),
+        None => outcome.coverage.as_str().to_string(),
+    };
     println!(
-        "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred",
+        "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred, coverage {}",
         outcome.out.display(),
         outcome.vertices,
         outcome.triangles,
         outcome.sliders,
         outcome.unresolved,
-        outcome.deferred
+        outcome.deferred,
+        coverage
     );
     Ok(())
 }

@@ -178,15 +178,29 @@ fn tier1_bake_matches_between_surfaces() {
     // The same numbers, as each surface prints them.
     assert_eq!(
         argv_stdout.trim(),
-        format!(
-            "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred",
-            argv_out.display(),
-            result["vertices"],
-            result["triangles"],
-            result["sliders"],
-            result["unresolved"],
-            result["deferred"]
-        ),
+        {
+            // The same coverage token, as each surface prints it.
+            let coverage = match result["coverage"]["percent"].as_f64() {
+                Some(percent) => format!(
+                    "{} ({s}={percent})",
+                    result["coverage"]["state"],
+                    s = result["coverage"]["slider"]
+                ),
+                None => result["coverage"]["state"]
+                    .as_str()
+                    .expect("state")
+                    .to_string(),
+            };
+            format!(
+                "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred, coverage {coverage}",
+                argv_out.display(),
+                result["vertices"],
+                result["triangles"],
+                result["sliders"],
+                result["unresolved"],
+                result["deferred"],
+            )
+        },
         "bake numbers differ between argv and command surfaces"
     );
     assert_eq!(result["vertices"], 4);

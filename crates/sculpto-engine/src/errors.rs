@@ -256,6 +256,10 @@ pub fn bundle(error: BundleError) -> CommandError {
 pub fn bake(error: BakeError) -> CommandError {
     let (kind, code) = match &error {
         BakeError::SetNotResolved { .. } => (ErrorKind::NotFound, "set_not_resolved"),
+        BakeError::CoverageSliderAbsent { .. } => {
+            (ErrorKind::InvalidParams, "coverage_slider_absent")
+        }
+        BakeError::CoverageUnapplied { .. } => (ErrorKind::Refused, "coverage_unapplied"),
         BakeError::Container { .. } => (ErrorKind::InvalidRequest, "slider_container"),
         BakeError::IndexOutOfBounds { .. } => (ErrorKind::InvalidParams, "index_out_of_bounds"),
     };
