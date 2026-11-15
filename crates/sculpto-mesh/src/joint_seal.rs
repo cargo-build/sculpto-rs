@@ -2564,8 +2564,17 @@ fn seat_groups(
         let decisive = scored.first().is_none_or(|(runner, _, _)| {
             (runner - best_score).max(0.0) / runner.max(1e-300) >= SEAT_ASSIGNMENT_MARGIN
         });
+        // A coincident member is pinned to its own cycle before the cost
+        // search runs, so the verdict must say so: a cost margin would claim
+        // evidence the solve did not use. @req BLD-13
+        let pinned = members
+            .iter()
+            .enumerate()
+            .all(|(slot, _)| pins[slot].is_some());
         let handedness = if members.len() < 2 {
             "n/a: one seated part per socket"
+        } else if pinned {
+            "decisive: measured coincidence pins the authored pairing"
         } else if decisive {
             "decisive: correspondence cost separates the assignments"
         } else {

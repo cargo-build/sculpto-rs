@@ -206,12 +206,17 @@ fn the_report_names_hand_shells_by_role_not_by_the_classifier() {
         assert_eq!(row["joint"], format!("{label}:torso"));
         assert_eq!(row["socket"], "torso");
         let handedness = row["handedness"].as_str().expect("handedness row");
+        // The synthetic cuffs sit on their own socket cycles, so the authored
+        // pin decides the pairing before the cost search; the marker must name
+        // that evidence and survive the role relabel.
         assert_eq!(
-            handedness, "undecided: ring geometry cannot detect a swap; verify by sheet",
-            "congruent cuffs cannot decide a swap; the marker must survive the relabel"
+            handedness, "decisive: measured coincidence pins the authored pairing",
+            "a coincident cuff is pinned by measurement, not by cost"
         );
-        assert_eq!(row["correspondence"], "kabsch_umeyama");
-        assert_eq!(row["bridge_triangles"], 16, "8↔8 ring weld");
+        // The authored-coincident cuff keeps its placement and welds onto the
+        // socket ring: no ribbon is built, the two 8-vertex loops become one.
+        assert_eq!(row["correspondence"], "authored");
+        assert_eq!(row["bridge_triangles"], 0, "a weld is not a bridge");
         assert_eq!(row["boundary_ring_before"], 8);
         assert_eq!(row["boundary_ring_after"], 0);
     }
@@ -221,7 +226,10 @@ fn the_report_names_hand_shells_by_role_not_by_the_classifier() {
     assert_eq!(result["assembled"]["vertices"], 48);
     assert_eq!(result["assembled"]["triangles"], 60);
     assert_eq!(result["output"]["vertices"], 48);
-    assert_eq!(result["output"]["triangles"], 92);
+    assert_eq!(
+        result["output"]["triangles"], 60,
+        "the weld adds no ribbon triangles to the assembled 60"
+    );
     assert_eq!(vertices_of(&out), 48);
 }
 
