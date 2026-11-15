@@ -97,11 +97,16 @@ several cameras on consecutive ticks, `SCULPTO_VIEWER_DIR` receives
 
 ## Review lighting
 
-The interactive viewer spawns a three-point rig (key, fill, rim): one light leaves
-the far side black and reads as a hole. `L` toggles lit/flat at runtime; flat
-hides the rig and renders every material unlit, so a review shows the silhouette,
-the seams and the layer palette without a shadow that can be mistaken for a
-defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds.
+Lighting is runtime PBR, not baked into the exported GLB (`viewer export` writes
+albedo and normals only). The interactive viewer defaults to **one key light** with
+`shadow_maps_enabled`, and spawns a matte ground so the cast shadow is visible: turn
+the figure with `T` and the shading and shadow move with the surface. `3` toggles the
+optional three-point rig (fill and rim) when the far side is too dark to read;
+`SCULPTO_VIEWER_THREE_POINT` seeds it. `L` toggles lit/flat; flat hides the whole rig
+and ground and renders every material unlit, so a review shows the silhouette, the
+seams and the layer palette without a shadow that can be mistaken for a defect. The
+capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds and stays on the black
+backdrop (no ground).
 
 `T` switches the drag from camera orbit to a turntable: the figure rotates under
 the fixed key light, so shading and cast shadows sweep across the surface. That

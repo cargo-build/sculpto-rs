@@ -75,6 +75,27 @@ struct FlatMode(bool);
 #[derive(Component)]
 struct ReviewLight;
 
+/// Fill and rim lights: visible only in the optional three-point rig, so the
+/// default is one key light and its honest runtime shadow.
+#[derive(Component)]
+struct FillLight;
+
+/// The key light is the only default source; it casts the shadow.
+#[derive(Component)]
+struct KeyLight;
+
+/// Review ground: it exists only to receive the key light's shadow in the
+/// interactive window, which is how a turntable turn proves the light is
+/// runtime rather than baked onto the model.
+#[derive(Component)]
+struct ReviewGround;
+
+/// Review rig: one key light by default; `3` adds the fill/rim pair.
+#[derive(Resource, Clone, Copy)]
+struct RigMode {
+    three_point: bool,
+}
+
 /// Materials flattened by the flat mode, so switching back restores them.
 #[derive(Resource, Default)]
 struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
@@ -201,7 +222,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title:
-                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset, L lit/flat, T turntable"
+                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset, L lit/flat, T turntable, 3 rig"
                                 .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -233,6 +254,9 @@ fn main() {
             pitch: 0.0,
         })
         .insert_resource(FlatMode(config.flat))
+        .insert_resource(RigMode {
+            three_point: std::env::var("SCULPTO_VIEWER_THREE_POINT").is_ok(),
+        })
         .insert_resource(Units(options.units))
         .insert_resource(Bench(options.bench))
         .insert_resource(config)
@@ -268,7 +292,7 @@ fn main() {
         .insert_resource(GlobalAmbientLight {
             brightness: env_f32(
                 "SCULPTO_VIEWER_AMBIENT",
-                if options.interactive { 120.0 } else { 0.0 },
+                if options.interactive { 60.0 } else { 0.0 },
             ),
             ..default()
         })
@@ -285,6 +309,8 @@ fn main() {
                 orbit_controls,
                 toggle_flat,
                 apply_flat_mode,
+                toggle_rig,
+                apply_review_visibility,
                 toggle_turntable,
                 apply_turntable,
             ),
@@ -337,25 +363,61 @@ fn toggle_flat(
     }
 }
 
-/// Flat review hides the light rig and renders unlit materials: silhouette,
-/// seams and layer colours, with nothing that reads as a defect. Runs every
-/// frame because glTF materials stream in after startup.
+/// `3` adds the fill/rim pair to the single key light; the default rig stays
+/// one source so the runtime shading and shadow are not filled away.
+fn toggle_rig(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut rig: ResMut<RigMode>,
+) {
+    if config.interactive && keys.just_pressed(KeyCode::Digit3) {
+        rig.three_point = !rig.three_point;
+    }
+}
+
+/// One visibility rule for the review scene: flat hides everything, the
+/// default rig shows only the key, and `3` shows the fill/rim pair as well.
+/// The ground is interactive-only and hides in flat so the silhouette stays
+/// against the black backdrop.
+fn apply_review_visibility(
+    flat: Res<FlatMode>,
+    rig: Res<RigMode>,
+    mut lights: Query<
+        (
+            &mut Visibility,
+            Option<&KeyLight>,
+            Option<&FillLight>,
+            Option<&ReviewGround>,
+        ),
+        Or<(With<ReviewLight>, With<ReviewGround>)>,
+    >,
+) {
+    for (mut visibility, key, fill, ground) in &mut lights {
+        let wanted = if flat.0 {
+            Visibility::Hidden
+        } else if ground.is_some() {
+            Visibility::Inherited
+        } else if key.is_some() {
+            Visibility::Inherited
+        } else if fill.is_some() && !rig.three_point {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+}
+
+/// Flat review renders unlit materials: silhouette, seams and layer colours,
+/// with nothing that reads as a defect. Runs every frame because glTF
+/// materials stream in after startup.
 fn apply_flat_mode(
     flat: Res<FlatMode>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut lights: Query<&mut Visibility, With<ReviewLight>>,
     mut flipped: ResMut<FlatFlipped>,
 ) {
-    let want = if flat.0 {
-        Visibility::Hidden
-    } else {
-        Visibility::Visible
-    };
-    for mut visibility in &mut lights {
-        if *visibility != want {
-            *visibility = want;
-        }
-    }
     if flat.0 {
         // Remember which materials we flattened so `L` can restore the lit
         // look; leaving them unlit made the second press look like a no-op.
@@ -390,6 +452,8 @@ struct PlayerGraph {
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     units: Res<Units>,
@@ -453,24 +517,42 @@ fn setup(
     } else {
         commands.insert_resource(OrbitCamera::looking_at(camera_eye, camera_target));
     }
-    // Three-point review rig: key, fill and rim. One light leaves the far side
-    // black and reads as a hole; the rim separates the garment edge from the
-    // body. Flat mode hides all three together.
-    for (illuminance, position) in [
-        (10_000.0_f32, Vec3::new(3.0, 5.0, 2.0)),
-        (3_500.0, Vec3::new(-3.0, 2.0, -2.5)),
-        (6_000.0, Vec3::new(0.0, 3.0, -4.0)),
-    ] {
-        commands.spawn((
+    // One key light by default: the shading and the cast shadow are computed
+    // at runtime, so turning the figure under it changes both. `3` adds the
+    // fill/rim pair when the far side is too dark to read.
+    let rig = [
+        (10_000.0_f32, Vec3::new(3.0, 5.0, 2.0), true),
+        (3_500.0, Vec3::new(-3.0, 2.0, -2.5), false),
+        (6_000.0, Vec3::new(0.0, 3.0, -4.0), false),
+    ];
+    for (index, (illuminance, position, key)) in rig.into_iter().enumerate() {
+        let mut entity = commands.spawn((
             DirectionalLight {
                 illuminance,
-                // Only the key casts shadows: every shadow-casting light costs
-                // a map, and the fill/rim exist to keep the far side readable.
-                shadow_maps_enabled: illuminance > 9_000.0,
+                shadow_maps_enabled: key,
                 ..default()
             },
             Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y),
             ReviewLight,
+        ));
+        match index {
+            0 => entity.insert(KeyLight),
+            1 | 2 => entity.insert(FillLight),
+            _ => unreachable!(),
+        };
+    }
+    if config.interactive {
+        // A matte ground receives the key's shadow. It is interactive-only so
+        // the archived headless captures stay on the black review backdrop.
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(4.0, 0.02, 4.0))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.06, 0.06, 0.07),
+                perceptual_roughness: 0.95,
+                ..default()
+            })),
+            Transform::from_xyz(0.0, -0.01, 0.0),
+            ReviewGround,
         ));
     }
 
@@ -1081,6 +1163,82 @@ mod tests {
             "lit restores what flat flattened"
         );
         assert!(app.world().resource::<FlatFlipped>().0.is_empty());
+    }
+
+    #[test]
+    fn default_rig_shows_the_key_only() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .insert_resource(FlatMode(false))
+            .insert_resource(RigMode { three_point: false })
+            .add_systems(Update, apply_review_visibility);
+        let key = app
+            .world_mut()
+            .spawn((Visibility::Inherited, ReviewLight, KeyLight))
+            .id();
+        let fill = app
+            .world_mut()
+            .spawn((Visibility::Inherited, ReviewLight, FillLight))
+            .id();
+
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(key).expect("key"),
+            Visibility::Inherited
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(fill).expect("fill"),
+            Visibility::Hidden,
+            "one source by default: the fill would flatten the shadow"
+        );
+    }
+
+    #[test]
+    fn three_point_shows_fill_and_flat_hides_everything() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .insert_resource(FlatMode(false))
+            .insert_resource(RigMode { three_point: true })
+            .add_systems(Update, apply_review_visibility);
+        let fill = app
+            .world_mut()
+            .spawn((Visibility::Inherited, ReviewLight, FillLight))
+            .id();
+        let ground = app
+            .world_mut()
+            .spawn((Visibility::Inherited, ReviewGround))
+            .id();
+
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(fill).expect("fill"),
+            Visibility::Inherited
+        );
+
+        app.world_mut().resource_mut::<FlatMode>().0 = true;
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(fill).expect("fill"),
+            Visibility::Hidden
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(ground).expect("ground"),
+            Visibility::Hidden,
+            "flat keeps the black backdrop for the silhouette"
+        );
+    }
+
+    #[test]
+    fn key_three_toggles_the_rig() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(RigMode { three_point: false })
+            .add_systems(Update, toggle_rig);
+
+        press(&mut app, KeyCode::Digit3);
+        app.update();
+        assert!(app.world().resource::<RigMode>().three_point);
     }
 
     #[test]
