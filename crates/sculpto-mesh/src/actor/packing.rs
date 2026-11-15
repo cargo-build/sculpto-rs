@@ -128,7 +128,7 @@ impl Source {
 }
 
 /// Translate one adapter failure into the actor error the packer reports.
-fn packed(error: PackError) -> ActorError {
+pub(super) fn packed(error: PackError) -> ActorError {
     match error {
         PackError::Decode(error) => ActorError::Decode(error),
         PackError::Invalid { context, reason } => ActorError::Invalid { context, reason },

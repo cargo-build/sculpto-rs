@@ -170,3 +170,131 @@ fn a_packed_glb_parses_and_its_accessor_counts_match() {
         json!(["baked0"])
     );
 }
+
+/// A minimal skeleton GLB with one named rotation clip, for insertion tests.
+fn skeleton_base(clip_name: &str) -> Vec<u8> {
+    let mut bin = Vec::new();
+    let mut push = |values: &[f32]| -> usize {
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let offset = bin.len();
+        bin.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        offset
+    };
+    let times_off = push(&[0.0, 1.0]);
+    let rot_off = push(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    let json = json!({
+        "asset": {"version": "2.0"},
+        "buffers": [{"byteLength": bin.len()}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": times_off, "byteLength": 8},
+            {"buffer": 0, "byteOffset": rot_off, "byteLength": 32},
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "type": "SCALAR", "count": 2,
+             "min": [0.0], "max": [1.0]},
+            {"bufferView": 1, "componentType": 5126, "type": "VEC4", "count": 2},
+        ],
+        "nodes": [
+            {"name": "Root", "children": [1]},
+            {"name": "Joint", "translation": [0.0, 1.0, 0.0]},
+        ],
+        "animations": [{
+            "name": clip_name,
+            "channels": [{"sampler": 0, "target": {"node": 1, "path": "rotation"}}],
+            "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}],
+        }],
+    });
+    gltf::binary::Glb {
+        header: gltf::binary::Header {
+            magic: *b"glTF",
+            version: 2,
+            length: 0,
+        },
+        json: std::borrow::Cow::Owned(serde_json::to_vec(&json).unwrap()),
+        bin: Some(std::borrow::Cow::Owned(bin)),
+    }
+    .to_vec()
+    .unwrap()
+}
+
+#[test]
+fn insert_animation_lands_at_the_walk_slot_and_keeps_existing_clips() {
+    use sculpto_gltf::pack::Track;
+    let base = skeleton_base("Idle");
+    let base_accessors = 2;
+    let mut writer = PackWriter::from_glb(&base).expect("base packer");
+    let tracks = [
+        Track::Rotation {
+            node: 1,
+            values: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.3826834, 0.9238795]],
+        },
+        Track::Translation {
+            node: 1,
+            values: vec![[0.0, 1.0, 0.0], [0.0, 1.03, 0.0]],
+        },
+    ];
+    let index = writer
+        .insert_animation(1, "Gait", &[0.0, 1.0], &tracks)
+        .expect("insert");
+    assert_eq!(index, 1);
+    let packed = writer.finish().expect("packed GLB");
+    let parsed = Gltf::from_slice(&packed).expect("packed GLB parses");
+    let names: Vec<_> = parsed
+        .document
+        .animations()
+        .map(|clip| clip.name().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["Idle", "Gait"]);
+    // One shared time accessor plus one output accessor per track.
+    assert_eq!(parsed.document.accessors().count(), base_accessors + 3);
+    let gait = parsed.document.animations().nth(1).expect("gait clip");
+    assert_eq!(gait.channels().count(), 2);
+    let paths: Vec<_> = gait
+        .channels()
+        .map(|channel| channel.target().property())
+        .collect();
+    assert!(paths.contains(&Property::Rotation));
+    assert!(paths.contains(&Property::Translation));
+    // Every sampler is LINEAR and shares the input accessor.
+    let input = gait.samplers().next().expect("sampler").input().index();
+    assert!(
+        gait.samplers()
+            .all(|sampler| sampler.input().index() == input)
+    );
+}
+
+#[test]
+fn insert_animation_clamps_to_zero_on_a_clipless_actor_and_refuses_short_input() {
+    use sculpto_gltf::pack::Track;
+    // A clipless base: drop the animations array from the skeleton base.
+    let base = skeleton_base("Idle");
+    let framing = gltf::binary::Glb::from_slice(&base).unwrap();
+    let mut json: Value = serde_json::from_slice(&framing.json).unwrap();
+    json.as_object_mut().unwrap().remove("animations");
+    let clipless = gltf::binary::Glb {
+        header: gltf::binary::Header {
+            magic: *b"glTF",
+            version: 2,
+            length: 0,
+        },
+        json: std::borrow::Cow::Owned(serde_json::to_vec(&json).unwrap()),
+        bin: Some(framing.bin.unwrap()),
+    }
+    .to_vec()
+    .unwrap();
+    let mut writer = PackWriter::from_glb(&clipless).expect("packer");
+    let tracks = [Track::Rotation {
+        node: 1,
+        values: vec![[0.0, 0.0, 0.0, 1.0]; 2],
+    }];
+    let index = writer
+        .insert_animation(1, "Pose", &[0.0, 1.0], &tracks)
+        .expect("insert");
+    assert_eq!(index, 0, "clamped to the first slot when no clip exists");
+
+    let mut writer = PackWriter::from_glb(&base).expect("packer");
+    assert!(writer.insert_animation(1, "Bad", &[0.0], &tracks).is_err());
+    assert!(writer.insert_animation(1, "Bad", &[0.0, 1.0], &[]).is_err());
+}
