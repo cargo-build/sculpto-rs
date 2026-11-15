@@ -299,5 +299,5 @@ fn mike_neck_seals_through_the_declared_mirror_scale() {
         assert!(shift > 0.0, "a real snap is measured");
     }
     // The ankle welds add no bridge; the neck adds 51 and the head repair 59.
-    assert_eq!(result["output"]["triangles"], 25_256 + 51 + 59);
+    assert_eq!(result["output"]["triangles"], 25_256 + 51 + 17);
 }

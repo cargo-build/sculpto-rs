@@ -149,18 +149,25 @@ fn emily_assembly_reproduces_the_accepted_numbers() {
 
     // The bridge triangles are real: the neck adds 54 and each ankle 40, and
     // the head repair adds its patches; the recipe digests are reported.
-    assert_eq!(result["output"]["vertices"], 34_686);
-    assert_eq!(result["output"]["triangles"], 65_882);
-    assert_eq!(vertices_of(&out), 34_686);
-    assert_eq!(count(&out, "f "), 65_882);
+    assert_eq!(result["output"]["vertices"], 34_683);
+    assert_eq!(result["output"]["triangles"], 65_864);
+    assert_eq!(vertices_of(&out), 34_683);
+    assert_eq!(count(&out, "f "), 65_864);
     // The delivered head carries no puncture: the pre-seal fill closed its own
     // small loops and the post-seal repair closed the skull slit.
     let holes = &result["head_holes"];
     assert!(!holes["filled"].as_array().expect("filled").is_empty());
     let repair = &result["head_seal_repair"];
+    // The authored skull slit is a zero-width cut: the tolerance weld zips its
+    // lips before the fill, so Emily needs no post-seal patch at all.
+    assert_eq!(
+        repair["filled"].as_u64().expect("repair count"),
+        0,
+        "the zipped slit leaves no puncture to patch"
+    );
     assert!(
-        repair["filled"].as_u64().expect("repair count") >= 2,
-        "the skull slit breaks into at least two punctures"
+        repair["weld_merged"].as_u64().expect("weld merged") >= 20,
+        "the authored slit lips are welded, not fanned"
     );
     assert_eq!(repair["left_open"].as_array().expect("left open").len(), 0);
     let input_digest = result["seal"]["input_digest"]

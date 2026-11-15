@@ -22,6 +22,10 @@ use std::collections::BTreeMap;
 /// the ankle rims 130–160 and the foot toes 160, so only true punctures qualify.
 pub const DEFAULT_HOLE_VERTEX_CAP: usize = 32;
 
+/// Largest gap between the two lips of the authored head cut, in body units. The
+/// measured lips are <= 0.00501 u apart; a wider gap is a real hole, not a seam.
+const WELD_TOLERANCE: f32 = 0.05;
+
 /// One filled loop, in output coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FilledHole {
@@ -426,16 +430,54 @@ fn weld_head_components(
     margin: f32,
 ) -> Result<WeldReport, HoleFillError> {
     let components = boundary_components(triangles, positions)?;
-    let mut groups: BTreeMap<[u32; 3], Vec<u32>> = BTreeMap::new();
-    for (vertices, _) in components
+    // The authored cut is zero-width: its two lips sit within a few thousandths of
+    // a unit of each other, not bit-exactly. Pair the mutual nearest boundary
+    // vertices under a small tolerance, round after round, so the cut zips shut
+    // with the head's own skin and no lid is needed. @req BODY-01
+    let candidates: Vec<u32> = components
         .iter()
         .filter(|(vertices, _)| inside_box(component_centroid(positions, vertices), head, margin))
-    {
-        for vertex in vertices {
-            let key = positions[*vertex as usize].map(f32::to_bits);
-            groups.entry(key).or_default().push(*vertex);
+        .flat_map(|(vertices, _)| vertices.iter().copied())
+        .collect();
+    let mut parent: BTreeMap<u32, u32> = candidates.iter().map(|v| (*v, *v)).collect();
+    let mut members: BTreeMap<u32, Vec<u32>> = candidates.iter().map(|v| (*v, vec![*v])).collect();
+    loop {
+        let representatives: Vec<u32> = members.keys().copied().collect();
+        let mut nearest: BTreeMap<u32, (f32, u32)> = BTreeMap::new();
+        for (index, from) in representatives.iter().enumerate() {
+            for to in representatives.iter().skip(index + 1) {
+                let a = positions[*from as usize];
+                let b = positions[*to as usize];
+                let distance =
+                    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
+                if distance > WELD_TOLERANCE * WELD_TOLERANCE {
+                    continue;
+                }
+                for (vertex, other) in [(from, to), (to, from)] {
+                    let entry = nearest.entry(*vertex).or_insert((f32::MAX, *other));
+                    if distance < entry.0 {
+                        *entry = (distance, *other);
+                    }
+                }
+            }
+        }
+        let mut mutual: Vec<(u32, u32)> = Vec::new();
+        for (vertex, (_, other)) in &nearest {
+            if *vertex < *other && nearest.get(other).is_some_and(|(_, back)| back == vertex) {
+                mutual.push((*vertex, *other));
+            }
+        }
+        if mutual.is_empty() {
+            break;
+        }
+        for (from, to) in mutual {
+            let (low, high) = (from.min(to), from.max(to));
+            let moved = members.remove(&high).expect("group is present");
+            members.entry(low).or_default().extend(moved);
+            parent.insert(high, low);
         }
     }
+    let groups = members;
     let mut mapping: BTreeMap<u32, u32> = BTreeMap::new();
     let mut report = WeldReport::default();
     for vertices in groups.values().filter(|vertices| vertices.len() > 1) {
