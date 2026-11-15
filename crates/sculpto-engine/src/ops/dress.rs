@@ -347,6 +347,11 @@ fn obj_error(field: &str, path: &Path, error: &ObjError) -> CommandError {
             "obj_malformed",
             format!("{field} `{}`: {message}", path.display()),
         ),
+        ObjError::MissingObject { .. } => CommandError::new(
+            ErrorKind::InvalidParams,
+            "obj_missing_object",
+            format!("{field} `{}`: {error}", path.display()),
+        ),
     }
 }
 
