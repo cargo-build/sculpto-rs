@@ -641,6 +641,7 @@ name = "sculpto-engine"
 version = "0.2.0"
 dependencies = [
  "glam 0.34.3",
+ "gltf",
  "schemars",
  "sculpto-bake",
  "sculpto-blender",

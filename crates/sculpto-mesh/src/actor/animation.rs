@@ -68,6 +68,30 @@ pub(super) fn worlds(
     Ok(worlds)
 }
 
+/// Authored time span of one uniquely named clip, without applying channels.
+///
+/// Morph-weight channels on unselected nodes are skipped exactly as in
+/// [`worlds`], so a span refusal matches what sampling the same clip would
+/// refuse.
+pub(super) fn span(actor: &Actor, name: &str) -> Result<(f64, f64), ActorError> {
+    let clips: Vec<_> = actor
+        .document
+        .animations()
+        .filter(|clip| clip.name() == Some(name))
+        .collect();
+    let clip = match clips.as_slice() {
+        [clip] => clip,
+        _ => {
+            return Err(ActorError::Clip {
+                name: name.to_owned(),
+                matches: clips.len(),
+            });
+        }
+    };
+    let read = read(actor, clip, &[])?;
+    Ok((read.start, read.end))
+}
+
 fn apply(
     actor: &Actor,
     clip: &gltf::Animation<'_>,

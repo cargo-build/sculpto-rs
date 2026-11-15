@@ -2,6 +2,7 @@
 
 mod pack;
 mod rig;
+mod stress;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,7 +13,9 @@ use std::process::ExitCode;
 use sculpto_mesh::actor::{Actor, Pose, Sample};
 
 const USAGE: &str = "usage: sculpto actor sample --input actor.glb --part NAME [--part NAME ...] \
-    (--rest | --clip NAME --time SECONDS) --out actor.obj [--report actor.json]";
+    (--rest | --clip NAME --time SECONDS) --out actor.obj [--report actor.json]
+usage: sculpto actor stress --input actor.glb --body NAME --garment NAME [--garment NAME ...] \
+    (--rest | --clip NAME --frames N) --tolerance UNITS [--out report.json]";
 
 #[derive(Debug)]
 struct Arguments<'arg> {
@@ -29,6 +32,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "rig") {
         return rig::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "stress") {
+        return stress::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,

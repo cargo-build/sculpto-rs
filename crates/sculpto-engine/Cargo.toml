@@ -21,4 +21,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 glam.workspace = true
+gltf = { version = "1", default-features = false, features = ["utils", "names", "extras"] }
 sha2 = "0.10"

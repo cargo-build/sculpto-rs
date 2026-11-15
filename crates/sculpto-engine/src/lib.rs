@@ -24,6 +24,7 @@ pub mod ops;
 mod parts;
 pub mod rules;
 mod seal;
+mod stress;
 mod viewer;
 
 /// A stable command identifier.
@@ -32,6 +33,9 @@ mod viewer;
 /// not be renamed without a migration entry in the issuing epic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
+    /// Pose a dressed skinned actor at declared clip times and report the
+    /// per-frame graded clearance table through the depth owner.
+    ActorStress,
     /// Fit explicit component seam targets without changing render topology.
     ComponentSeamFit,
     /// Report the engine build version.
@@ -103,6 +107,7 @@ impl CommandId {
     /// Wire name, for example `commands.list`.
     pub fn as_str(self) -> &'static str {
         match self {
+            CommandId::ActorStress => "actor.stress",
             CommandId::ComponentSeamFit => "component.seam_fit",
             CommandId::Version => "version",
             CommandId::CommandsList => "commands.list",
@@ -279,6 +284,14 @@ impl Spec {
 }
 
 const COMMANDS: &[Spec] = &[
+    Spec {
+        id: CommandId::ActorStress,
+        summary: "Pose a dressed skinned actor at declared clip times and report the per-frame graded clearance table (visible_max, penetrations, pairs) through the depth owner; sampled frames, not containment or continuous clearance.",
+        mutates: true,
+        stub: false,
+        schema: stress::schema,
+        handler: stress::run,
+    },
     Spec {
         id: CommandId::ComponentSeamFit,
         summary: "Fit explicit component seam targets with bounded mesh-edge support.",
@@ -618,6 +631,7 @@ mod tests {
     fn dispatch_wires_the_documented_commands() {
         assert!(dispatch("version", &Value::Null).is_ok());
         for id in [
+            "actor.stress",
             "bake",
             "blender.cloth_bake",
             "blender.cloth_check",

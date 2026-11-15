@@ -6,9 +6,13 @@ mod decode;
 mod geometry;
 mod packing;
 mod rig;
+mod stress;
 
 pub use clips::{LocalRest, SourceChannel, SourceClip, SourceProperty, SourceValues};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
+pub use stress::{
+    FrameRow, GarmentRow, PartAddress, StressError, StressPlan, StressPose, StressReport, stress,
+};
 
 use std::fmt;
 use std::ops::Range;
@@ -212,6 +216,15 @@ impl Actor {
         let nodes = geometry::select(&self.document, parts)?;
         let worlds = animation::worlds(self, &nodes, pose)?;
         geometry::sample(self, &nodes, &worlds)
+    }
+
+    /// Authored time span of one uniquely named clip. @req DECL0013
+    ///
+    /// # Errors
+    /// The typed clip refusal ([`ActorError::Clip`]) when the name matches
+    /// zero or several clips.
+    pub fn clip_span(&self, name: &str) -> Result<(f64, f64), ActorError> {
+        animation::span(self, name)
     }
 
     /// Reduced skin correspondence for the same explicit parts and pose.
