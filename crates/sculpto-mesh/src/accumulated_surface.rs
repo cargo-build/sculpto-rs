@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::check::{SurfaceIndex, VisibleDepth, occlusion_hides_vertex, unit_triangle_normal};
-use crate::surface_util::vertex_normals;
+use crate::surface_util::{SideField, contact_offset, sub, vertex_normals};
 use crate::wrap::{FitError, Mesh, validate_geometry};
 
 /// The layer id the body always carries in a provenance list.
@@ -286,14 +286,26 @@ impl AccumulatedSurface {
 
     /// The graded depths of `garment` against the composite, outermost member
     /// first: every garment vertex grades against the highest-order member it
-    /// is behind, with that member's nearest triangle supplying the depth, the
-    /// push direction and the facing/occlusion classification.
+    /// is behind *and covered by*, with that member's nearest triangle
+    /// supplying the depth, the push direction and the facing/occlusion
+    /// classification.
+    ///
+    /// Coverage is the dress band's own rule
+    /// ([`crate::surface_util::contact_offset`]): a member is a vertex's contact
+    /// surface only within [`crate::surface_util::COVERAGE_MIN_COSINE`] of its
+    /// normal axis, and a closest point on an edge or a corner names that shared
+    /// element's side rather than the triangle the nearest-point search
+    /// returned. A vertex 49 u below a leg hem is therefore not "behind" the hem
+    /// triangle's extended plane, and a tie at a hem corner cannot flip
+    /// membership — the layered trousers read −17.89 / +55.10 / +40.60 at one
+    /// such tie.
     ///
     /// A vertex behind a lower member only (bare skin under an open hem)
     /// grades against that member, so bare-skin contacts stay measured; a
-    /// vertex behind no member is outside and not graded. The classification
-    /// is [`visible_depths`]'s per member, so the graded set cannot drift from
-    /// `garment depth` against any single member.
+    /// vertex behind no member is outside and not graded. With one member the
+    /// composite has no ownership choice and the graded set is
+    /// [`visible_depths`]'s own, so it cannot drift from `garment depth` against
+    /// that member.
     ///
     /// # Errors
     /// [`FitError`] when the garment cannot be graded: the shared fit-input
@@ -312,6 +324,16 @@ impl AccumulatedSurface {
         validate_geometry(garment, (&members[0].0, &members[0].1))?;
         let garment_surface = SurfaceIndex::build(garment.0, garment.1);
         let garment_normals = vertex_normals(garment.0, garment.1);
+        // Ownership is a choice between members, so the side must not follow a
+        // triangle tie and a distant horizon must not reach past itself; one
+        // member has neither question and keeps `visible_depths`' own
+        // arithmetic.
+        let sides: Option<Vec<SideField>> = (self.layers.len() > 1).then(|| {
+            members
+                .iter()
+                .map(|(positions, triangles)| SideField::build(positions, triangles))
+                .collect()
+        });
         let mut graded = Vec::new();
         for (vertex, &point) in garment.0.iter().enumerate() {
             // Highest order first: the first member the vertex is behind is
@@ -321,23 +343,44 @@ impl AccumulatedSurface {
                 let Some(closest) = indexes[member].closest(point) else {
                     return Err(FitError::EmptyBodyFaces);
                 };
-                let face = triangles[closest.triangle];
-                let corners = [
-                    positions[face[0] as usize],
-                    positions[face[1] as usize],
-                    positions[face[2] as usize],
-                ];
-                let Some(normal) = unit_triangle_normal(corners) else {
-                    // A degenerate nearest face cannot name a side; the member
-                    // reads the vertex as outside, exactly like `visible_depths`.
-                    continue;
+                let (normal, signed) = match &sides {
+                    Some(sides) => {
+                        let Some(side) = sides[member].side(
+                            positions,
+                            triangles,
+                            closest.triangle,
+                            closest.point,
+                        ) else {
+                            continue;
+                        };
+                        let Some(signed) = contact_offset(side, sub(point, closest.point)) else {
+                            continue;
+                        };
+                        (side.normal.map(f64::from), signed)
+                    }
+                    None => {
+                        let face = triangles[closest.triangle];
+                        let corners = [
+                            positions[face[0] as usize],
+                            positions[face[1] as usize],
+                            positions[face[2] as usize],
+                        ];
+                        let Some(normal) = unit_triangle_normal(corners) else {
+                            // A degenerate nearest face cannot name a side; the
+                            // member reads the vertex as outside, exactly like
+                            // `visible_depths`.
+                            continue;
+                        };
+                        let offset = [
+                            f64::from(point[0]) - f64::from(closest.point[0]),
+                            f64::from(point[1]) - f64::from(closest.point[1]),
+                            f64::from(point[2]) - f64::from(closest.point[2]),
+                        ];
+                        let signed =
+                            offset[0] * normal[0] + offset[1] * normal[1] + offset[2] * normal[2];
+                        (normal, signed)
+                    }
                 };
-                let offset = [
-                    f64::from(point[0]) - f64::from(closest.point[0]),
-                    f64::from(point[1]) - f64::from(closest.point[1]),
-                    f64::from(point[2]) - f64::from(closest.point[2]),
-                ];
-                let signed = offset[0] * normal[0] + offset[1] * normal[1] + offset[2] * normal[2];
                 if signed >= 0.0 {
                     continue;
                 }
@@ -661,6 +704,146 @@ mod tests {
         for layered in &graded {
             assert_eq!(layered.member, 0, "the body owns bare skin");
             assert!((layered.depth.depth - 0.1).abs() < 1e-5);
+        }
+    }
+
+    /// An open shell above the body: two triangles at `x = 0.5` spanning
+    /// `y ∈ [0.8, 1.6]` and `z ∈ [-0.5, 0.5]`, wound to face `+x`. Its hem at
+    /// `y = 0.8` is an authored opening.
+    fn open_shell() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        (
+            vec![
+                [0.5, 0.8, -0.5],
+                [0.5, 0.8, 0.5],
+                [0.5, 1.6, 0.5],
+                [0.5, 1.6, -0.5],
+            ],
+            vec![[0u32, 2, 1], [0, 3, 2]],
+        )
+    }
+
+    /// One sheet facing `+x` at `point`, spanned by two edge vectors.
+    fn facing_sheet(
+        point: [f32; 3],
+        first: [f32; 3],
+        second: [f32; 3],
+    ) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let corner = |offset: [f32; 3]| {
+            [
+                point[0] + offset[0],
+                point[1] + offset[1],
+                point[2] + offset[2],
+            ]
+        };
+        (
+            vec![point, corner(first), corner(second)],
+            vec![[0u32, 1, 2]],
+        )
+    }
+
+    /// Two triangles meeting at 90° on the shared edge `(0,0,0)-(0,1,0)`: the
+    /// first faces `+z`, the second `+x`. `swap` lists them in the other order,
+    /// so the nearest-point search breaks their tie the other way.
+    fn fold(swap: bool) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let positions = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+        ];
+        let triangles = match swap {
+            true => vec![[0u32, 2, 3], [0, 1, 2]],
+            false => vec![[0u32, 1, 2], [0, 2, 3]],
+        };
+        (positions, triangles)
+    }
+
+    #[test]
+    fn a_vertex_far_below_an_open_hem_grades_against_the_body() {
+        // 0.2 behind the hem triangle's extended plane, 0.63 from the hem
+        // itself, and 0.1 behind the body's own `+x` face: the shell's rim does
+        // not cover it, so the body keeps the contact. Grading the extended
+        // plane instead is what made the layered trousers report a shin at
+        // depth 2.86 against a panty 49 u away.
+        let (body, body_faces) = cube(0.4);
+        let (shell, shell_faces) = open_shell();
+        let mut accumulated = AccumulatedSurface::from_body(&body, &body_faces).expect("a body");
+        accumulated
+            .push_layer("shell", 10, &shell, &shell_faces)
+            .expect("an open shell is a valid layer");
+        let (garment, faces) = facing_sheet([0.3, 0.2, 0.0], [0.0, 0.1, 0.0], [0.0, 0.0, 0.1]);
+        let graded = accumulated
+            .layered_visible_depths((&garment, &faces))
+            .expect("gradable");
+        assert_eq!(graded.len(), 3, "every sheet vertex is graded: {graded:?}");
+        for layered in &graded {
+            assert_eq!(layered.member, 0, "the body owns the vertex below the hem");
+            assert!(
+                (layered.depth.depth - 0.1).abs() < 1e-5,
+                "depth {}",
+                layered.depth.depth
+            );
+        }
+    }
+
+    #[test]
+    fn a_hem_corner_tie_names_one_side_whatever_triangle_the_search_returns() {
+        // The two triangles of the fold tie for the closest point near their
+        // shared edge, and their face normals disagree there: 0.2 behind
+        // either face, 0.283 along the shared edge's summed side. Near the
+        // shared corner the disagreement is a sign flip (+0.2 front for one
+        // face, -0.5 behind for the other), so following the returned triangle
+        // would make membership a tie of the search. The shared element's side
+        // names one answer for both orders.
+        let near_edge = [-0.2, 0.5, -0.2];
+        let near_corner = [-0.5, -1.5, 0.2];
+        let mut graded = Vec::new();
+        for swap in [false, true] {
+            let (body, body_faces) = cube(0.1);
+            let (fold, fold_faces) = fold(swap);
+            let mut accumulated =
+                AccumulatedSurface::from_body(&body, &body_faces).expect("a body");
+            accumulated
+                .push_layer("shell", 10, &fold, &fold_faces)
+                .expect("a fold is a valid layer");
+            let (near, near_faces) = facing_sheet(
+                near_edge,
+                [0.0, 0.1, 0.0],
+                [-0.070_710_68, 0.0, 0.070_710_68],
+            );
+            let (corner, corner_faces) = facing_sheet(
+                near_corner,
+                [0.0, 0.1, 0.0],
+                [-0.070_710_68, 0.0, 0.070_710_68],
+            );
+            let garment = [near, corner].concat();
+            let faces = [
+                near_faces[0],
+                [
+                    corner_faces[0][0] + 3,
+                    corner_faces[0][1] + 3,
+                    corner_faces[0][2] + 3,
+                ],
+            ];
+            graded.push(
+                accumulated
+                    .layered_visible_depths((&garment, &faces))
+                    .expect("gradable"),
+            );
+        }
+        assert_eq!(
+            graded[0], graded[1],
+            "the same closest point names one side in either triangle order"
+        );
+        assert_eq!(graded[0].len(), 3, "only the near-edge sheet is graded");
+        for layered in &graded[0] {
+            assert!(layered.depth.vertex < 3, "the corner sheet is not owned");
+            assert_eq!(layered.member, 1, "the fold owns its covered sheet");
+            assert!(
+                (layered.depth.depth - 0.282_842_7).abs() < 1e-5,
+                "depth {} is the shared edge's side, not a face normal's 0.2",
+                layered.depth.depth
+            );
         }
     }
 

@@ -36,12 +36,14 @@
 //! @req DECL0013 DECL0015
 
 use std::fmt;
+use std::ops::Range;
 
 use crate::accumulated_surface::AccumulatedSurface;
 use crate::check::{ClosestSurfacePoint, SurfaceIndex, unit_triangle_normal};
 use crate::surface_util::{
-    OpenEdges, add, coincident_groups, component_labels, dot, face_normal_of, first_non_finite,
-    length, outward_vertex_normals, remap_faces, scale, sub, unit, vertex_normals,
+    OpenEdges, SideField, add, coincident_groups, component_labels, contact_offset, dot,
+    face_normal_of, first_non_finite, length, outward_vertex_normals, remap_faces, scale, sub,
+    unit, vertex_normals,
 };
 use crate::wrap::repair::final_push::{
     FinalPushOptions, FinalPushReport, final_push, final_push_layered,
@@ -356,8 +358,12 @@ use std::collections::{BTreeMap, BTreeSet};
 struct Obstacle<'a> {
     /// Nearest-point index per member, over that member's face slice.
     members: Vec<SurfaceIndex>,
-    /// Each member's face-slice start in `faces`, in dressing order.
-    member_face_starts: Vec<usize>,
+    /// Each member's face slice in `faces`, in dressing order.
+    member_faces: Vec<Range<usize>>,
+    /// Each member's side field, present only when ownership is a choice: a
+    /// single member cannot own or lose a vertex, and `dress` without
+    /// `--against` keeps the nearest triangle's own face normal.
+    sides: Option<Vec<SideField>>,
     positions: &'a [[f32; 3]],
     faces: &'a [[u32; 3]],
     /// Obstacle vertex normals and the majority orientation sign
@@ -371,7 +377,8 @@ impl<'a> Obstacle<'a> {
         let (normals, _) = outward_vertex_normals(positions, faces);
         Self {
             members: vec![SurfaceIndex::build(positions, faces)],
-            member_face_starts: vec![0],
+            member_faces: std::iter::once(0..faces.len()).collect(),
+            sides: None,
             positions,
             faces,
             normals,
@@ -383,20 +390,24 @@ impl<'a> Obstacle<'a> {
     /// layer, over that layer's slice of the composite triangle list.
     fn build_layered(accumulated: &'a AccumulatedSurface) -> Self {
         let (positions, faces) = accumulated.obstacle();
-        let members = accumulated
+        let member_faces: Vec<Range<usize>> = accumulated
             .layers()
             .iter()
-            .map(|layer| SurfaceIndex::build(positions, &faces[layer.triangle_range.clone()]))
+            .map(|layer| layer.triangle_range.clone())
             .collect();
-        let member_face_starts = accumulated
-            .layers()
+        let members = member_faces
             .iter()
-            .map(|layer| layer.triangle_range.start)
+            .map(|range| SurfaceIndex::build(positions, &faces[range.clone()]))
+            .collect();
+        let sides = member_faces
+            .iter()
+            .map(|range| SideField::build(positions, &faces[range.clone()]))
             .collect();
         let (normals, _) = outward_vertex_normals(positions, faces);
         Self {
             members,
-            member_face_starts,
+            member_faces,
+            sides: Some(sides),
             positions,
             faces,
             normals,
@@ -405,13 +416,42 @@ impl<'a> Obstacle<'a> {
     }
 
     /// The nearest point of one member and the sample it names for `point`.
+    ///
+    /// A layered obstacle resolves the member's *side* through its
+    /// [`SideField`] and applies the coverage rule: a tie at a hem corner names
+    /// one deterministic side, and a member is the vertex's contact surface only
+    /// within [`crate::surface_util::COVERAGE_MIN_COSINE`] of its normal axis, so
+    /// a vertex that only grazes a distant surface is pushed by the member below
+    /// instead of along a far horizon. `None` is that refusal. A single-member
+    /// obstacle keeps the nearest triangle's own face normal, the measurement
+    /// `dress` has always taken.
     fn member_sample(
         &self,
         member: usize,
         closest: &ClosestSurfacePoint,
         point: [f32; 3],
+    ) -> Option<Sample> {
+        let Some(sides) = self.sides.as_ref() else {
+            return Some(self.plain_sample(member, closest, point));
+        };
+        let faces = &self.faces[self.member_faces[member].clone()];
+        let side = sides[member].side(self.positions, faces, closest.triangle, closest.point)?;
+        let signed = contact_offset(side, sub(point, closest.point))?;
+        Some(Sample {
+            signed: signed as f32,
+            normal: Some(side.normal),
+            member,
+        })
+    }
+
+    /// The nearest triangle's own face-normal sample, with no coverage rule.
+    fn plain_sample(
+        &self,
+        member: usize,
+        closest: &ClosestSurfacePoint,
+        point: [f32; 3],
     ) -> Sample {
-        let face = self.faces[self.member_face_starts[member] + closest.triangle];
+        let face = self.faces[self.member_faces[member].start + closest.triangle];
         let corners = [
             self.positions[face[0] as usize],
             self.positions[face[1] as usize],
@@ -431,16 +471,23 @@ impl<'a> Obstacle<'a> {
     }
 
     fn sample(&self, point: [f32; 3]) -> Option<Sample> {
-        // Outermost member first: the first member the vertex is behind owns
-        // it, exactly the rule `AccumulatedSurface::layered_visible_depths`
-        // grades by. A vertex behind no member floats; the nearest member is
-        // its pull target, and on a tie the outermost member wins. One member
-        // reduces both branches to the plain nearest-triangle sample `dress`
-        // has always taken.
+        // Outermost member first: the first member the vertex is behind and
+        // covered by owns it, exactly the rule
+        // `AccumulatedSurface::layered_visible_depths` grades by. A vertex
+        // behind no member floats; the nearest covering member is its pull
+        // target, and on a tie the outermost member wins. One member reduces
+        // both branches to the plain nearest-triangle sample `dress` has always
+        // taken.
         let mut nearest: Option<(usize, ClosestSurfacePoint)> = None;
+        let mut last_resort: Option<(usize, ClosestSurfacePoint)> = None;
         for member in (0..self.members.len()).rev() {
             let closest: ClosestSurfacePoint = self.members[member].closest(point)?;
-            let sample = self.member_sample(member, &closest, point);
+            if last_resort.is_none_or(|(_, best)| closest.distance < best.distance) {
+                last_resort = Some((member, closest));
+            }
+            let Some(sample) = self.member_sample(member, &closest, point) else {
+                continue;
+            };
             if sample.normal.is_some() && sample.signed < 0.0 {
                 return Some(sample);
             }
@@ -448,8 +495,12 @@ impl<'a> Obstacle<'a> {
                 nearest = Some((member, closest));
             }
         }
-        let (member, closest) = nearest?;
-        Some(self.member_sample(member, &closest, point))
+        match nearest {
+            Some((member, closest)) => self.member_sample(member, &closest, point),
+            // Every member is one the vertex only grazes: measure it against
+            // the nearest one anyway, so no vertex leaves the band unmeasured.
+            None => last_resort.map(|(member, closest)| self.plain_sample(member, &closest, point)),
+        }
     }
 
     /// Obstacle vertices poking through the garment: the shard a render shows

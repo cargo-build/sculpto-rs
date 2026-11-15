@@ -736,3 +736,87 @@ fn a_layered_dress_grades_each_region_against_its_own_member() {
         );
     }
 }
+
+/// An open shell above the body: two triangles at `x = 0.5` spanning
+/// `y ∈ [0.8, 1.6]`, `z ∈ [-0.5, 0.5]`, wound to face `+x`. Its hem at
+/// `y = 0.8` is an authored opening — the case the closed-cube layered tests
+/// cannot reach.
+fn open_shell() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    (
+        vec![
+            [0.5, 0.8, -0.5],
+            [0.5, 0.8, 0.5],
+            [0.5, 1.6, 0.5],
+            [0.5, 1.6, -0.5],
+        ],
+        vec![[0u32, 2, 1], [0, 3, 2]],
+    )
+}
+
+#[test]
+fn an_open_hem_owns_only_what_it_covers() {
+    // Two garment sheets against body + open shell: the upper one lies under
+    // the shell's own surface and must resolve against the shell, the lower one
+    // sits inside the body below the shell's hem — 0.2 behind the hem
+    // triangle's extended plane but 0.71 away from the hem itself, where a
+    // rim's half-space stops being a surface.
+    let (body, body_faces) = cube(0.4);
+    let (shell, shell_faces) = open_shell();
+    let mut accumulated =
+        AccumulatedSurface::from_body(&body, &body_faces).expect("the body seeds the stack");
+    accumulated
+        .push_layer("shell", 10, &shell, &shell_faces)
+        .expect("an open shell is a valid layer");
+    assert_eq!(accumulated.surface_label(), "accumulated[body, shell]");
+
+    let garment = [
+        [0.3, 1.0, 0.0],
+        [0.3, 1.1, 0.0],
+        [0.3, 1.0, 0.1],
+        // Below the hem, inside the body.
+        [0.3, 0.2, 0.0],
+        [0.3, 0.3, 0.0],
+        [0.3, 0.2, 0.1],
+    ]
+    .to_vec();
+    let faces = vec![[0u32, 1, 2], [3, 4, 5]];
+    let options = DressParams {
+        clearance: 0.05,
+        contact: 0.01,
+        ..params()
+    };
+    let (positions, _, report) =
+        dress_against((&garment, &faces), &accumulated, &options).expect("a layered dress");
+
+    let projections = report.projections.expect("a layered report projects");
+    assert_eq!(
+        projections.vertex_members,
+        vec![1, 1, 1, 0, 0, 0],
+        "the shell owns its own covered sheet; the body owns the sheet below its hem"
+    );
+    assert_eq!(
+        report.max_floating_gap, 0.0,
+        "no vertex floats outside the band"
+    );
+    assert_eq!(
+        report.max_penetration, 0.0,
+        "no vertex is left behind the band"
+    );
+    for point in &positions[0..3] {
+        assert!(
+            (point[0] - 0.51).abs() < 5e-3,
+            "the shell-covered sheet seats at the shell's contact: {point:?}"
+        );
+    }
+    for point in &positions[3..6] {
+        // 0.41 is the body's `+x`, `+y` or `+z` face plus the declared contact:
+        // the body's band, never the shell's 0.51.
+        let standoff = point
+            .iter()
+            .fold(0.0f32, |widest, value| widest.max(value.abs()));
+        assert!(
+            (standoff - 0.41).abs() < 5e-3,
+            "the sheet below the hem seats at the body's contact, never the hem's: {point:?}"
+        );
+    }
+}

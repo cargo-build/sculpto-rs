@@ -213,6 +213,159 @@ pub(crate) fn past_open_edge(open: &OpenEdges, face: [u32; 3], bary: [f32; 3]) -
         || (near_u && near_v && open.vertex_is_open(face[2]))
 }
 
+/// How far a closest surface point may sit from a triangle corner or edge and
+/// still name that shared element, as a fraction of the triangle's longest side.
+/// The nearest-point search reports an f32 position, so this band is what
+/// absorbs its rounding; inside it the point is on the shared element for every
+/// triangle that shares it.
+const SHARED_ELEMENT_EPSILON: f32 = 1e-3;
+
+/// Cosine of the cone around a member's surface normal inside which the member
+/// is the vertex's contact surface: `cos 45°`, the exact `1/√2`.
+///
+/// A member is a contact surface for a vertex only when the vertex lies under
+/// its surface rather than past its silhouette: the behind-depth must be at
+/// least the lateral reach. The nearest-triangle half-space alone reaches
+/// arbitrarily far — on the layered trousers a shin vertex 49.41 u below a leg
+/// hem was owned at depth 2.86, 145 vertices 5–53 u from the panty were pushed
+/// along such a horizon, and the measured far-field captures reach 22.8 u at a
+/// lateral offset larger than their depth. Those are not contacts: they are
+/// grazing views of a distant surface, and they resolve against the member
+/// below instead.
+pub(crate) const COVERAGE_MIN_COSINE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// The side one surface names at a closest point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SurfaceSide {
+    /// Outward unit pseudo-normal of the closest point's shared element.
+    pub(crate) normal: [f32; 3],
+}
+
+/// One surface's side at any closest point.
+///
+/// A nearest-point search returns one triangle, and at a hem corner three
+/// triangles tie for the *same* closest point while their face normals
+/// disagree — the layered trousers read −17.89 / +55.10 / +40.60 signed at one
+/// such corner, so following the returned triangle made ownership a tie of the
+/// search. The side here is the shared element's: the face normal inside a
+/// triangle, the sum of the incident face normals on an edge, the area-weighted
+/// vertex normal at a corner. Tied triangles name the same shared element, so
+/// they name the same side. @req DECL0013 DECL0015
+pub(crate) struct SideField {
+    faces: Vec<Option<[f32; 3]>>,
+    vertices: Vec<[f32; 3]>,
+    /// Summed incident face normals of every edge.
+    edges: HashMap<(u32, u32), [f32; 3]>,
+}
+
+impl SideField {
+    pub(crate) fn build(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> Self {
+        let vertices = vertex_normals(positions, faces);
+        let sides: Vec<Option<[f32; 3]>> = faces
+            .iter()
+            .map(|face| {
+                let normal = unit(face_normal_of(
+                    face.map(|vertex| positions[vertex as usize]),
+                ));
+                (dot(normal, normal) > 0.0).then_some(normal)
+            })
+            .collect();
+        // An edge sums its incident face normals: two flat faces agree on it (a
+        // quad's diagonal keeps the face normal exactly) and a crease gets the
+        // pseudo-normal between its sides.
+        let mut edges: HashMap<(u32, u32), [f32; 3]> = HashMap::new();
+        for (face, side) in faces.iter().zip(&sides) {
+            let Some(side) = side else {
+                continue;
+            };
+            for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+                let entry = edges.entry((a.min(b), a.max(b))).or_insert([0.0; 3]);
+                *entry = add(*entry, *side);
+            }
+        }
+        Self {
+            faces: sides,
+            vertices,
+            edges,
+        }
+    }
+
+    /// The side `point` reads at its closest point on `triangle`, or `None` for
+    /// a triangle that cannot name a side.
+    pub(crate) fn side(
+        &self,
+        positions: &[[f32; 3]],
+        faces: &[[u32; 3]],
+        triangle: usize,
+        point: [f32; 3],
+    ) -> Option<SurfaceSide> {
+        let face = faces[triangle];
+        let face_side = *self.faces.get(triangle)?.as_ref()?;
+        let corners = face.map(|vertex| positions[vertex as usize]);
+        let epsilon = SHARED_ELEMENT_EPSILON
+            * [(0, 1), (1, 2), (2, 0)]
+                .map(|(a, b)| length(sub(corners[b], corners[a])))
+                .into_iter()
+                .fold(0.0f32, f32::max);
+        let mut nearest = 0;
+        let mut nearest_distance = f32::INFINITY;
+        for (index, &corner) in corners.iter().enumerate() {
+            let distance = length(sub(point, corner));
+            if distance < nearest_distance {
+                nearest = index;
+                nearest_distance = distance;
+            }
+        }
+        if nearest_distance <= epsilon {
+            return Some(SurfaceSide {
+                normal: self.vertices[face[nearest] as usize],
+            });
+        }
+        for (a, b) in [(0usize, 1usize), (1, 2), (2, 0)] {
+            if segment_distance(point, corners[a], corners[b]) > epsilon {
+                continue;
+            }
+            let key = (face[a].min(face[b]), face[a].max(face[b]));
+            let Some(&sum) = self.edges.get(&key) else {
+                break;
+            };
+            let normal = unit(sum);
+            if dot(normal, normal) == 0.0 {
+                break;
+            }
+            return Some(SurfaceSide { normal });
+        }
+        Some(SurfaceSide { normal: face_side })
+    }
+}
+
+/// The signed offset of `point` from one member's surface at its closest point,
+/// or `None` when the member is not its contact surface.
+///
+/// A member is a contact surface only inside [`COVERAGE_MIN_COSINE`] of its
+/// normal axis, on either side: behind, it owns the vertex; in front, it is the
+/// pull target. Outside it the vertex only grazes the member's horizon and
+/// belongs to the member below.
+pub(crate) fn contact_offset(side: SurfaceSide, offset: [f32; 3]) -> Option<f64> {
+    let signed = f64::from(dot(offset, side.normal));
+    match signed.abs() < f64::from(COVERAGE_MIN_COSINE) * f64::from(length(offset)) {
+        true => None,
+        false => Some(signed),
+    }
+}
+
+/// Distance from `point` to the segment `a..b`.
+fn segment_distance(point: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
+    let along = sub(b, a);
+    let squared = dot(along, along);
+    let offset = sub(point, a);
+    let position = match squared > 0.0 {
+        true => (dot(offset, along) / squared).clamp(0.0, 1.0),
+        false => 0.0,
+    };
+    length(sub(point, add(a, scale(along, position))))
+}
+
 pub(crate) fn first_non_finite(positions: &[[f32; 3]]) -> Option<usize> {
     positions
         .iter()
