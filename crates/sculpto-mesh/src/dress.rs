@@ -27,16 +27,25 @@
 //! is brought to the declared clearance, so that ease is not retained. Keep an
 //! authored standoff when that is the requirement
 //! ([`crate::wrap::GapMode::Keep`]); dress answers the opposite acceptance.
+//!
+//! [`dress_against`] dresses over a stack that is already partly clothed: the
+//! obstacle becomes the [`AccumulatedSurface`] of the body plus the fitted
+//! layers, graded by the outermost-member rule, so a raw outer garment resolves
+//! its covered regions against the cloth it must clear and its bare regions
+//! against the body. Plain [`dress`] keeps the single-body behaviour exactly.
 //! @req DECL0013 DECL0015
 
 use std::fmt;
 
+use crate::accumulated_surface::AccumulatedSurface;
 use crate::check::{ClosestSurfacePoint, SurfaceIndex, unit_triangle_normal};
 use crate::surface_util::{
     OpenEdges, add, coincident_groups, component_labels, dot, face_normal_of, first_non_finite,
     length, outward_vertex_normals, remap_faces, scale, sub, unit, vertex_normals,
 };
-use crate::wrap::repair::final_push::{FinalPushOptions, FinalPushReport, final_push};
+use crate::wrap::repair::final_push::{
+    FinalPushOptions, FinalPushReport, final_push, final_push_layered,
+};
 use crate::wrap::{BodySurface, FitError, FitOptions, GapMode, Mesh, fit_to_body};
 
 /// Midpoint subdivision rounds the solve may run. Two rounds take a 926-face
@@ -292,28 +301,66 @@ pub struct DressReport {
     pub registration: Option<crate::wrap::FitReport>,
     /// Final push-out report, absent when `final_push` was off.
     pub final_push: Option<FinalPushReport>,
+    /// Which accumulated member the returned vertices projected against,
+    /// present only for a layered dress ([`dress_against`]).
+    pub projections: Option<DressProjections>,
 }
 
-/// One garment vertex measured against its nearest body triangle.
+/// What a layered dress resolved its vertices against. @req DECL0013 DECL0015
+#[derive(Debug, Clone, PartialEq)]
+pub struct DressProjections {
+    /// Provenance label, for example `accumulated[body, panty]`.
+    pub surface: String,
+    /// Members in dressing order with the vertices each one owns.
+    pub members: Vec<DressMemberProjection>,
+    /// Owning member index of every returned vertex, in vertex order.
+    pub vertex_members: Vec<usize>,
+}
+
+/// One accumulated member and the returned vertices it owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DressMemberProjection {
+    /// `body`, or the fitted layer's declared id.
+    pub id: String,
+    /// The body's `0`, or the layer's declared rank.
+    pub order: u32,
+    /// Returned vertices whose owning member this is.
+    pub vertices: usize,
+}
+
+/// One garment vertex measured against its nearest obstacle triangle.
 #[derive(Debug, Clone, Copy)]
 struct Sample {
-    /// Signed distance along the nearest body triangle's normal; negative is
-    /// behind that triangle, the same sign `check` grades.
+    /// Signed distance along the owning member's nearest triangle normal;
+    /// negative is behind that triangle, the same sign `check` grades.
     signed: f32,
     /// Unit outward normal of that triangle; `None` when it is degenerate and
     /// names no side, so the vertex has no direction to move in.
     normal: Option<[f32; 3]>,
+    /// The member the vertex resolved against, in dressing order (`0` is the
+    /// body): the highest-order member the vertex is behind, or the nearest
+    /// one when it is behind none.
+    member: usize,
 }
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The body one dress queries across iterations: nearest point and side for
+/// The obstacle one dress queries across iterations: nearest point and side for
 /// the contact solve, plus the poke ray the band cannot see.
+///
+/// The obstacle may be one surface (the body [`dress`] uses) or the members of
+/// an [`AccumulatedSurface`] ([`dress_against`]); every member carries its own
+/// nearest-point index over its slice of `faces`, so sampling can apply the
+/// outermost-member rule instead of a bare nearest-triangle query over the
+/// concatenation.
 struct Obstacle<'a> {
-    index: SurfaceIndex,
+    /// Nearest-point index per member, over that member's face slice.
+    members: Vec<SurfaceIndex>,
+    /// Each member's face-slice start in `faces`, in dressing order.
+    member_face_starts: Vec<usize>,
     positions: &'a [[f32; 3]],
     faces: &'a [[u32; 3]],
-    /// Body vertex normals and the majority orientation sign
+    /// Obstacle vertex normals and the majority orientation sign
     /// (`surface_util::outward_vertex_normals`); the poke ray runs inward.
     normals: Vec<[f32; 3]>,
     surface: BodySurface<'a>,
@@ -323,7 +370,8 @@ impl<'a> Obstacle<'a> {
     fn build(positions: &'a [[f32; 3]], faces: &'a [[u32; 3]]) -> Self {
         let (normals, _) = outward_vertex_normals(positions, faces);
         Self {
-            index: SurfaceIndex::build(positions, faces),
+            members: vec![SurfaceIndex::build(positions, faces)],
+            member_face_starts: vec![0],
             positions,
             faces,
             normals,
@@ -331,9 +379,39 @@ impl<'a> Obstacle<'a> {
         }
     }
 
-    fn sample(&self, point: [f32; 3]) -> Option<Sample> {
-        let closest: ClosestSurfacePoint = self.index.closest(point)?;
-        let face = self.faces[closest.triangle];
+    /// The accumulated surface as one obstacle: one member index per declared
+    /// layer, over that layer's slice of the composite triangle list.
+    fn build_layered(accumulated: &'a AccumulatedSurface) -> Self {
+        let (positions, faces) = accumulated.obstacle();
+        let members = accumulated
+            .layers()
+            .iter()
+            .map(|layer| SurfaceIndex::build(positions, &faces[layer.triangle_range.clone()]))
+            .collect();
+        let member_face_starts = accumulated
+            .layers()
+            .iter()
+            .map(|layer| layer.triangle_range.start)
+            .collect();
+        let (normals, _) = outward_vertex_normals(positions, faces);
+        Self {
+            members,
+            member_face_starts,
+            positions,
+            faces,
+            normals,
+            surface: BodySurface::build(positions, faces),
+        }
+    }
+
+    /// The nearest point of one member and the sample it names for `point`.
+    fn member_sample(
+        &self,
+        member: usize,
+        closest: &ClosestSurfacePoint,
+        point: [f32; 3],
+    ) -> Sample {
+        let face = self.faces[self.member_face_starts[member] + closest.triangle];
         let corners = [
             self.positions[face[0] as usize],
             self.positions[face[1] as usize],
@@ -345,11 +423,37 @@ impl<'a> Obstacle<'a> {
             Some(normal) => dot(sub(point, closest.point), normal),
             None => 0.0,
         };
-        Some(Sample { signed, normal })
+        Sample {
+            signed,
+            normal,
+            member,
+        }
     }
 
-    /// Body vertices poking through the garment: the shard a render shows and
-    /// a per-vertex clearance cannot see. @req DECL0013
+    fn sample(&self, point: [f32; 3]) -> Option<Sample> {
+        // Outermost member first: the first member the vertex is behind owns
+        // it, exactly the rule `AccumulatedSurface::layered_visible_depths`
+        // grades by. A vertex behind no member floats; the nearest member is
+        // its pull target, and on a tie the outermost member wins. One member
+        // reduces both branches to the plain nearest-triangle sample `dress`
+        // has always taken.
+        let mut nearest: Option<(usize, ClosestSurfacePoint)> = None;
+        for member in (0..self.members.len()).rev() {
+            let closest: ClosestSurfacePoint = self.members[member].closest(point)?;
+            let sample = self.member_sample(member, &closest, point);
+            if sample.normal.is_some() && sample.signed < 0.0 {
+                return Some(sample);
+            }
+            if nearest.is_none_or(|(_, best)| closest.distance < best.distance) {
+                nearest = Some((member, closest));
+            }
+        }
+        let (member, closest) = nearest?;
+        Some(self.member_sample(member, &closest, point))
+    }
+
+    /// Obstacle vertices poking through the garment: the shard a render shows
+    /// and a per-vertex clearance cannot see. @req DECL0013
     fn poke_hits<'g>(&self, garment: Mesh<'g>) -> Vec<(usize, crate::check::RayHit, f32)> {
         self.surface.poke_hits(garment, &self.normals, POKE_SEARCH)
     }
@@ -543,13 +647,65 @@ pub fn dress(
 ) -> Result<Dressed, DressError> {
     params.validate()?;
     validate_geometry(garment, body)?;
+    let obstacle = Obstacle::build(body.0, body.1);
+    solve(garment, body, &obstacle, None, params)
+}
+
+/// Dress `garment` over an already-fitted stack: the accumulated surface of the
+/// body plus the layers below the new garment.
+///
+/// The obstacle is the composite graded by the outermost-member rule, so a
+/// vertex the underwear covers resolves against the underwear and a vertex over
+/// bare skin resolves against the body — never against a covered body triangle
+/// the cloth between them hides. The registration stage runs against the same
+/// composite, an optional final push-out grades through
+/// [`final_push_layered`], and the report names the member every returned
+/// vertex projected against.
+///
+/// # Errors
+///
+/// The same refusals as [`dress`]; the composite itself is validated by
+/// [`AccumulatedSurface`] before this runs.
+pub fn dress_against(
+    garment: Mesh<'_>,
+    accumulated: &AccumulatedSurface,
+    params: &DressParams,
+) -> Result<Dressed, DressError> {
+    params.validate()?;
+    validate_geometry(garment, accumulated.obstacle())?;
+    let obstacle = Obstacle::build_layered(accumulated);
+    let mut dressed = solve(
+        garment,
+        accumulated.obstacle(),
+        &obstacle,
+        Some(accumulated),
+        params,
+    )?;
+    dressed.2.projections = Some(project(&obstacle, accumulated, &dressed.0));
+    Ok(dressed)
+}
+
+/// The shared solve both entry points run: seam merge, subdivision, contact
+/// band, interleaved registration, poke repair and the optional final
+/// push-out. The callers validated the parameters and the geometry before
+/// building the obstacle.
+///
+/// `register` is the surface the registration stage fits against — the body
+/// for [`dress`], the accumulated composite for [`dress_against`] — and
+/// `accumulated` switches the final push-out to its layered grading.
+fn solve(
+    garment: Mesh<'_>,
+    register: Mesh<'_>,
+    obstacle: &Obstacle<'_>,
+    accumulated: Option<&AccumulatedSurface>,
+    params: &DressParams,
+) -> Result<Dressed, DressError> {
     let (welded_positions, welded_triangles, seam_weld) =
         seam_weld(garment.0, garment.1, SEAM_WELD_EPSILON);
     let (mut positions, triangles) =
         midpoint_subdivide(&welded_positions, &welded_triangles, params.cuts);
 
-    let obstacle = Obstacle::build(body.0, body.1);
-    let before = measure(&obstacle, &positions, &triangles, params);
+    let before = measure(obstacle, &positions, &triangles, params);
     let pokes_before = obstacle.poke_hits((&positions, &triangles)).len();
     let authored = positions.clone();
     let mut moved_of = vec![false; positions.len()];
@@ -562,19 +718,18 @@ pub fn dress(
     // the cloth onto the body it has to cover; the fit then carries that
     // deformation over the garment's own edges. Each round ends with a contact
     // pass, because the fit alone leaves a floating shell behind. @req DECL0013
-    let first = resolve(&obstacle, &mut positions, &triangles, &mut moved_of, params);
+    let first = resolve(obstacle, &mut positions, &triangles, &mut moved_of, params);
     let mut iterations = first.iterations;
     let mut max_move = first.max_move;
     let mut registration = None;
     let mut solved = first;
     for _ in 0..params.rounds {
         let options = register_options(params);
-        let (registered, report) =
-            fit_to_body((&positions, &triangles), (body.0, body.1), None, &options)
-                .map_err(DressError::Registration)?;
+        let (registered, report) = fit_to_body((&positions, &triangles), register, None, &options)
+            .map_err(DressError::Registration)?;
         positions = registered;
         registration = Some(report);
-        solved = resolve(&obstacle, &mut positions, &triangles, &mut moved_of, params);
+        solved = resolve(obstacle, &mut positions, &triangles, &mut moved_of, params);
         iterations += solved.iterations;
         max_move = max_move.max(solved.max_move);
     }
@@ -602,15 +757,25 @@ pub fn dress(
         flipped: flipped_triangles(&authored, &positions, &triangles),
         registration,
         final_push: None,
+        projections: None,
     };
     if let Some(options) = params.final_push {
-        let (pushed, push_report) = final_push(
-            (&positions, &triangles),
-            (body.0, body.1),
-            None,
-            &FitOptions::default(),
-            &options,
-        )
+        let (pushed, push_report) = match accumulated {
+            None => final_push(
+                (&positions, &triangles),
+                register,
+                None,
+                &FitOptions::default(),
+                &options,
+            ),
+            Some(accumulated) => final_push_layered(
+                (&positions, &triangles),
+                accumulated,
+                None,
+                &FitOptions::default(),
+                &options,
+            ),
+        }
         .map_err(DressError::FinalPush)?;
         positions = pushed;
         report.final_push = Some(push_report);
@@ -619,6 +784,39 @@ pub fn dress(
         return Err(DressError::NonFiniteResult { vertex });
     }
     Ok((positions, triangles, report))
+}
+
+/// Which accumulated member every solved vertex resolved against: the same
+/// outermost-member sample the contact solve took, read once more off the
+/// returned mesh. @req DECL0013
+fn project(
+    obstacle: &Obstacle<'_>,
+    accumulated: &AccumulatedSurface,
+    positions: &[[f32; 3]],
+) -> DressProjections {
+    let mut members: Vec<DressMemberProjection> = accumulated
+        .layers()
+        .iter()
+        .map(|layer| DressMemberProjection {
+            id: layer.id.clone(),
+            order: layer.order,
+            vertices: 0,
+        })
+        .collect();
+    let mut vertex_members = Vec::with_capacity(positions.len());
+    for &position in positions {
+        let member = obstacle
+            .sample(position)
+            .map(|sample| sample.member)
+            .unwrap_or(0);
+        members[member].vertices += 1;
+        vertex_members.push(member);
+    }
+    DressProjections {
+        surface: accumulated.surface_label(),
+        members,
+        vertex_members,
+    }
 }
 
 /// The registration the contact solve starts from: a constant declared gap

@@ -1249,7 +1249,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 
 fn garment(args: &[String]) -> ExitCode {
     let usage = "usage: sculpto garment fit --nif <path> --shape <name> [--body-shape <name>] --body <obj> --out <obj> [--body-ref <obj>] [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]
-       sculpto garment dress --body <obj> --garment <obj> --out <obj> [--clearance <units>] [--contact <units>] [--cuts <n>] [--iterations <n>] [--max-step <units>] [--relax <weight>] [--rounds <n>] [--poke-passes <n>] [--tolerance <units> [--passes <n>]] [--report <json>] [--json]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+       sculpto garment dress --body <obj> --garment <obj> [--against <layers.json>] --out <obj> [--clearance <units>] [--contact <units>] [--cuts <n>] [--iterations <n>] [--max-step <units>] [--relax <weight>] [--rounds <n>] [--poke-passes <n>] [--tolerance <units> [--passes <n>]] [--report <json>] [--json]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
        sculpto garment push --body <obj> --garment <obj> --tolerance <units> --out <obj> [--passes <n>] [--json]
        sculpto garment stack --outfit <layers.json> [--body <obj>] --tolerance <units> [--json]
@@ -1503,6 +1503,7 @@ fn garment_dress_inner(args: &[String]) -> Result<(), String> {
     let params = sculpto_engine::ops::DressParams {
         body: PathBuf::from(required(&flags, "body")?),
         garment: PathBuf::from(required(&flags, "garment")?),
+        against: flags.get("against").map(PathBuf::from),
         out: PathBuf::from(required(&flags, "out")?),
         clearance: optional_number(&flags, "clearance")?,
         contact: optional_number(&flags, "contact")?,
@@ -1560,6 +1561,19 @@ fn garment_dress_inner(args: &[String]) -> Result<(), String> {
         mesh.pokes_after,
         mesh.flipped,
     );
+    if let Some(against) = &outcome.against {
+        let counts = against
+            .projections
+            .members
+            .iter()
+            .map(|member| format!("{} {}", member.id, member.vertices))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "dress: projected against {}: {}",
+            against.projections.surface, counts
+        );
+    }
     if let Some(push) = &outcome.final_push {
         print_final_push(push);
     }

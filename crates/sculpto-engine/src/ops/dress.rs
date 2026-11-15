@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde_json::{Value, json};
 
+use sculpto_mesh::accumulated_surface::{AccumulatedError, AccumulatedSurface, BODY_SURFACE};
 use sculpto_mesh::dress::{
-    DressError, DressParams as SolveParams, MAX_CUTS, SeamWeldReport, dress,
+    DressError, DressParams as SolveParams, DressProjections, MAX_CUTS, SeamWeldReport, dress,
+    dress_against,
 };
+use sculpto_mesh::layer_stack::{LayerStack, StackError, resolve_body};
 use sculpto_mesh::wrap::repair::final_push::{FinalPushOptions, FinalPushReport};
 
 use crate::obj::{ObjError, display_to_source, read_obj_mesh, write_obj};
@@ -28,6 +31,11 @@ pub struct DressParams {
     pub body: PathBuf,
     /// Raw garment OBJ; its authored topology is not required to match the body.
     pub garment: PathBuf,
+    /// Layer-stack manifest (`garment stack`'s shape): the garment is dressed
+    /// against the accumulated surface of the body plus these already-fitted
+    /// layers, outermost-member rule, instead of the body alone. Absent keeps
+    /// the single-body behaviour.
+    pub against: Option<PathBuf>,
     /// Output OBJ: the densified, dressed mesh.
     pub out: PathBuf,
     /// Declared standoff in input units, the largest accepted floating gap.
@@ -65,6 +73,9 @@ pub struct DressOutcome {
     pub body: PathBuf,
     /// Garment that was dressed.
     pub garment: PathBuf,
+    /// The layer manifest the obstacle was accumulated from, present only for
+    /// a layered dress (`against`).
+    pub against: Option<DressAgainst>,
     /// Solve parameters actually used.
     pub solve: SolveParams,
     /// Registration report, absent when registration was off.
@@ -75,6 +86,15 @@ pub struct DressOutcome {
     pub seam_weld: SeamWeldReport,
     /// The mesh and its band measurements.
     pub mesh: DressMeasurements,
+}
+
+/// The accumulated obstacle one layered dress used. @req DECL0013 DECL0015
+#[derive(Debug, Clone, PartialEq)]
+pub struct DressAgainst {
+    /// Manifest the layers were read from.
+    pub manifest: PathBuf,
+    /// Which member the returned vertices resolved against.
+    pub projections: DressProjections,
 }
 
 /// The report of one dress, flattened for the JSON envelope.
@@ -182,6 +202,26 @@ impl DressOutcome {
                 "strained_edges": registration.strained_edges,
             });
         }
+        if let Some(against) = &self.against {
+            let members: Vec<Value> = against
+                .projections
+                .members
+                .iter()
+                .map(|member| {
+                    json!({
+                        "id": member.id,
+                        "order": member.order,
+                        "vertices": member.vertices,
+                    })
+                })
+                .collect();
+            value["against"] = json!({
+                "manifest": against.manifest.display().to_string(),
+                "surface": against.projections.surface,
+                "members": members,
+                "projections": against.projections.vertex_members,
+            });
+        }
         if let Some(push) = &self.final_push {
             value["final_push"] = json!(push);
         }
@@ -196,15 +236,23 @@ impl DressOutcome {
 /// Refuses unreadable or malformed OBJs as their own classified failures, and
 /// every [`DressError`] with its domain code; the fitted OBJ is written before
 /// the band verdict, so a refusal still leaves the measured geometry to review.
+/// A declared `against` manifest adds its own typed refusals
+/// ([`accumulated_obstacle`]).
 pub fn dress_garment(params: &DressParams) -> Result<DressOutcome, CommandError> {
     let body =
         read_obj_mesh(&params.body).map_err(|error| obj_error("body", &params.body, &error))?;
     let garment = read_obj_mesh(&params.garment)
         .map_err(|error| obj_error("garment", &params.garment, &error))?;
     let solve = solve_params(params)?;
-    let (positions, triangles, report) =
-        dress((&garment.0, &garment.1), (&body.0, &body.1), &solve)
-            .map_err(|error| solve_refused(&error))?;
+    let (positions, triangles, report) = match &params.against {
+        None => dress((&garment.0, &garment.1), (&body.0, &body.1), &solve)
+            .map_err(|error| solve_refused(&error))?,
+        Some(manifest) => {
+            let accumulated = accumulated_obstacle(manifest, &params.body, &body)?;
+            dress_against((&garment.0, &garment.1), &accumulated, &solve)
+                .map_err(|error| solve_refused(&error))?
+        }
+    };
     if let Some(parent) = params.out.parent() {
         fs::create_dir_all(parent).map_err(|error| errors::io(parent, error))?;
     }
@@ -221,6 +269,14 @@ pub fn dress_garment(params: &DressParams) -> Result<DressOutcome, CommandError>
         out: params.out.clone(),
         body: params.body.clone(),
         garment: params.garment.clone(),
+        against: params
+            .against
+            .as_deref()
+            .zip(report.projections.clone())
+            .map(|(manifest, projections)| DressAgainst {
+                manifest: manifest.to_path_buf(),
+                projections,
+            }),
         solve,
         registration: report.registration,
         final_push: report.final_push,
@@ -259,6 +315,103 @@ pub fn dress_garment(params: &DressParams) -> Result<DressOutcome, CommandError>
         ));
     }
     Ok(outcome)
+}
+
+/// The accumulated obstacle a layered dress grades against: the body plus the
+/// manifest's already-fitted layers, in the dressing order the manifest
+/// declares. @req DECL0013 DECL0015
+///
+/// The manifest lists only layers below the garment being dressed, so every
+/// declared order must sit strictly above the previous one — an inversion
+/// would dress the new garment under a layer it must clear.
+///
+/// # Errors
+///
+/// Typed refusals, never a silent body fallback: an unreadable or invalid
+/// manifest or a body the manifest disagrees with
+/// (`dress_against_manifest_invalid`), a body that cannot serve as an obstacle
+/// (`dress_against_body_underivable`), a missing or malformed layer OBJ
+/// (`dress_against_layer_missing`, `dress_against_layer_malformed`), a layer
+/// that cannot join the composite (`dress_against_layer_underivable`), and a
+/// layer whose order is not below the next outer one's
+/// (`dress_against_order_not_below`).
+fn accumulated_obstacle(
+    manifest: &Path,
+    body_path: &Path,
+    body: &crate::obj::ObjMesh,
+) -> Result<AccumulatedSurface, CommandError> {
+    let text = fs::read_to_string(manifest).map_err(|error| errors::io(manifest, error))?;
+    let stack = LayerStack::parse_json(&text, manifest)
+        .map_err(|error| dress_against_manifest_invalid(&error))?;
+    // The manifest body, when declared, must be the body being dressed over.
+    resolve_body(&stack, Some(body_path))
+        .map_err(|error| dress_against_manifest_invalid(&error))?;
+    let mut accumulated = AccumulatedSurface::from_body(&body.0, &body.1)
+        .map_err(|error| dress_against_underivable(BODY_SURFACE, &error))?;
+    for layer in &stack.layers {
+        let mesh = read_obj_mesh(&layer.obj)
+            .map_err(|error| dress_against_obj(&layer.id, &layer.obj, &error))?;
+        accumulated
+            .push_layer(&layer.id, layer.order, &mesh.0, &mesh.1)
+            .map_err(|error| dress_against_push(&layer.id, layer.order, &error))?;
+    }
+    Ok(accumulated)
+}
+
+fn dress_against_manifest_invalid(error: &StackError) -> CommandError {
+    CommandError::new(
+        ErrorKind::InvalidParams,
+        "dress_against_manifest_invalid",
+        error.to_string(),
+    )
+}
+
+fn dress_against_underivable(surface: &str, error: &AccumulatedError) -> CommandError {
+    CommandError::new(
+        ErrorKind::Refused,
+        if surface == BODY_SURFACE {
+            "dress_against_body_underivable"
+        } else {
+            "dress_against_layer_underivable"
+        },
+        format!("cannot derive the accumulated surface from `{surface}`: {error}"),
+    )
+}
+
+/// Split a declared layer's OBJ read failure by its own contract.
+fn dress_against_obj(id: &str, path: &Path, error: &ObjError) -> CommandError {
+    match error {
+        ObjError::Io(message) => CommandError::new(
+            ErrorKind::NotFound,
+            "dress_against_layer_missing",
+            format!("layer `{id}`: {}: {message}", path.display()),
+        ),
+        ObjError::Malformed(message) => CommandError::new(
+            ErrorKind::InvalidRequest,
+            "dress_against_layer_malformed",
+            format!("layer `{id}`: {}: {message}", path.display()),
+        ),
+        ObjError::MissingObject { name, .. } => CommandError::new(
+            ErrorKind::NotFound,
+            "dress_against_layer_missing",
+            format!(
+                "layer `{id}`: {}: object `{name}` not found",
+                path.display()
+            ),
+        ),
+    }
+}
+
+fn dress_against_push(id: &str, order: u32, error: &AccumulatedError) -> CommandError {
+    let code = match error {
+        AccumulatedError::OrderNotIncreasing { .. } => "dress_against_order_not_below",
+        _ => "dress_against_layer_underivable",
+    };
+    CommandError::new(
+        ErrorKind::Refused,
+        code,
+        format!("layer `{id}` (order {order}) cannot join the accumulated surface: {error}"),
+    )
 }
 
 /// The band promise the solve makes, as a refusal message: the returned mesh

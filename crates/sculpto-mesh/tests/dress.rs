@@ -4,9 +4,10 @@
 //! Controls are hand-computable: a flat plane has an exact normal and standoff,
 //! so a contact solve either lands in the band or the test says by how much.
 
+use sculpto_mesh::accumulated_surface::AccumulatedSurface;
 use sculpto_mesh::dress::{
     DressError, DressParams, MAX_CUTS, MAX_ITERATIONS, MAX_POKE_PASSES, MAX_ROUNDS,
-    SEAM_WELD_EPSILON, dress, midpoint_subdivide, seam_weld,
+    SEAM_WELD_EPSILON, dress, dress_against, midpoint_subdivide, seam_weld,
 };
 
 /// A square patch of `cells` × `cells` quads on `z`, wound so +Z faces out.
@@ -592,4 +593,146 @@ fn malformed_geometry_is_refused_by_name() {
         ),
         Err(DressError::BodyFaceIndex { vertex: 77, .. })
     ));
+}
+
+/// Outward-wound cube of half-extent `half`.
+fn cube(half: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let positions = [
+        [-half, -half, -half],
+        [half, -half, -half],
+        [half, half, -half],
+        [-half, half, -half],
+        [-half, -half, half],
+        [half, -half, half],
+        [half, half, half],
+        [-half, half, half],
+    ]
+    .to_vec();
+    let triangles = vec![
+        [4u32, 5, 6],
+        [4, 6, 7],
+        [1, 0, 3],
+        [1, 3, 2],
+        [1, 2, 6],
+        [1, 6, 5],
+        [0, 4, 7],
+        [0, 7, 3],
+        [3, 7, 6],
+        [3, 6, 2],
+        [0, 1, 5],
+        [0, 5, 4],
+    ];
+    (positions, triangles)
+}
+
+/// One sheet facing `+x` at `x`.
+fn sheet(x: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    (
+        vec![[x, 0.0, 0.0], [x, 0.1, 0.0], [x, 0.0, 0.1]],
+        vec![[0u32, 1, 2]],
+    )
+}
+
+#[test]
+fn a_layered_dress_resolves_covered_vertices_against_the_outermost_member() {
+    // The sheet sits at x = 0.30: behind the panty shell (-0.20 from its +x
+    // face) and behind the body (-0.10 from its own). The outermost-member
+    // rule must let the panty own it, so the layered dress seats it outside
+    // the panty at the declared band — while the same sheet dressed against
+    // the body alone lands at the body's band, inside the panty, which is the
+    // covered-crease failure `dress_against` exists to remove.
+    let (body, body_faces) = cube(0.4);
+    let (panty, panty_faces) = cube(0.5);
+    let mut accumulated =
+        AccumulatedSurface::from_body(&body, &body_faces).expect("the body seeds the stack");
+    accumulated
+        .push_layer("panty", 10, &panty, &panty_faces)
+        .expect("a valid layer");
+    let (garment, faces) = sheet(0.30);
+    let options = DressParams {
+        clearance: 0.05,
+        contact: 0.01,
+        ..params()
+    };
+    let (positions, _, report) =
+        dress_against((&garment, &faces), &accumulated, &options).expect("a layered dress");
+    let projections = report.projections.expect("a layered report projects");
+    assert_eq!(projections.surface, "accumulated[body, panty]");
+    assert_eq!(
+        projections.members[0].vertices, 0,
+        "the body owns nothing the panty covers"
+    );
+    assert_eq!(
+        projections.members[1].vertices, 3,
+        "the panty owns the sheet"
+    );
+    assert_eq!(projections.vertex_members, vec![1, 1, 1]);
+    for point in &positions {
+        assert!(
+            point[0] >= 0.5 && point[0] <= 0.5 + options.clearance + 1e-4,
+            "the sheet seats outside the panty in the band: {point:?}"
+        );
+    }
+    let (single_positions, _, single) =
+        dress((&garment, &faces), (&body, &body_faces), &options).expect("a plain dress");
+    assert!(
+        single.projections.is_none(),
+        "a single-body dress reports no projections"
+    );
+    for point in &single_positions {
+        assert!(
+            point[0] <= 0.4 + options.clearance,
+            "the body-only dress lands inside the panty: {point:?}"
+        );
+    }
+}
+
+#[test]
+fn a_layered_dress_grades_each_region_against_its_own_member() {
+    // A body cube at the origin and a closed panty cube centred at x = 3: one
+    // garment of two sheets, one floating over each region. The sheet over
+    // bare body resolves against the body and the sheet behind the panty
+    // region against the panty — the legs-versus-hips choice of a real
+    // two-layer dress, with both sheets seated at their own member's band.
+    let (body, body_faces) = cube(0.4);
+    let (mut panty, panty_faces) = cube(0.4);
+    for point in &mut panty {
+        point[0] += 3.0;
+    }
+    let mut accumulated =
+        AccumulatedSurface::from_body(&body, &body_faces).expect("the body seeds the stack");
+    accumulated
+        .push_layer("panty", 10, &panty, &panty_faces)
+        .expect("a valid layer");
+    let (near, _) = sheet(0.60);
+    let (far, _) = sheet(3.60);
+    let garment = [near, far].concat();
+    let faces = vec![[0u32, 1, 2], [3, 4, 5]];
+    let options = DressParams {
+        clearance: 0.05,
+        contact: 0.01,
+        ..params()
+    };
+    let (positions, _, report) =
+        dress_against((&garment, &faces), &accumulated, &options).expect("a layered dress");
+    let projections = report.projections.expect("a layered report projects");
+    assert_eq!(
+        projections.vertex_members,
+        vec![0, 0, 0, 1, 1, 1],
+        "each sheet resolves against its own region's member"
+    );
+    assert_eq!(projections.members[0].vertices, 3);
+    assert_eq!(projections.members[1].vertices, 3);
+    for point in &positions[0..3] {
+        assert!(
+            (point[0] - 0.45).abs() < 0.01,
+            "the bare-body sheet seats at the body's band: {point:?}"
+        );
+    }
+    for point in &positions[3..6] {
+        assert!(
+            (point[0] - 3.45).abs() < 0.01,
+            "the panty-region sheet seats at the panty's band: {point:?}"
+        );
+    }
 }

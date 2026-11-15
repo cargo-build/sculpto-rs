@@ -335,3 +335,166 @@ fn configured_underwear_dresses_onto_the_exact_bijin_body() {
         assert_eq!(depth.max, 0.0, "{name} leaves no penetrating vertex");
     }
 }
+
+/// Outward-wound cube OBJ of half-extent `half`, centred at the origin.
+fn cube_obj(half: f32) -> String {
+    let positions = [
+        [-half, -half, -half],
+        [half, -half, -half],
+        [half, half, -half],
+        [-half, half, -half],
+        [-half, -half, half],
+        [half, -half, half],
+        [half, half, half],
+        [-half, half, half],
+    ];
+    let faces = [
+        [4, 5, 6],
+        [4, 6, 7],
+        [1, 0, 3],
+        [1, 3, 2],
+        [1, 2, 6],
+        [1, 6, 5],
+        [0, 4, 7],
+        [0, 7, 3],
+        [3, 7, 6],
+        [3, 6, 2],
+        [0, 1, 5],
+        [0, 5, 4],
+    ];
+    let mut text = String::new();
+    for [x, y, z] in positions {
+        text.push_str(&format!("v {x} {y} {z}\n"));
+    }
+    for face in faces {
+        text.push_str(&format!(
+            "f {} {} {}\n",
+            face[0] + 1,
+            face[1] + 1,
+            face[2] + 1
+        ));
+    }
+    text
+}
+
+/// Two disconnected `+x` sheets at `first` and `second`, as one OBJ.
+fn two_sheet_obj(first: f32, second: f32) -> String {
+    format!(
+        "v {first} 0 0\nv {first} 0.1 0\nv {first} 0 0.1\n\
+         v {second} 0 0\nv {second} 0.1 0\nv {second} 0 0.1\n\
+         f 1 2 3\nf 4 5 6\n"
+    )
+}
+
+/// A dress request with an `against` manifest over cube fixtures.
+fn dress_against(
+    directory: &std::path::Path,
+    manifest: &str,
+) -> Result<serde_json::Value, sculpto_engine::CommandError> {
+    let manifest_path = directory.join("layers.json");
+    fs::write(&manifest_path, manifest).unwrap();
+    dispatch(
+        "outfit.dress",
+        &json!({
+            "body": directory.join("body.obj").display().to_string(),
+            "garment": directory.join("garment.obj").display().to_string(),
+            "against": manifest_path.display().to_string(),
+            "out": directory.join("dressed.obj").display().to_string(),
+            "clearance": 0.05,
+            "contact": 0.01,
+            "cuts": 0,
+        }),
+    )
+}
+
+#[test]
+fn an_against_layer_file_that_is_missing_is_refused_by_name() {
+    let directory = fixture_directory("against-missing");
+    fs::write(directory.join("body.obj"), cube_obj(0.4)).unwrap();
+    fs::write(directory.join("garment.obj"), two_sheet_obj(0.6, 3.6)).unwrap();
+    let error = dress_against(
+        &directory,
+        r#"{"body": "body.obj", "layers": [{"id": "panty", "order": 10, "obj": "ghost.obj"}]}"#,
+    )
+    .expect_err("a declared layer file must exist");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert_eq!(error.code(), "dress_against_layer_missing");
+    assert!(
+        error.message().contains("ghost.obj"),
+        "the refusal names the missing file: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn an_against_layer_whose_order_is_not_below_is_refused() {
+    let directory = fixture_directory("against-order");
+    fs::write(directory.join("body.obj"), cube_obj(0.4)).unwrap();
+    fs::write(directory.join("garment.obj"), two_sheet_obj(0.6, 3.6)).unwrap();
+    fs::write(directory.join("panty.obj"), cube_obj(0.4)).unwrap();
+    fs::write(directory.join("trousers.obj"), cube_obj(0.4)).unwrap();
+    // Trousers declared under the panty they must dress over: the second
+    // layer's order is not above the previous one's.
+    let error = dress_against(
+        &directory,
+        r#"{"body": "body.obj", "layers": [
+            {"id": "panty", "order": 10, "obj": "panty.obj"},
+            {"id": "trousers", "order": 5, "obj": "trousers.obj"}]}"#,
+    )
+    .expect_err("an inverted stack cannot be dressed over");
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert_eq!(error.code(), "dress_against_order_not_below");
+    assert!(
+        error.message().contains("not above"),
+        "the refusal names the inversion: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn an_against_dress_reports_the_member_each_vertex_resolved_against() {
+    let directory = fixture_directory("against-regions");
+    fs::write(directory.join("body.obj"), cube_obj(0.4)).unwrap();
+    fs::write(directory.join("garment.obj"), two_sheet_obj(0.6, 3.6)).unwrap();
+    // A panty cube centred at x = 3: the second sheet floats over it, the
+    // first over bare body.
+    let panty = cube_obj(0.4);
+    let shifted = panty
+        .lines()
+        .map(|line| match line.strip_prefix("v ") {
+            Some(rest) => {
+                let lanes: Vec<f32> = rest
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, lane)| {
+                        lane.parse::<f32>().unwrap() + if index == 0 { 3.0 } else { 0.0 }
+                    })
+                    .collect();
+                format!("v {} {} {}", lanes[0], lanes[1], lanes[2])
+            }
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(directory.join("panty.obj"), format!("{shifted}\n")).unwrap();
+    let report = dress_against(
+        &directory,
+        r#"{"body": "body.obj", "layers": [{"id": "panty", "order": 10, "obj": "panty.obj"}]}"#,
+    )
+    .expect("a two-layer obstacle dresses");
+    assert_eq!(
+        report["against"]["surface"], "accumulated[body, panty]",
+        "the report names the obstacle: {report}"
+    );
+    assert_eq!(report["against"]["projections"], json!([0, 0, 0, 1, 1, 1]));
+    let members = report["against"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["id"], "body");
+    assert_eq!(members[0]["order"], 0);
+    assert_eq!(members[0]["vertices"], 3);
+    assert_eq!(members[1]["id"], "panty");
+    assert_eq!(members[1]["order"], 10);
+    assert_eq!(members[1]["vertices"], 3);
+    assert_eq!(report["max_floating_gap"], 0.0);
+    assert_eq!(report["max_penetration"], 0.0);
+}

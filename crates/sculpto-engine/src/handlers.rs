@@ -721,6 +721,7 @@ pub fn dress(input: &Value) -> Result<Value, CommandError> {
     let params = ops::DressParams {
         body: path(input, "body")?,
         garment: path(input, "garment")?,
+        against: checked_optional_path(input, "against")?,
         out: path(input, "out")?,
         clearance: optional_f32(input, "clearance")?,
         contact: optional_f32(input, "contact")?,
