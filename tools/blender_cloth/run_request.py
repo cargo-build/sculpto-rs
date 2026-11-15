@@ -165,6 +165,7 @@ def solver_arguments(request: dict) -> tuple[str, list[str]]:
             "body_thickness": legacy["body_thickness"],
             "collision_quality": legacy["collision_quality"],
             "gravity": legacy["gravity"],
+            "air_damping": legacy["air_damping"],
             "quality": legacy["quality"],
             "ground": 1 if legacy["ground"] else 0,
             "pin_policy": legacy_policy,

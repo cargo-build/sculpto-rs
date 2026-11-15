@@ -70,6 +70,7 @@ if body_thickness < 0.0:
     body_thickness = body_min + 0.2
 collision_quality = int(cfg.get("collision_quality", "4"))
 gravity = float(cfg.get("gravity", "-9.81"))
+air_damping = float(cfg.get("air_damping", "1.0"))
 self_collision = int(cfg.get("self_collision", 1))
 quality = int(cfg.get("quality", 10))
 ground = int(cfg.get("ground", 0))
@@ -189,7 +190,7 @@ settings.vertex_group_mass = "pin"
 settings.pin_stiffness = 1.0
 settings.quality = quality
 settings.mass = mass
-settings.air_damping = 1.0
+settings.air_damping = air_damping
 settings.tension_stiffness = structural
 settings.compression_stiffness = structural
 settings.shear_stiffness = shear
@@ -235,6 +236,7 @@ report = {
         "body_thickness": body_thickness,
         "collision_quality": collision_quality,
         "gravity": gravity,
+        "air_damping": air_damping,
         "quality": quality,
         "ground": bool(ground),
     },

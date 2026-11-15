@@ -101,6 +101,10 @@ fn default_legacy_gravity() -> f64 {
     -9.81
 }
 
+fn default_legacy_air_damping() -> f64 {
+    1.0
+}
+
 fn default_legacy_quality() -> u32 {
     10
 }
@@ -356,6 +360,9 @@ pub struct LegacySettings {
     /// Scene gravity, units/s². Lab-unit scenes need their own value.
     #[serde(default = "default_legacy_gravity")]
     pub gravity: f64,
+    /// Air damping applied to cloth motion.
+    #[serde(default = "default_legacy_air_damping")]
+    pub air_damping: f64,
     /// Solver quality steps.
     #[serde(default = "default_legacy_quality")]
     pub quality: u32,
@@ -377,6 +384,7 @@ impl Default for LegacySettings {
             body_thickness: default_legacy_body_thickness(),
             collision_quality: default_legacy_collision_quality(),
             gravity: default_legacy_gravity(),
+            air_damping: default_legacy_air_damping(),
             quality: default_legacy_quality(),
             ground: false,
         }
