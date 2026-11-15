@@ -338,6 +338,13 @@ pub struct BakeParams {
 pub struct BakeOutcome {
     /// Output path.
     pub out: PathBuf,
+    /// Weight endpoint the percentages were taken from (`big`/`small`).
+    ///
+    /// Part of the outcome because the two endpoints are different bodies: a
+    /// `_1` (big) body is measurably larger than the `_0` (small) one at the
+    /// same preset, and comparing bakes across endpoints reads as a morph
+    /// defect. Printing the endpoint keeps the frame of every bake visible.
+    pub endpoint: &'static str,
     /// Vertices written.
     pub vertices: usize,
     /// Triangles written.
@@ -452,6 +459,10 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
         .map_err(|error| errors::io(&params.out, error))?;
     Ok(BakeOutcome {
         out: params.out.clone(),
+        endpoint: match size {
+            SliderSize::Big => "big",
+            SliderSize::Small => "small",
+        },
         vertices: baked.len(),
         triangles: shape.triangles.len(),
         sliders: plan.sliders.len(),

@@ -69,8 +69,11 @@ const DEFERRED_PROJECT: &str = r#"<SliderSetInfo version="1">
 const PRESETS: &str =
     r#"<SliderPresets><Preset name="Neutral" set="Body Set"></Preset></SliderPresets>"#;
 
-/// The coverage block's authored deltas: vertices 1 and 3 move, 0 and 2 do not.
-const COVER_DELTAS: [(usize, [f32; 3]); 2] = [(1, [0.3, 0.0, 0.4]), (3, [0.0, -0.2, 0.0])];
+/// The coverage block's authored deltas: the protruding breast tip (vertex 1,
+/// front = −z) and its blending-ring vertex 3. Every z component is inward
+/// (+z), the direction the authored `NipBGone` morph moves real chest
+/// geometry; x/y components model the small authored lateral drift.
+const COVER_DELTAS: [(usize, [f32; 3]); 2] = [(1, [0.3, 0.0, 0.5]), (3, [0.0, -0.2, 0.15])];
 
 struct Scratch(PathBuf);
 
@@ -104,9 +107,11 @@ impl Drop for Scratch {
 fn quad() -> MeshAsset {
     MeshAsset {
         name: "Body".into(),
+        // Vertex 1 is the protruding breast tip (front = −z), like the real
+        // chest apex the coverage morph flattens.
         positions: vec![
             [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
+            [1.0, 0.0, -0.8],
             [1.0, 1.0, 0.0],
             [0.0, 1.0, 0.0],
         ],
@@ -346,4 +351,116 @@ fn a_bad_coverage_token_is_invalid_params() {
     )
     .expect_err("the token vocabulary is clothed and nude");
     assert_eq!(error.kind(), ErrorKind::InvalidParams);
+}
+
+/// The coverage direction contract of the clothed state. @req BODY-01
+///
+/// The front is −z, so flattening the breast tip means its z can only
+/// **increase** (move inward), and no breast vertex may be pushed outward by
+/// more than rounding. A build that flips the authored sign, applies the
+/// morph through a wrong vertex mapping, or composes it with the wrong
+/// endpoint semantics pushes the tip out and fails here.
+#[test]
+fn clothed_pulls_the_breast_tip_inward_and_never_pushes_outward() {
+    let scratch = home();
+    bake(
+        &scratch,
+        "direction-nude",
+        None,
+        Some("nude"),
+        serde_json::json!({}),
+    )
+    .expect("nude bakes");
+    bake(
+        &scratch,
+        "direction-clothed",
+        None,
+        Some("clothed"),
+        serde_json::json!({}),
+    )
+    .expect("clothed bakes");
+
+    let nude = positions(&scratch, "direction-nude");
+    let clothed = positions(&scratch, "direction-clothed");
+    assert_eq!(nude, uncovered());
+
+    let (tip, nude_tip_z) = nude
+        .iter()
+        .enumerate()
+        .fold((usize::MAX, f32::INFINITY), |(index, z), (i, p)| {
+            (if p[2] < z { i } else { index }, z.min(p[2]))
+        });
+    assert_eq!(
+        tip, 1,
+        "the fixture's breast tip is the coverage cap vertex"
+    );
+    let clothed_tip_z = clothed[tip][2];
+    assert!(
+        clothed_tip_z >= nude_tip_z,
+        "clothed tip z {clothed_tip_z} must not be more negative than nude {nude_tip_z}"
+    );
+    let authored = COVER_DELTAS
+        .iter()
+        .find(|&&(i, _)| i == tip)
+        .map(|&(_, delta)| delta[2])
+        .expect("tip delta");
+    assert!(
+        clothed_tip_z - nude_tip_z >= authored - 1e-4,
+        "the tip must retract by the authored amount, got {} of {authored}",
+        clothed_tip_z - nude_tip_z
+    );
+
+    // No breast vertex moves outward (−z) beyond rounding: the authored block
+    // is pure flattening plus a small lateral drift.
+    let outward = nude
+        .iter()
+        .zip(&clothed)
+        .map(|(before, after)| before[2] - after[2])
+        .fold(0.0f32, f32::max);
+    assert!(
+        outward <= 0.02,
+        "max outward displacement {outward} exceeds the 0.02 gate"
+    );
+}
+
+/// The moved set must be exactly the authored coverage block: a vertex
+/// outside the morph's authored disc moving is a mapping defect, not coverage.
+#[test]
+fn no_vertex_outside_the_authored_disc_moves() {
+    let scratch = home();
+    bake(
+        &scratch,
+        "disc-nude",
+        None,
+        Some("nude"),
+        serde_json::json!({}),
+    )
+    .expect("nude bakes");
+    bake(
+        &scratch,
+        "disc-clothed",
+        None,
+        Some("clothed"),
+        serde_json::json!({}),
+    )
+    .expect("clothed bakes");
+
+    let nude = positions(&scratch, "disc-nude");
+    let clothed = positions(&scratch, "disc-clothed");
+    let moved = nude
+        .iter()
+        .zip(&clothed)
+        .enumerate()
+        .filter_map(|(index, (before, after))| {
+            (before.iter().zip(after).any(|(b, a)| (b - a).abs() > 1e-6)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let authored = COVER_DELTAS
+        .iter()
+        .map(|&(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        moved, authored,
+        "the clothed state must move exactly the authored coverage block"
+    );
 }

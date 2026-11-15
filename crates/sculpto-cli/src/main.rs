@@ -1075,13 +1075,14 @@ fn bake_inner(args: &[String]) -> Result<(), String> {
         None => outcome.coverage.as_str().to_string(),
     };
     println!(
-        "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred, coverage {}",
+        "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred, endpoint {}, coverage {}",
         outcome.out.display(),
         outcome.vertices,
         outcome.triangles,
         outcome.sliders,
         outcome.unresolved,
         outcome.deferred,
+        outcome.endpoint,
         coverage
     );
     Ok(())

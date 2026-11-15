@@ -563,6 +563,7 @@ pub fn bake(input: &Value) -> Result<Value, CommandError> {
     let outcome = ops::bake(&params)?;
     Ok(json!({
         "out": outcome.out.display().to_string(),
+        "endpoint": outcome.endpoint,
         "vertices": outcome.vertices,
         "triangles": outcome.triangles,
         "sliders": outcome.sliders,

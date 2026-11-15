@@ -179,7 +179,7 @@ fn tier1_bake_matches_between_surfaces() {
     assert_eq!(
         argv_stdout.trim(),
         {
-            // The same coverage token, as each surface prints it.
+            // The same endpoint and coverage token, as each surface prints them.
             let coverage = match result["coverage"]["percent"].as_f64() {
                 Some(percent) => format!(
                     "{} ({s}={percent})",
@@ -192,13 +192,14 @@ fn tier1_bake_matches_between_surfaces() {
                     .to_string(),
             };
             format!(
-                "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred, coverage {coverage}",
+                "{}: {} vertices, {} triangles, {} sliders, {} unresolved, {} deferred, endpoint {}, coverage {coverage}",
                 argv_out.display(),
                 result["vertices"],
                 result["triangles"],
                 result["sliders"],
                 result["unresolved"],
                 result["deferred"],
+                result["endpoint"].as_str().expect("endpoint"),
             )
         },
         "bake numbers differ between argv and command surfaces"
