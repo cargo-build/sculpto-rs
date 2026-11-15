@@ -228,10 +228,10 @@ fn main() {
 
     app.insert_resource(FlatFlipped::default())
         .insert_resource(Turntable {
-        enabled: std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
-        yaw: 0.0,
-        pitch: 0.0,
-    })
+            enabled: std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
+            yaw: 0.0,
+            pitch: 0.0,
+        })
         .insert_resource(FlatMode(config.flat))
         .insert_resource(Units(options.units))
         .insert_resource(Bench(options.bench))
@@ -346,7 +346,11 @@ fn apply_flat_mode(
     mut lights: Query<&mut Visibility, With<ReviewLight>>,
     mut flipped: ResMut<FlatFlipped>,
 ) {
-    let want = if flat.0 { Visibility::Hidden } else { Visibility::Visible };
+    let want = if flat.0 {
+        Visibility::Hidden
+    } else {
+        Visibility::Visible
+    };
     for mut visibility in &mut lights {
         if *visibility != want {
             *visibility = want;
@@ -979,4 +983,142 @@ fn benchmark(
         rss
     );
     exit.write(AppExit::Success);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn viewer_config(interactive: bool, flat: bool) -> ViewerConfig {
+        ViewerConfig {
+            report_mode: false,
+            debug_scene: false,
+            interactive,
+            flat,
+            asset_file: String::new(),
+        }
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        input.clear();
+        input.release_all();
+        input.press(key);
+    }
+
+    #[test]
+    fn l_toggles_flat_and_back() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(FlatMode(false))
+            .add_systems(Update, toggle_flat);
+
+        press(&mut app, KeyCode::KeyL);
+        app.update();
+        assert!(app.world().resource::<FlatMode>().0, "first L enters flat");
+
+        press(&mut app, KeyCode::KeyL);
+        app.update();
+        assert!(
+            !app.world().resource::<FlatMode>().0,
+            "second L returns to lit"
+        );
+    }
+
+    #[test]
+    fn l_is_ignored_when_not_interactive() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(false, false))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(FlatMode(false))
+            .add_systems(Update, toggle_flat);
+
+        press(&mut app, KeyCode::KeyL);
+        app.update();
+        assert!(!app.world().resource::<FlatMode>().0);
+    }
+
+    #[test]
+    fn flat_restores_every_material_it_flattened() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .insert_resource(FlatMode(false))
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .init_resource::<FlatFlipped>()
+            .add_systems(Update, apply_flat_mode);
+        let id = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default())
+            .id();
+
+        app.world_mut().resource_mut::<FlatMode>().0 = true;
+        app.update();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(id)
+                .expect("material")
+                .unlit,
+            "flat renders unlit"
+        );
+        assert_eq!(
+            app.world().resource::<FlatFlipped>().0.len(),
+            1,
+            "a material is remembered once, not once per frame"
+        );
+
+        app.world_mut().resource_mut::<FlatMode>().0 = false;
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(id)
+                .expect("material")
+                .unlit,
+            "lit restores what flat flattened"
+        );
+        assert!(app.world().resource::<FlatFlipped>().0.is_empty());
+    }
+
+    #[test]
+    fn t_flips_the_turntable_only_when_interactive() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(Turntable {
+                enabled: false,
+                yaw: 0.0,
+                pitch: 0.0,
+            })
+            .add_systems(Update, toggle_turntable);
+
+        press(&mut app, KeyCode::KeyT);
+        app.update();
+        assert!(app.world().resource::<Turntable>().enabled);
+    }
+
+    #[test]
+    fn turntable_rotates_the_model_under_a_fixed_light() {
+        let mut app = App::new();
+        app.insert_resource(Turntable {
+            enabled: true,
+            yaw: 0.75,
+            pitch: 0.0,
+        })
+        .add_systems(Update, apply_turntable);
+        let model = app
+            .world_mut()
+            .spawn((Transform::default(), ReviewModel))
+            .id();
+
+        app.update();
+        let rotation = app.world().get::<Transform>(model).expect("model").rotation;
+        assert!(
+            (rotation.to_euler(bevy::math::EulerRot::YXZ).0 - 0.75).abs() < 1e-4,
+            "the figure turns; the light rig stays world-fixed"
+        );
+    }
 }
