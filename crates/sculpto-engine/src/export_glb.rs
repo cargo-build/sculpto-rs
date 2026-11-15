@@ -21,7 +21,7 @@
 //! name, a rest-incompatible clip, a duplicate part and a constant clip.
 //! @req DECL0008
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -47,10 +47,10 @@ use crate::{CommandError, ErrorKind, errors};
 pub const DEFAULT_REST_TRANSLATION_TOLERANCE: f64 = 0.05;
 /// Admitted spread of the per-bone unit ratios, relative to their median.
 pub const DEFAULT_REST_SCALE_TOLERANCE: f64 = 0.02;
-/// Admitted excess of a bone-frame difference over that bone's own direction
-/// change, degrees: a larger gap is a roll convention difference, which a
-/// channel import would turn into a limb swing.
-pub const DEFAULT_REST_FRAME_TOLERANCE_DEGREES: f64 = 5.0;
+/// Admitted constant bone-roll difference a clip may need normalized, degrees.
+/// Above it the clip's own frames are too far from the reference stance for a
+/// channel import: the roll removal would be doing the retargeting.
+pub const DEFAULT_ROLL_TOLERANCE_DEGREES: f64 = 60.0;
 /// A channel whose samples stay within this distance is constant, not motion.
 const CONSTANT_EPSILON: f64 = 1e-6;
 /// Largest weighted mass a re-derived bind may carry before the source itself
@@ -86,9 +86,9 @@ pub struct ExportGlbParams {
     /// Admitted spread of the per-bone unit ratios, relative to the median.
     #[serde(default)]
     pub rest_scale_tolerance: Option<f64>,
-    /// Admitted excess of a bone-frame difference over its direction change.
+    /// Admitted constant bone-roll difference, degrees.
     #[serde(default)]
-    pub rest_frame_tolerance_degrees: Option<f64>,
+    pub rest_roll_tolerance_degrees: Option<f64>,
     /// GLB output path.
     pub out: PathBuf,
     /// Also write the report JSON here.
@@ -209,6 +209,8 @@ pub struct ClipPlan {
     pub scale: f64,
     /// Channels that found their bone by name.
     pub mapped_bones: usize,
+    /// Channels dropped because their bone carries no weight in this skin.
+    pub dropped_bones: Vec<String>,
     /// Channels whose bone is a root of the destination rig: the rig's own
     /// placement is authoritative, so only the rest-relative motion is applied.
     pub root_bones: usize,
@@ -251,9 +253,8 @@ pub struct ClipTolerances {
     pub translation_relative: f64,
     /// Spread of the per-bone unit ratios, relative to the median.
     pub scale_relative: f64,
-    /// Admitted excess of a bone-frame delta over the bone's own direction
-    /// change, degrees: beyond it the clip's frames are not the reference's.
-    pub frame_degrees: f64,
+    /// Admitted constant bone-roll difference to normalize, degrees.
+    pub roll_degrees: f64,
 }
 
 impl Default for ClipTolerances {
@@ -261,7 +262,7 @@ impl Default for ClipTolerances {
         Self {
             translation_relative: DEFAULT_REST_TRANSLATION_TOLERANCE,
             scale_relative: DEFAULT_REST_SCALE_TOLERANCE,
-            frame_degrees: DEFAULT_REST_FRAME_TOLERANCE_DEGREES,
+            roll_degrees: DEFAULT_ROLL_TOLERANCE_DEGREES,
         }
     }
 }
@@ -339,9 +340,9 @@ pub fn run(params: &ExportGlbParams) -> Result<Value, CommandError> {
         scale_relative: params
             .rest_scale_tolerance
             .unwrap_or(DEFAULT_REST_SCALE_TOLERANCE),
-        frame_degrees: params
-            .rest_frame_tolerance_degrees
-            .unwrap_or(DEFAULT_REST_FRAME_TOLERANCE_DEGREES),
+        roll_degrees: params
+            .rest_roll_tolerance_degrees
+            .unwrap_or(DEFAULT_ROLL_TOLERANCE_DEGREES),
     };
     let mut clips = match (&params.clips, params.clip_names.is_empty()) {
         (Some(path), false) => {
@@ -416,6 +417,7 @@ pub fn run(params: &ExportGlbParams) -> Result<Value, CommandError> {
                 "samples": plan.clip.times.len(),
                 "channels": plan.clip.channels.len(),
                 "mapped_bones": plan.mapped_bones,
+                "dropped_bones": plan.dropped_bones,
                 "root_bones": plan.root_bones,
                 "moving_channels": plan.moving_channels,
                 "unit_scale": plan.scale,
@@ -638,7 +640,8 @@ pub fn merge_shapes(
         )
     })?;
 
-    let (palette, index) = palette_of(rig)?;
+    let weighted = weighted_bones(document, body, garments)?;
+    let (palette, index) = palette_of(rig, &weighted)?;
     // The first selected shape that weighs a bone supplies its authored bind,
     // converted into the body frame; the body is first, so it wins.
     let mut authored: Vec<Option<(usize, DMat4)>> = vec![None; palette.len()];
@@ -968,22 +971,88 @@ pub fn merge_shapes(
     })
 }
 
-/// One resolved palette: names in rig order plus their slot lookup.
-fn palette_of(rig: &Rig) -> Result<(Vec<String>, BTreeMap<String, usize>), CommandError> {
+/// Every bone name the selected shapes actually weight.
+fn weighted_bones(
+    document: &NifDocument,
+    body: usize,
+    garments: &[usize],
+) -> Result<BTreeSet<String>, CommandError> {
+    let mut names = BTreeSet::new();
+    for shape_index in std::iter::once(body).chain(garments.iter().copied()) {
+        let shape = document.shapes.get(shape_index).ok_or_else(|| {
+            errors::invalid(
+                "garment_shapes",
+                format!("shape index {shape_index} is outside the file"),
+            )
+        })?;
+        let skin = shape.skin.as_ref().ok_or_else(|| {
+            refused(
+                "export_glb_unskinned_shape",
+                format!("shape {:?} carries no authored skin", shape.name),
+            )
+        })?;
+        for (bone, _) in skin.bones.iter().enumerate() {
+            let carried = (0..skin.influences.rows()).any(|vertex| {
+                skin.influences.row(vertex).is_some_and(|row| {
+                    row.joints
+                        .iter()
+                        .zip(row.weights)
+                        .any(|(index, weight)| usize::from(*index) == bone && *weight > 0.0)
+                })
+            });
+            if carried {
+                names.insert(skin.bones[bone].clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The skin palette: every weighted bone and every ancestor of one, in rig
+/// order.
+///
+/// A whole-rig palette is not writable by consumers (Bevy refuses a skin above
+/// 256 joints), and a bone no vertex weights cannot deform anything; the
+/// ancestors stay so each weighted bone keeps its rest chain. Clip channels of
+/// bones outside the set carry no weight and are reported as dropped.
+fn palette_of(
+    rig: &Rig,
+    weighted: &BTreeSet<String>,
+) -> Result<(Vec<String>, BTreeMap<String, usize>), CommandError> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for joint in rig.joints() {
         if let Some(name) = &joint.name {
             *counts.entry(name.as_str()).or_insert(0) += 1;
         }
     }
+    let mut needed: BTreeSet<usize> = BTreeSet::new();
+    for name in weighted {
+        let joint = rig.joint_by_name(name).map_err(|error| {
+            refused(
+                "export_glb_incomplete_rig",
+                format!("weighted bone {name:?}: {error}"),
+            )
+        })?;
+        let mut cursor = Some(joint);
+        while let Some(current) = cursor {
+            if !needed.insert(current.index()) {
+                break;
+            }
+            cursor = rig.joint(current).and_then(|joint| joint.parent);
+        }
+    }
     let mut palette = Vec::new();
     let mut index = BTreeMap::new();
-    for joint in rig.joints() {
+    for (slot, joint) in rig.joints().iter().enumerate() {
+        if !needed.contains(&slot) {
+            continue;
+        }
         let Some(name) = &joint.name else {
+            // An unnamed ancestor cannot enter a name-keyed palette; the rest
+            // proof then refuses its weighted descendant, which is the honest
+            // report.
             continue;
         };
-        // A duplicated name cannot address one joint, so it cannot enter a
-        // palette; a weighted bone with that name refuses below instead.
         if counts.get(name.as_str()) != Some(&1) {
             continue;
         }
@@ -1072,6 +1141,7 @@ pub fn plan_clip(
         .map(|(slot, name)| (name.as_str(), slot))
         .collect();
     let mut missing: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     let mut tracks: Vec<Track> = Vec::new();
     for channel in &source.channels {
         let name = channel.node_name.as_deref().ok_or_else(|| {
@@ -1084,7 +1154,12 @@ pub fn plan_clip(
             )
         })?;
         let Some(&slot) = slots.get(name) else {
-            missing.push(name.to_owned());
+            match rig.joint_by_name(name) {
+                // A bone the rig names but no vertex weights: it cannot deform
+                // this skin, so its channel is dropped and counted.
+                Ok(_) => dropped.push(name.to_owned()),
+                Err(_) => missing.push(name.to_owned()),
+            }
             continue;
         };
         let joint = rig.joint_by_name(name).map_err(|error| {
@@ -1129,6 +1204,8 @@ pub fn plan_clip(
             }
         }
     }
+    dropped.sort_unstable();
+    dropped.dedup();
     if !missing.is_empty() {
         missing.sort_unstable();
         missing.dedup();
@@ -1374,6 +1451,18 @@ pub fn plan_clip(
             max_roll = max_roll.max(quaternion_angle(&twist).to_degrees());
             twist_baseline[position] = twist;
         }
+    }
+    if max_roll > tolerances.roll_degrees {
+        return Err(refused(
+            "export_glb_clip_rest_mismatch",
+            format!(
+                "clip {:?} needs up to {max_roll:.3}° of bone-roll normalization against the \
+                 reference stance (admitted {:.3}°); its frames were baked on a different \
+                 convention, so removing the difference would be retargeting. Re-bake the clip on \
+                 this skeleton (Blender route) or declare a larger --rest-roll-tolerance-deg",
+                source.name, tolerances.roll_degrees
+            ),
+        ));
     }
 
     let mut rotation_values: Vec<Vec<[f64; 4]>> = tracks
@@ -1629,6 +1718,7 @@ pub fn plan_clip(
         duration,
         scale,
         mapped_bones: tracks.len(),
+        dropped_bones: dropped.clone(),
         root_bones,
         moving_channels,
         max_motion_degrees,

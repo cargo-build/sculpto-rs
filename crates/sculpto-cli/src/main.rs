@@ -148,6 +148,7 @@ export-glb options:
   --units-per-metre <n>   scale the written file to metres (BodySlide sources: 71.4286)
   --rest-translation-tolerance <n>    admitted rest bone-position residual, relative to the skeleton extent (default 0.05)
   --rest-scale-tolerance <n>          admitted spread of per-bone unit ratios (default 0.02)
+  --rest-roll-tolerance-deg <n>       admitted bone-roll normalization per clip (default 60)
   --out <glb>             output GLB
   --report <json>         also write the report JSON
 
@@ -1272,6 +1273,7 @@ fn export_glb(args: &[String]) -> ExitCode {
     let mut units: Option<f64> = None;
     let mut translation: Option<f64> = None;
     let mut spread: Option<f64> = None;
+    let mut roll: Option<f64> = None;
     let mut iter = args.iter();
     let reject = |message: String| -> ExitCode {
         eprintln!("export-glb: {message}");
@@ -1306,6 +1308,10 @@ fn export_glb(args: &[String]) -> ExitCode {
                 Ok(parsed) => translation = Some(parsed),
                 Err(code) => return code,
             },
+            "rest-roll-tolerance-deg" => match number(name, value) {
+                Ok(parsed) => roll = Some(parsed),
+                Err(code) => return code,
+            },
             "rest-scale-tolerance" => match number(name, value) {
                 Ok(parsed) => spread = Some(parsed),
                 Err(code) => return code,
@@ -1338,6 +1344,7 @@ fn export_glb(args: &[String]) -> ExitCode {
         ("units_per_metre", units),
         ("rest_translation_tolerance", translation),
         ("rest_scale_tolerance", spread),
+        ("rest_roll_tolerance_degrees", roll),
     ] {
         if let Some(value) = value {
             input[key] = serde_json::json!(value);

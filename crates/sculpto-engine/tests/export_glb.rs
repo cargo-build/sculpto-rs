@@ -223,7 +223,7 @@ fn run_refuses_missing_shape_names_and_clip_declarations() {
         units_per_metre: None,
         rest_translation_tolerance: None,
         rest_scale_tolerance: None,
-        rest_frame_tolerance_degrees: None,
+        rest_roll_tolerance_degrees: None,
         out: directory.join("out.glb"),
         report: None,
     };
@@ -399,7 +399,7 @@ fn configured_bodies_export_a_checked_clipped_actor() {
             units_per_metre: Some(71.4286),
             rest_translation_tolerance: None,
             rest_scale_tolerance: None,
-            rest_frame_tolerance_degrees: None,
+            rest_roll_tolerance_degrees: None,
             out: out.join(out_name),
             report: Some(out.join(out_name).with_extension("json")),
         };
