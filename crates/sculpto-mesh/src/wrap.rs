@@ -37,7 +37,8 @@ use crate::mask::VertexMask;
 use crate::point_query::PointIndex;
 use crate::surface_util::{
     OpenEdges, add, barycentric_clamped, coincident_groups, cross, dot, edge_pairs, face_normal_of,
-    first_non_finite, length, outward_vertex_normals, past_open_edge, scale, sub, unit,
+    first_non_finite, length, outward_vertex_normals, past_open_edge, remap_faces, scale, sub,
+    unit,
 };
 
 /// A mesh as positions plus triangles indexing them.
@@ -1425,15 +1426,10 @@ fn weld(positions: &[[f32; 3]], faces: &[[u32; 3]], weld_distance: f32) -> Welde
     }
     let mut welded_faces = Vec::with_capacity(faces.len());
     let mut neighbour_sets = vec![BTreeSet::new(); rest.len()];
-    for &face in faces {
-        let corners = [
-            unknown_of[face[0] as usize],
-            unknown_of[face[1] as usize],
-            unknown_of[face[2] as usize],
-        ];
-        if corners[0] == corners[1] || corners[1] == corners[2] || corners[0] == corners[2] {
-            continue;
-        }
+    let unknown: Vec<u32> = unknown_of.iter().map(|&index| index as u32).collect();
+    let (remapped, _dropped) = remap_faces(faces, &unknown);
+    for face in &remapped {
+        let corners = face.map(|corner| corner as usize);
         for (a, b) in edge_pairs(&corners) {
             neighbour_sets[a].insert(b);
             neighbour_sets[b].insert(a);

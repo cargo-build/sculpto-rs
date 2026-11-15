@@ -5,8 +5,8 @@
 //! so a contact solve either lands in the band or the test says by how much.
 
 use sculpto_mesh::dress::{
-    DressError, DressParams, MAX_CUTS, MAX_ITERATIONS, MAX_POKE_PASSES, MAX_ROUNDS, dress,
-    midpoint_subdivide,
+    DressError, DressParams, MAX_CUTS, MAX_ITERATIONS, MAX_POKE_PASSES, MAX_ROUNDS,
+    SEAM_WELD_EPSILON, dress, midpoint_subdivide, seam_weld,
 };
 
 /// A square patch of `cells` × `cells` quads on `z`, wound so +Z faces out.
@@ -44,6 +44,169 @@ fn params() -> DressParams {
 /// Signed clearance of every vertex against the plane `z = 0`.
 fn plane_standoffs(positions: &[[f32; 3]]) -> Vec<f32> {
     positions.iter().map(|position| position[2]).collect()
+}
+
+/// Edges one triangle uses: the mesh's open border.
+fn boundary_edges(triangles: &[[u32; 3]]) -> usize {
+    let mut uses: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for face in triangles {
+        for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+            *uses.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    uses.values().filter(|&&count| count == 1).count()
+}
+
+/// Two triangles authored as separate pieces that share the diagonal of a unit
+/// square: the seam copies are duplicated vertices, which is how the supplied
+/// underwear is authored.
+fn split_quad() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+    ];
+    (positions, vec![[0, 1, 2], [3, 4, 5]])
+}
+
+#[test]
+fn a_twin_seam_between_two_pieces_is_merged() {
+    let (positions, triangles) = split_quad();
+    let (welded, faces, report) = seam_weld(&positions, &triangles, SEAM_WELD_EPSILON);
+    assert_eq!(
+        (welded.len(), faces.len()),
+        (4, 2),
+        "the two duplicated seam vertices become one each"
+    );
+    assert_eq!(report.vertex_map, vec![0, 1, 2, 3, 0, 2], "raw to merged");
+    assert_eq!(report.groups, vec![vec![0, 4], vec![2, 5]]);
+    assert_eq!((report.components_before, report.components_after), (2, 1));
+    assert_eq!(report.merged_vertices, 2);
+    assert_eq!(report.merged_pairs, 2);
+    assert_eq!(
+        (report.boundary_edges_before, report.boundary_edges_after),
+        (6, 4),
+        "the shared diagonal stops being two open edges"
+    );
+    assert_eq!(report.dropped_faces, 0, "no face collapsed");
+
+    // The merged seam is one edge, so one cut gives it one shared midpoint
+    // instead of two copies that drift apart in the solve.
+    let (subdivided, cut) = midpoint_subdivide(&welded, &faces, 1);
+    assert_eq!(
+        (subdivided.len(), cut.len()),
+        (9, 8),
+        "four merged vertices plus five edge midpoints"
+    );
+    assert_eq!(
+        subdivided
+            .iter()
+            .filter(|position| **position == [0.5, 0.5, 0.0])
+            .count(),
+        1,
+        "the seam midpoint is shared, not duplicated"
+    );
+    assert_eq!(boundary_edges(&cut), 8, "the square's border, cut twice");
+}
+
+#[test]
+fn an_authored_dart_inside_one_piece_stays_open() {
+    // One connected piece with two coincident vertices: the panty hip slit and
+    // the two bra pinches have exactly this structure.
+    let positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 1.0, 0.0],
+    ];
+    let triangles = vec![[0u32, 1, 2], [2, 3, 4]];
+    let (welded, faces, report) = seam_weld(&positions, &triangles, SEAM_WELD_EPSILON);
+    assert_eq!(
+        (welded.len(), faces.len()),
+        (5, 2),
+        "an intra-piece coincidence is an authored feature, not a seam"
+    );
+    assert!(report.groups.is_empty());
+    assert_eq!(report.vertex_map, vec![0, 1, 2, 3, 4]);
+    assert_eq!((report.components_before, report.components_after), (1, 1));
+    assert_eq!(report.boundary_edges_before, report.boundary_edges_after);
+}
+
+#[test]
+fn a_seam_beyond_the_tolerance_stays_open() {
+    // The whole second piece sits ten tolerances away: no pair merges.
+    let far = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [10.0 * SEAM_WELD_EPSILON, 0.0, 0.0],
+        [1.0 + 10.0 * SEAM_WELD_EPSILON, 0.0, 0.0],
+        [1.0 + 10.0 * SEAM_WELD_EPSILON, 1.0, 0.0],
+    ];
+    let (welded, _, report) = seam_weld(&far, &[[0u32, 1, 2], [3, 4, 5]], SEAM_WELD_EPSILON);
+    assert_eq!(welded.len(), 6, "ten tolerances apart is two pieces");
+    assert!(report.groups.is_empty());
+    assert_eq!(report.components_before, 2);
+
+    // The rule is a distance, not bit equality: half a tolerance still merges.
+    let near = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.5 * SEAM_WELD_EPSILON, 0.0, 0.0],
+        [1.0 + 0.5 * SEAM_WELD_EPSILON, 0.0, 0.0],
+        [1.0 + 0.5 * SEAM_WELD_EPSILON, 1.0, 0.0],
+    ];
+    let (welded, _, report) = seam_weld(&near, &[[0u32, 1, 2], [3, 4, 5]], SEAM_WELD_EPSILON);
+    assert_eq!(welded.len(), 3, "all three seam pairs merge");
+    assert_eq!(report.groups, vec![vec![0, 3], vec![1, 4], vec![2, 5]]);
+}
+
+#[test]
+fn the_seam_merge_is_deterministic() {
+    // A twin seam and a garment with nothing to merge: the scan order must not
+    // make either report depend on the run.
+    for (positions, triangles) in [split_quad(), patch(4, 0.0, 1.0)] {
+        let first = seam_weld(&positions, &triangles, SEAM_WELD_EPSILON);
+        let second = seam_weld(&positions, &triangles, SEAM_WELD_EPSILON);
+        assert_eq!(first.2, second.2, "the same input reports the same merge");
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, second.1);
+    }
+}
+
+#[test]
+fn dressing_a_twin_seam_leaves_no_tear() {
+    let body = patch(4, 0.0, 2.0);
+    let garment = split_quad();
+    let options = DressParams {
+        cuts: 1,
+        ..params()
+    };
+    let (dressed, faces, report) = dress((&garment.0, &garment.1), (&body.0, &body.1), &options)
+        .expect("a twin-seam patch dresses");
+    assert_eq!(report.seam_weld.welded_vertices, 4);
+    assert_eq!(
+        report.source_vertices, 6,
+        "the report keeps the source count"
+    );
+    assert_eq!((dressed.len(), faces.len()), (9, 8));
+    assert_eq!(
+        boundary_edges(&faces),
+        8,
+        "the square keeps one closed border: the seam is not a crack"
+    );
+    // A merged copy has no vertex of its own: both source ids name one dressed
+    // vertex, so the solve cannot separate them.
+    assert_eq!(
+        report.seam_weld.vertex_map[0],
+        report.seam_weld.vertex_map[4]
+    );
+    assert_eq!(dressed[0], dressed[report.seam_weld.vertex_map[4] as usize]);
 }
 
 #[test]

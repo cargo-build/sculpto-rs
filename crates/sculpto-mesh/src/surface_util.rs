@@ -62,6 +62,58 @@ pub(crate) fn coincident_groups(points: &[[f32; 3]], tolerance: f32) -> Vec<Vec<
     groups
 }
 
+/// Connected components of a face set, as one label per vertex.
+///
+/// One label per connected piece is what separates an authored dart (two
+/// coincident lips of the *same* piece) from an authored seam (the same point
+/// on two pieces). @req DECL0013
+pub(crate) fn component_labels(vertices: usize, faces: &[[u32; 3]]) -> Vec<u32> {
+    let mut parent: Vec<usize> = (0..vertices).collect();
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    for face in faces {
+        for (a, b) in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])] {
+            let (a, b) = (find(&mut parent, a as usize), find(&mut parent, b as usize));
+            if a != b {
+                parent[a] = b;
+            }
+        }
+    }
+    let mut label_of: HashMap<usize, u32> = HashMap::new();
+    (0..vertices)
+        .map(|vertex| {
+            let root = find(&mut parent, vertex);
+            let next = label_of.len() as u32;
+            *label_of.entry(root).or_insert(next)
+        })
+        .collect()
+}
+
+/// Remap `faces` onto welded ids and drop every face whose remapped corners
+/// collide (`Weld`'s face filter, `SurfaceFit.cpp:110-120`).
+///
+/// A collapsed face names no surface: keeping it would leave a triangle whose
+/// normal, area and standoff are all zero. The weld and the dress seam merge
+/// share this rule so the two cannot disagree on it. @req DECL0013
+pub(crate) fn remap_faces(faces: &[[u32; 3]], merged_of: &[u32]) -> (Vec<[u32; 3]>, usize) {
+    let mut kept = Vec::with_capacity(faces.len());
+    let mut dropped = 0;
+    for face in faces {
+        let corners = face.map(|corner| merged_of[corner as usize]);
+        if corners[0] == corners[1] || corners[1] == corners[2] || corners[0] == corners[2] {
+            dropped += 1;
+            continue;
+        }
+        kept.push(corners);
+    }
+    (kept, dropped)
+}
+
 /// Barycentric weights of `p` clamped onto the triangle
 /// (`BarycentricOnTriangle`, `SurfaceFit.cpp:38-59`; the same `Barycentric` at
 /// `MeshAnalysis.cpp:499-522` feeds the closest surface points). @req DECL0013
@@ -135,6 +187,11 @@ impl OpenEdges {
         self.usage
             .get(&(a.min(b), a.max(b)))
             .is_some_and(|uses| *uses == 1)
+    }
+
+    /// How many edges one triangle uses: the mesh's open border.
+    pub(crate) fn boundary_edges(&self) -> usize {
+        self.usage.values().filter(|&&uses| uses == 1).count()
     }
 
     pub(crate) fn vertex_is_open(&self, vertex: u32) -> bool {

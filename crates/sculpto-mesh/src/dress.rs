@@ -33,8 +33,8 @@ use std::fmt;
 
 use crate::check::{ClosestSurfacePoint, SurfaceIndex, unit_triangle_normal};
 use crate::surface_util::{
-    add, dot, face_normal_of, first_non_finite, length, outward_vertex_normals, scale, sub, unit,
-    vertex_normals,
+    OpenEdges, add, coincident_groups, component_labels, dot, face_normal_of, first_non_finite,
+    length, outward_vertex_normals, remap_faces, scale, sub, unit, vertex_normals,
 };
 use crate::wrap::repair::final_push::{FinalPushOptions, FinalPushReport, final_push};
 use crate::wrap::{BodySurface, FitError, FitOptions, GapMode, Mesh, fit_to_body};
@@ -250,10 +250,12 @@ pub struct DressReport {
     pub source_triangles: usize,
     /// Midpoint subdivision rounds executed.
     pub cuts: u32,
-    /// Vertices of the returned mesh (after subdivision).
+    /// Vertices of the returned mesh (after the seam merge and subdivision).
     pub vertices: usize,
-    /// Triangles of the returned mesh (after subdivision).
+    /// Triangles of the returned mesh (after the seam merge and subdivision).
     pub triangles: usize,
+    /// What the seam merge did to the authored garment.
+    pub seam_weld: SeamWeldReport,
     /// Declared clearance the solve used.
     pub clearance: f32,
     /// Contact standoff the solve used.
@@ -303,7 +305,7 @@ struct Sample {
     normal: Option<[f32; 3]>,
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The body one dress queries across iterations: nearest point and side for
 /// the contact solve, plus the poke ray the band cannot see.
@@ -356,10 +358,10 @@ impl<'a> Obstacle<'a> {
 /// Midpoint-subdivide `triangles` `cuts` times, sharing every new edge vertex.
 ///
 /// Vertex order is stable: the input vertices keep their indices and the new
-/// midpoint vertices follow in first-edge order, which is what keeps a garment
-/// identity map (`report.source_vertices`) usable after dressing. Sharing the
-/// edge vertices is not an optimisation — a per-triangle fan would open every
-/// edge into a crack the contact solve cannot close.
+/// midpoint vertices follow in first-edge order, so a caller's vertex map stays
+/// valid after dressing — [`seam_weld`] supplies the authored-to-merged half.
+/// Sharing the edge vertices is not an optimisation — a per-triangle fan would
+/// open every edge into a crack the contact solve cannot close.
 pub fn midpoint_subdivide(
     positions: &[[f32; 3]],
     triangles: &[[u32; 3]],
@@ -396,11 +398,138 @@ pub fn midpoint_subdivide(
 /// The dressed mesh and its report: positions, triangles and measurements.
 pub type Dressed = (Vec<[f32; 3]>, Vec<[u32; 3]>, DressReport);
 
+/// Tolerance of the seam merge, in input units: the crate's own resolution
+/// (`FitOptions::weld_distance`, `CONVERGENCE`).
+///
+/// The supplied garments carry their authored seam copies at bit-identical
+/// positions, so any positive tolerance merges them; 1e-4 is chosen for
+/// consistency with the two other users of that resolution, not because the
+/// twins need the room. It is absolute in input units: a caller that rescales a
+/// garment rescales the meaning of the seam tolerance with it.
+pub const SEAM_WELD_EPSILON: f32 = 1e-4;
+
+/// What the seam merge did to the authored garment.
+///
+/// A garment is authored as separate pieces — the supplied panty is five, the
+/// bra six — and their seam copies are exactly coincident. Subdividing and
+/// solving each copy separately tears them apart, so the merge runs first. The
+/// record is the audit trail: `groups` names the merged raw ids and
+/// `vertex_map` is the fast path from a source vertex to its dressed one.
+/// @req DECL0013
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeamWeldReport {
+    /// Tolerance the grouping used, in input units.
+    pub tolerance: f32,
+    /// Vertices of the merged garment.
+    pub welded_vertices: usize,
+    /// Source vertices that became a copy of a representative.
+    pub merged_vertices: usize,
+    /// Coincident source pairs the merge joined.
+    pub merged_pairs: usize,
+    /// Merged groups: raw ids, the representative first. A group joins
+    /// coincident copies that belonged to *different* pieces; a coincidence
+    /// inside one piece is an authored dart and stays open.
+    pub groups: Vec<Vec<u32>>,
+    /// Merged vertex of every source vertex, in source order.
+    pub vertex_map: Vec<u32>,
+    /// Connected pieces of the authored garment.
+    pub components_before: usize,
+    /// Connected pieces of the merged garment.
+    pub components_after: usize,
+    /// Edges one triangle used before the merge: the authored openings.
+    pub boundary_edges_before: usize,
+    /// Edges one triangle uses after the merge: the openings that remain.
+    pub boundary_edges_after: usize,
+    /// Faces dropped because the merge collapsed two of their corners.
+    pub dropped_faces: usize,
+}
+
+/// Merge the coincident seam copies of separate garment pieces.
+///
+/// Faces a piece authored as its own dart — two coincident lips of one
+/// connected piece — are not merged: they are a zero-width feature of that
+/// piece, and closing them would delete it. A merged group takes the lowest raw
+/// id as its representative and the merged mesh lists representatives in
+/// ascending id order, so the merge is deterministic and `vertex_map` is the
+/// only source-to-dressed correspondence a caller needs.
+///
+/// @req DECL0013
+pub fn seam_weld(
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+    tolerance: f32,
+) -> (Vec<[f32; 3]>, Vec<[u32; 3]>, SeamWeldReport) {
+    let piece_of = component_labels(positions.len(), triangles);
+    let groups: Vec<Vec<u32>> = coincident_groups(positions, tolerance)
+        .into_iter()
+        .filter(|group| {
+            let piece = piece_of[group[0]];
+            group.iter().any(|&vertex| piece_of[vertex] != piece)
+        })
+        .map(|group| {
+            let mut ids: Vec<u32> = group.into_iter().map(|vertex| vertex as u32).collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+
+    let mut representative = (0..positions.len() as u32).collect::<Vec<u32>>();
+    for group in &groups {
+        let Some(lowest) = group.iter().copied().min() else {
+            continue;
+        };
+        group
+            .iter()
+            .for_each(|&vertex| representative[vertex as usize] = lowest);
+    }
+    let mut merged_of = vec![u32::MAX; positions.len()];
+    let mut welded_positions = Vec::with_capacity(positions.len());
+    for vertex in 0..positions.len() as u32 {
+        if representative[vertex as usize] == vertex {
+            merged_of[vertex as usize] = welded_positions.len() as u32;
+            welded_positions.push(positions[vertex as usize]);
+        }
+    }
+    for vertex in 0..positions.len() as u32 {
+        if merged_of[vertex as usize] == u32::MAX {
+            merged_of[vertex as usize] = merged_of[representative[vertex as usize] as usize];
+        }
+    }
+    let (welded_triangles, dropped_faces) = remap_faces(triangles, &merged_of);
+    let merged_components =
+        distinct_labels(&component_labels(welded_positions.len(), &welded_triangles));
+    let report = SeamWeldReport {
+        tolerance,
+        welded_vertices: welded_positions.len(),
+        merged_vertices: positions.len() - welded_positions.len(),
+        merged_pairs: groups
+            .iter()
+            .map(|group| group.len() * (group.len() - 1) / 2)
+            .sum(),
+        groups,
+        vertex_map: merged_of,
+        components_before: distinct_labels(&piece_of),
+        components_after: merged_components,
+        boundary_edges_before: OpenEdges::build(triangles, positions.len()).boundary_edges(),
+        boundary_edges_after: OpenEdges::build(&welded_triangles, welded_positions.len())
+            .boundary_edges(),
+        dropped_faces,
+    };
+    (welded_positions, welded_triangles, report)
+}
+
+/// How many distinct values `labels` holds.
+fn distinct_labels(labels: &[u32]) -> usize {
+    labels.iter().copied().collect::<BTreeSet<u32>>().len()
+}
+
 /// Dress `garment` onto `body` and return the fitted mesh plus a report.
 ///
 /// Both meshes must be in the same frame. The returned mesh is the subdivided
-/// one: its first `garment.0.len()` vertices are the garment's own vertices in
-/// their input order, so a caller keeps its identity map.
+/// one: its first `report.seam_weld.welded_vertices` vertices are the merged
+/// garment's vertices in ascending representative order and the rest are
+/// subdivision midpoints. [`SeamWeldReport::vertex_map`] locates source vertex
+/// `i`; a merged copy shares its representative's position and motion.
 ///
 /// # Errors
 ///
@@ -414,7 +543,10 @@ pub fn dress(
 ) -> Result<Dressed, DressError> {
     params.validate()?;
     validate_geometry(garment, body)?;
-    let (mut positions, triangles) = midpoint_subdivide(garment.0, garment.1, params.cuts);
+    let (welded_positions, welded_triangles, seam_weld) =
+        seam_weld(garment.0, garment.1, SEAM_WELD_EPSILON);
+    let (mut positions, triangles) =
+        midpoint_subdivide(&welded_positions, &welded_triangles, params.cuts);
 
     let obstacle = Obstacle::build(body.0, body.1);
     let before = measure(&obstacle, &positions, &triangles, params);
@@ -452,6 +584,7 @@ pub fn dress(
         cuts: params.cuts,
         vertices: positions.len(),
         triangles: triangles.len(),
+        seam_weld,
         clearance: params.clearance,
         contact: params.contact,
         iterations,

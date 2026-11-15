@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde_json::{Value, json};
 
-use sculpto_mesh::dress::{DressError, DressParams as SolveParams, MAX_CUTS, dress};
+use sculpto_mesh::dress::{
+    DressError, DressParams as SolveParams, MAX_CUTS, SeamWeldReport, dress,
+};
 use sculpto_mesh::wrap::repair::final_push::{FinalPushOptions, FinalPushReport};
 
 use crate::obj::{ObjError, display_to_source, read_obj_mesh, write_obj};
@@ -69,6 +71,8 @@ pub struct DressOutcome {
     pub registration: Option<sculpto_mesh::wrap::FitReport>,
     /// Final push-out report, absent when the stage did not run.
     pub final_push: Option<FinalPushReport>,
+    /// The seam merge: what the authored pieces became before subdivision.
+    pub seam_weld: SeamWeldReport,
     /// The mesh and its band measurements.
     pub mesh: DressMeasurements,
 }
@@ -143,6 +147,19 @@ impl DressOutcome {
             "pokes_before": self.mesh.pokes_before,
             "pokes_after": self.mesh.pokes_after,
             "flipped": self.mesh.flipped,
+            "seam_weld": {
+                "tolerance": self.seam_weld.tolerance,
+                "welded_vertices": self.seam_weld.welded_vertices,
+                "merged_vertices": self.seam_weld.merged_vertices,
+                "merged_pairs": self.seam_weld.merged_pairs,
+                "groups": self.seam_weld.groups,
+                "vertex_map": self.seam_weld.vertex_map,
+                "components_before": self.seam_weld.components_before,
+                "components_after": self.seam_weld.components_after,
+                "boundary_edges_before": self.seam_weld.boundary_edges_before,
+                "boundary_edges_after": self.seam_weld.boundary_edges_after,
+                "dropped_faces": self.seam_weld.dropped_faces,
+            },
         });
         if let Some(registration) = self.registration {
             value["registration"] = json!({
@@ -207,6 +224,7 @@ pub fn dress_garment(params: &DressParams) -> Result<DressOutcome, CommandError>
         solve,
         registration: report.registration,
         final_push: report.final_push,
+        seam_weld: report.seam_weld,
         mesh: DressMeasurements {
             source_vertices: report.source_vertices,
             source_triangles: report.source_triangles,
