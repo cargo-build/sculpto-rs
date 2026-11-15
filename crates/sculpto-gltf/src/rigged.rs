@@ -21,7 +21,44 @@ pub fn write_rigged_glb(
     clips: &[Clip],
 ) -> Result<Vec<u8>, GltfError> {
     let layout = Layout::new(asset, binding, shape)?;
-    encode_glb(asset, clips, Some(&layout))
+    encode_glb(asset, clips, Some(&layout), &[])
+}
+
+/// One written part of a multi-part rigged actor: a triangle partition and the
+/// material that colours it.
+///
+/// The palette is the review palette (`crate::review`), so a written actor and a
+/// review GLB name the same layer colours; the writer never picks a colour of
+/// its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartMaterial {
+    /// Triangle partition the material colours; every partition of the asset
+    /// needs exactly one entry.
+    pub partition: u16,
+    /// glTF material name, usually the part name.
+    pub name: String,
+    /// The material's `baseColorFactor`.
+    pub color: [f32; 4],
+}
+
+/// [`write_rigged_glb`] for a mesh whose partitions carry their own materials.
+///
+/// One checked skin and one palette still describe the whole mesh; only the
+/// primitives differ, one per partition with its declared material. @req DECL0008
+///
+/// # Errors
+/// Every refusal of [`write_rigged_glb`], plus a partition without a declared
+/// material, a duplicate declaration and a mesh that already declares material
+/// slots.
+pub fn write_partitioned_rigged_glb(
+    asset: &MeshAsset,
+    binding: &RestBinding<'_>,
+    shape: usize,
+    clips: &[Clip],
+    parts: &[PartMaterial],
+) -> Result<Vec<u8>, GltfError> {
+    let layout = Layout::new(asset, binding, shape)?;
+    encode_glb(asset, clips, Some(&layout), parts)
 }
 
 pub(crate) struct Layout<'a> {

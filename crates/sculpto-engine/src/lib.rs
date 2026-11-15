@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 mod assemble;
 mod component;
 pub mod errors;
+pub mod export_actor;
 pub mod export_glb;
 mod handlers;
 pub mod obj;
@@ -86,6 +87,8 @@ pub enum CommandId {
     ExportBundle,
     /// Merge a skinned NIF's body and garments into one checked, clipped GLB.
     ExportGlb,
+    /// Bind assembled body parts to a NIF rig and write one coloured actor GLB.
+    ExportActor,
     /// Write sparse morph targets as a Skyrim `.tri` slider file.
     ExportTri,
     /// Zero a GLB's default morph weights.
@@ -127,6 +130,7 @@ impl CommandId {
             CommandId::ExportNif => "export.nif",
             CommandId::ExportBundle => "export.bundle",
             CommandId::ExportGlb => "export.glb",
+            CommandId::ExportActor => "export.actor",
             CommandId::ExportTri => "export.tri",
             CommandId::GltfResetWeights => "gltf.reset_weights",
             CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
@@ -490,6 +494,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: export_glb::schema,
         handler: export_glb::export,
+    },
+    Spec {
+        id: CommandId::ExportActor,
+        summary: "Bind an assembled body and its ranked garment OBJs to a NIF rig and write one coloured, clipped actor GLB: one skin, one primitive and one palette material per part.",
+        mutates: true,
+        stub: false,
+        schema: export_actor::schema,
+        handler: export_actor::export,
     },
     Spec {
         id: CommandId::ExportTri,

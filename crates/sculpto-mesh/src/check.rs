@@ -916,6 +916,23 @@ pub(crate) fn closest_surface_points(
     points.iter().map(|&point| index.closest(point)).collect()
 }
 
+/// Distance from each query point to the nearest point of one surface.
+///
+/// The weight copy, the control-surface bind and the actor export all ask this
+/// one question; the BVH and its triangle predicate stay here. `None` means the
+/// query point has no comparable triangle, which a caller must treat as
+/// unreached rather than as zero. @req DECL0013
+pub fn surface_distances(
+    points: &[[f32; 3]],
+    positions: &[[f32; 3]],
+    faces: &[[u32; 3]],
+) -> Vec<Option<f32>> {
+    closest_surface_points(points, positions, faces)
+        .into_iter()
+        .map(|hit| hit.map(|hit| hit.distance))
+        .collect()
+}
+
 /// Shared acceleration for validated control-surface binding. @req DECL0013
 pub(crate) fn nearest_triangle_indices(
     points: &[[f32; 3]],

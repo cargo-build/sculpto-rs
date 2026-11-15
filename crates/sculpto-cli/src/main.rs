@@ -45,6 +45,8 @@ commands:
   export-nif [options]  re-encode NIF shapes for a Skyrim target (one shape or a bundle)
   export-tri [options]  write sparse morph targets as a Skyrim `.tri` slider file
   export-glb [options]  merge a skinned NIF's body and garments into one clipped actor GLB
+  export-actor [options]
+                        bind an assembled body plus ranked OBJs to a NIF rig; one coloured actor GLB
   body assemble --manifest <json> --out <obj> [--report <json>]
                         place and concatenate the declared parts, then seal the joints
   body audit-parts [options]
@@ -149,6 +151,25 @@ export-glb options:
   --rest-translation-tolerance <n>    admitted rest bone-position residual, relative to the skeleton extent (default 0.05)
   --rest-scale-tolerance <n>          admitted spread of per-bone unit ratios (default 0.02)
   --rest-roll-tolerance-deg <n>       admitted bone-roll normalization per clip (default 60)
+  --out <glb>             output GLB
+  --report <json>         also write the report JSON
+
+export-actor options:
+  --nif <path>            skinned NIF carrying the rig, palette and body weights
+  --body-shape <name>     shape whose weights and rest matrices bind the parts
+  --body <obj>            the assembled body OBJ (every part in one shell)
+  --layer <rank>=<obj>    ranked underwear or garment OBJ (repeatable; rank 1..=5)
+  --skeleton <path>       family skeleton NIF that completes the authored rig
+  --clips <path>          source actor GLB whose clips are mapped by bone name
+  --clip <name>           clip to write (repeatable; the written order is this order)
+  --units-per-metre <n>   scale the written file to metres (BodySlide sources: 71.4286)
+  --reach <units>         reach inside which a part takes copied body weights (default 3)
+  --smooth <n>            smoothing passes over the bound region (default 6)
+  --extremity-bone <name> bone a vertex beyond the reach may bind to (repeatable;
+                          empty means every uniquely named palette bone)
+  --rest-translation-tolerance <n>    admitted rest bone-position residual (default 0.05)
+  --rest-scale-tolerance <n>          admitted spread of per-bone unit ratios (default 0.02)
+  --rest-frame-tolerance <n>          admitted bone-frame excess in degrees (default 5)
   --out <glb>             output GLB
   --report <json>         also write the report JSON
 
@@ -330,6 +351,7 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "export-nif" => export_nif(rest),
         [command, rest @ ..] if command == "export-tri" => export_tri(rest),
         [command, rest @ ..] if command == "export-glb" => export_glb(rest),
+        [command, rest @ ..] if command == "export-actor" => export_actor(rest),
         [command, action, rest @ ..] if command == "body" && action == "assemble" => {
             body_assemble(rest)
         }
@@ -1351,6 +1373,123 @@ fn export_glb(args: &[String]) -> ExitCode {
         }
     }
     run::dispatch_payload("export.glb", &input)
+}
+
+/// `export-actor`: repeated `--layer rank=obj`, `--clip` and `--extremity-bone`
+/// flags, so the flags are parsed here instead of through [`parse_flags`].
+fn export_actor(args: &[String]) -> ExitCode {
+    let mut nif: Option<String> = None;
+    let mut body_shape: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut layers: Vec<serde_json::Value> = Vec::new();
+    let mut skeleton: Option<String> = None;
+    let mut clips: Option<String> = None;
+    let mut clip_names: Vec<String> = Vec::new();
+    let mut extremity: Vec<String> = Vec::new();
+    let mut out: Option<String> = None;
+    let mut report: Option<String> = None;
+    let mut units: Option<f64> = None;
+    let mut reach: Option<f32> = None;
+    let mut smooth: Option<u32> = None;
+    let mut translation: Option<f64> = None;
+    let mut scale_tolerance: Option<f64> = None;
+    let mut frame: Option<f64> = None;
+    let mut iter = args.iter();
+    let reject = |message: String| -> ExitCode {
+        eprintln!("export-actor: {message}");
+        ExitCode::from(2)
+    };
+    let number = |name: &str, value: &str| -> Result<f64, ExitCode> {
+        value
+            .parse::<f64>()
+            .map_err(|_| reject(format!("`--{name} {value}` is not a number")))
+    };
+    while let Some(key) = iter.next() {
+        let Some(name) = key.strip_prefix("--") else {
+            return reject(format!("unexpected argument `{key}`"));
+        };
+        let Some(value) = iter.next() else {
+            return reject(format!("`--{name}` needs a value"));
+        };
+        match name {
+            "nif" => nif = Some(value.clone()),
+            "body-shape" => body_shape = Some(value.clone()),
+            "body" => body = Some(value.clone()),
+            "layer" => match value.split_once('=') {
+                Some((rank, obj)) if !obj.is_empty() => match rank.parse::<u32>() {
+                    Ok(order) => layers.push(serde_json::json!({"order": order, "obj": obj})),
+                    Err(_) => return reject(format!("`--layer {value}`: `{rank}` is not a rank")),
+                },
+                _ => return reject(format!("`--layer {value}` needs <rank>=<obj>")),
+            },
+            "skeleton" => skeleton = Some(value.clone()),
+            "clips" => clips = Some(value.clone()),
+            "clip" => clip_names.push(value.clone()),
+            "extremity-bone" => extremity.push(value.clone()),
+            "out" => out = Some(value.clone()),
+            "report" => report = Some(value.clone()),
+            "units-per-metre" => match number(name, value) {
+                Ok(parsed) => units = Some(parsed),
+                Err(code) => return code,
+            },
+            "reach" => match number(name, value) {
+                Ok(parsed) => reach = Some(parsed as f32),
+                Err(code) => return code,
+            },
+            "smooth" => match number(name, value) {
+                Ok(parsed) if parsed >= 0.0 => smooth = Some(parsed as u32),
+                Ok(_) => return reject(format!("`--smooth {value}` is negative")),
+                Err(code) => return code,
+            },
+            "rest-translation-tolerance" => match number(name, value) {
+                Ok(parsed) => translation = Some(parsed),
+                Err(code) => return code,
+            },
+            "rest-scale-tolerance" => match number(name, value) {
+                Ok(parsed) => scale_tolerance = Some(parsed),
+                Err(code) => return code,
+            },
+            "rest-frame-tolerance" => match number(name, value) {
+                Ok(parsed) => frame = Some(parsed),
+                Err(code) => return code,
+            },
+            other => return reject(format!("unknown option `--{other}`")),
+        }
+    }
+    let (Some(nif), Some(body_shape), Some(body), Some(out)) = (nif, body_shape, body, out) else {
+        return reject("`--nif`, `--body-shape`, `--body` and `--out` are required".to_string());
+    };
+    let mut input = serde_json::json!({
+        "nif": nif,
+        "body_shape": body_shape,
+        "body": body,
+        "layers": layers,
+        "clip_names": clip_names,
+        "extremity_bones": extremity,
+        "out": out,
+    });
+    for (key, value) in [("skeleton", skeleton), ("clips", clips), ("report", report)] {
+        if let Some(value) = value {
+            input[key] = serde_json::json!(value);
+        }
+    }
+    for (key, value) in [
+        ("units_per_metre", units),
+        ("rest_translation_tolerance", translation),
+        ("rest_scale_tolerance", scale_tolerance),
+        ("rest_frame_tolerance_degrees", frame),
+    ] {
+        if let Some(value) = value {
+            input[key] = serde_json::json!(value);
+        }
+    }
+    if let Some(value) = reach {
+        input["reach_radius"] = serde_json::json!(value);
+    }
+    if let Some(value) = smooth {
+        input["smooth_iterations"] = serde_json::json!(value);
+    }
+    run::dispatch_payload("export.actor", &input)
 }
 
 /// Positions plus triangles, the shape an OBJ carries in the display frame.

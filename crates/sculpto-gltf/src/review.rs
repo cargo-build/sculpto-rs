@@ -211,7 +211,11 @@ pub fn write_review_glb(parts: &[ReviewPart]) -> Result<Vec<u8>, GltfError> {
 }
 
 /// Area-weighted per-vertex normals; degenerate corners contribute nothing.
-fn smooth_normals(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<[f32; 3]> {
+///
+/// The review writer and the rigged actor writer share it: an OBJ part carries
+/// no normals, and a file without them shades flat or black in the viewer.
+#[must_use]
+pub fn smooth_normals(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<[f32; 3]> {
     let mut normals = vec![[0.0_f32; 3]; positions.len()];
     for [a, b, c] in triangles {
         let (pa, pb, pc) = (

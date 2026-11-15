@@ -511,7 +511,10 @@ pub fn run(params: &ExportGlbParams) -> Result<Value, CommandError> {
 
 /// Read the family template and complete the authored rig, or keep the authored
 /// rig when no template is declared.
-fn complete_rig(document: &NifDocument, template: Option<&Path>) -> Result<Rig, CommandError> {
+pub(crate) fn complete_rig(
+    document: &NifDocument,
+    template: Option<&Path>,
+) -> Result<Rig, CommandError> {
     let authored = document.rig.as_ref().ok_or_else(|| {
         refused(
             "export_glb_incomplete_rig",
@@ -552,7 +555,7 @@ fn complete_rig(document: &NifDocument, template: Option<&Path>) -> Result<Rig, 
 }
 
 /// Resolve one declared shape name; both a missing and an ambiguous name refuse.
-fn resolve_shape(
+pub(crate) fn resolve_shape(
     document: &NifDocument,
     name: &str,
     field: &'static str,
@@ -827,6 +830,98 @@ pub fn merge_shapes(
         });
     }
 
+    let bound = bind_palette(
+        rig,
+        ArenaInfluences {
+            palette: &palette,
+            authored: &authored,
+            positions: &asset.positions,
+            joints,
+            values,
+            offsets,
+            source_mass: None,
+        },
+        global_to_skin,
+        root,
+        body,
+    )?;
+    asset.skin = Some(bound.skin.clone());
+    Ok(MergedActor {
+        asset,
+        shape: body,
+        root,
+        global_to_skin,
+        basis: bound.basis,
+        parts,
+        palette,
+        bind_residual: bound.bind_residual,
+        source_bind_mismatch: bound.source_bind_mismatch,
+        repaired_mass: bound.repaired_mass,
+        bind_repairs: bound.repairs,
+    })
+}
+
+/// One merged arena's influences, before any bind is chosen.
+pub(crate) struct ArenaInfluences<'a> {
+    /// One name per palette entry.
+    pub(crate) palette: &'a [String],
+    /// The authored bind per palette slot, with the shape that supplied it.
+    pub(crate) authored: &'a [Option<(usize, DMat4)>],
+    /// Merged vertices in the body skin frame.
+    pub(crate) positions: &'a [[f32; 3]],
+    /// Packed influence slots into the palette.
+    pub(crate) joints: Vec<u16>,
+    /// Packed influence weights, parallel to `joints`.
+    pub(crate) values: Vec<f32>,
+    /// Row starts into `joints`/`values`, one per vertex plus the end.
+    pub(crate) offsets: Vec<u32>,
+    /// Weighted mass per palette slot to charge against [`REPAIR_MASS_CAP`],
+    /// when the client synthesized weights the source never carried.
+    ///
+    /// The cap asks whether the *source* skin disagrees with its own rest, so a
+    /// caller whose arena mixes copied and synthesized influences measures it on
+    /// the copied mass alone; `None` measures the whole arena.
+    pub(crate) source_mass: Option<&'a [f64]>,
+}
+
+/// One checked bind set: the skin plus what the rest proof measured.
+pub(crate) struct BoundPalette {
+    pub(crate) skin: Skin,
+    pub(crate) bind_residual: f64,
+    pub(crate) source_bind_mismatch: f64,
+    pub(crate) repaired_mass: f64,
+    pub(crate) repairs: Vec<BindRepair>,
+    pub(crate) basis: [[f64; 4]; 4],
+}
+
+/// Choose one bind per palette bone and prove the arena's rest at the body basis.
+///
+/// An authored bind is kept only when the influences it actually carries
+/// reconstruct the rest; otherwise the bind is re-derived from the rest world
+/// and the repair is reported. A repair that carries more than
+/// [`REPAIR_MASS_CAP`] of the mass named by
+/// [`ArenaInfluences::source_mass`] is a source defect, not a bind repair, and
+/// refuses. @req DECL0008
+///
+/// # Errors
+/// A palette name the rig does not resolve, weights the skin refuses, a whole
+/// skin disagreeing with the source rest, and any rest proof defect.
+pub(crate) fn bind_palette(
+    rig: &Rig,
+    arena: ArenaInfluences<'_>,
+    global_to_skin: [[f32; 4]; 4],
+    root: JointId,
+    shape: usize,
+) -> Result<BoundPalette, CommandError> {
+    let ArenaInfluences {
+        palette,
+        authored,
+        positions,
+        joints,
+        values,
+        offsets,
+        source_mass,
+    } = arena;
     let global = DMat4::from_cols_array_2d(&global_to_skin.map(|column| column.map(f64::from)));
     let inverse_global = global.inverse();
     let mut mass: Vec<f64> = vec![0.0; palette.len()];
@@ -836,6 +931,11 @@ pub fn merge_shapes(
         mass[usize::from(*slot)] += weight;
         total += weight;
     }
+    // The repair cap is charged against the mass the source itself carried.
+    let (capped, capped_total) = match source_mass {
+        Some(mass) if mass.len() == palette.len() => (mass, mass.iter().sum()),
+        _ => (mass.as_slice(), total),
+    };
     let worlds: Vec<DMat4> = palette
         .iter()
         .map(|name| {
@@ -864,8 +964,8 @@ pub fn merge_shapes(
                 source_bind_mismatch.max(rest_displacement(worlds[slot] * bind * global));
         }
     }
-    for vertex in 0..asset.positions.len() {
-        let point = DVec3::from_array(asset.positions[vertex].map(f64::from));
+    for vertex in 0..positions.len() {
+        let point = DVec3::from_array(positions[vertex].map(f64::from));
         let expected = inverse_global.transform_point3(point);
         let start = offsets[vertex] as usize;
         let end = offsets[vertex + 1] as usize;
@@ -894,8 +994,8 @@ pub fn merge_shapes(
                 bind
             }
             Some((shape_index, _)) => {
-                let weight_mass = match total > 0.0 {
-                    true => mass[slot] / total,
+                let weight_mass = match capped_total > 0.0 {
+                    true => capped[slot] / capped_total,
                     false => 0.0,
                 };
                 repaired_mass += weight_mass;
@@ -930,49 +1030,40 @@ pub fn merge_shapes(
     }
     let influences =
         SkinWeights::new(offsets, joints, values, palette.len()).map_err(weight_error)?;
-    asset.skin = Some(Skin {
-        bones: palette.clone(),
+    let skin = Skin {
+        bones: palette.to_vec(),
         bind_inverse: binds,
         influences,
-    });
+    };
     // The automatic proof picks the basis (identity for a native document) and
     // measures every weighted vertex; the writer re-proves at the same basis.
     let basis = {
-        let skin = asset
-            .skin
-            .as_ref()
-            .expect("the merged skin was just installed");
         let binding = RestBinding::prove(
             rig,
             RigFrame::SourceZUp,
             &[SkinRestSource {
-                shape: body,
+                shape,
                 root,
-                positions: &asset.positions,
-                skin,
+                positions,
+                skin: &skin,
                 global_to_skin,
             }],
         )
         .map_err(rest_error)?;
         binding.basis()
     };
-    Ok(MergedActor {
-        asset,
-        shape: body,
-        root,
-        global_to_skin,
-        basis,
-        parts,
-        palette,
+    Ok(BoundPalette {
+        skin,
         bind_residual,
         source_bind_mismatch,
         repaired_mass,
-        bind_repairs: repairs,
+        repairs,
+        basis,
     })
 }
 
 /// Every bone name the selected shapes actually weight.
-fn weighted_bones(
+pub(crate) fn weighted_bones(
     document: &NifDocument,
     body: usize,
     garments: &[usize],
@@ -1015,7 +1106,7 @@ fn weighted_bones(
 /// 256 joints), and a bone no vertex weights cannot deform anything; the
 /// ancestors stay so each weighted bone keeps its rest chain. Clip channels of
 /// bones outside the set carry no weight and are reported as dropped.
-fn palette_of(
+pub(crate) fn palette_of(
     rig: &Rig,
     weighted: &BTreeSet<String>,
 ) -> Result<(Vec<String>, BTreeMap<String, usize>), CommandError> {
@@ -2111,7 +2202,7 @@ fn median(values: &mut [f64]) -> f64 {
 ///
 /// Every affine is conjugated by the same similarity (`S · M · S⁻¹`), so the
 /// rest proof that held in source units still holds exactly.
-fn scale_merged(merged: &mut MergedActor, scale: f64) {
+pub(crate) fn scale_merged(merged: &mut MergedActor, scale: f64) {
     let similarity = DMat4::from_scale(DVec3::splat(scale));
     let inverse = similarity.inverse();
     for position in &mut merged.asset.positions {
@@ -2130,7 +2221,7 @@ fn scale_merged(merged: &mut MergedActor, scale: f64) {
 
 /// One rig in another unit: every rest translation is scaled, every rotation
 /// and scale stays as authored.
-fn scale_rig(rig: &Rig, scale: f64) -> Result<Rig, CommandError> {
+pub(crate) fn scale_rig(rig: &Rig, scale: f64) -> Result<Rig, CommandError> {
     let joints = rig
         .joints()
         .iter()
@@ -2156,7 +2247,7 @@ fn scale_rig(rig: &Rig, scale: f64) -> Result<Rig, CommandError> {
 
 /// One clip in another unit: translation samples scale, rotations and ratios
 /// do not.
-fn scale_clip(clip: &mut Clip, scale: f64) {
+pub(crate) fn scale_clip(clip: &mut Clip, scale: f64) {
     for channel in &mut clip.channels {
         if let ClipChannel::Translation { values, .. } = channel {
             for value in values {
@@ -2169,7 +2260,7 @@ fn scale_clip(clip: &mut Clip, scale: f64) {
 }
 
 /// One `f32` affine conjugated by a similarity.
-fn conjugate(matrix: [[f32; 4]; 4], similarity: DMat4, inverse: DMat4) -> [[f32; 4]; 4] {
+pub(crate) fn conjugate(matrix: [[f32; 4]; 4], similarity: DMat4, inverse: DMat4) -> [[f32; 4]; 4] {
     let matrix = DMat4::from_cols_array_2d(&matrix.map(|column| column.map(f64::from)));
     (similarity * matrix * inverse)
         .to_cols_array_2d()
@@ -2177,13 +2268,17 @@ fn conjugate(matrix: [[f32; 4]; 4], similarity: DMat4, inverse: DMat4) -> [[f32;
 }
 
 /// One `f64` affine conjugated by a similarity.
-fn conjugate_f64(matrix: [[f64; 4]; 4], similarity: DMat4, inverse: DMat4) -> [[f64; 4]; 4] {
+pub(crate) fn conjugate_f64(
+    matrix: [[f64; 4]; 4],
+    similarity: DMat4,
+    inverse: DMat4,
+) -> [[f64; 4]; 4] {
     let matrix = DMat4::from_cols_array_2d(&matrix);
     (similarity * matrix * inverse).to_cols_array_2d()
 }
 
 /// Influence width statistics of the merged skin.
-fn influence_summary(skin: Option<&Skin>) -> Value {
+pub(crate) fn influence_summary(skin: Option<&Skin>) -> Value {
     let Some(skin) = skin else {
         return json!({ "vertices": 0, "widest": 0 });
     };
@@ -2206,7 +2301,7 @@ fn influence_summary(skin: Option<&Skin>) -> Value {
 }
 
 /// Axis-aligned bounds of the written positions.
-fn bounds(positions: &[[f32; 3]]) -> Value {
+pub(crate) fn bounds(positions: &[[f32; 3]]) -> Value {
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
     for position in positions {
@@ -2218,15 +2313,15 @@ fn bounds(positions: &[[f32; 3]]) -> Value {
     json!({ "min": min, "max": max })
 }
 
-fn refused(code: &'static str, message: impl Into<String>) -> CommandError {
+pub(crate) fn refused(code: &'static str, message: impl Into<String>) -> CommandError {
     CommandError::new(ErrorKind::Refused, code, message)
 }
 
-fn weight_error(error: SkinWeightError) -> CommandError {
+pub(crate) fn weight_error(error: SkinWeightError) -> CommandError {
     refused("export_glb_skin", error.to_string())
 }
 
-fn actor_error(error: ActorError) -> CommandError {
+pub(crate) fn actor_error(error: ActorError) -> CommandError {
     match &error {
         ActorError::Clip { name, matches } => CommandError::new(
             ErrorKind::NotFound,
@@ -2246,12 +2341,12 @@ fn actor_error(error: ActorError) -> CommandError {
     }
 }
 
-fn rest_error(error: RestBindError) -> CommandError {
+pub(crate) fn rest_error(error: RestBindError) -> CommandError {
     refused("export_glb_rest", error.to_string())
 }
 
 /// The writer's refusals keep their own names.
-fn glb_error(error: GltfError) -> CommandError {
+pub(crate) fn glb_error(error: GltfError) -> CommandError {
     match &error {
         GltfError::ConstantClip { .. } => refused("export_glb_clip_constant", error.to_string()),
         GltfError::ClipBoneOutOfRange { .. } => {
@@ -2271,14 +2366,14 @@ fn glb_error(error: GltfError) -> CommandError {
     }
 }
 
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CommandError> {
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CommandError> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|error| errors::io(parent, error))?;
     }
     std::fs::write(path, bytes).map_err(|error| errors::io(path, error))
 }
 
-fn write_report(path: &Path, report: &Value) -> Result<(), CommandError> {
+pub(crate) fn write_report(path: &Path, report: &Value) -> Result<(), CommandError> {
     let text = serde_json::to_string_pretty(report).map_err(|error| {
         CommandError::new(
             ErrorKind::Io,
@@ -2298,6 +2393,6 @@ fn write_report(path: &Path, report: &Value) -> Result<(), CommandError> {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

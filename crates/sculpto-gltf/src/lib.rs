@@ -62,7 +62,7 @@ pub mod sanitize;
 
 mod rigged;
 
-pub use rigged::write_rigged_glb;
+pub use rigged::{PartMaterial, write_partitioned_rigged_glb, write_rigged_glb};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -188,6 +188,23 @@ pub enum GltfError {
     /// The model carries an inline physics document; glTF has no slot for it,
     /// so the sidecar must ship as a file referenced by path.
     PhysicsInlineUnsupported,
+    /// A triangle partition has no declared part material, so its primitive
+    /// would open untextured and uncoloured.
+    PartMaterialMissing {
+        /// The partition without a material.
+        partition: u16,
+    },
+    /// Two part materials declare the same partition, so neither owns it.
+    PartMaterialDuplicate {
+        /// The partition declared twice.
+        partition: u16,
+    },
+    /// The mesh already declares material slots and also asks for part
+    /// materials: the writer will not choose between them.
+    PartMaterialConflict {
+        /// The number of material slots the mesh declares.
+        count: usize,
+    },
     /// The JSON chunk failed to serialize.
     Serialize(String),
     /// The GLB container failed to frame the chunks.
@@ -284,6 +301,19 @@ impl fmt::Display for GltfError {
                 "inline physics document has no glTF slot; ship the sidecar as a file \
                  and reference it with PhysicsRef::Path (written as \
                  extras.sculpto.physics)"
+            ),
+            Self::PartMaterialMissing { partition } => write!(
+                f,
+                "triangle partition {partition} has no declared part material"
+            ),
+            Self::PartMaterialDuplicate { partition } => write!(
+                f,
+                "two part materials declare triangle partition {partition}"
+            ),
+            Self::PartMaterialConflict { count } => write!(
+                f,
+                "the mesh declares {count} material slot(s) and also asks for part \
+                 materials; declare one route"
             ),
             Self::Serialize(detail) => write!(f, "GLB JSON failed: {detail}"),
             Self::Encode(detail) => write!(f, "GLB framing failed: {detail}"),
@@ -392,13 +422,14 @@ pub fn write_glb_with_profile(
 ///
 /// Every refusal check runs before any byte is produced.
 pub fn write_glb_with(asset: &MeshAsset, clips: &[Clip]) -> Result<Vec<u8>, GltfError> {
-    encode_glb(asset, clips, None)
+    encode_glb(asset, clips, None, &[])
 }
 
 fn encode_glb(
     asset: &MeshAsset,
     clips: &[Clip],
     rigged: Option<&rigged::Layout<'_>>,
+    parts: &[rigged::PartMaterial],
 ) -> Result<Vec<u8>, GltfError> {
     asset.validate().map_err(GltfError::InvalidMesh)?;
     if asset.triangles.is_empty() {
@@ -469,6 +500,30 @@ fn encode_glb(
         }
         count => return Err(GltfError::MultipleMaterialSlots { count }),
     };
+    // Part materials are the alternative route: one colour per partition, and
+    // no conflict with the single-slot route above.
+    let mut part_materials: BTreeMap<u16, usize> = BTreeMap::new();
+    if !parts.is_empty() {
+        if !asset.materials.is_empty() {
+            return Err(GltfError::PartMaterialConflict {
+                count: asset.materials.len(),
+            });
+        }
+        for (index, part) in parts.iter().enumerate() {
+            if part_materials.insert(part.partition, index).is_some() {
+                return Err(GltfError::PartMaterialDuplicate {
+                    partition: part.partition,
+                });
+            }
+        }
+        for partition in &asset.triangle_partitions {
+            if !part_materials.contains_key(&partition.0) {
+                return Err(GltfError::PartMaterialMissing {
+                    partition: partition.0,
+                });
+            }
+        }
+    }
 
     let mut writer = Writer::default();
     let mut attributes = Map::new();
@@ -578,6 +633,15 @@ fn encode_glb(
         }
         materials.push(Value::Object(material));
     }
+    // The part route names its material per written partition; the colours come
+    // from the caller (the review palette), never from here.
+    for part in parts {
+        materials.push(json!({
+            "name": part.name,
+            "pbrMetallicRoughness": { "baseColorFactor": part.color },
+            "doubleSided": true,
+        }));
+    }
 
     let mut target_names = Vec::with_capacity(asset.morphs.len());
     let mut primitive_targets = Vec::with_capacity(asset.morphs.len());
@@ -686,8 +750,8 @@ fn encode_glb(
         by_partition.entry(*partition).or_default().push(index);
     }
     let primitives: Vec<Value> = by_partition
-        .values()
-        .map(|triangle_indices| {
+        .iter()
+        .map(|(partition, triangle_indices)| {
             let indices: Vec<u32> = triangle_indices
                 .iter()
                 .flat_map(|&triangle| asset.triangles[triangle])
@@ -700,6 +764,8 @@ fn encode_glb(
             });
             if material_slot.is_some() {
                 prim["material"] = json!(0);
+            } else if let Some(index) = part_materials.get(&partition.0) {
+                prim["material"] = json!(index);
             }
             if !primitive_targets.is_empty() {
                 prim["targets"] = json!(primitive_targets);
