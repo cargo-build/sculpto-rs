@@ -110,5 +110,8 @@ silhouette, the seams and the layer palette without a shadow that can be mistake
 for a defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds and stays
 on the black backdrop (no ground); `SCULPTO_VIEWER_GROUND=1` adds the ground and
 `SCULPTO_VIEWER_TURNTABLE_YAW` seeds the figure pose for a shadow comparison.
-Keyboard events need the window focused — agent-opened preview windows start
-unfocused by design, so click the figure once.
+`0` selects the idle clip and `1` the walk clip of a rigged GLB (the actor graph
+loads `Animation0` and `Animation1`; the cloth clip keeps running). A top-left
+controls card lists the keys and `H` hides or shows it. Keyboard events need the
+window focused — agent-opened preview windows start unfocused by design, so click
+the figure once.

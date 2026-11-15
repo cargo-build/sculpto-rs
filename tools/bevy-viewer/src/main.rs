@@ -148,6 +148,14 @@ struct CharacterPose {
 #[derive(Component, Clone, Copy)]
 struct ModelHome(Vec3);
 
+/// The top-left controls card; `H` hides or shows it.
+#[derive(Component)]
+struct HelpOverlay;
+
+/// Selected actor clip: `0` idle, `1` walk. Cloth keeps its own clip.
+#[derive(Resource, Clone, Copy)]
+struct ClipSelection(usize);
+
 struct CliOptions {
     report: bool,
     headless: bool,
@@ -255,7 +263,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title:
-                            "Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig"
+                            "Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, H help"
                                 .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -281,6 +289,12 @@ fn main() {
     }
 
     app.insert_resource(FlatFlipped::default())
+        .insert_resource(ClipSelection(
+            std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        ))
         .insert_resource(LightOrbit::from_position(Vec3::new(3.0, 5.0, 2.0)))
         .insert_resource(CharacterPose {
             yaw: env_f32("SCULPTO_VIEWER_TURNTABLE_YAW", 0.0),
@@ -336,6 +350,7 @@ fn main() {
             (
                 report_counts,
                 advance_animation,
+                select_clip,
                 capture_once,
                 benchmark,
                 debug_scene,
@@ -348,6 +363,7 @@ fn main() {
                 apply_review_visibility,
                 character_controls,
                 apply_character_pose,
+                toggle_help,
             ),
         )
         .run();
@@ -583,8 +599,7 @@ fn setup(
         let mut entity = commands.spawn((
             DirectionalLight {
                 illuminance,
-                shadow_maps_enabled: key
-                    && std::env::var("SCULPTO_VIEWER_NO_SHADOWS").is_err(),
+                shadow_maps_enabled: key && std::env::var("SCULPTO_VIEWER_NO_SHADOWS").is_err(),
                 ..default()
             },
             Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y),
@@ -616,17 +631,17 @@ fn setup(
     commands.insert_resource(GltfRoot(gltf_handle));
 
     if !config.report_mode {
-        let actor_animation = env_or("SCULPTO_VIEWER_ACTOR_ANIMATION", "4");
         let cloth_animation = env_or("SCULPTO_VIEWER_CLOTH_ANIMATION", "0");
-        let actor_clip =
-            asset_server.load(format!("{}#Animation{actor_animation}", config.asset_file));
+        let actor_idle = asset_server.load(format!("{}#Animation0", config.asset_file));
+        let actor_walk = asset_server.load(format!("{}#Animation1", config.asset_file));
         let cloth_clip =
             asset_server.load(format!("{}#Animation{cloth_animation}", config.asset_file));
-        let (mut graph, actor_node) = AnimationGraph::from_clip(actor_clip);
+        let (mut graph, actor_idle_node) = AnimationGraph::from_clip(actor_idle);
+        let actor_walk_node = graph.add_clip(actor_walk, 1.0, graph.root);
         let cloth_node = graph.add_clip(cloth_clip, 1.0, graph.root);
         commands.insert_resource(PlayerGraph {
             handle: graphs.add(graph),
-            nodes: vec![actor_node, cloth_node],
+            nodes: vec![actor_idle_node, actor_walk_node, cloth_node],
         });
     }
 
@@ -643,6 +658,58 @@ fn setup(
             ModelHome(home),
             ReviewModel,
         ));
+    }
+    if config.interactive {
+        commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(12.0),
+                    top: Val::Px(12.0),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(2.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+                HelpOverlay,
+            ))
+            .with_children(|card| {
+                for line in [
+                    "Drag LMB orbit · RMB pan · wheel zoom",
+                    "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
+                    "Shift+LMB move key light",
+                    "0 idle · 1 walk",
+                    "R reset · L lit/flat · 3 three-point rig · H hide help",
+                ] {
+                    card.spawn((
+                        Text::new(line),
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(13.0),
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                }
+            });
+    }
+}
+
+/// `H` hides or shows the controls card. Agent-opened windows start unfocused,
+/// so the first key press needs one click on the figure.
+fn toggle_help(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut card: Query<&mut Visibility, With<HelpOverlay>>,
+) {
+    if !config.interactive || !keys.just_pressed(KeyCode::KeyH) {
+        return;
+    }
+    for mut visibility in &mut card {
+        *visibility = match *visibility {
+            Visibility::Hidden => Visibility::Inherited,
+            _ => Visibility::Hidden,
+        };
     }
 }
 
@@ -887,6 +954,7 @@ fn advance_animation(
     mut commands: Commands,
     config: Res<ViewerConfig>,
     graph: Option<Res<PlayerGraph>>,
+    selection: Res<ClipSelection>,
     mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
 ) {
     if config.report_mode {
@@ -895,14 +963,48 @@ fn advance_animation(
     // The glTF scene spawns its players asynchronously; attach our graph and
     // start both clips the moment each player appears.
     let Some(graph) = graph else { return };
+    let selection = selection.0.min(1);
     for (entity, mut player) in &mut players {
-        for node in &graph.nodes {
-            player.play(*node).repeat();
-        }
+        player.play(graph.nodes[selection]).repeat();
+        player.play(graph.nodes[2]).repeat();
         commands
             .entity(entity)
             .insert(AnimationGraphHandle(graph.handle.clone()));
         info!("viewer: started 1 animation players");
+    }
+}
+
+/// `0` idle, `1` walk: stop the player and restart the chosen actor clip while
+/// the cloth clip keeps running.
+fn select_clip(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    graph: Option<Res<PlayerGraph>>,
+    mut selection: ResMut<ClipSelection>,
+    mut players: Query<&mut AnimationPlayer>,
+) {
+    if !config.interactive {
+        return;
+    }
+    let wanted = if keys.just_pressed(KeyCode::Digit0) {
+        Some(0)
+    } else if keys.just_pressed(KeyCode::Digit1) {
+        Some(1)
+    } else {
+        None
+    };
+    let Some(wanted) = wanted else {
+        return;
+    };
+    if selection.0 == wanted {
+        return;
+    }
+    selection.0 = wanted;
+    let Some(graph) = graph else { return };
+    for mut player in &mut players {
+        player.stop_all();
+        player.play(graph.nodes[wanted]).repeat();
+        player.play(graph.nodes[2]).repeat();
     }
 }
 
@@ -1321,6 +1423,32 @@ mod tests {
         press(&mut app, KeyCode::Digit3);
         app.update();
         assert!(app.world().resource::<RigMode>().three_point);
+    }
+
+    #[test]
+    fn h_hides_and_shows_the_help_card() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, toggle_help);
+        let card = app
+            .world_mut()
+            .spawn((Visibility::Inherited, HelpOverlay))
+            .id();
+
+        press(&mut app, KeyCode::KeyH);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(card).expect("card"),
+            Visibility::Hidden
+        );
+
+        press(&mut app, KeyCode::KeyH);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(card).expect("card"),
+            Visibility::Inherited
+        );
     }
 
     #[test]
