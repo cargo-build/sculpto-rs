@@ -150,6 +150,37 @@ fn the_default_bodies_export_as_complete_coloured_actors() {
             assert_ne!(*material, "#FFFFFF", "{label}: a part is untextured white");
         }
 
+        // Every garment layer is welded before the bind: its authored panels
+        // joined, its seam boundary closed, and the audit record present.
+        for part in parts.iter().filter(|part| part["role"] == "layer") {
+            let seam = &part["seam_weld"];
+            assert!(
+                !seam.is_null(),
+                "{label}: layer {} reports no seam weld",
+                part["name"]
+            );
+            let merged = seam["merged_pairs"].as_u64().expect("merged pairs");
+            assert!(
+                merged > 0,
+                "{label}: {} merged no panel pairs",
+                part["name"]
+            );
+            assert_eq!(
+                seam["dropped_faces"].as_u64().expect("dropped faces"),
+                0,
+                "{label}: {} lost a face to the weld",
+                part["name"]
+            );
+            assert!(
+                seam["components_after"].as_u64().expect("components after")
+                    < seam["components_before"]
+                        .as_u64()
+                        .expect("components before"),
+                "{label}: {} panels did not join",
+                part["name"]
+            );
+        }
+
         // The extremities are bound, with the counts the fallback measured.
         let fallback: Vec<String> = report["palette"]["fallback_bones"]
             .as_array()

@@ -253,3 +253,38 @@ fn the_nearest_fallback_bone_wins() {
         .collect();
     assert_eq!(counts.get("Head"), Some(&4));
 }
+
+#[test]
+fn a_layer_welds_its_panels_but_keeps_an_authored_dart() {
+    // Panel A is triangle [0,1,2]; panel B is [3,4,5], [5,7,6] and [3,5,8],
+    // joined through shared indices. Vertices 1 and 4 coincide across the two
+    // panels — the seam merges them. Vertices 6 and 8 coincide *inside* panel
+    // B: an authored dart the weld must leave open.
+    use sculpto_engine::export_actor::weld_layer;
+    let positions = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 1.0, 0.0],
+        [2.0, 2.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [2.0, 2.0, 0.0],
+    ];
+    let triangles = [[0_u32, 1, 2], [3, 4, 5], [5, 7, 6], [3, 5, 8]];
+    let (welded, welded_triangles, report) = weld_layer(&positions, &triangles);
+
+    assert_eq!(report.components_before, 2, "the panels start separate");
+    assert_eq!(report.components_after, 1, "the shared corner joins them");
+    assert_eq!(welded.len(), 8, "one twin merges, the dart copy stays");
+    assert_eq!(welded.len(), report.welded_vertices);
+    assert_eq!(welded_triangles.len(), 4, "no face collapses");
+    assert_eq!(report.dropped_faces, 0);
+    assert_eq!(report.merged_pairs, 1, "only the cross-panel pair merges");
+    assert_eq!(report.vertex_map[1], report.vertex_map[4]);
+    assert_ne!(
+        report.vertex_map[6], report.vertex_map[8],
+        "the intra-panel dart stays open"
+    );
+}

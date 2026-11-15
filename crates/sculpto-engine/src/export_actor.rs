@@ -12,21 +12,26 @@
 //!    and the rest matrices; the family template completes the rig;
 //! 2. every declared OBJ part is moved into the body's skin frame with the
 //!    shape's own placement;
-//! 3. the engine's weight copy ([`transfer`]) carries the body's authored
+//! 3. a garment layer's authored seam copies — separate pieces that abut
+//!    exactly — are merged by the dress weld ([`weld_layer`]) before any
+//!    weight is bound, so skinning cannot slide the panels apart;
+//! 4. the engine's weight copy ([`transfer`]) carries the body's authored
 //!    weights onto the part wherever the part lies on the body surface;
-//! 4. a vertex the copy cannot reach — the head, the hands and the feet of an
+//! 5. a vertex the copy cannot reach — the head, the hands and the feet of an
 //!    assembled body sit 10–19 source units away from the surface the NIF skins
 //!    — is bound to the nearest declared extremity bone instead, and the seam
 //!    between the copied and the bound region is smoothed over the mesh graph,
 //!    so no extremity is a rigid island with a torn boundary;
-//! 5. all parts merge into one arena with one palette, one partition per part
+//! 6. all parts merge into one arena with one palette, one partition per part
 //!    and the review palette's colour for each;
-//! 6. named clips are mapped by bone name exactly as `export.glb` maps them;
-//! 7. the file is written through [`write_partitioned_rigged_glb`]: one skin,
+//! 7. named clips are mapped by bone name exactly as `export.glb` maps them;
+//! 8. the file is written through [`write_partitioned_rigged_glb`]: one skin,
 //!    one primitive per part, one material per part.
 //!
 //! Nothing is glued by hand and no geometry is moved: a part keeps its authored
-//! vertices and only gains influences. The report measures what the copy
+//! vertices and only gains influences — the one exception is a garment layer's
+//! exactly-coincident seam copies, which the weld merges into shared vertices
+//! before the bind. The report measures what the copy
 //! reached, what the fallback bound, how far the unreached vertices sit and
 //! which bone carries them, so "skinned" is a number, not an assertion.
 //! @req DECL0008
@@ -48,6 +53,7 @@ use sculpto_gltf::review::{BODY_COLOR, hex, palette as review_palette, smooth_no
 use sculpto_gltf::{Clip, PartMaterial, write_partitioned_rigged_glb};
 use sculpto_mesh::actor::Actor;
 use sculpto_mesh::check::surface_distances;
+use sculpto_mesh::dress::{SEAM_WELD_EPSILON, SeamWeldReport, seam_weld};
 use sculpto_mesh::garment::{Influences, TransferError, TransferOptions, transfer};
 use sculpto_mesh::mask::VertexMask;
 use sculpto_mesh::weight_norm::{MAX_INFLUENCES, SUM_TOLERANCE, pack_influences};
@@ -171,6 +177,9 @@ struct SourcePart {
     color: [f32; 4],
     positions: Vec<[f32; 3]>,
     triangles: Vec<[u32; 3]>,
+    /// What the seam merge did to an authored garment layer; `None` for the
+    /// body, whose joints the seal already owns.
+    seam_weld: Option<SeamWeldReport>,
 }
 
 /// One part after binding: the rows plus what the copy and the fallback measured.
@@ -227,6 +236,7 @@ struct PartRow {
     vertices: Range<usize>,
     triangles: Range<usize>,
     partition: u16,
+    seam_weld: Option<SeamWeldReport>,
 }
 
 /// Export one rigged, coloured actor GLB and render its report.
@@ -362,20 +372,16 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
         .smooth_iterations
         .unwrap_or(DEFAULT_SMOOTH_ITERATIONS);
 
-    // Read every part in the body's own skin frame, once.
+    // Read every part in the body's own skin frame, once. A garment layer is
+    // authored as separate pieces whose seam copies abut exactly, so the dress
+    // weld merges them here, before any weight is bound.
     let mut parts = vec![read_part(&params.body, "body", 0, BODY_COLOR, &placement)?];
     let mut ordered = params.layers.clone();
     ordered.sort_by_key(|layer| layer.order);
     for layer in ordered {
         let rank = u8::try_from(layer.order).expect("the palette gate validated 1..=5");
         let color = review_palette(rank).expect("the palette gate validated 1..=5");
-        parts.push(read_part(
-            &layer.obj,
-            "layer",
-            layer.order,
-            color,
-            &placement,
-        )?);
+        parts.push(read_layer(&layer.obj, layer.order, color, &placement)?);
     }
     let mut seen = BTreeSet::new();
     for part in &parts {
@@ -459,6 +465,7 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
             vertices: base..arena.positions.len(),
             triangles: first_triangle..arena.triangles.len(),
             partition,
+            seam_weld: part.seam_weld.clone(),
         });
         rows.extend(skin.rows.iter().cloned());
         part_skins.push(skin);
@@ -679,7 +686,7 @@ fn part_value(part: &PartRow, skin: &BoundPart) -> Value {
             .map(|(bone, vertices)| json!({"bone": bone, "vertices": vertices}))
             .collect::<Vec<_>>()
     };
-    json!({
+    let mut value = json!({
         "name": part.name,
         "role": part.role,
         "order": part.order,
@@ -700,7 +707,22 @@ fn part_value(part: &PartRow, skin: &BoundPart) -> Value {
         "influences_sum_error": skin.sum_error,
         "fallback_bones": pairs(&skin.fallback),
         "dominant_bones": pairs(&skin.dominant),
-    })
+    });
+    if let Some(seam) = &part.seam_weld {
+        value["seam_weld"] = json!({
+            "tolerance": seam.tolerance,
+            "source_vertices": seam.welded_vertices + seam.merged_vertices,
+            "welded_vertices": seam.welded_vertices,
+            "merged_vertices": seam.merged_vertices,
+            "merged_pairs": seam.merged_pairs,
+            "components_before": seam.components_before,
+            "components_after": seam.components_after,
+            "boundary_edges_before": seam.boundary_edges_before,
+            "boundary_edges_after": seam.boundary_edges_after,
+            "dropped_faces": seam.dropped_faces,
+        });
+    }
+    value
 }
 
 fn clip_value(index: usize, plan: &ClipPlan) -> Value {
@@ -847,7 +869,59 @@ fn read_part(
             .map(|&point| placement.position_in_mesh(point))
             .collect(),
         triangles,
+        seam_weld: None,
     })
+}
+
+/// Read one garment layer, merge its authored seam copies and move it into the
+/// body's skin frame.
+fn read_layer(
+    path: &Path,
+    order: u32,
+    color: [f32; 4],
+    placement: &ShapePlacement,
+) -> Result<SourcePart, CommandError> {
+    let (positions, triangles) = read_obj_surface(path)?;
+    if positions.is_empty() || triangles.is_empty() {
+        return Err(refused(
+            "export_actor_empty_part",
+            format!("{} has no geometry to write", path.display()),
+        ));
+    }
+    let (welded, welded_triangles, seam_weld) = weld_layer(&positions, &triangles);
+    let name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "layer".to_string());
+    Ok(SourcePart {
+        name,
+        role: "layer",
+        order,
+        color,
+        positions: welded
+            .iter()
+            .map(|&point| placement.position_in_mesh(point))
+            .collect(),
+        triangles: welded_triangles,
+        seam_weld: Some(seam_weld),
+    })
+}
+
+/// Merge an authored garment's seam copies with the dress weld.
+///
+/// The authored underwear is printed as separate pieces — the HIMBO boxers are
+/// eleven, the CBBE panty five — whose boundary vertices abut exactly. Bound
+/// unwelded, skinning slides the panels apart: the waistband ring floats off
+/// the shorts and the free gusset ends up between the legs. [`seam_weld`]
+/// already owns the rule (merge only coincident groups spanning two pieces,
+/// keep an authored dart, drop a collapsed face), so this is the same weld the
+/// dress path applies, run on the garment before any weight is bound.
+/// @req DECL0013
+pub fn weld_layer(
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+) -> (Vec<[f32; 3]>, Vec<[u32; 3]>, SeamWeldReport) {
+    seam_weld(positions, triangles, SEAM_WELD_EPSILON)
 }
 
 /// The body surface and its authored rows, shared by every part.
