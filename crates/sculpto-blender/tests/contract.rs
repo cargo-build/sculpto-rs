@@ -78,6 +78,28 @@ fn schema_is_an_object() {
 }
 
 #[test]
+fn legacy_lab_settings_roundtrip_and_keep_metre_defaults() {
+    let settings: sculpto_blender::LegacySettings = serde_json::from_value(serde_json::json!({
+        "gravity": -981.0,
+        "body_thickness": -1.0,
+        "shear": 20.0,
+        "collision_quality": 6
+    }))
+    .expect("lab settings");
+    assert_eq!(settings.gravity, -981.0);
+    assert_eq!(settings.body_thickness, -1.0);
+    assert_eq!(settings.shear, Some(20.0));
+    assert_eq!(settings.collision_quality, 6);
+
+    let defaults: sculpto_blender::LegacySettings =
+        serde_json::from_value(serde_json::json!({})).expect("defaults");
+    assert_eq!(defaults.gravity, -9.81);
+    assert_eq!(defaults.body_thickness, 0.005);
+    assert_eq!(defaults.shear, None);
+    assert_eq!(defaults.collision_quality, 4);
+}
+
+#[test]
 fn unknown_request_field_is_rejected() {
     let value = serde_json::json!({
         "run_id": "x",

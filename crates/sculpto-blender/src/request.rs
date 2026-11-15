@@ -89,6 +89,18 @@ fn default_legacy_body_min() -> f64 {
     0.002
 }
 
+fn default_legacy_body_thickness() -> f64 {
+    0.005
+}
+
+fn default_legacy_collision_quality() -> u32 {
+    4
+}
+
+fn default_legacy_gravity() -> f64 {
+    -9.81
+}
+
 fn default_legacy_quality() -> u32 {
     10
 }
@@ -316,9 +328,12 @@ pub struct LegacySettings {
     /// Bending stiffness.
     #[serde(default = "default_legacy_bending")]
     pub bending: f64,
-    /// Structural/shear/tension stiffness.
+    /// Structural (tension and compression) stiffness.
     #[serde(default = "default_legacy_structural")]
     pub structural: f64,
+    /// Shear stiffness; defaults to `structural`.
+    #[serde(default)]
+    pub shear: Option<f64>,
     /// Per-vertex mass, scaled down with vertex count.
     #[serde(default = "default_legacy_mass")]
     pub mass: f64,
@@ -331,6 +346,16 @@ pub struct LegacySettings {
     /// Body-collision minimum distance, scene units.
     #[serde(default = "default_legacy_body_min")]
     pub body_min: f64,
+    /// Body-collision thickness, scene units. A negative value means
+    /// `body_min + 0.2`, the lab-harness default.
+    #[serde(default = "default_legacy_body_thickness")]
+    pub body_thickness: f64,
+    /// Collision quality steps.
+    #[serde(default = "default_legacy_collision_quality")]
+    pub collision_quality: u32,
+    /// Scene gravity, units/s². Lab-unit scenes need their own value.
+    #[serde(default = "default_legacy_gravity")]
+    pub gravity: f64,
     /// Solver quality steps.
     #[serde(default = "default_legacy_quality")]
     pub quality: u32,
@@ -344,10 +369,14 @@ impl Default for LegacySettings {
         Self {
             bending: default_legacy_bending(),
             structural: default_legacy_structural(),
+            shear: None,
             mass: default_legacy_mass(),
             self_collision: default_true(),
             self_min: default_legacy_self_min(),
             body_min: default_legacy_body_min(),
+            body_thickness: default_legacy_body_thickness(),
+            collision_quality: default_legacy_collision_quality(),
+            gravity: default_legacy_gravity(),
             quality: default_legacy_quality(),
             ground: false,
         }

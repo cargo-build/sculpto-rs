@@ -60,9 +60,16 @@ pin_component_band = float(cfg.get("pin_component_band", "0.10"))
 body_name = cfg.get("body", "BaseShape")
 bending = float(cfg.get("bending", "20"))
 structural = float(cfg.get("structural", "200"))
+shear = float(cfg.get("shear", str(structural)))
 mass = float(cfg.get("mass", "0.006"))
 self_min = float(cfg.get("self_min", "0.0015"))
 body_min = float(cfg.get("body_min", "0.002"))
+# A negative thickness keeps the lab-harness rule: body_min + 0.2.
+body_thickness = float(cfg.get("body_thickness", "0.005"))
+if body_thickness < 0.0:
+    body_thickness = body_min + 0.2
+collision_quality = int(cfg.get("collision_quality", "4"))
+gravity = float(cfg.get("gravity", "-9.81"))
 self_collision = int(cfg.get("self_collision", 1))
 quality = int(cfg.get("quality", 10))
 ground = int(cfg.get("ground", 0))
@@ -173,7 +180,7 @@ if ground:
     floor.collision.thickness_outer = 0.002
     floor.collision.cloth_friction = 5.0
     floor.hide_render = True
-body.collision.thickness_outer = 0.005
+body.collision.thickness_outer = body_thickness
 body.collision.cloth_friction = 5.0
 
 modifier = garment.modifiers.new("Cloth", "CLOTH")
@@ -185,7 +192,7 @@ settings.mass = mass
 settings.air_damping = 1.0
 settings.tension_stiffness = structural
 settings.compression_stiffness = structural
-settings.shear_stiffness = structural
+settings.shear_stiffness = shear
 settings.bending_stiffness = bending
 settings.bending_stiffness_max = bending
 collision = modifier.collision_settings
@@ -193,7 +200,8 @@ collision.use_self_collision = bool(self_collision)
 collision.self_distance_min = self_min
 collision.self_friction = 5.0
 collision.distance_min = body_min
-collision.collision_quality = 4
+collision.collision_quality = collision_quality
+scene.gravity = (0.0, 0.0, gravity)
 modifier.point_cache.frame_start = 0
 modifier.point_cache.frame_end = frame_end_cap
 
@@ -219,10 +227,16 @@ report = {
     "cloth": {
         "bending": bending,
         "structural": structural,
+        "shear": shear,
         "mass": mass,
         "self_collision": bool(self_collision),
         "self_distance_min": self_min,
-        "body_distance_min": body_min, "ground": bool(ground),
+        "body_distance_min": body_min,
+        "body_thickness": body_thickness,
+        "collision_quality": collision_quality,
+        "gravity": gravity,
+        "quality": quality,
+        "ground": bool(ground),
     },
     "frame_range": [0, frame_end],
     "frame_end_mode": frame_end_mode,
