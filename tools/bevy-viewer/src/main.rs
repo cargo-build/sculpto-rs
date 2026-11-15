@@ -104,11 +104,35 @@ struct RigMode {
 #[derive(Resource, Default)]
 struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
 
-/// `B` shows the skeleton through a semi-transparent body. Enabled at start by
-/// `SCULPTO_VIEWER_SKELETON=1` so a headless capture can prove the mode.
+/// `B` cycles the skeleton overlay: off -> primary chain -> every driven joint.
+/// Enabled at start by `SCULPTO_VIEWER_SKELETON=1` so a headless capture can
+/// prove the mode.
 #[derive(Resource, Clone, Copy, Default)]
 struct SkelMode {
-    on: bool,
+    level: u8,
+}
+
+impl SkelMode {
+    fn on(&self) -> bool {
+        self.level > 0
+    }
+}
+
+/// Space pauses, Ctrl+, and Ctrl+. slow down and speed up the clip so a pose can
+/// be studied instead of glimpsed.
+#[derive(Resource)]
+struct Playback {
+    paused: bool,
+    speed: f32,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            speed: 1.0,
+        }
+    }
 }
 
 /// Pooled overlay entities: bones and joints are spawned once, then moved to
@@ -289,7 +313,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: format!(
-                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, H help",
+                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, Space pause, Ctrl+,/. speed, H help",
                             config.status
                         ),
                         resolution: (1280, 900).into(),
@@ -333,8 +357,16 @@ fn main() {
             three_point: std::env::var("SCULPTO_VIEWER_THREE_POINT").is_ok(),
         })
         .insert_resource(SkelMode {
-            on: std::env::var("SCULPTO_VIEWER_SKELETON").is_ok(),
+            // 1 = primary chain, 2 = every driven joint; any other value is off.
+            // The operator's rule: never show a translucent body without its
+            // bones. The overlay is on by default; `B` cycles it and
+            // SCULPTO_VIEWER_SKELETON=0 is the explicit opt-out.
+            level: std::env::var("SCULPTO_VIEWER_SKELETON")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2),
         })
+        .insert_resource(Playback::default())
         .insert_resource(SkelPool::default())
         .insert_resource(GlassRestore::default())
         .insert_resource(Units(options.units))
@@ -402,6 +434,7 @@ fn main() {
                 toggle_help,
             ),
         )
+        .add_systems(Update, (control_playback, apply_playback))
         .run();
 }
 
@@ -495,7 +528,42 @@ fn toggle_skeleton(
     mut skel: ResMut<SkelMode>,
 ) {
     if config.interactive && keys.just_pressed(KeyCode::KeyB) {
-        skel.on = !skel.on;
+        skel.level = (skel.level + 1) % 3;
+    }
+}
+
+/// Space pauses the clip; Ctrl+, and Ctrl+. halve and double the playback rate.
+fn control_playback(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut playback: ResMut<Playback>,
+) {
+    if !config.interactive {
+        return;
+    }
+    if keys.just_pressed(KeyCode::Space) {
+        playback.paused = !playback.paused;
+    }
+    let control = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    if control && keys.just_pressed(KeyCode::Comma) {
+        playback.speed = (playback.speed * 0.5).max(0.05);
+    }
+    if control && keys.just_pressed(KeyCode::Period) {
+        playback.speed = (playback.speed * 2.0).min(4.0);
+    }
+}
+
+/// Apply the playback state to every animation player that exists.
+fn apply_playback(playback: Res<Playback>, mut players: Query<&mut AnimationPlayer>) {
+    for mut player in &mut players {
+        if playback.paused {
+            player.pause_all();
+        } else {
+            player.resume_all();
+        }
+        for (_, animation) in player.playing_animations_mut() {
+            animation.set_speed(playback.speed);
+        }
     }
 }
 
@@ -510,7 +578,7 @@ fn apply_skeleton_mode(
         (Without<ReviewGround>, Without<SkelJoint>, Without<SkelBone>),
     >,
 ) {
-    if skel.on {
+    if skel.on() {
         for handle in &actors {
             let id = handle.id();
             if restore.0.contains(&id) {
@@ -606,13 +674,39 @@ fn draw_skeleton(
             }
         }
     }
+    // Level 1 keeps the chain an animator reasons about: pelvis, spine, neck,
+    // head, clavicles, arms, hands, thighs, calves, feet and toes. Twist bones
+    // and finger chains only appear at level 2.
+    let primary = |name: &str| {
+        !name.contains("Twist")
+            && !name.contains("Finger")
+            && [
+                "Pelvis", "Spine", "Neck", "Head", "Clavicle", "UpperArm", "Forearm", "Hand",
+                "Thigh", "Calf", "Foot", "Toe",
+            ]
+            .iter()
+            .any(|key| name.contains(key))
+    };
+    // Skeleton scaffolding, not body bones: `NPC Root` sits at the actor origin and
+    // `NPC COM` a metre above it, so the bar between them crosses the whole figure
+    // as a stray vertical line. The joints stay drawn; only a bar leaving them does
+    // not.
+    let is_anchor = |name: &str| name.ends_with("[Root]") || name.ends_with("[COM ]");
+    let anchors: std::collections::HashSet<Entity> = nodes
+        .iter()
+        .filter(|(_, name, _, _)| is_anchor(name.as_str()))
+        .map(|(entity, _, _, _)| entity)
+        .collect();
     let mut bones: Vec<(Entity, Vec3, Option<Entity>)> = Vec::new();
     for (entity, name, transform, parent) in &nodes {
-        if is_bone(name.as_str()) && driven.contains(&entity) {
+        if is_bone(name.as_str())
+            && driven.contains(&entity)
+            && (skel.level > 1 || primary(name.as_str()))
+        {
             bones.push((entity, transform.translation(), parent.map(|p| p.parent())));
         }
     }
-    if !skel.on {
+    if !skel.on() {
         for entity in pool.joints.iter().chain(pool.bones.iter()) {
             if let Ok((_, mut visibility)) = overlay.get_mut(*entity) {
                 *visibility = Visibility::Hidden;
@@ -636,7 +730,10 @@ fn draw_skeleton(
         let Some(entity) = pool.bones.get(index) else {
             continue;
         };
-        let target = parent.and_then(|parent| positions.get(&parent)).copied();
+        let target = parent
+            .filter(|parent| !anchors.contains(parent))
+            .and_then(|parent| positions.get(&parent))
+            .copied();
         if let (Some(start), Ok((mut transform, mut visibility))) =
             (target, overlay.get_mut(*entity))
         {
@@ -914,7 +1011,8 @@ fn setup(
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB move key light",
                     "0 idle · 1 walk",
-                    "R reset · L lit/flat · 3 three-point rig · B bones · H hide help",
+                    "0 idle · 1 walk · Space pause · Ctrl+, slower · Ctrl+. faster",
+                    "R reset · L lit/flat · 3 rig · B bones (chain/all) · H help",
                 ] {
                     card.spawn((
                         Text::new(line),
