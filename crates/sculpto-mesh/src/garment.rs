@@ -493,9 +493,9 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
 /// One vertex's bone influences, keyed by bone name.
 pub type Influences = BTreeMap<String, f32>;
 
-/// Proximity radius a transfer uses when the caller sets none (`Automorph.h:96`).
+/// Proximity radius a transfer uses when the caller sets none (`Automorph.h:78`).
 pub const DEFAULT_TRANSFER_RADIUS: f32 = 10.0;
-/// Neighbours a transfer blends when the caller sets none (`Automorph.h:99`).
+/// Neighbours a transfer blends when the caller sets none (`Automorph.h:86`).
 pub const DEFAULT_TRANSFER_MAX_RESULTS: usize = 10;
 
 /// How a weight copy reads the body and classifies the garment's bones.
@@ -503,7 +503,8 @@ pub const DEFAULT_TRANSFER_MAX_RESULTS: usize = 10;
 /// The defaults are the native copy: a ten-unit radius, ten blended neighbours,
 /// no masks, a new unweighted garment, every source bone copied, no extra
 /// normalizable bones, and neither remainder spreading nor the second
-/// normalization pass (`BoneWeightCopyOptions`, `ProjectOperations.h:66-80`).
+/// normalization pass (`OutfitProject.cpp:2644-2651`: radius, neighbour cap, mask,
+/// bone list, locked bones and the spread flag).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransferOptions {
     /// Inclusive proximity radius; zero uses the native insertion-tree mode.
@@ -522,7 +523,7 @@ pub struct TransferOptions {
     pub normalizable: Vec<String>,
     /// Native remainder spreading over the normalizable class.
     pub spread: bool,
-    /// Native `BoneWeightCopyOptions::normalize` second all-normalizable pass.
+    /// Native second all-normalizable pass (`OutfitProject.cpp:2743-2748`).
     pub normalize: bool,
 }
 
@@ -652,16 +653,18 @@ impl std::error::Error for TransferError {}
 /// [`SUM_TOLERANCE`](crate::weight_norm::SUM_TOLERANCE).
 ///
 /// A body mask above zero removes that body vertex from the cache before the
-/// neighbour cap (`OutfitProject.cpp:2868-2876`). A garment mask above zero
+/// neighbour cap (`Automorph.cpp:223,232` build the cache under the mask). A garment
+/// mask above zero
 /// keeps that vertex's whole current map, so it is never zeroed, normalized or
-/// packed (`OutfitProject.cpp:2891`, `2910`). Its existing sum and influence
+/// packed (`WeightNorm.cpp:64,141`, called from `OutfitProject.cpp:2747`). Its existing
+/// sum and influence
 /// count must already satisfy the output contract; otherwise the copy refuses.
 /// A fresh one-neighbour copy preserves the accepted nearest-copy precision,
 /// including weights below the native edit normalizer's pruning epsilon.
 ///
 /// Bones the garment already carries outside `copy` and `normalizable` stay
-/// locked and bit-identical. The native rigid-prop detection
-/// (`keepRigidParts`) is not ported here.
+/// locked and bit-identical: that is the native `lockedBones` argument
+/// (`OutfitProject.cpp:2650`). No separate rigid-part detection is ported.
 ///
 /// # Errors
 ///
@@ -781,7 +784,8 @@ pub fn transfer(
     normalize_vertices(&normalizer, &mut weights, &touched)?;
     if options.normalize {
         // The reference's second pass treats every copied bone as normalizable,
-        // which closes the sums the copy left short (`ProjectOperations.cpp:627-647`).
+        // which closes the sums the copy left short (`OutfitProject.cpp:2747`,
+        // `WeightNorm.cpp:64,141`).
         let closer =
             WeightNormalizer::new(&bones, &locked, 0, false).map_err(TransferError::Normalize)?;
         normalize_vertices(&closer, &mut weights, &touched)?;
@@ -850,7 +854,7 @@ fn copy_bones(
         let delta = copy_bone_delta(cache, body_weights, bone, max_results)
             .map_err(TransferError::Proximity)?;
         // Native zeroes the garment's existing weights for this bone before it
-        // writes the interpolated result (`OutfitProject.cpp:2887-2917`).
+        // writes the interpolated result (`OutfitProject.cpp:2738`, normalized at `2747`).
         weights
             .iter_mut()
             .enumerate()

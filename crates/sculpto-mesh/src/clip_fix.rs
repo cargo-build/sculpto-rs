@@ -17,9 +17,12 @@
 //! Divergences from the source, kept deliberate: empty or malformed input is
 //! rejected ([`ClipFixError`]) where the source silently returns; `strength`
 //! outside `0..=1` is rejected instead of clamped (`0` stays the source's
-//! no-op); the optional lock mask is the source caller's own per-vertex fix
-//! weight (`ProjectOperations.cpp:937-966`: none where masked, all where
-//! free, a blend on a soft border) applied after the mask-free primitive, so
+//! no-op); the native primitive takes one global strength
+//! (`components/ClippingFixer.cpp:175`, `ClippingFixer.h:28`) and BodySlide
+//! applies it to caller-chosen vertex subsets (`program/BodySlideApp.cpp:4330`).
+//! Our optional lock mask is the per-vertex form of that selection: none where
+//! masked, all where free, a blend on a soft border, applied after the mask-free
+//! primitive, so
 //! fully locked vertices keep their positions bit-identically; co-located
 //! copies are grouped by the shared spatial-hash welder instead of the
 //! source's x-sorted per-axis scan (exact duplicates group identically); the
@@ -403,8 +406,9 @@ pub fn fix_clipping(
 
     unify_coincident_copies(garment.0, &mut displacements);
 
-    // The source caller's per-vertex fix weight: none where masked, all
-    // where free, a blend on a soft border (`ProjectOperations.cpp:964-966`).
+    // The caller's per-vertex selection as a fix weight: none where masked,
+    // all where free, a blend on a soft border (`ClippingFixer.h:28` takes the
+    // global strength; the subset is the caller's).
     let mut moved = 0usize;
     let mut max_push = 0.0f32;
     let mut positions = Vec::with_capacity(count);

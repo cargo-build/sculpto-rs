@@ -1,8 +1,8 @@
 //! Acceptance for the reference bone-weight copy.
 //!
 //! Every case is synthetic and hand-computed from
-//! `OutfitProject::CopyBoneWeights` (`OutfitProject.cpp:2820-2928`) and
-//! `ProjectOperations::CopyBoneWeights` (`ProjectOperations.cpp:649-800`): one
+//! `OutfitProject::CopyBoneWeights` (`OutfitProject.cpp:2644-2748`) with the
+//! proximity cache and blend in `Automorph.cpp:223-610`: one
 //! sparse weight field per copied bone, inverse-distance blended over the
 //! proximity cache, masked on both sides, then normalized and packed.
 

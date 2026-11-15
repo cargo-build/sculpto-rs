@@ -26,13 +26,14 @@ use crate::point_query::PointIndex;
 /// Inverse-distance weight of an exact match, so a zero distance stays finite.
 const EXACT_MATCH_WEIGHT: f32 = 1000.0;
 
-/// Nearly-zero threshold of nifly's `Vector3::IsZero(true)` (`Object3d.hpp:16`).
+/// Nearly-zero threshold of nifly's `Vector3::IsZero(true)` (`Object3d.hpp:111`,
+/// epsilon at `:16`).
 const NEARLY_ZERO: f32 = 0.0001;
 
-/// Proximity radius used when the caller sets none (`Automorph.h:96`).
+/// Proximity radius used when the caller sets none (`Automorph.h:78`).
 const DEFAULT_RADIUS: f32 = 10.0;
 
-/// Neighbour cap used when the caller sets none (`Automorph.h:99`).
+/// Neighbour cap used when the caller sets none (`Automorph.h:86`).
 const DEFAULT_MAX_RESULTS: usize = 10;
 
 /// How far a garment vertex looks for body vertices to follow.

@@ -1,8 +1,8 @@
 //! Acceptance for the native weight normalizer and the strict influence pack.
 //!
 //! Every case is synthetic and hand-computed from `BoneWeightAutoNormalizer`
-//! (`WeightNorm.cpp:64-181`) and `ProjectOperations::NormalizeCopiedWeights`
-//! (`ProjectOperations.cpp:627-647`): the reference arithmetic uses
+//! (`WeightNorm.cpp:64-181`) and the copy's own normalize loop
+//! (`OutfitProject.cpp:2743-2748`): the reference arithmetic uses
 //! `WEIGHT_EPSILON`, and the pack is our explicit stricter step.
 
 use std::collections::BTreeSet;
