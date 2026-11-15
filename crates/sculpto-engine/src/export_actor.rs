@@ -15,13 +15,16 @@
 //! 3. a garment layer's authored seam copies — separate pieces that abut
 //!    exactly — are merged by the dress weld ([`weld_layer`]) before any
 //!    weight is bound, so skinning cannot slide the panels apart;
-//! 4. the engine's weight copy ([`transfer`]) carries the body's authored
-//!    weights onto the part wherever the part lies on the body surface;
-//! 5. a vertex the copy cannot reach — the head, the hands and the feet of an
-//!    assembled body sit 10–19 source units away from the surface the NIF skins
-//!    — is bound to the nearest declared extremity bone instead, and the seam
-//!    between the copied and the bound region is smoothed over the mesh graph,
-//!    so no extremity is a rigid island with a torn boundary;
+//! 4. the engine's weight copy ([`transfer`]) carries authored weights onto the
+//!    part from the **nearest declared source shape**: the head, hands and feet
+//!    of an assembled body are their own NIF shapes in this collection, not part
+//!    of the body shape, so a single body surface cannot weight them and their
+//!    authored Calf↔Foot↔Toe0, Hand↔Forearm and Head↔Spine2 blends would be
+//!    discarded;
+//! 5. a vertex no declared source can reach is bound to the nearest declared
+//!    extremity bone instead, and the seam between the copied and the bound
+//!    region is smoothed over the mesh graph, so an extremity is not a rigid
+//!    island with a torn boundary;
 //! 6. all parts merge into one arena with one palette, one partition per part
 //!    and the review palette's colour for each;
 //! 7. named clips are mapped by bone name exactly as `export.glb` maps them;
@@ -80,6 +83,10 @@ pub const DEFAULT_REACH_RADIUS: f32 = 3.0;
 pub const DEFAULT_LAYER_REACH_RADIUS: f32 = sculpto_mesh::garment::DEFAULT_TRANSFER_RADIUS;
 /// Graph-smoothing passes over the bound region and its seam.
 pub const DEFAULT_SMOOTH_ITERATIONS: usize = 6;
+/// Largest median surface distance, in source units, a declared weight source may
+/// sit from the vertices it owns. One unit is 1.4 cm; a source further away than
+/// that is not in the part's frame, and its weights would describe another surface.
+pub const DEFAULT_SOURCE_REACH_TOLERANCE: f32 = 1.0;
 /// Share of its own row a smoothed vertex keeps; the rest is the mean of its
 /// neighbours. A half is the largest step that stays monotone across a rigid
 /// region: a uniform neighbourhood does not drift.
@@ -93,6 +100,12 @@ pub struct ExportActorParams {
     pub nif: PathBuf,
     /// Shape name whose weights and rest matrices bind the assembled parts.
     pub body_shape: String,
+    /// Additional authored weight sources: the shapes an assembled body's own
+    /// parts came from. A part vertex copies from whichever declared source is
+    /// nearest, so the head, hands and feet keep the blend their own shape
+    /// authored instead of one rigid bone.
+    #[serde(default)]
+    pub sources: Vec<ActorSource>,
     /// The assembled body OBJ (every part in one shell).
     pub body: PathBuf,
     /// Ranked garment or underwear OBJs, in the body's frame.
@@ -131,6 +144,10 @@ pub struct ExportActorParams {
     /// Smoothing passes over the bound region and its seam.
     #[serde(default)]
     pub smooth_iterations: Option<usize>,
+    /// Admitted median distance, in source units, between a declared source and
+    /// the vertices it owns. A source further away is refused as misaligned.
+    #[serde(default)]
+    pub source_reach_tolerance: Option<f32>,
     /// Bones a vertex beyond the reach may be bound to; empty means every
     /// uniquely named palette bone, nearest rest origin first.
     #[serde(default)]
@@ -150,6 +167,99 @@ pub struct ActorLayer {
     pub order: u32,
     /// Layer OBJ in the body's frame.
     pub obj: PathBuf,
+}
+
+/// One authored weight source: a shape whose skin the parts may copy.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActorSource {
+    /// NIF that carries the shape; absent means the command's own `nif`.
+    #[serde(default)]
+    pub nif: Option<PathBuf>,
+    /// Shape name inside that file.
+    pub shape: String,
+    /// The transform the assembly applied to this part, in the source frame.
+    ///
+    /// The assembled head of an authored body is rotated, scaled or seated off
+    /// the position its NIF authors, so the source surface has to receive the
+    /// same transform before a nearest-surface copy means anything. This mirrors
+    /// the `body assemble` manifest's own `scale`/`rotate`/`translate`, applied in
+    /// that order; absent means the part was placed exactly as authored.
+    #[serde(default)]
+    pub placement: Option<SourcePlacement>,
+}
+
+/// The assembly transform one part received, in the source frame.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePlacement {
+    /// Signed per-axis scale about the origin, applied first.
+    #[serde(default)]
+    pub scale: Option<[f64; 3]>,
+    /// Rotation about one source axis through the origin, applied after the scale.
+    #[serde(default)]
+    pub rotate: Option<SourceRotate>,
+    /// Translation in source units, applied last.
+    #[serde(default)]
+    pub translate: Option<[f64; 3]>,
+}
+
+/// One axis rotation of a declared source.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRotate {
+    /// Source axis the part turns about.
+    pub axis: SourceAxis,
+    /// Degrees, right-handed about that axis.
+    pub degrees: f64,
+}
+
+/// Source axis a declared part rotation turns about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceAxis {
+    /// The source X axis.
+    X,
+    /// The source Y axis.
+    Y,
+    /// The source Z axis.
+    Z,
+}
+
+impl SourcePlacement {
+    /// The part's placement matrix: translation after rotation after scale.
+    fn matrix(&self) -> DMat4 {
+        let scale = self.scale.unwrap_or([1.0; 3]);
+        let mut matrix = DMat4::from_scale(DVec3::from(scale));
+        if let Some(rotate) = &self.rotate {
+            let (sin, cos) = rotate.degrees.to_radians().sin_cos();
+            let rotation = match rotate.axis {
+                SourceAxis::X => DMat4::from_cols_array_2d(&[
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, cos, sin, 0.0],
+                    [0.0, -sin, cos, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+                SourceAxis::Y => DMat4::from_cols_array_2d(&[
+                    [cos, 0.0, -sin, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [sin, 0.0, cos, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+                SourceAxis::Z => DMat4::from_cols_array_2d(&[
+                    [cos, sin, 0.0, 0.0],
+                    [-sin, cos, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+            };
+            matrix = rotation * matrix;
+        }
+        if let Some(translate) = self.translate {
+            matrix = DMat4::from_translation(DVec3::from(translate)) * matrix;
+        }
+        matrix
+    }
 }
 
 /// The command input schema.
@@ -182,6 +292,19 @@ struct SourcePart {
     seam_weld: Option<SeamWeldReport>,
 }
 
+/// What one part copied from one weight source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceBind {
+    /// Shape name the vertices copied from.
+    pub shape: String,
+    /// Vertices whose nearest source is this one.
+    pub vertices: usize,
+    /// Median surface distance to this source.
+    pub reach_median: f32,
+    /// Largest surface distance to this source.
+    pub reach_max: f32,
+}
+
 /// One part after binding: the rows plus what the copy and the fallback measured.
 #[derive(Debug)]
 pub struct BoundPart {
@@ -197,6 +320,8 @@ pub struct BoundPart {
     /// Weighted mass the copy gave this part, per palette slot. The bound mass
     /// comes from the fallback, not from the source, so it is not counted here.
     copied_mass: Vec<f64>,
+    /// Per-source attribution, in declaration order.
+    sources: Vec<SourceBind>,
     rows: Vec<Influences>,
 }
 
@@ -313,15 +438,49 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
         )
     })?;
 
-    // The palette carries every bone the body skin weights plus the declared
+    // Every declared source, placed in the body's own skin frame. The body shape
+    // is always the first source: a part on the body surface copies from it.
+    let (sources, source_bounds) = read_sources(
+        &document,
+        &params.nif,
+        &params.body_shape,
+        shape,
+        global_to_skin,
+        &params.sources,
+    )?;
+
+    // The palette carries every bone any source weights plus the declared
     // extremity bones, then their ancestors: a whole-rig palette is refused by
     // readers above 256 joints and a bone no vertex weights deforms nothing.
     let mut weighted = weighted_bones(&document, shape, &[])?;
+    for source in &sources {
+        for row in &source.rows {
+            for (bone, weight) in row {
+                if *weight > 0.0 {
+                    weighted.insert(bone.clone());
+                }
+            }
+        }
+    }
     for name in &params.extremity_bones {
         weighted.insert(name.clone());
     }
     let (palette, index) = palette_of(&rig, &weighted)?;
-    let body_rows = name_rows(authored_skin);
+    // A bone an extra source also weights takes the derived bind: the body shape's
+    // authored inverse would reconstruct the body's rest, not the part's, and the
+    // repair gate would charge the difference as a source defect.
+    let shared: BTreeSet<String> = sources
+        .iter()
+        .skip(1)
+        .flat_map(|source| {
+            source
+                .rows
+                .iter()
+                .flat_map(|row| row.iter().map(|(bone, weight)| (*weight, bone.as_str())))
+        })
+        .filter(|(weight, _)| *weight > 0.0)
+        .map(|(_, bone)| bone.to_owned())
+        .collect();
     let mut authored: Vec<Option<(usize, DMat4)>> = vec![None; palette.len()];
     for (bone, name) in authored_skin.bones.iter().enumerate() {
         let slot = *index.get(name.as_str()).ok_or_else(|| {
@@ -340,6 +499,9 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
                 format!("body shape {:?} has no bind for bone {bone}", source.name),
             )
         })?;
+        if shared.contains(name.as_str()) {
+            continue;
+        }
         authored[slot] = Some((
             shape,
             DMat4::from_cols_array_2d(&bind.map(|column| column.map(f64::from))),
@@ -396,18 +558,8 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
         }
     }
 
-    // Skin every part against the one body skin, then merge the arena.
-    let binder = PartBinder::new(
-        &rig,
-        &palette,
-        &fallback,
-        BodySurface {
-            positions: &source.positions,
-            triangles: &source.triangles,
-            rows: &body_rows,
-        },
-        iterations,
-    );
+    // Skin every part against the declared weight sources, then merge the arena.
+    let binder = PartBinder::new(&rig, &palette, &fallback, &sources, iterations);
     let mut arena = MeshAsset {
         name: params.body_shape.clone(),
         ..Default::default()
@@ -470,13 +622,48 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
         rows.extend(skin.rows.iter().cloned());
         part_skins.push(skin);
     }
+    let source_tolerance = params
+        .source_reach_tolerance
+        .unwrap_or(DEFAULT_SOURCE_REACH_TOLERANCE);
+    if !source_tolerance.is_finite() || source_tolerance <= 0.0 {
+        return Err(errors::invalid(
+            "source_reach_tolerance",
+            format!("{source_tolerance} is not a positive finite distance"),
+        ));
+    }
+    for (part, skin) in part_rows.iter().zip(&part_skins) {
+        // Only the assembled body has to sit on its own source: a garment layer is
+        // authored to float at its ease, and `layer_reach_radius` already bounds it.
+        if part.role != "body" {
+            continue;
+        }
+        for source in &skin.sources {
+            if source.vertices == 0 || source.reach_median <= source_tolerance {
+                continue;
+            }
+            return Err(refused(
+                "export_actor_source_misaligned",
+                format!(
+                    "source {:?} owns {} vertices of part {:?} at a median distance of {:.4} \
+                     source units (admitted {source_tolerance}); declare the part `placement` the \
+                     assembly applied, or the copied weights describe a surface the part is not",
+                    source.shape, source.vertices, part.name, source.reach_median
+                ),
+            ));
+        }
+    }
 
     // One influence arena over the whole palette.
     let mut joints = Vec::new();
     let mut values = Vec::new();
     let mut offsets = vec![0_u32];
     for row in &rows {
-        for (bone, weight) in row {
+        // Influence weights are stored heaviest first, the order every importer
+        // reads a bone row in (Unity `BoneWeight.html:244`); a `BTreeMap` row is
+        // otherwise in bone-name order.
+        let mut ordered: Vec<(&String, &f32)> = row.iter().collect();
+        ordered.sort_by(|left, right| right.1.total_cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (bone, weight) in ordered {
             let slot = *index.get(bone.as_str()).ok_or_else(|| {
                 refused(
                     "export_actor_palette",
@@ -658,6 +845,17 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
             "smooth_iterations": iterations,
             "skins": 1,
             "parts": part_rows.len(),
+            "sources": sources
+                .iter()
+                .zip(&source_bounds)
+                .map(|(source, (shape, lo, hi))| json!({
+                    "shape": shape,
+                    "declared": source.shape,
+                    "vertices": source.positions.len(),
+                    "triangles": source.triangles.len(),
+                    "bounds_in_body_frame": {"min": lo, "max": hi},
+                }))
+                .collect::<Vec<_>>(),
         },
         "units": {
             "units_per_metre": params.units_per_metre,
@@ -671,8 +869,9 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
             "tangents": !arena.tangents.is_empty(),
         },
         "bounds": bounds(&arena.positions),
-        "statement": "one skinned actor: the copy reaches the body surface and the fallback binds the \
-                      extremities it cannot reach; a per-part colour is a review material, not a fit result",
+        "statement": "one skinned actor: every part vertex copies the nearest declared source shape and \
+                      the fallback binds only what no source reaches; a per-part colour is a review \
+                      material, not a fit result",
     });
     if let Some(path) = &params.report {
         write_report(path, &report)?;
@@ -707,6 +906,16 @@ fn part_value(part: &PartRow, skin: &BoundPart) -> Value {
         "influences_sum_error": skin.sum_error,
         "fallback_bones": pairs(&skin.fallback),
         "dominant_bones": pairs(&skin.dominant),
+        "sources": skin
+            .sources
+            .iter()
+            .map(|source| json!({
+                "shape": source.shape,
+                "vertices": source.vertices,
+                "reach_median": source.reach_median,
+                "reach_max": source.reach_max,
+            }))
+            .collect::<Vec<_>>(),
     });
     if let Some(seam) = &part.seam_weld {
         value["seam_weld"] = json!({
@@ -924,14 +1133,164 @@ pub fn weld_layer(
     seam_weld(positions, triangles, SEAM_WELD_EPSILON)
 }
 
-/// The body surface and its authored rows, shared by every part.
-pub struct BodySurface<'a> {
-    /// Body vertices in the skin frame the copy runs in.
-    pub positions: &'a [[f32; 3]],
-    /// Body triangles over those vertices.
-    pub triangles: &'a [[u32; 3]],
-    /// Authored weights per body vertex, by bone name.
-    pub rows: &'a [Influences],
+/// A source's axis-aligned bounds in the body skin frame, for the report.
+type SourceBounds = (String, [f32; 3], [f32; 3]);
+
+/// One authored weight source placed in the body's own skin frame.
+///
+/// The head, hands and feet of this collection are their own NIF shapes, so a
+/// part vertex has to copy from the shape it actually is; the body surface alone
+/// leaves every extremity vertex beyond reach. @req DECL0002
+pub struct WeightSource {
+    /// Shape name, as the report names it.
+    pub shape: String,
+    /// Source vertices in the body skin frame.
+    pub positions: Vec<[f32; 3]>,
+    /// Source triangles over those vertices.
+    pub triangles: Vec<[u32; 3]>,
+    /// Authored weights per source vertex, by bone name.
+    pub rows: Vec<Influences>,
+}
+
+/// Read the body shape and every declared source into the body's skin frame.
+///
+/// A part vertex copies from the nearest source, so the sources must share one
+/// frame: each shape's stored position is taken to the source scene with its own
+/// global-to-skin inverse and then into the body skin with the body's matrix.
+fn read_sources(
+    body_document: &sculpto_nif::NifDocument,
+    body_path: &Path,
+    body_shape_name: &str,
+    body_shape: usize,
+    body_global_skin: [[f32; 4]; 4],
+    declared: &[ActorSource],
+) -> Result<(Vec<WeightSource>, Vec<SourceBounds>), CommandError> {
+    let body = body_document.shapes.get(body_shape).ok_or_else(|| {
+        errors::invalid(
+            "body_shape",
+            format!("shape index {body_shape} is outside the file"),
+        )
+    })?;
+    let body_skin = body
+        .skin
+        .as_ref()
+        .expect("the body shape's skin was resolved");
+    let bounds_of = |positions: &[[f32; 3]]| {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for point in positions {
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(point[axis]);
+                hi[axis] = hi[axis].max(point[axis]);
+            }
+        }
+        (lo, hi)
+    };
+    let (body_lo, body_hi) = bounds_of(&body.positions);
+    let mut source_bounds: Vec<SourceBounds> = vec![(body_shape_name.to_owned(), body_lo, body_hi)];
+    let mut sources = vec![WeightSource {
+        shape: body_shape_name.to_owned(),
+        positions: body.positions.clone(),
+        triangles: body.triangles.clone(),
+        rows: name_rows(body_skin),
+    }];
+    let to_body = DMat4::from_cols_array_2d(&body_global_skin.map(|column| column.map(f64::from)));
+    let mut cache: BTreeMap<PathBuf, sculpto_nif::NifDocument> = BTreeMap::new();
+    for entry in declared {
+        let path = entry.nif.clone().unwrap_or_else(|| body_path.to_path_buf());
+        let document = match cache.remove(&path) {
+            Some(document) => document,
+            None => {
+                let bytes = std::fs::read(&path).map_err(|error| errors::io(&path, error))?;
+                sculpto_nif::read(&bytes).map_err(errors::nif)?
+            }
+        };
+        let index = resolve_shape(&document, &entry.shape, "sources")?;
+        let shape = document.shapes.get(index).expect("a resolved shape exists");
+        let skin = shape.skin.as_ref().ok_or_else(|| {
+            refused(
+                "export_actor_unskinned_shape",
+                format!("source shape {:?} carries no authored skin", shape.name),
+            )
+        })?;
+        if shape.positions.is_empty() || shape.triangles.is_empty() {
+            return Err(refused(
+                "export_actor_empty_shape",
+                format!("source shape {:?} has no geometry to copy from", shape.name),
+            ));
+        }
+        if path == body_path && index == body_shape {
+            return Err(errors::invalid(
+                "sources",
+                format!(
+                    "shape {:?} is declared as a source and is already the body shape; its weights \
+                     would be counted twice",
+                    entry.shape
+                ),
+            ));
+        }
+        let record = document.sources.get(index).ok_or_else(|| {
+            refused(
+                "export_actor_incomplete_rig",
+                format!("source shape {index} has no source skin record"),
+            )
+        })?;
+        let source_global = record.global_skin.ok_or_else(|| {
+            refused(
+                "export_actor_incomplete_rig",
+                format!(
+                    "source shape {:?} has no global-to-skin matrix; it cannot reach the body frame",
+                    shape.name
+                ),
+            )
+        })?;
+        // G_body · M · G_source⁻¹ brings a stored source vertex into the body
+        // skin frame: M is the placement the assembly gave the part in the source
+        // scene, and the two global-to-skin matrices differ whenever the files
+        // were exported from different skeleton roots.
+        let to_source =
+            DMat4::from_cols_array_2d(&source_global.map(|column| column.map(f64::from)));
+        let placement = entry
+            .placement
+            .as_ref()
+            .map_or(DMat4::IDENTITY, SourcePlacement::matrix);
+        let frame = to_body * placement * to_source.inverse();
+        let positions = shape
+            .positions
+            .iter()
+            .map(|&point| {
+                frame
+                    .transform_point3(DVec3::from(point.map(f64::from)))
+                    .to_array()
+                    .map(|value| value as f32)
+            })
+            .collect::<Vec<[f32; 3]>>();
+        if let Some(bad) = positions
+            .iter()
+            .position(|point| point.iter().any(|v| !v.is_finite()))
+        {
+            return Err(refused(
+                "export_actor_source_frame",
+                format!(
+                    "source shape {:?} vertex {bad} has no finite position in the body frame; its \
+                     global-to-skin matrix cannot be inverted into this scene",
+                    shape.name
+                ),
+            ));
+        }
+        let triangles = shape.triangles.clone();
+        let rows = name_rows(skin);
+        cache.insert(path, document);
+        let (lo, hi) = bounds_of(&positions);
+        source_bounds.push((entry.shape.clone(), lo, hi));
+        sources.push(WeightSource {
+            shape: entry.shape.clone(),
+            positions,
+            triangles,
+            rows,
+        });
+    }
+    Ok((sources, source_bounds))
 }
 
 /// One part's binding context: the rig, the palette, the fallback bones and the
@@ -944,71 +1303,87 @@ pub struct PartBinder<'a> {
     rig: &'a Rig,
     palette: &'a [String],
     fallback: &'a [usize],
-    body: BodySurface<'a>,
+    sources: &'a [WeightSource],
     iterations: usize,
 }
 
 impl<'a> PartBinder<'a> {
-    /// Bind one part against one body surface.
+    /// Bind one part against the declared weight sources.
     #[must_use]
     pub fn new(
         rig: &'a Rig,
         palette: &'a [String],
         fallback: &'a [usize],
-        body: BodySurface<'a>,
+        sources: &'a [WeightSource],
         iterations: usize,
     ) -> Self {
         Self {
             rig,
             palette,
             fallback,
-            body,
+            sources,
             iterations,
         }
     }
 
-    /// Copy the body skin onto one part and bind what the copy cannot reach.
+    /// Copy the authored weights onto one part and bind what no source reaches.
+    ///
+    /// Every part vertex copies from the declared source nearest to it, so the
+    /// assembled head, hands and feet keep the blend their own shape authored.
     ///
     /// # Errors
-    /// A part vertex with no comparable body triangle, no fallback bone for an
-    /// unreached vertex, a copy the engine refuses, and every violated weight
-    /// invariant (a zero-sum row, more than four influences, an off-unit sum).
+    /// A part vertex with no comparable triangle in any source, no fallback bone
+    /// for an unreached vertex, a copy the engine refuses, and every violated
+    /// weight invariant (a zero-sum row, more than four influences, an off-unit
+    /// sum).
     pub fn bind(
         &self,
         positions: &[[f32; 3]],
         triangles: &[[u32; 3]],
         reach_limit: f32,
     ) -> Result<BoundPart, CommandError> {
-        let distances = surface_distances(positions, self.body.positions, self.body.triangles);
-        let mut values = Vec::with_capacity(positions.len());
-        let mut reach: Vec<f32> = Vec::with_capacity(positions.len());
+        if self.sources.is_empty() {
+            return Err(refused(
+                "export_actor_unreachable",
+                "no weight source is declared; a part vertex has nothing to copy from".to_owned(),
+            ));
+        }
+        // One surface-distance field per source; the nearest source owns the
+        // vertex, and the smallest of those distances is what the reach tests.
+        let mut nearest = vec![0_usize; positions.len()];
+        let mut reach: Vec<f32> = vec![f32::INFINITY; positions.len()];
+        let mut per_source: Vec<Vec<f32>> = vec![Vec::new(); self.sources.len()];
+        let mut measured = vec![false; positions.len()];
+        for (index, source) in self.sources.iter().enumerate() {
+            let distances = surface_distances(positions, &source.positions, &source.triangles);
+            for (vertex, hit) in distances.iter().enumerate() {
+                let Some(distance) = hit else {
+                    continue;
+                };
+                measured[vertex] = true;
+                if *distance < reach[vertex] {
+                    reach[vertex] = *distance;
+                    nearest[vertex] = index;
+                }
+            }
+        }
         let mut unreached = Vec::new();
-        for (vertex, hit) in distances.iter().enumerate() {
-            let Some(distance) = hit else {
+        for (vertex, distance) in reach.iter().enumerate() {
+            if !measured[vertex] {
                 return Err(refused(
                     "export_actor_unreachable",
                     format!(
-                        "part vertex {vertex} is outside reach: the body surface has no comparable \
-                         triangle, so no weight could be copied and no distance measured"
+                        "part vertex {vertex} is outside reach: no declared source has a \
+                         comparable triangle, so no weight could be copied"
                     ),
                 ));
-            };
-            reach.push(*distance);
-            let beyond = *distance > reach_limit;
-            values.push(match beyond {
-                true => 1.0,
-                false => 0.0,
-            });
-            if beyond {
+            }
+            if *distance > reach_limit {
                 unreached.push(vertex);
+            } else {
+                per_source[nearest[vertex]].push(*distance);
             }
         }
-        let mask = VertexMask::from_values(values).map_err(|error| {
-            refused(
-                "export_actor_unreachable",
-                format!("the reach mask is invalid: {error}"),
-            )
-        })?;
         if !unreached.is_empty() && self.fallback.is_empty() {
             return Err(refused(
                 "export_actor_unreachable",
@@ -1041,10 +1416,10 @@ impl<'a> PartBinder<'a> {
                 DVec3::new(world[3][0], world[3][1], world[3][2])
             })
             .collect();
-        let mut current: Vec<Influences> = vec![Influences::new(); positions.len()];
+        let mut current: Vec<Influences> = Vec::with_capacity(positions.len());
         let mut fallback: BTreeMap<usize, usize> = BTreeMap::new();
-        for &vertex in &unreached {
-            let point = DVec3::from_array(positions[vertex].map(f64::from));
+        for (vertex, position) in positions.iter().enumerate() {
+            let point = DVec3::from_array(position.map(f64::from));
             let nearest = origins
                 .iter()
                 .enumerate()
@@ -1057,25 +1432,63 @@ impl<'a> PartBinder<'a> {
                 .map(|(order, _)| order)
                 .expect("a declared fallback bone has an origin");
             let slot = self.fallback[nearest];
-            *fallback.entry(slot).or_insert(0) += 1;
-            current[vertex].insert(self.palette[slot].clone(), 1.0);
+            let unreached_here = unreached.binary_search(&vertex).is_ok();
+            if unreached_here {
+                *fallback.entry(slot).or_insert(0) += 1;
+            }
+            let mut row = Influences::new();
+            row.insert(self.palette[slot].clone(), 1.0);
+            current.push(row);
         }
 
-        // The copy radius stays above the reach so a vertex the surface test
-        // admits always has a cached body vertex to copy from: the cache measures
-        // vertex-to-vertex distance, the mask measures surface distance.
-        let mut rows = transfer(
-            positions,
-            self.body.positions,
-            self.body.rows,
-            &TransferOptions {
-                radius: reach_limit * 2.0,
-                garment_mask: Some(mask.as_slice().to_vec()),
-                current: Some(current),
-                ..TransferOptions::default()
-            },
-        )
-        .map_err(copy_error)?;
+        // One copy per source. A vertex every source but its own keeps masked, so
+        // the copy leaves that row exactly as it stands; only the source that owns
+        // a vertex writes it. Rows a source has not written yet carry their
+        // fallback bone as a legal placeholder and are replaced when their source
+        // runs, so a masked row is always a complete weight set.
+        let mut rows = current.clone();
+        for (index, source) in self.sources.iter().enumerate() {
+            let values: Vec<f32> = (0..positions.len())
+                .map(|vertex| {
+                    match unreached.binary_search(&vertex).is_ok() || nearest[vertex] != index {
+                        true => 1.0,
+                        false => 0.0,
+                    }
+                })
+                .collect();
+            let mask = VertexMask::from_values(values).map_err(|error| {
+                refused(
+                    "export_actor_unreachable",
+                    format!("the reach mask is invalid: {error}"),
+                )
+            })?;
+            // A masked row keeps its current weights, so it has to be complete;
+            // the vertices this source owns start empty so the copy writes the
+            // row outright instead of leaving a seed bone at weight one.
+            let mut base: Vec<Influences> = rows.clone();
+            for (vertex, row) in base.iter_mut().enumerate() {
+                if mask.as_slice()[vertex] == 0.0 {
+                    *row = Influences::new();
+                }
+            }
+            let copied = transfer(
+                positions,
+                &source.positions,
+                &source.rows,
+                &TransferOptions {
+                    radius: reach_limit * 2.0,
+                    garment_mask: Some(mask.as_slice().to_vec()),
+                    current: Some(base),
+                    ..TransferOptions::default()
+                },
+            )
+            .map_err(copy_error)?;
+            for (vertex, row) in copied.into_iter().enumerate() {
+                if mask.as_slice()[vertex] == 0.0 {
+                    rows[vertex] = row;
+                }
+            }
+        }
         let smoothed = smooth(triangles, &mut rows, &unreached, self.iterations);
         let (widest, sum_error) = contract(&rows, positions.len())?;
         let bound: BTreeSet<usize> = unreached.iter().copied().collect();
@@ -1098,17 +1511,29 @@ impl<'a> PartBinder<'a> {
             .map(|(slot, vertices)| (self.palette[slot].clone(), vertices))
             .collect();
         fallback.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let sources = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| SourceBind {
+                shape: source.shape.clone(),
+                vertices: per_source[index].len(),
+                reach_median: median(&mut per_source[index].clone()),
+                reach_max: per_source[index].iter().copied().fold(0.0_f32, f32::max),
+            })
+            .collect();
         Ok(BoundPart {
             reached: positions.len() - unreached.len(),
             bound: unreached.len(),
             smoothed,
-            reach_median: median(&mut reach.clone()),
-            reach_max: reach.iter().copied().fold(0.0_f32, f32::max),
+            reach_median: median(&mut per_source.iter().flatten().copied().collect::<Vec<_>>()),
+            reach_max: per_source.iter().flatten().copied().fold(0.0_f32, f32::max),
             widest,
             sum_error,
             fallback,
             dominant: dominant(&rows),
             copied_mass,
+            sources,
             rows,
         })
     }

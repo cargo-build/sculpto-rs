@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigFrame};
-use sculpto_engine::export_actor::{BodySurface, PartBinder};
+use sculpto_engine::export_actor::{PartBinder, WeightSource};
 use sculpto_mesh::garment::Influences;
 
 /// Root at the origin, a torso at z=1 and a head at z=5: the extremity bone sits
@@ -80,19 +80,15 @@ fn bind(
     let rig = rig();
     let palette = palette();
     let (positions, triangles) = part();
-    PartBinder::new(
-        &rig,
-        &palette,
-        fallback,
-        BodySurface {
-            positions: &body_positions,
-            triangles: &body_triangles,
-            rows: &rows,
-        },
-        iterations,
-    )
-    .bind(&positions, &triangles, reach)
-    .expect("the portable part binds")
+    let sources = [WeightSource {
+        shape: "Torso".to_owned(),
+        positions: body_positions.clone(),
+        triangles: body_triangles.clone(),
+        rows,
+    }];
+    PartBinder::new(&rig, &palette, fallback, &sources, iterations)
+        .bind(&positions, &triangles, reach)
+        .expect("the portable part binds")
 }
 
 #[test]
@@ -163,19 +159,15 @@ fn an_unreached_vertex_with_no_fallback_refuses_with_its_measure() {
     let rig = rig();
     let palette = palette();
     let (positions, triangles) = part();
-    let refused = PartBinder::new(
-        &rig,
-        &palette,
-        &[],
-        BodySurface {
-            positions: &body_positions,
-            triangles: &body_triangles,
-            rows: &rows,
-        },
-        0,
-    )
-    .bind(&positions, &triangles, 3.0)
-    .expect_err("four vertices have nowhere to go");
+    let sources = [WeightSource {
+        shape: "Torso".to_owned(),
+        positions: body_positions.clone(),
+        triangles: body_triangles.clone(),
+        rows: rows.clone(),
+    }];
+    let refused = PartBinder::new(&rig, &palette, &[], &sources, 0)
+        .bind(&positions, &triangles, 3.0)
+        .expect_err("four vertices have nowhere to go");
     assert_eq!(refused.code(), "export_actor_unreachable");
     let message = format!("{refused}");
     assert!(
@@ -211,19 +203,15 @@ fn a_palette_slot_is_not_a_rig_index() {
     let (body_positions, body_triangles) = body();
     let rows = body_rows();
     let (positions, triangles) = part();
-    let bound = PartBinder::new(
-        &rig,
-        &palette,
-        &[1, 2],
-        BodySurface {
-            positions: &body_positions,
-            triangles: &body_triangles,
-            rows: &rows,
-        },
-        0,
-    )
-    .bind(&positions, &triangles, 3.0)
-    .expect("the portable part binds");
+    let sources = [WeightSource {
+        shape: "Torso".to_owned(),
+        positions: body_positions.clone(),
+        triangles: body_triangles.clone(),
+        rows: rows.clone(),
+    }];
+    let bound = PartBinder::new(&rig, &palette, &[1, 2], &sources, 0)
+        .bind(&positions, &triangles, 3.0)
+        .expect("the portable part binds");
     for (vertex, row) in bound.rows().iter().enumerate().skip(6) {
         assert_eq!(
             row.get("Head"),

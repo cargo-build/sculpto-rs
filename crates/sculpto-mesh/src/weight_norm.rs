@@ -24,6 +24,14 @@ pub const WEIGHT_EPSILON: f32 = 0.001;
 pub const MAX_INFLUENCES: usize = 4;
 /// Admitted error of the packed weight sum.
 pub const SUM_TOLERANCE: f32 = 1e-4;
+/// Smallest influence the final pack keeps, before the row is renormalized.
+///
+/// A weight under a ten-thousandth of a vertex carries no visible deformation but
+/// still costs an influence slot, so the strict pack drops it and gives its mass
+/// to the influences that remain: the importer rule is "residue below
+/// `minBoneWeight` is dropped before renormalising"
+/// (`ModelImporter-minBoneWeight.html:243`, default `0.0001`).
+pub const MIN_INFLUENCE_WEIGHT: f32 = 1e-4;
 
 /// Why one influence is not an acceptable skin weight.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -330,9 +338,10 @@ impl WeightNormalizer {
 /// Cap one vertex at the four NIF influence slots around its locked mass.
 ///
 /// Locked positives are kept bit-exactly and consume their exact mass, not the
-/// normalizer's epsilon-rounded total. The largest unlocked positives take the
-/// remaining slots, ties resolving by name, and only they are scaled to the
-/// exact remainder. A remainder inside [`SUM_TOLERANCE`] is left unassigned
+/// normalizer's epsilon-rounded total. Unlocked positives below
+/// [`MIN_INFLUENCE_WEIGHT`] are dropped as residue first, then the largest of what
+/// remains take the free slots, ties resolving by name, and only they are scaled
+/// to the exact remainder. A remainder inside [`SUM_TOLERANCE`] is left unassigned
 /// because the sum already meets the guarantee.
 ///
 /// # Errors
@@ -386,9 +395,22 @@ pub fn pack_influences(
     let slots = MAX_INFLUENCES - packed.len();
     let mut unlocked: Vec<(String, f32)> = influences
         .iter()
-        .filter(|(bone, weight)| !locked.contains(bone.as_str()) && **weight > 0.0)
+        .filter(|(bone, weight)| {
+            !locked.contains(bone.as_str()) && **weight >= MIN_INFLUENCE_WEIGHT
+        })
         .map(|(bone, weight)| (bone.clone(), *weight))
         .collect();
+    if unlocked.is_empty() {
+        // Every unlocked influence is residue; the heaviest one carries the
+        // remainder so the row never collapses to nothing.
+        if let Some(row) = influences
+            .iter()
+            .filter(|(bone, weight)| !locked.contains(bone.as_str()) && **weight > 0.0)
+            .max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(left.0)))
+        {
+            unlocked.push((row.0.clone(), *row.1));
+        }
+    }
     // Largest first, name ascending on a tie: a rerun chooses the same bones.
     unlocked.sort_by(|left, right| {
         right

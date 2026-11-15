@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sculpto_engine::export_actor::{ActorLayer, ExportActorParams, run};
+use sculpto_engine::export_actor::{ActorLayer, ActorSource, ExportActorParams, run};
 use sculpto_mesh::actor::{Actor, Pose};
 use serde_json::Value;
 
@@ -47,6 +47,25 @@ fn params(case: &Value, out_dir: &Path) -> ExportActorParams {
     ExportActorParams {
         nif: path(case, "nif"),
         body_shape: case["body_shape"].as_str().expect("body_shape").to_string(),
+        sources: case
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| ActorSource {
+                        nif: entry.get("nif").and_then(Value::as_str).map(PathBuf::from),
+                        shape: entry["shape"].as_str().expect("source shape").to_string(),
+                        placement: entry.get("placement").filter(|value| !value.is_null()).map(
+                            |value| {
+                                serde_json::from_value(value.clone())
+                                    .expect("the source placement matches the declaration")
+                            },
+                        ),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         body: path(case, "body"),
         layers: case["layers"]
             .as_array()
@@ -72,6 +91,7 @@ fn params(case: &Value, out_dir: &Path) -> ExportActorParams {
         reach_radius: None,
         layer_reach_radius: None,
         smooth_iterations: None,
+        source_reach_tolerance: None,
         extremity_bones: case["extremity_bones"]
             .as_array()
             .expect("extremity_bones")

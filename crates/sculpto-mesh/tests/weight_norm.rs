@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 
 use sculpto_mesh::garment::Influences;
 use sculpto_mesh::weight_norm::{
-    MAX_INFLUENCES, SUM_TOLERANCE, WEIGHT_EPSILON, WeightError, WeightNormalizer, pack_influences,
+    MAX_INFLUENCES, MIN_INFLUENCE_WEIGHT, SUM_TOLERANCE, WEIGHT_EPSILON, WeightError,
+    WeightNormalizer, pack_influences,
 };
 
 fn names(list: &[&str]) -> Vec<String> {
@@ -228,6 +229,44 @@ fn six_positives_reduce_to_four() {
     // The four kept weights sum to 0.8 and are scaled to the exact remainder.
     close(packed["C"], 0.375, "scaled C");
     close(mass(&packed), 1.0, "packed sum");
+}
+
+#[test]
+fn residue_below_the_import_threshold_is_dropped_before_renormalising() {
+    // One real influence and three residues an importer would discard: the pack
+    // keeps the real one and gives it the whole remainder instead of spending
+    // three slots on weights no vertex can show.
+    let vertex = influences(&[
+        ("Spine", 0.7),
+        ("Chest", MIN_INFLUENCE_WEIGHT / 2.0),
+        ("Neck", MIN_INFLUENCE_WEIGHT / 4.0),
+        ("Head", MIN_INFLUENCE_WEIGHT / 8.0),
+    ]);
+    let packed = pack_influences(&vertex, &BTreeSet::new()).expect("packed");
+    assert_eq!(
+        packed.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["Spine"]
+    );
+    close(
+        packed["Spine"],
+        1.0,
+        "the residue mass moved to the kept influence",
+    );
+}
+
+#[test]
+fn an_all_residue_row_keeps_its_heaviest_influence() {
+    let vertex = influences(&[
+        ("Spine", MIN_INFLUENCE_WEIGHT / 2.0),
+        ("Chest", MIN_INFLUENCE_WEIGHT / 3.0),
+    ]);
+    let packed = pack_influences(&vertex, &BTreeSet::new()).expect("packed");
+    assert_eq!(
+        packed.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["Spine"],
+        "a row that is all residue still carries its remainder"
+    );
+    close(packed["Spine"], 1.0, "single-influence row");
 }
 
 #[test]

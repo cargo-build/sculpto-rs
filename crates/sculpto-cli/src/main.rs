@@ -158,6 +158,10 @@ export-actor options:
   --nif <path>            skinned NIF carrying the rig, palette and body weights
   --body-shape <name>     shape whose weights and rest matrices bind the parts
   --body <obj>            the assembled body OBJ (every part in one shell)
+  --source <shape>[=<nif>]
+                          authored weight source a part vertex may copy from; the
+                          nearest declared source owns each vertex (repeatable; the
+                          body shape is always the first source)
   --layer <rank>=<obj>    ranked underwear or garment OBJ (repeatable; rank 1..=5)
   --skeleton <path>       family skeleton NIF that completes the authored rig
   --clips <path>          source actor GLB whose clips are mapped by bone name
@@ -1375,8 +1379,9 @@ fn export_glb(args: &[String]) -> ExitCode {
     run::dispatch_payload("export.glb", &input)
 }
 
-/// `export-actor`: repeated `--layer rank=obj`, `--clip` and `--extremity-bone`
-/// flags, so the flags are parsed here instead of through [`parse_flags`].
+/// `export-actor`: repeated `--layer rank=obj`, `--clip`, `--source` and
+/// `--extremity-bone` flags, so the flags are parsed here instead of through
+/// [`parse_flags`].
 fn export_actor(args: &[String]) -> ExitCode {
     let mut nif: Option<String> = None;
     let mut body_shape: Option<String> = None;
@@ -1386,6 +1391,7 @@ fn export_actor(args: &[String]) -> ExitCode {
     let mut clips: Option<String> = None;
     let mut clip_names: Vec<String> = Vec::new();
     let mut extremity: Vec<String> = Vec::new();
+    let mut sources: Vec<serde_json::Value> = Vec::new();
     let mut out: Option<String> = None;
     let mut report: Option<String> = None;
     let mut units: Option<f64> = None;
@@ -1426,6 +1432,17 @@ fn export_actor(args: &[String]) -> ExitCode {
             "clips" => clips = Some(value.clone()),
             "clip" => clip_names.push(value.clone()),
             "extremity-bone" => extremity.push(value.clone()),
+            "source" => match value.split_once('=') {
+                Some((shape, file)) if !shape.is_empty() && !file.is_empty() => {
+                    sources.push(serde_json::json!({"shape": shape, "nif": file}));
+                }
+                Some(_) => {
+                    return reject(format!(
+                        "`--source {value}` needs <shape>=<nif> with neither side empty"
+                    ));
+                }
+                None => sources.push(serde_json::json!({"shape": value})),
+            },
             "out" => out = Some(value.clone()),
             "report" => report = Some(value.clone()),
             "units-per-metre" => match number(name, value) {
@@ -1466,6 +1483,7 @@ fn export_actor(args: &[String]) -> ExitCode {
         "layers": layers,
         "clip_names": clip_names,
         "extremity_bones": extremity,
+        "sources": sources,
         "out": out,
     });
     for (key, value) in [("skeleton", skeleton), ("clips", clips), ("report", report)] {
