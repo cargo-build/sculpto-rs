@@ -29,19 +29,19 @@ WGPU_BACKEND=vulkan ./target/debug/cloth-viewer
 ```
 
 The build needs the window, X11 and Vulkan development inputs that NixOS does
-not expose in a plain shell. Build and run inside the shipped shell, and pass
-the runtime ICD through:
+not expose in a plain shell. Build and run inside the shipped dev shell
+(`flake.nix`), which also exports the runtime libraries, so no hand-assembled
+`LD_LIBRARY_PATH` is needed:
 
 ```sh
-nix-shell shell.nix --run 'cargo build -j 2'
-nix-shell shell.nix --run '
-  LD_LIBRARY_PATH=/run/opengl-driver/lib:$(echo "$NIX_LDFLAGS" |
-    grep -o -- "-L[^ ]*" | sed "s/^-L//" | paste -sd:):$LD_LIBRARY_PATH \
-  VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json \
-  WGPU_BACKEND=vulkan \
-  ./target/debug/cloth-viewer --interactive \
-    --glb ~/Models/sculpto-cloth-fixture-20261115/peanut-r105.glb'
+nix develop -c cargo build -j 2
+nix develop -c ./target/debug/cloth-viewer --interactive \
+  --glb ~/Models/sculpto-cloth-fixture-20261115/peanut-r105.glb
 ```
+
+The shell puts `/run/opengl-driver/lib` (the host's GL/Vulkan driver) first when
+it exists; set `VK_ICD_FILENAMES`/`WGPU_BACKEND` only for a non-default backend.
+An `.envrc` with `use flake` loads the same shell on `cd` when direnv is on.
 
 `SCULPTO_VIEWER_SCALE` multiplies the loaded scene before the fixed camera and
 lights see it. BodySlide-authored fixtures are in lab units (71.4286 per
