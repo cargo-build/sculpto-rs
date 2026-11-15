@@ -495,7 +495,10 @@ fn fill_head_components(
                 .iter()
                 .map(|vertex| {
                     let p = positions[*vertex as usize];
-                    ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2) + (p[2] - center[2]).powi(2)).sqrt()
+                    ((p[0] - center[0]).powi(2)
+                        + (p[1] - center[1]).powi(2)
+                        + (p[2] - center[2]).powi(2))
+                    .sqrt()
                 })
                 .fold(0.0_f32, f32::max);
             let lift = 0.30 * radius;
