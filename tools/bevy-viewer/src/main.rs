@@ -388,7 +388,7 @@ fn character_controls(
         };
         let right = camera.rotation * Vec3::X;
         let up = camera.rotation * Vec3::Y;
-        pose.offset += right * (delta.x * 0.002) + up * (delta.y * 0.002);
+        pose.offset += right * (delta.x * 0.002) - up * (delta.y * 0.002);
     }
 }
 
@@ -583,7 +583,8 @@ fn setup(
         let mut entity = commands.spawn((
             DirectionalLight {
                 illuminance,
-                shadow_maps_enabled: key,
+                shadow_maps_enabled: key
+                    && std::env::var("SCULPTO_VIEWER_NO_SHADOWS").is_err(),
                 ..default()
             },
             Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y),

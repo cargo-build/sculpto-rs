@@ -485,8 +485,24 @@ fn fill_head_components(
 ) -> Result<HoleFillReport, HoleFillError> {
     let components = boundary_components(triangles, positions)?;
     let mut report = HoleFillReport::default();
-    for (vertices, _normal) in components {
-        let center = component_centroid(positions, &vertices);
+    for (vertices, normal) in components {
+        let mut center = component_centroid(positions, &vertices);
+        // Lift the patch slightly along the outward normal: a flat lid on a
+        // concave nape renders as a dark crease even with shadows off.
+        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if length > 0.0 {
+            let radius = vertices
+                .iter()
+                .map(|vertex| {
+                    let p = positions[*vertex as usize];
+                    ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2) + (p[2] - center[2]).powi(2)).sqrt()
+                })
+                .fold(0.0_f32, f32::max);
+            let lift = 0.30 * radius;
+            center[0] += (normal[0] / length) as f32 * lift;
+            center[1] += (normal[1] / length) as f32 * lift;
+            center[2] += (normal[2] / length) as f32 * lift;
+        }
         if !inside_box(center, head, margin) {
             continue;
         }
