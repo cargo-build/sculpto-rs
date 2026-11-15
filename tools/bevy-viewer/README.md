@@ -99,18 +99,16 @@ several cameras on consecutive ticks, `SCULPTO_VIEWER_DIR` receives
 
 Lighting is runtime PBR, not baked into the exported GLB (`viewer export` writes
 albedo and normals only). The interactive viewer defaults to **one key light** with
-`shadow_maps_enabled`, and spawns a matte ground so the cast shadow is visible: turn
-the figure with the default LMB drag and the shading and shadow move with the
-surface; `T` switches the drag to camera orbit. `3` toggles the
-optional three-point rig (fill and rim) when the far side is too dark to read;
-`SCULPTO_VIEWER_THREE_POINT` seeds it. `L` toggles lit/flat; flat hides the whole rig
-and ground and renders every material unlit, so a review shows the silhouette, the
-seams and the layer palette without a shadow that can be mistaken for a defect. The
-capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds and stays on the black
-backdrop (no ground).
-
-`T` switches the drag from camera orbit to a turntable: the figure rotates under
-the fixed key light, so shading and cast shadows sweep across the surface. That
-is the mode for judging form; a camera orbit keeps every surface lit the same
-way and is only a change of viewpoint. Keyboard events need the window focused —
-agent-opened preview windows start unfocused by design, so click the figure once.
+`shadow_maps_enabled`, and spawns a matte ground so the cast shadow is visible. The
+default mouse keeps the camera controls (LMB orbit, RMB pan). **Ctrl+LMB turns the
+figure**, **Ctrl+RMB moves it sideways** under the fixed light, and **Shift+LMB
+moves the key light**; every one of those changes the shading and the cast shadow.
+`3` toggles the optional three-point rig (fill and rim) when the far side is too dark
+to read; `SCULPTO_VIEWER_THREE_POINT` seeds it. `L` toggles lit/flat; flat hides the
+whole rig and ground and renders every material unlit, so a review shows the
+silhouette, the seams and the layer palette without a shadow that can be mistaken
+for a defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds and stays
+on the black backdrop (no ground); `SCULPTO_VIEWER_GROUND=1` adds the ground and
+`SCULPTO_VIEWER_TURNTABLE_YAW` seeds the figure pose for a shadow comparison.
+Keyboard events need the window focused — agent-opened preview windows start
+unfocused by design, so click the figure once.

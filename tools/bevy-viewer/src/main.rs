@@ -106,14 +106,47 @@ struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
 #[derive(Component)]
 struct ReviewModel;
 
-/// Turntable state: `T` flips it and horizontal drag then rotates the model
-/// instead of orbiting the camera. Seeded by `SCULPTO_VIEWER_TURNTABLE`.
-#[derive(Resource)]
-struct Turntable {
-    enabled: bool,
+/// Key-light orbit: Shift+LMB moves the light around the figure while the
+/// character stays put, so the shading and cast shadow follow the light.
+#[derive(Resource, Clone, Copy)]
+struct LightOrbit {
+    azimuth: f32,
+    elevation: f32,
+    radius: f32,
+}
+
+impl LightOrbit {
+    fn from_position(position: Vec3) -> Self {
+        let radius = position.length().max(0.2);
+        Self {
+            azimuth: position.x.atan2(position.z),
+            elevation: (position.y / radius).asin(),
+            radius,
+        }
+    }
+
+    fn position(self) -> Vec3 {
+        let horizontal = self.radius * self.elevation.cos();
+        Vec3::new(
+            horizontal * self.azimuth.sin(),
+            self.radius * self.elevation.sin(),
+            horizontal * self.azimuth.cos(),
+        )
+    }
+}
+
+/// Character pose under the fixed light: Ctrl+LMB rotates the figure, Ctrl+RMB
+/// moves it sideways; the default mouse keeps the camera controls.
+#[derive(Resource, Clone, Copy)]
+struct CharacterPose {
     yaw: f32,
     pitch: f32,
+    offset: Vec3,
 }
+
+/// The model's spawn translation, so a character offset is relative to home.
+#[derive(Component, Clone, Copy)]
+struct ModelHome(Vec3);
 
 struct CliOptions {
     report: bool,
@@ -222,7 +255,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title:
-                            "Sculpto cloth review — drag turns the figure (T camera orbit), RMB pan, wheel zoom, R reset, L lit/flat, 3 rig"
+                            "Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig"
                                 .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -248,13 +281,11 @@ fn main() {
     }
 
     app.insert_resource(FlatFlipped::default())
-        .insert_resource(Turntable {
-            // Interactive review starts in turntable: dragging turns the
-            // figure under the fixed key light, so the shading and the cast
-            // shadow move with it. `T` switches the drag to camera orbit.
-            enabled: config.interactive || std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
+        .insert_resource(LightOrbit::from_position(Vec3::new(3.0, 5.0, 2.0)))
+        .insert_resource(CharacterPose {
             yaw: env_f32("SCULPTO_VIEWER_TURNTABLE_YAW", 0.0),
             pitch: 0.0,
+            offset: Vec3::ZERO,
         })
         .insert_resource(FlatMode(config.flat))
         .insert_resource(RigMode {
@@ -310,47 +341,67 @@ fn main() {
                 debug_scene,
                 debug_playback,
                 orbit_controls,
+                light_controls,
                 toggle_flat,
                 apply_flat_mode,
                 toggle_rig,
                 apply_review_visibility,
-                toggle_turntable,
-                apply_turntable,
+                character_controls,
+                apply_character_pose,
             ),
         )
         .run();
 }
 
-/// `T` flips turntable / camera-orbit: the default drag turns the figure under
-/// a fixed key light, so the shading and the shadows move with the surface.
-fn toggle_turntable(
+/// Ctrl+LMB turns the figure and Ctrl+RMB moves it sideways; the default mouse
+/// keeps the camera controls. The light stays world-fixed, so a character move
+/// changes the shading and the cast shadow.
+fn character_controls(
     config: Res<ViewerConfig>,
+    buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut turntable: ResMut<Turntable>,
+    mut motion: MessageReader<MouseMotion>,
+    pose: Option<ResMut<CharacterPose>>,
+    cameras: Query<&Transform, With<Camera3d>>,
 ) {
-    if config.interactive && keys.just_pressed(KeyCode::KeyT) {
-        turntable.enabled = !turntable.enabled;
+    if !config.interactive {
+        return;
+    }
+    let Some(mut pose) = pose else {
+        return;
+    };
+    let control = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    if !control {
+        return;
+    }
+    let mut delta = Vec2::ZERO;
+    for event in motion.read() {
+        delta += event.delta;
+    }
+    if buttons.pressed(MouseButton::Left) {
+        pose.yaw -= delta.x * 0.005;
+        pose.pitch = (pose.pitch - delta.y * 0.005).clamp(-1.2, 1.2);
+    }
+    if buttons.pressed(MouseButton::Right) {
+        let Ok(camera) = cameras.single() else {
+            return;
+        };
+        let right = camera.rotation * Vec3::X;
+        let up = camera.rotation * Vec3::Y;
+        pose.offset += right * (delta.x * 0.002) + up * (delta.y * 0.002);
     }
 }
 
-/// Applies the turntable rotation to every spawned model. The light rig stays
-/// where it is, which is the point: the same world light now hits a different
-/// part of the surface as the figure turns.
-fn apply_turntable(
-    turntable: Res<Turntable>,
-    mut models: Query<&mut Transform, With<ReviewModel>>,
+/// Applies the character pose every frame. The model's home is its spawn
+/// translation, so an offset moves it relative to where the scene put it.
+fn apply_character_pose(
+    pose: Res<CharacterPose>,
+    mut models: Query<(&mut Transform, &ModelHome), With<ReviewModel>>,
 ) {
-    if !turntable.enabled {
-        return;
-    }
-    let rotation = Quat::from_euler(
-        bevy::math::EulerRot::YXZ,
-        turntable.yaw,
-        turntable.pitch,
-        0.0,
-    );
-    for mut transform in &mut models {
+    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, pose.yaw, pose.pitch, 0.0);
+    for (mut transform, home) in &mut models {
         transform.rotation = rotation;
+        transform.translation = home.0 + pose.offset;
     }
 }
 
@@ -584,9 +635,11 @@ fn setup(
         let row = index / columns;
         let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
         let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
+        let home = Vec3::new(x, 0.0, z);
         commands.spawn((
             bevy::world_serialization::WorldAssetRoot(scene.clone()),
-            Transform::from_xyz(x, 0.0, z).with_scale(Vec3::splat(scene_scale)),
+            Transform::from_translation(home).with_scale(Vec3::splat(scene_scale)),
+            ModelHome(home),
             ReviewModel,
         ));
     }
@@ -638,7 +691,6 @@ impl OrbitCamera {
 fn orbit_controls(
     config: Res<ViewerConfig>,
     orbit: Option<ResMut<OrbitCamera>>,
-    turntable: Option<ResMut<Turntable>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut motion: MessageReader<MouseMotion>,
@@ -651,11 +703,6 @@ fn orbit_controls(
     let Some(mut orbit) = orbit else {
         return;
     };
-    // Turntable mode rotates the figure under the fixed key light, so the
-    // shading and cast shadows sweep across the surface; camera orbit alone
-    // would move the viewpoint but leave every surface lit the same way.
-    let mut turntable = turntable.filter(|state| state.enabled);
-
     let mut delta = Vec2::ZERO;
     for event in motion.read() {
         delta += event.delta;
@@ -671,16 +718,13 @@ fn orbit_controls(
     if keys.just_pressed(KeyCode::KeyR) {
         orbit.reset();
     }
-    if buttons.pressed(MouseButton::Left) {
-        if let Some(state) = turntable.as_mut() {
-            state.yaw -= delta.x * 0.005;
-            state.pitch = (state.pitch - delta.y * 0.005).clamp(-1.2, 1.2);
-        } else {
-            orbit.yaw -= delta.x * 0.005;
-            orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
-        }
+    let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
+        orbit.yaw -= delta.x * 0.005;
+        orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
     }
-    if buttons.pressed(MouseButton::Right) {
+    if buttons.pressed(MouseButton::Right) && !moving_character {
         let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
         let right = rotation * Vec3::X;
         let up = rotation * Vec3::Y;
@@ -697,6 +741,39 @@ fn orbit_controls(
     let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     transform.translation = orbit.target + rotation * Vec3::Z * orbit.distance;
     transform.look_at(orbit.target, Vec3::Y);
+}
+
+/// Shift+LMB moves the key light around the figure; the character stays put so
+/// a shadow comparison is a light change, not a pose change.
+fn light_controls(
+    config: Res<ViewerConfig>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut motion: MessageReader<MouseMotion>,
+    orbit: Option<ResMut<LightOrbit>>,
+    mut lights: Query<&mut Transform, With<KeyLight>>,
+) {
+    if !config.interactive {
+        return;
+    }
+    let Some(mut orbit) = orbit else {
+        return;
+    };
+    let mut delta = Vec2::ZERO;
+    for event in motion.read() {
+        delta += event.delta;
+    }
+    if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+        && buttons.pressed(MouseButton::Left)
+    {
+        orbit.azimuth -= delta.x * 0.005;
+        orbit.elevation = (orbit.elevation - delta.y * 0.005).clamp(-0.2, 1.45);
+    }
+    let Ok(mut transform) = lights.single_mut() else {
+        return;
+    };
+    transform.translation = orbit.position();
+    transform.look_at(Vec3::ZERO, Vec3::Y);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1246,41 +1323,33 @@ mod tests {
     }
 
     #[test]
-    fn t_flips_the_turntable_only_when_interactive() {
+    fn character_pose_rotates_and_offsets_from_home() {
         let mut app = App::new();
-        app.insert_resource(viewer_config(true, false))
-            .init_resource::<ButtonInput<KeyCode>>()
-            .insert_resource(Turntable {
-                enabled: false,
-                yaw: 0.0,
-                pitch: 0.0,
-            })
-            .add_systems(Update, toggle_turntable);
-
-        press(&mut app, KeyCode::KeyT);
-        app.update();
-        assert!(app.world().resource::<Turntable>().enabled);
-    }
-
-    #[test]
-    fn turntable_rotates_the_model_under_a_fixed_light() {
-        let mut app = App::new();
-        app.insert_resource(Turntable {
-            enabled: true,
+        app.insert_resource(CharacterPose {
             yaw: 0.75,
             pitch: 0.0,
+            offset: Vec3::new(0.1, 0.2, 0.0),
         })
-        .add_systems(Update, apply_turntable);
+        .add_systems(Update, apply_character_pose);
         let model = app
             .world_mut()
-            .spawn((Transform::default(), ReviewModel))
+            .spawn((
+                Transform::default(),
+                ModelHome(Vec3::new(1.0, 0.0, 2.0)),
+                ReviewModel,
+            ))
             .id();
 
         app.update();
-        let rotation = app.world().get::<Transform>(model).expect("model").rotation;
+        let transform = app.world().get::<Transform>(model).expect("model");
         assert!(
-            (rotation.to_euler(bevy::math::EulerRot::YXZ).0 - 0.75).abs() < 1e-4,
-            "the figure turns; the light rig stays world-fixed"
+            (transform.rotation.to_euler(bevy::math::EulerRot::YXZ).0 - 0.75).abs() < 1e-4,
+            "Ctrl+LMB turns the figure"
+        );
+        assert_eq!(
+            transform.translation,
+            Vec3::new(1.1, 0.2, 2.0),
+            "Ctrl+RMB offsets the figure from its home"
         );
     }
 }
