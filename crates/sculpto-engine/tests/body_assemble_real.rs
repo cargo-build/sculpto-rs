@@ -228,7 +228,18 @@ fn mike_neck_seals_through_the_declared_mirror_scale() {
                   "scale": [-71.4286, -71.4286, 71.4286] },
                 { "path": root.join("hands.obj"), "role": "hands" },
             ],
-            "joints": [{ "part": "head", "socket": "body" }],
+            // The feet pair per shell: the soles against the leg sockets.
+            // The manifest keeps the anatomical leg names (`foot R/L`);
+            // pre-seal the classifier hands a cuff the plain name first, so
+            // the report may print the resolved `foot R 2` — the weld rows
+            // are asserted by semantics, not by the occurrence counter.
+            "joints": [
+                { "part": "head", "socket": "body" },
+                { "part": "hands", "socket": "body", "seat": true },
+                { "part": "feet", "socket": "body",
+                  "shells": [ { "part": "sole R", "socket": "foot R" },
+                              { "part": "sole L", "socket": "foot L" } ] },
+            ],
         })
         .to_string(),
     )
@@ -243,7 +254,7 @@ fn mike_neck_seals_through_the_declared_mirror_scale() {
     )
     .expect("the Mike body assembles");
 
-    assert_eq!(result["assembled"]["vertices"], 13_379);
+    assert_eq!(result["assembled"]["vertices"], 13_380);
     assert_eq!(
         result["parts"][2]["placement"]["scale"],
         json!([-71.4286, -71.4286, 71.4286])
@@ -252,7 +263,9 @@ fn mike_neck_seals_through_the_declared_mirror_scale() {
         result["parts"][2]["placement"]["mirrored"], false,
         "two negative lanes are a rotation, not a mirror: the winding already faces outward"
     );
-    let neck = &result["seal"]["joints"][0];
+    let rows = result["seal"]["joints"].as_array().expect("seal rows");
+    assert_eq!(rows.len(), 5, "neck + two wrists + two ankles");
+    let neck = &rows[0];
     assert_eq!(neck["bridge_triangles"], 51);
     assert_eq!(neck["boundary_ring_before"], 26);
     assert_eq!(neck["boundary_ring_after"], 0);
@@ -263,5 +276,28 @@ fn mike_neck_seals_through_the_declared_mirror_scale() {
         .as_f64()
         .expect("dihedral");
     assert!(dihedral < 30.0, "seam dihedral {dihedral} deg");
-    assert_eq!(result["output"]["triangles"], 25_256 + 51);
+    for wrist in &rows[1..3] {
+        assert_eq!(wrist["correspondence"], "authored");
+        assert_eq!(wrist["bridge_triangles"], 0);
+        assert_eq!(wrist["boundary_ring_after"], 0);
+        assert_eq!(wrist["boundary_arc_after"], 0);
+    }
+    // The HIMBO ankles are authored as one coincident ring (measured snaps
+    // 4.8e-7..1.21e-3 u over ~1.93 u steps): they weld with no ribbon, no
+    // smoothing move and no non-manifold edge — never the zero-span sliver
+    // the bridge would build here.
+    for ankle in &rows[3..5] {
+        assert_eq!(ankle["correspondence"], "coincident_weld");
+        assert_eq!(ankle["bridge_triangles"], 0);
+        assert_eq!(ankle["boundary_ring_before"], 10);
+        assert_eq!(ankle["boundary_ring_after"], 0);
+        assert_eq!(ankle["boundary_arc_after"], 0);
+        assert_eq!(ankle["non_manifold_after"], 0);
+        assert!(ankle["weld_merged"].as_u64().expect("weld merged") >= 10);
+        let shift = ankle["weld_max_shift"].as_f64().expect("weld shift");
+        assert!(shift <= 0.0013, "weld snap {shift}");
+        assert!(shift > 0.0, "a real snap is measured");
+    }
+    // The ankle welds add no bridge; the neck adds 51 and the head repair 59.
+    assert_eq!(result["output"]["triangles"], 25_256 + 51 + 59);
 }

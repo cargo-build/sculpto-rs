@@ -82,6 +82,15 @@ pub const SEAT_CENTROID_MAX_SHIFT_RATIO: f64 = 3.0;
 /// ring spacing (~1.7 u on the 10-position wrist circles), so 1e-4 cannot
 /// fuse distinct ring nodes. @req BLD-13
 pub const SEAL_CYCLE_DEDUPE_EPSILON: f32 = 1e-4;
+/// Coincident-arc weld cap, as a fraction of the seam ring's mean edge step:
+/// the largest cuff→ring snap a discovered joint still welds instead of
+/// bridging. Measured: the HIMBO ankles are authored as one ring snapped to
+/// 4.8e-7..1.21e-3 u over ~1.93 u steps (≤ 6.3e-4 of a step), while the 3BA
+/// ankles are two authored rings abutting at 0.012..0.252 u over ~0.7 u steps
+/// (≥ 1.8e-2 of a step) and must keep their bridge ribbon. 0.005 of a step
+/// sits ~8x above the largest coincidence snap and ~3.5x below the smallest
+/// real abutment. @req BLD-13
+pub const SEAL_WELD_CAP_RATIO: f64 = 0.005;
 /// Why the unique-position collar wins over the proximity arc; printed in
 /// every joint row so the choice is auditable. @req BLD-13
 pub const SEAM_CHOICE: &str = "proximity arc (29 v with coincident ends); the full 86-v loop is not a neck ring and its slit duplicates are never bridged";
@@ -477,7 +486,9 @@ pub struct JointReport {
     /// The pairing band in force (declared or derived).
     pub arc_band_used: f64,
     /// Correspondence method: `authored` (the part was already placed),
-    /// `kabsch_umeyama` (a solved seat) or `monotone_dp` (a discovered rim pair).
+    /// `kabsch_umeyama` (a solved seat), `monotone_dp` (a discovered rim
+    /// pair) or `coincident_weld` (the discovered arcs were authored as one
+    /// ring and welded, no bridge).
     pub correspondence: &'static str,
     /// Bridge triangles added.
     pub bridge_triangles: usize,
@@ -512,6 +523,17 @@ pub struct JointReport {
     /// Boundary copies the dedupe band merged beyond exact coincidence on
     /// this joint (Mike's right wrist: 1).
     pub cycle_dedupe_merged: usize,
+    /// Rim vertices the coincident-arc weld rewired onto a group
+    /// representative (the discovered ankle path: every cuff vertex plus
+    /// the collapsed ring lip twins); 0 when the joint bridged.
+    pub weld_merged: usize,
+    /// Largest cuff→ring vertex snap of the coincident-arc weld, input
+    /// units; 0.0 when the joint bridged. No smoothing runs on a weld.
+    pub weld_max_shift: f64,
+    /// The coincident-arc weld cap in force on a discovered joint
+    /// ([`SEAL_WELD_CAP_RATIO`] × the seam ring's mean step); 0.0 on a
+    /// seated joint, which welds by authored correspondence instead.
+    pub weld_cap: f64,
     /// Cross-side pairing verdict of a seated group: decisive, undecided
     /// (warn: ring geometry cannot detect a swap), or n/a for single parts.
     pub handedness: &'static str,
@@ -1703,6 +1725,234 @@ fn weld_seated_cuff(triangles: &mut Vec<[u32; 3]>, ring: &[u32], cuff: &[u32]) -
         })
         .collect();
     merged
+}
+
+/// Mean edge step of one selected arc walk: the weld cap's scale, taken from
+/// the seam actually selected so a compound rim's slit chain cannot inflate
+/// it. @req BLD-13
+fn arc_step_mean(arc: &[u32], closed: bool, positions: &[[f32; 3]]) -> f64 {
+    if arc.len() < 2 {
+        return 0.0;
+    }
+    let steps = (0..arc.len() - 1)
+        .map(|k| distance(point_of(positions, arc[k]), point_of(positions, arc[k + 1])))
+        .chain(closed.then(|| {
+            distance(
+                point_of(positions, arc[arc.len() - 1]),
+                point_of(positions, arc[0]),
+            )
+        }));
+    let count = arc.len() - 1 + usize::from(closed);
+    steps.sum::<f64>() / count as f64
+}
+
+/// Coincidence groups of one selected arc: vertices closer than
+/// [`SEAL_CYCLE_DEDUPE_EPSILON`] merge into one node (the authored slit-lip
+/// twin a compound rim carries beside its ring position), grouped
+/// transitively by union-find with the smaller id rooting — the same rule
+/// [`socket_cycles`] groups a seated cuff. Groups keep first-occurrence walk
+/// order with members ascending. @req BLD-13
+fn arc_coincidence_groups(arc: &[u32], positions: &[[f32; 3]]) -> Vec<Vec<u32>> {
+    let band_sq = f64::from(SEAL_CYCLE_DEDUPE_EPSILON) * f64::from(SEAL_CYCLE_DEDUPE_EPSILON);
+    let mut parent: HashMap<u32, u32> = arc.iter().map(|&id| (id, id)).collect();
+    let find = |parent: &mut HashMap<u32, u32>, mut id: u32| -> u32 {
+        while parent[&id] != id {
+            let up = parent[&id];
+            parent.insert(id, parent[&up]);
+            id = up;
+        }
+        id
+    };
+    for (at, &left) in arc.iter().enumerate() {
+        for &right in &arc[at + 1..] {
+            let (a, b) = (point_of(positions, left), point_of(positions, right));
+            let offset = [
+                f64::from(a[0] - b[0]),
+                f64::from(a[1] - b[1]),
+                f64::from(a[2] - b[2]),
+            ];
+            if offset.iter().map(|lane| lane * lane).sum::<f64>() > band_sq {
+                continue;
+            }
+            let left_root = find(&mut parent, left);
+            let right_root = find(&mut parent, right);
+            if left_root < right_root {
+                parent.insert(right_root, left_root);
+            } else {
+                parent.insert(left_root, right_root);
+            }
+        }
+    }
+    let mut order: Vec<u32> = Vec::new();
+    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &id in arc {
+        let root = find(&mut parent, id);
+        if groups.entry(root).or_default().is_empty() {
+            order.push(root);
+        }
+        groups.get_mut(&root).expect("rooted").push(id);
+    }
+    order
+        .into_iter()
+        .map(|root| {
+            let mut group = groups.remove(&root).expect("rooted");
+            group.sort_unstable();
+            group
+        })
+        .collect()
+}
+
+/// Weld a discovered joint's selected arcs when they are authored as one
+/// coincident ring: the arcs' coincidence groups (each slit-lip twin folded
+/// into its ring node) must pair 1:1 by nearest representative with every
+/// snap inside [`SEAL_WELD_CAP_RATIO`] of the ring's mean step, and the
+/// collapsed collar walk must consume the collapsed ring's edge set exactly
+/// — a closed ring against an open arc (the Mike neck: 26 closed ring edges
+/// under a 25-edge collar run) would leave an opening, so it keeps its
+/// bridge. Both arcs' lip twins collapse onto their group representatives
+/// (the wrist weld's dedupe-band semantics: the measured ankles walk in
+/// opposite directions with their lips on opposite ends, so no strict
+/// vertex bijection exists before the collapse), every cuff vertex rewires
+/// onto its paired ring representative and degenerate triangles drop.
+/// Nothing moves beyond the cap-bounded snap, no ribbon is built and no
+/// smoothing is needed. Returns the rewired rim vertices and the largest
+/// snap. `None` keeps the bridge: unequal group counts, a non-injective
+/// nearest map, one gap over the cap or an edge the rewiring cannot consume
+/// (the Bijin neck's 26↔29 and the 3BA ankle abutment both bridge).
+/// @req BLD-13
+fn weld_coincident_arcs(
+    triangles: &mut Vec<[u32; 3]>,
+    ring: &[u32],
+    collar: &[u32],
+    ring_closed: bool,
+    collar_closed: bool,
+    positions: &[[f32; 3]],
+) -> Option<(usize, f64)> {
+    let ring_groups = arc_coincidence_groups(ring, positions);
+    let collar_groups = arc_coincidence_groups(collar, positions);
+    if ring_groups.len() != collar_groups.len() || ring_groups.len() < 3 {
+        return None;
+    }
+    let cap = SEAL_WELD_CAP_RATIO * arc_step_mean(ring, ring_closed, positions);
+    // Nearest ring group per collar group, representatives = smallest id.
+    // A shared target breaks the 1:1 pairing and keeps the bridge.
+    let mut targets: Vec<usize> = Vec::with_capacity(collar_groups.len());
+    for group in &collar_groups {
+        let from = point_of(positions, group[0]);
+        let nearest = ring_groups
+            .iter()
+            .enumerate()
+            .map(|(ring_at, ring_group)| {
+                let to = point_of(positions, ring_group[0]);
+                let offset = [
+                    f64::from(from[0] - to[0]),
+                    f64::from(from[1] - to[1]),
+                    f64::from(from[2] - to[2]),
+                ];
+                (offset.iter().map(|lane| lane * lane).sum::<f64>(), ring_at)
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)))?;
+        if nearest.0.sqrt() > cap {
+            if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+                eprintln!(
+                    "weld refuse: group gap {:.3e} > cap {:.3e}",
+                    nearest.0.sqrt(),
+                    cap
+                );
+            }
+            return None;
+        }
+        targets.push(nearest.1);
+    }
+    let mut used = targets.clone();
+    used.sort_unstable();
+    if used.windows(2).any(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    // Vertex-level map, group-collapse semantics (the wrist weld's dedupe
+    // band applied to the selected arcs): every ring group collapses onto
+    // its representative, and every cuff vertex rewires onto its paired
+    // ring group's representative. The measured ankles need this: the two
+    // walks run in opposite directions with their lip twins on opposite
+    // ends — the cuff's two lip copies face one ring vertex and the ring's
+    // lip pair faces one cuff vertex — so no strict vertex bijection exists
+    // until both lips collapse onto their representatives.
+    let mut identity: HashMap<u32, u32> = HashMap::new();
+    let mut max_shift = 0.0f64;
+    for group in &ring_groups {
+        let kept = group[0];
+        for &from in &group[1..] {
+            identity.insert(from, kept);
+            max_shift = max_shift.max(distance(
+                point_of(positions, from),
+                point_of(positions, kept),
+            ));
+        }
+    }
+    for (group, &ring_at) in collar_groups.iter().zip(&targets) {
+        let kept = ring_groups[ring_at][0];
+        for &from in group {
+            identity.insert(from, kept);
+            max_shift = max_shift.max(distance(
+                point_of(positions, from),
+                point_of(positions, kept),
+            ));
+        }
+    }
+    let merged = identity.len();
+    // Edge-set equality after the collapse: each collapsed ring walk edge
+    // must gain exactly its second use from the rewired collar walk, and
+    // the collar may not dangle an edge the collapsed ring does not own.
+    // This also refuses the closed-ring / open-arc mismatch by construction
+    // (different edge counts).
+    let collapsed = |edge: (u32, u32)| {
+        let to_a = identity.get(&edge.0).copied().unwrap_or(edge.0);
+        let to_b = identity.get(&edge.1).copied().unwrap_or(edge.1);
+        (to_a.min(to_b), to_a.max(to_b))
+    };
+    let ring_edges: BTreeSet<(u32, u32)> = Rim {
+        vertices: ring.to_vec(),
+        simple: true,
+        closed: ring_closed,
+    }
+    .edges()
+    .into_iter()
+    .map(collapsed)
+    .collect();
+    let mapped_collar_edges: BTreeSet<(u32, u32)> = Rim {
+        vertices: collar.to_vec(),
+        simple: true,
+        closed: collar_closed,
+    }
+    .edges()
+    .into_iter()
+    .map(collapsed)
+    .collect();
+    if ring_edges != mapped_collar_edges {
+        if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+            eprintln!(
+                "weld refuse: edge sets differ; ring-only {:?} collar-only {:?}; groups ring {:?} collar {:?}; targets {:?}",
+                ring_edges
+                    .difference(&mapped_collar_edges)
+                    .collect::<Vec<_>>(),
+                mapped_collar_edges
+                    .difference(&ring_edges)
+                    .collect::<Vec<_>>(),
+                ring_groups,
+                collar_groups,
+                targets
+            );
+        }
+        return None;
+    }
+    *triangles = triangles
+        .iter()
+        .map(|triangle| triangle.map(|vertex| *identity.get(&vertex).unwrap_or(&vertex)))
+        .filter(|triangle| {
+            triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[0] != triangle[2]
+        })
+        .collect();
+    Some((merged, max_shift))
 }
 
 /// One seated joint's solved data the seal loop consumes: the report plus the
@@ -3364,16 +3614,43 @@ fn seal_joints_mode(
         // Gap facts belong to the seam actually bridged, not the whole
         // compound loop with its mouth slit far above the collar.
         let (gap_min, gap_mean, gap_max) = rim_gap(&collar, &ring, &positions);
+        // A coincident discovered pair welds instead of bridging: when the
+        // selected arcs are authored as one ring (their coincidence groups
+        // pair 1:1 inside the weld cap — the HIMBO ankles), the ribbon
+        // between them is a zero-span sliver, measured unsmoothed
+        // min_bridge_area 0.0 / aspect 2.3e12, and the smoothed seal refuses
+        // its own shift bound. The cuff rewires onto the ring; nothing
+        // moves and no bridge is built. Any missed condition keeps the
+        // bridge path untouched below.
+        let mut welded_pair = seated[index].as_ref().is_some_and(|seat| seat.authored);
+        let mut weld: Option<(usize, f64)> = None;
+        if seated[index].is_none() {
+            weld = weld_coincident_arcs(
+                &mut triangles,
+                &ring,
+                &collar,
+                ring_closed,
+                collar_closed,
+                &positions,
+            );
+            welded_pair = weld.is_some();
+        }
+        let weld_cap_used = if seated[index].is_none() {
+            SEAL_WELD_CAP_RATIO * arc_step_mean(&ring, ring_closed, &positions)
+        } else {
+            0.0
+        };
 
         if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
             eprintln!(
-                "seal: ring={} collar={} ring_closed={ring_closed} collar_closed={collar_closed} band={:.3} gap={:.3}..{:.3} pinch_edges={}",
+                "seal: ring={} collar={} ring_closed={ring_closed} collar_closed={collar_closed} band={:.3} gap={:.3}..{:.3} pinch_edges={} welded={}",
                 ring.len(),
                 collar.len(),
                 arc_band_used,
                 gap_min,
                 gap_max,
-                pinch_edges
+                pinch_edges,
+                welded_pair
             );
         }
         // Build the bridge. The two rims can be authored in the same
@@ -3383,7 +3660,6 @@ fn seal_joints_mode(
         // correspondence, so reversing one walk alone would rotate one ring
         // against the other: its retry reverses both together, which leaves
         // every pair in place.
-        let welded_pair = seated[index].as_ref().is_some_and(|seat| seat.authored);
         let ring_reversed: Vec<u32> = ring.iter().copied().rev().collect();
         let collar_reversed: Vec<u32> = collar.iter().copied().rev().collect();
         let walk_orders: Vec<(&[u32], &[u32])> = if welded_pair {
@@ -3686,6 +3962,7 @@ fn seal_joints_mode(
         let correspondence = match seated[index].as_ref() {
             Some(seat) if seat.authored => "authored",
             Some(_) => "kabsch_umeyama",
+            None if weld.is_some() => "coincident_weld",
             None => "monotone_dp",
         };
         joints.push(JointReport {
@@ -3742,6 +4019,9 @@ fn seal_joints_mode(
             merged_duplicates: 0,
             cycle_dedupe_epsilon: SEAL_CYCLE_DEDUPE_EPSILON,
             cycle_dedupe_merged,
+            weld_merged: weld.map_or(0, |(merged, _)| merged),
+            weld_max_shift: weld.map_or(0.0, |(_, max_shift)| max_shift),
+            weld_cap: weld_cap_used,
             handedness: seated[index].as_ref().map_or("", |seat| seat.handedness),
             seat,
             smoothing,
@@ -5243,5 +5523,216 @@ mod tests {
         let error =
             seal_joints(&positions, &triangles, &requests, &SealOptions::default()).unwrap_err();
         assert_eq!(error.code(), "seal_ring_not_simple", "{error}");
+    }
+
+    /// The coincident-ankle fixture: a socket tube whose open 10-ring at z 0
+    /// is capped at z 4, under a foot tube whose open ring sits `lift` above
+    /// it at the given radius and is capped at z −1.5 — two clean closed rims,
+    /// no slit, so the discovered path sees exactly the seam pair.
+    /// `lift` 0.001 at radius 2.73 is the authored coincidence (5.9e-4 of
+    /// the 1.687 step); 0.5 is a real abutment far over the weld cap; the
+    /// 12-cuff at radius 2.2 is the neck-shaped negative (unequal counts over
+    /// 0.53..0.94 u gaps, no near/far break). @req BLD-13
+    fn weld_fixture(
+        foot_sides: usize,
+        lift: f32,
+        radius: f32,
+    ) -> (Vec<[f32; 3]>, Vec<[u32; 3]>, JointRequest) {
+        let socket_bottom: Vec<u32> = (0..10u32).collect();
+        let socket_top: Vec<u32> = (10..20u32).collect();
+        let foot_seam: Vec<u32> = (20..20 + foot_sides as u32).collect();
+        let foot_cap_ids: Vec<u32> = (20 + foot_sides as u32..20 + 2 * foot_sides as u32).collect();
+        let mut positions: Vec<[f32; 3]> = ring(10, 2.73, 0.0);
+        positions.extend(ring(10, 2.73, 4.0));
+        positions.extend(ring(foot_sides, radius, lift));
+        positions.extend(ring(foot_sides, radius, -1.5));
+        let mut triangles: Vec<[u32; 3]> = prism(&socket_bottom, &socket_top);
+        triangles.extend(cap(&socket_top));
+        triangles.extend(prism(&foot_cap_ids, &foot_seam));
+        triangles.extend(cap(&foot_cap_ids));
+        let identities = parts::shell_identities(&positions, &triangles);
+        let foot = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 20)
+            .expect("the foot shell");
+        let socket = identities
+            .iter()
+            .find(|shell| shell.members[0] < 20)
+            .expect("the socket shell");
+        (
+            positions,
+            triangles,
+            JointRequest {
+                part: foot.name.clone(),
+                socket: socket.name.clone(),
+                seat: false,
+            },
+        )
+    }
+
+    #[test]
+    fn coincident_arcs_weld_with_no_bridge_no_move_and_no_sliver() {
+        let (positions, triangles, request) = weld_fixture(10, 0.001, 2.73);
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &[request],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                ..SealOptions::default()
+            },
+        )
+        .expect("the authored-coincident rims weld");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.correspondence, "coincident_weld");
+        assert_eq!(joint.bridge_triangles, 0, "no zero-span ribbon");
+        assert_eq!(joint.edges_consumed, [0, 0]);
+        // Deterministic 1:1: every one of the 10 cuff vertices paired and
+        // rewired; the largest snap stays inside the reported cap.
+        assert_eq!(joint.weld_merged, 10);
+        assert!(joint.weld_max_shift > 0.0, "{}", joint.weld_max_shift);
+        assert!(
+            joint.weld_max_shift <= joint.weld_cap,
+            "shift {} > cap {}",
+            joint.weld_max_shift,
+            joint.weld_cap
+        );
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.boundary_arc_after, 0);
+        assert_eq!(joint.non_manifold_after, 0);
+        assert_eq!(joint.winding_conflicts, 0);
+        // Nothing moved: no vertex changed, no bridge triangle exists and no
+        // degenerate or zero-area triangle survived the rewiring.
+        assert_eq!(outcome.positions, positions);
+        assert_eq!(outcome.triangles.len(), triangles.len());
+        for triangle in &outcome.triangles {
+            assert!(
+                triangle[0] != triangle[1]
+                    && triangle[1] != triangle[2]
+                    && triangle[0] != triangle[2],
+                "degenerate {triangle:?}"
+            );
+            let (area, _) = triangle_area_and_aspect(
+                outcome.positions[triangle[0] as usize],
+                outcome.positions[triangle[1] as usize],
+                outcome.positions[triangle[2] as usize],
+            );
+            assert!(area > 0.0, "zero area at {triangle:?}");
+        }
+        assert_eq!(joint.smoothing.changed_vertices, 0);
+    }
+
+    #[test]
+    fn a_wide_gap_ring_keeps_the_bridge_and_never_welds() {
+        // 0.5 u apart is a real abutment (59x the cap): the ribbon must be
+        // built, and no cuff vertex may be snapped onto the socket ring.
+        let (positions, triangles, request) = weld_fixture(10, 0.5, 2.73);
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &[request],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                ..SealOptions::default()
+            },
+        )
+        .expect("the abutting rims bridge");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.correspondence, "monotone_dp");
+        assert_eq!(joint.bridge_triangles, 20);
+        assert_eq!(joint.weld_merged, 0);
+        assert_eq!(joint.weld_max_shift, 0.0);
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.boundary_arc_after, 0);
+        assert_eq!(joint.non_manifold_after, 0);
+        assert!(joint.min_bridge_area > 0.0, "{}", joint.min_bridge_area);
+    }
+
+    #[test]
+    fn an_unequal_coincident_ring_keeps_the_bridge() {
+        // A 12-cuff against the 10-ring, offset radially like the neck: the
+        // group counts cannot pair 1:1 (and the 0.53..0.94 u gaps sit far
+        // over the cap), so the weld refuses by construction and the bridge
+        // takes over — the neck's 26↔29 rule.
+        let (positions, triangles, request) = weld_fixture(12, 0.001, 2.2);
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &[request],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                ..SealOptions::default()
+            },
+        )
+        .expect("the unequal rims bridge");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.correspondence, "monotone_dp");
+        assert_eq!(joint.bridge_triangles, 22, "10 ring + 12 collar edges");
+        assert_eq!(joint.weld_merged, 0);
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.boundary_arc_after, 0);
+        assert_eq!(joint.non_manifold_after, 0);
+    }
+
+    #[test]
+    fn a_closed_ring_under_an_open_arc_keeps_the_bridge() {
+        // The Mike-neck shape at fixture scale: the socket's clean closed
+        // 10-ring (10 edges) sits under a slit foot tube whose near run is a
+        // 10-vertex OPEN arc (9 edges) — coincident, equal group counts, but
+        // the rewired collar could never consume the ring's closing edge, so
+        // welding would leave the ring open. The bridge must win.
+        let socket_bottom: Vec<u32> = (0..10u32).collect();
+        let socket_top: Vec<u32> = (10..20u32).collect();
+        let foot_bottom: Vec<u32> = (20..30u32).collect();
+        let foot_seam: Vec<u32> = (30..40u32).collect();
+        let mut positions: Vec<[f32; 3]> = ring(10, 2.73, 0.0);
+        positions.extend(ring(10, 2.73, 4.0));
+        positions.extend(ring(10, 2.73, -6.0));
+        positions.extend(ring(10, 2.73, 0.001));
+        let mut triangles: Vec<[u32; 3]> = prism(&socket_bottom, &socket_top);
+        triangles.extend(cap(&socket_top));
+        triangles.extend(slit_tube(&foot_bottom, &foot_seam));
+        let identities = parts::shell_identities(&positions, &triangles);
+        let foot = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 20)
+            .expect("the foot shell");
+        let socket = identities
+            .iter()
+            .find(|shell| shell.members[0] < 20)
+            .expect("the socket shell");
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &[JointRequest {
+                part: foot.name.clone(),
+                socket: socket.name.clone(),
+                seat: false,
+            }],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                // The fixture's slit is one long edge, so the smoothing band
+                // reaches the sparse far ring through it; the declared bound
+                // absorbs that drag (the real neck's dense slit does not
+                // need it: 3.067 ≤ 4.873 measured).
+                max_shift: Some(20.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("the open arc under a closed ring bridges");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.correspondence, "monotone_dp");
+        assert_eq!(joint.selected_collar, Some(10), "the trimmed near run");
+        assert_eq!(joint.weld_merged, 0);
+        // 10 closed ring edges + 9 open collar edges.
+        assert_eq!(joint.bridge_triangles, 19);
+        assert_eq!(joint.edges_consumed, [10, 9]);
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.boundary_arc_after, 0);
+        assert_eq!(joint.non_manifold_after, 0);
     }
 }
