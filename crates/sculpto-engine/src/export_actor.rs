@@ -27,7 +27,11 @@
 //!    island with a torn boundary;
 //! 6. all parts merge into one arena with one palette, one partition per part
 //!    and the review palette's colour for each;
-//! 7. named clips are mapped by bone name exactly as `export.glb` maps them;
+//! 7. named clips are mapped by bone name exactly as `export.glb` maps them,
+//!    then pass an admission gate: each clip's coverage of the standard rig
+//!    roles and its rest compatibility with the rig are measured, a rest that
+//!    is not comparable refuses the export unless explicitly allowed, and a
+//!    required role no channel drives refuses it outright;
 //! 8. the file is written through [`write_partitioned_rigged_glb`]: one skin,
 //!    one primitive per part, one material per part.
 //!
@@ -121,6 +125,15 @@ pub struct ExportActorParams {
     /// Clip names to write, in written order (index 0 first).
     #[serde(default)]
     pub clip_names: Vec<String>,
+    /// Standard rig roles every written clip must drive (`hips`, `knees`, …);
+    /// a clip that misses one refuses the export. Empty keeps the coverage
+    /// report-only, so a legitimately partial clip still exports.
+    #[serde(default)]
+    pub require_clip_roles: Vec<String>,
+    /// Export a clip whose rest pose is not comparable with the rig instead of
+    /// refusing it; the report carries the measured rotation and residual.
+    #[serde(default)]
+    pub allow_incompatible_rest: bool,
     /// Source units per metre; the written file is scaled to metres.
     #[serde(default)]
     pub units_per_metre: Option<f64>,
@@ -716,6 +729,19 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
     };
     let mut clips = plan_clips(params, &rig, &palette, &tolerances)?;
 
+    // The admission gate: nothing is written while a clip cannot drive this
+    // actor, so an unusable clip is a typed refusal, not a broken preview.
+    let mut coverages = Vec::with_capacity(clips.len());
+    for plan in &clips {
+        coverages.push(admit_clip(
+            plan,
+            &palette,
+            &params.require_clip_roles,
+            params.allow_incompatible_rest,
+            tolerances.translation_relative,
+        )?);
+    }
+
     // The written file is in the declared unit, so the rig the writer proves and
     // drives is the same scaled rig the geometry is converted to.
     let scale = match params.units_per_metre {
@@ -805,8 +831,9 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
         .collect();
     let clip_rows: Vec<Value> = clips
         .iter()
+        .zip(&coverages)
         .enumerate()
-        .map(|(index, plan)| clip_value(index, plan))
+        .map(|(index, (plan, coverage))| clip_value(index, plan, coverage))
         .collect();
     let report = json!({
         "out": params.out.display().to_string(),
@@ -987,14 +1014,22 @@ fn part_value(part: &PartRow, skin: &BoundPart) -> Value {
     value
 }
 
-fn clip_value(index: usize, plan: &ClipPlan) -> Value {
-    json!({
+/// One clip's report row: the planned channel numbers, the role coverage
+/// against the palette, and — only when the rest gate was overridden — the
+/// admission mark that says the numbers below were accepted, not proven.
+pub fn clip_value(index: usize, plan: &ClipPlan, coverage: &ClipCoverage) -> Value {
+    let mut value = json!({
         "index": index,
         "name": plan.clip.name,
         "duration": plan.duration,
         "samples": plan.clip.times.len(),
         "channels": plan.clip.channels.len(),
         "mapped_bones": plan.mapped_bones,
+        "palette_bones": coverage.palette_bones,
+        "roles_covered": coverage.roles_covered,
+        "roles_missing": coverage.roles_missing,
+        "role_bones": coverage.role_bones,
+        "untouched_bones": coverage.untouched_bones,
         "root_bones": plan.root_bones,
         "moving_channels": plan.moving_channels,
         "unit_scale": plan.scale,
@@ -1008,7 +1043,11 @@ fn clip_value(index: usize, plan: &ClipPlan) -> Value {
         "max_swing_degrees": plan.max_swing_degrees,
         "frame_outlier": plan.frame_outlier,
         "roll_normalization_degrees": plan.roll_normalization_degrees,
-    })
+    });
+    if !plan.rest_pose_comparable {
+        value["rest_incompatible_admitted"] = json!(true);
+    }
+    value
 }
 
 /// Refuse the declarations that cannot produce one well-defined actor.
@@ -1053,7 +1092,210 @@ fn validate(params: &ExportActorParams) -> Result<(), CommandError> {
         }
         orders.push(layer.order);
     }
+    if !params.require_clip_roles.is_empty() && params.clips.is_none() {
+        return Err(errors::invalid(
+            "require_clip_roles",
+            "roles are required but no `clips` source GLB is declared",
+        ));
+    }
+    let mut required = BTreeSet::new();
+    for role in &params.require_clip_roles {
+        if !CLIP_ROLES.contains(&role.as_str()) {
+            return Err(errors::invalid(
+                "require_clip_roles",
+                format!(
+                    "role {role:?} is not a standard rig role; the roles are {}",
+                    CLIP_ROLES.join(", ")
+                ),
+            ));
+        }
+        if !required.insert(role.as_str()) {
+            return Err(errors::invalid(
+                "require_clip_roles",
+                format!("role {role:?} is declared twice"),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The standard rig roles a clip's bone coverage is reported in, in report
+/// order. A role is the anatomical function, not one bone: `hips` is the
+/// thigh/hip pair, `shoulders` the clavicle/upper-arm pair, so either family's
+/// bone (`NPC`, `CME`) answers for it.
+pub const CLIP_ROLES: [&str; 10] = [
+    "hips",
+    "knees",
+    "ankles",
+    "toes",
+    "shoulders",
+    "elbows",
+    "hands",
+    "neck",
+    "head",
+    "twists",
+];
+
+/// The standard rig role one palette bone belongs to, by its SSE name.
+///
+/// `None` means the bone is not a role carrier: scaffolding (`Scene Root`,
+/// `NPC COM`), physics helpers (`NPC L Butt`) and the finger chains are
+/// reported as untouched palette bones instead of pretending a role moved.
+pub fn clip_role(bone: &str) -> Option<&'static str> {
+    let stripped = bone
+        .strip_prefix("NPC ")
+        .or_else(|| bone.strip_prefix("CME "))
+        .unwrap_or(bone);
+    let name = match stripped.split_once(" [") {
+        Some((plain, _)) => plain,
+        None => stripped,
+    };
+    match name {
+        "L Thigh" | "R Thigh" | "L Hip" | "R Hip" => return Some("hips"),
+        "L Calf" | "R Calf" | "L Knee" | "R Knee" => return Some("knees"),
+        "L Foot" | "R Foot" | "L Ankle" | "R Ankle" => return Some("ankles"),
+        "Neck" => return Some("neck"),
+        "Head" => return Some("head"),
+        "L Hand" | "R Hand" => return Some("hands"),
+        _ => {}
+    }
+    let side = name
+        .strip_prefix("L ")
+        .or_else(|| name.strip_prefix("R "))
+        .unwrap_or(name);
+    if let Some(digit) = side.strip_prefix("Toe")
+        && digit.len() == 1
+        && digit.as_bytes()[0].is_ascii_digit()
+    {
+        return Some("toes");
+    }
+    let twist = side
+        .strip_prefix("UpperarmTwist")
+        .or_else(|| side.strip_prefix("ForearmTwist"));
+    if let Some(digit) = twist
+        && digit.len() == 1
+        && digit.as_bytes()[0].is_ascii_digit()
+    {
+        return Some("twists");
+    }
+    match side {
+        "UpperArm" | "Clavicle" | "Shoulder" => Some("shoulders"),
+        "Forearm" | "Elbow" => Some("elbows"),
+        _ => None,
+    }
+}
+
+/// Which standard rig roles one clip drives, measured against the palette.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipCoverage {
+    /// Roles with at least one driven bone, in [`CLIP_ROLES`] order.
+    pub roles_covered: Vec<&'static str>,
+    /// Roles no driven bone carries, in [`CLIP_ROLES`] order.
+    pub roles_missing: Vec<&'static str>,
+    /// Driven palette bones per covered role, sorted by name.
+    pub role_bones: BTreeMap<&'static str, Vec<String>>,
+    /// Palette bones no channel drives, sorted by name.
+    pub untouched_bones: Vec<String>,
+    /// Palette bones the clip drives.
+    pub mapped_bones: usize,
+    /// Palette size.
+    pub palette_bones: usize,
+}
+
+/// Measure one planned clip's role coverage against the actor's palette.
+pub fn clip_coverage(plan: &ClipPlan, palette: &[String]) -> ClipCoverage {
+    let mapped: BTreeSet<&str> = plan.mapped_bone_names.iter().map(String::as_str).collect();
+    let mut coverage = ClipCoverage {
+        roles_covered: Vec::new(),
+        roles_missing: Vec::new(),
+        role_bones: BTreeMap::new(),
+        untouched_bones: palette
+            .iter()
+            .filter(|bone| !mapped.contains(bone.as_str()))
+            .cloned()
+            .collect(),
+        mapped_bones: mapped.len(),
+        palette_bones: palette.len(),
+    };
+    coverage.untouched_bones.sort_unstable();
+    for bone in &mapped {
+        if let Some(role) = clip_role(bone) {
+            coverage
+                .role_bones
+                .entry(role)
+                .or_default()
+                .push((*bone).to_string());
+        }
+    }
+    for bones in coverage.role_bones.values_mut() {
+        bones.sort_unstable();
+    }
+    for role in CLIP_ROLES {
+        match coverage.role_bones.contains_key(role) {
+            true => coverage.roles_covered.push(role),
+            false => coverage.roles_missing.push(role),
+        }
+    }
+    coverage
+}
+
+/// The admission gate one planned clip must pass before any output byte.
+///
+/// A rest the rig cannot reproduce refuses the export unless
+/// `allow_incompatible_rest` was declared, and a required role no channel
+/// drives refuses it outright; the coverage report itself never blocks a clip,
+/// so a legitimately partial clip (an upper-body idle) still exports.
+///
+/// # Errors
+/// `export_actor_clip_rest_incompatible` and `export_actor_clip_role_coverage`,
+/// each naming the clip and its measurement.
+pub fn admit_clip(
+    plan: &ClipPlan,
+    palette: &[String],
+    required: &[String],
+    allow_incompatible_rest: bool,
+    admitted_residual: f64,
+) -> Result<ClipCoverage, CommandError> {
+    if !plan.rest_pose_comparable && !allow_incompatible_rest {
+        return Err(refused(
+            "export_actor_clip_rest_incompatible",
+            format!(
+                "clip {:?} rest pose is not comparable with the rig: max rest rotation {:.2}°, \
+                 max bone-position residual {:.4} relative (admitted {:.4}) on {:?}; the clip was \
+                 authored on a different rest, so only its motion would play — declare \
+                 `allow_incompatible_rest` to export it anyway and read the measurements",
+                plan.clip.name,
+                plan.max_rest_rotation_degrees,
+                plan.max_rest_translation_residual,
+                admitted_residual,
+                plan.rest_pose_outlier,
+            ),
+        ));
+    }
+    let coverage = clip_coverage(plan, palette);
+    if !required.is_empty() {
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|role| coverage.roles_missing.contains(&role.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(refused(
+                "export_actor_clip_role_coverage",
+                format!(
+                    "clip {:?} drives {} of {} palette bones ({:.1} %) and does not drive the \
+                     required role(s): {}; covered: {}",
+                    plan.clip.name,
+                    coverage.mapped_bones,
+                    coverage.palette_bones,
+                    100.0 * coverage.mapped_bones as f64 / coverage.palette_bones.max(1) as f64,
+                    missing.join(", "),
+                    coverage.roles_covered.join(", "),
+                ),
+            ));
+        }
+    }
+    Ok(coverage)
 }
 
 /// The palette slots a vertex beyond the reach may be bound to.

@@ -134,7 +134,12 @@ pub fn run(args: &[String]) -> ExitCode {
 }
 
 pub(crate) fn dispatch_payload(command: &str, payload: &Value) -> ExitCode {
-    let result = dispatch(command, payload);
+    report(dispatch(command, payload))
+}
+
+/// Print one dispatch envelope and map its error kind to an exit code, leaving
+/// the report with the caller for its own notices.
+pub(crate) fn report(result: Result<Value, CommandError>) -> ExitCode {
     let exit = match &result {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => match error.kind() {

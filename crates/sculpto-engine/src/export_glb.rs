@@ -209,6 +209,9 @@ pub struct ClipPlan {
     pub scale: f64,
     /// Channels that found their bone by name.
     pub mapped_bones: usize,
+    /// Palette bones the clip drives, sorted by name; the input to the
+    /// admission gate's role coverage.
+    pub mapped_bone_names: Vec<String>,
     /// Channels dropped because their bone carries no weight in this skin.
     pub dropped_bones: Vec<String>,
     /// Channels whose bone is a root of the destination rig: the rig's own
@@ -1809,6 +1812,11 @@ pub fn plan_clip(
         duration,
         scale,
         mapped_bones: tracks.len(),
+        mapped_bone_names: {
+            let mut names: Vec<String> = tracks.iter().map(|track| track.name.clone()).collect();
+            names.sort_unstable();
+            names
+        },
         dropped_bones: dropped.clone(),
         root_bones,
         moving_channels,

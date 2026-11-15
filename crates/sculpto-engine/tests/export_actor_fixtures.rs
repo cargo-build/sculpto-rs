@@ -88,6 +88,20 @@ fn params(case: &Value, out_dir: &Path) -> ExportActorParams {
             .iter()
             .map(|name| name.as_str().expect("clip name").to_string())
             .collect(),
+        require_clip_roles: case
+            .get("require_clip_roles")
+            .and_then(Value::as_array)
+            .map(|roles| {
+                roles
+                    .iter()
+                    .map(|role| role.as_str().expect("role").to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        allow_incompatible_rest: case
+            .get("allow_incompatible_rest")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         units_per_metre: case.get("units_per_metre").and_then(Value::as_f64),
         rest_translation_tolerance: None,
         rest_scale_tolerance: None,

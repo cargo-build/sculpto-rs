@@ -173,6 +173,13 @@ export-actor options:
   --skeleton <path>       family skeleton NIF that completes the authored rig
   --clips <path>          source actor GLB whose clips are mapped by bone name
   --clip <name>           clip to write (repeatable; the written order is this order)
+  --require-clip-roles <list>
+                          comma-separated roles every clip must drive (hips, knees,
+                          ankles, toes, shoulders, elbows, hands, neck, head, twists);
+                          a clip that misses one refuses the export
+  --allow-incompatible-rest
+                          export a rest-incompatible clip instead of refusing it;
+                          stderr and the report carry the measured rotation and residual
   --units-per-metre <n>   scale the written file to metres (BodySlide sources: 71.4286)
   --reach <units>         reach inside which a part takes copied body weights (default 3)
   --smooth <n>            smoothing passes over the bound region (default 6)
@@ -1408,6 +1415,8 @@ fn export_actor(args: &[String]) -> ExitCode {
     let mut translation: Option<f64> = None;
     let mut scale_tolerance: Option<f64> = None;
     let mut frame: Option<f64> = None;
+    let mut require_roles: Vec<String> = Vec::new();
+    let mut allow_incompatible_rest = false;
     let mut iter = args.iter();
     let reject = |message: String| -> ExitCode {
         eprintln!("export-actor: {message}");
@@ -1419,6 +1428,10 @@ fn export_actor(args: &[String]) -> ExitCode {
             .map_err(|_| reject(format!("`--{name} {value}` is not a number")))
     };
     while let Some(key) = iter.next() {
+        if key == "--allow-incompatible-rest" {
+            allow_incompatible_rest = true;
+            continue;
+        }
         let Some(name) = key.strip_prefix("--") else {
             return reject(format!("unexpected argument `{key}`"));
         };
@@ -1447,6 +1460,16 @@ fn export_actor(args: &[String]) -> ExitCode {
             "skeleton" => skeleton = Some(value.clone()),
             "clips" => clips = Some(value.clone()),
             "clip" => clip_names.push(value.clone()),
+            "require-clip-roles" => {
+                for role in value.split(',').map(str::trim) {
+                    if role.is_empty() {
+                        return reject(format!(
+                            "`--require-clip-roles {value}` has an empty role name"
+                        ));
+                    }
+                    require_roles.push(role.to_owned());
+                }
+            }
             "extremity-bone" => extremity.push(value.clone()),
             "source" => match value.split_once('=') {
                 Some((shape, file)) if !shape.is_empty() && !file.is_empty() => {
@@ -1534,7 +1557,36 @@ fn export_actor(args: &[String]) -> ExitCode {
     if let Some(value) = smooth {
         input["smooth_iterations"] = serde_json::json!(value);
     }
-    run::dispatch_payload("export.actor", &input)
+    if !require_roles.is_empty() {
+        input["require_clip_roles"] = serde_json::json!(require_roles);
+    }
+    if allow_incompatible_rest {
+        input["allow_incompatible_rest"] = serde_json::json!(true);
+    }
+    let result = sculpto_engine::dispatch("export.actor", &input);
+    // The override the operator asked for prints its own price: every clip the
+    // rest gate would have refused names its measured rotation and residual.
+    if let Ok(report) = &result {
+        for clip in report["clips"].as_array().into_iter().flatten() {
+            if clip["rest_incompatible_admitted"].as_bool() != Some(true) {
+                continue;
+            }
+            let (Some(name), Some(rotation), Some(residual)) = (
+                clip["name"].as_str(),
+                clip["max_rest_rotation_degrees"].as_f64(),
+                clip["max_rest_translation_residual"].as_f64(),
+            ) else {
+                eprintln!("export-actor: an admitted clip row is missing its measurements");
+                continue;
+            };
+            eprintln!(
+                "export-actor: clip `{name}` exported despite an incompatible rest pose: max rest \
+                 rotation {rotation:.2}°, max bone-position residual {residual:.4} relative; the \
+                 motion plays, the stance does not"
+            );
+        }
+    }
+    run::report(result)
 }
 
 /// Positions plus triangles, the shape an OBJ carries in the display frame.
