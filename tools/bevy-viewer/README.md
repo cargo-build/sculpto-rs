@@ -102,3 +102,9 @@ the far side black and reads as a hole. `L` toggles lit/flat at runtime; flat
 hides the rig and renders every material unlit, so a review shows the silhouette,
 the seams and the layer palette without a shadow that can be mistaken for a
 defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds.
+
+`T` switches the drag from camera orbit to a turntable: the figure rotates under
+the fixed key light, so shading and cast shadows sweep across the surface. That
+is the mode for judging form; a camera orbit keeps every surface lit the same
+way and is only a change of viewpoint. Keyboard events need the window focused —
+agent-opened preview windows start unfocused by design, so click the figure once.

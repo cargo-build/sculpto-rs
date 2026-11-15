@@ -75,6 +75,25 @@ struct FlatMode(bool);
 #[derive(Component)]
 struct ReviewLight;
 
+/// Materials flattened by the flat mode, so switching back restores them.
+#[derive(Resource, Default)]
+struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
+
+/// Marks a spawned review model so the turntable can rotate it while the key
+/// light stays fixed in world space — that is what makes the shading and the
+/// cast shadows sweep across the figure as it turns.
+#[derive(Component)]
+struct ReviewModel;
+
+/// Turntable state: `T` flips it and horizontal drag then rotates the model
+/// instead of orbiting the camera. Seeded by `SCULPTO_VIEWER_TURNTABLE`.
+#[derive(Resource)]
+struct Turntable {
+    enabled: bool,
+    yaw: f32,
+    pitch: f32,
+}
+
 struct CliOptions {
     report: bool,
     headless: bool,
@@ -182,7 +201,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title:
-                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset, L lit/flat"
+                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset, L lit/flat, T turntable"
                                 .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -207,7 +226,13 @@ fn main() {
             );
     }
 
-    app.insert_resource(FlatMode(config.flat))
+    app.insert_resource(FlatFlipped::default())
+        .insert_resource(Turntable {
+        enabled: std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
+        yaw: 0.0,
+        pitch: 0.0,
+    })
+        .insert_resource(FlatMode(config.flat))
         .insert_resource(Units(options.units))
         .insert_resource(Bench(options.bench))
         .insert_resource(config)
@@ -260,9 +285,44 @@ fn main() {
                 orbit_controls,
                 toggle_flat,
                 apply_flat_mode,
+                toggle_turntable,
+                apply_turntable,
             ),
         )
         .run();
+}
+
+/// `T` flips camera-orbit / turntable: a turntable turns the figure under a
+/// fixed key light, so the shading and the shadows move with the surface.
+fn toggle_turntable(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut turntable: ResMut<Turntable>,
+) {
+    if config.interactive && keys.just_pressed(KeyCode::KeyT) {
+        turntable.enabled = !turntable.enabled;
+    }
+}
+
+/// Applies the turntable rotation to every spawned model. The light rig stays
+/// where it is, which is the point: the same world light now hits a different
+/// part of the surface as the figure turns.
+fn apply_turntable(
+    turntable: Res<Turntable>,
+    mut models: Query<&mut Transform, With<ReviewModel>>,
+) {
+    if !turntable.enabled {
+        return;
+    }
+    let rotation = Quat::from_euler(
+        bevy::math::EulerRot::YXZ,
+        turntable.yaw,
+        turntable.pitch,
+        0.0,
+    );
+    for mut transform in &mut models {
+        transform.rotation = rotation;
+    }
 }
 
 /// `L` flips lit/flat in the interactive viewer; the capture path keeps its
@@ -284,6 +344,7 @@ fn apply_flat_mode(
     flat: Res<FlatMode>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut lights: Query<&mut Visibility, With<ReviewLight>>,
+    mut flipped: ResMut<FlatFlipped>,
 ) {
     let want = if flat.0 { Visibility::Hidden } else { Visibility::Visible };
     for mut visibility in &mut lights {
@@ -291,12 +352,20 @@ fn apply_flat_mode(
             *visibility = want;
         }
     }
-    if !flat.0 {
-        return;
-    }
-    for (_, material) in materials.iter_mut() {
-        if !material.unlit {
-            material.unlit = true;
+    if flat.0 {
+        // Remember which materials we flattened so `L` can restore the lit
+        // look; leaving them unlit made the second press look like a no-op.
+        for (id, material) in materials.iter_mut() {
+            if !material.unlit {
+                material.unlit = true;
+                flipped.0.push(id);
+            }
+        }
+    } else {
+        for id in flipped.0.drain(..) {
+            if let Some(mut material) = materials.get_mut(id) {
+                material.unlit = false;
+            }
         }
     }
 }
@@ -425,6 +494,7 @@ fn setup(
         commands.spawn((
             bevy::world_serialization::WorldAssetRoot(scene.clone()),
             Transform::from_xyz(x, 0.0, z).with_scale(Vec3::splat(scene_scale)),
+            ReviewModel,
         ));
     }
 }
@@ -475,6 +545,7 @@ impl OrbitCamera {
 fn orbit_controls(
     config: Res<ViewerConfig>,
     orbit: Option<ResMut<OrbitCamera>>,
+    turntable: Option<ResMut<Turntable>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut motion: MessageReader<MouseMotion>,
@@ -487,6 +558,10 @@ fn orbit_controls(
     let Some(mut orbit) = orbit else {
         return;
     };
+    // Turntable mode rotates the figure under the fixed key light, so the
+    // shading and cast shadows sweep across the surface; camera orbit alone
+    // would move the viewpoint but leave every surface lit the same way.
+    let mut turntable = turntable.filter(|state| state.enabled);
 
     let mut delta = Vec2::ZERO;
     for event in motion.read() {
@@ -504,8 +579,13 @@ fn orbit_controls(
         orbit.reset();
     }
     if buttons.pressed(MouseButton::Left) {
-        orbit.yaw -= delta.x * 0.005;
-        orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
+        if let Some(state) = turntable.as_mut() {
+            state.yaw -= delta.x * 0.005;
+            state.pitch = (state.pitch - delta.y * 0.005).clamp(-1.2, 1.2);
+        } else {
+            orbit.yaw -= delta.x * 0.005;
+            orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
+        }
     }
     if buttons.pressed(MouseButton::Right) {
         let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
