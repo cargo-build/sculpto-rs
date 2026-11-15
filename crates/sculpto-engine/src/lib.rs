@@ -22,6 +22,7 @@ pub mod ops;
 mod parts;
 pub mod rules;
 mod seal;
+mod viewer;
 
 /// A stable command identifier.
 ///
@@ -87,6 +88,8 @@ pub enum CommandId {
     GltfResetWeights,
     /// Clamp a GLB's negative `texCoord` indices to UV set 0.
     GltfClampTexcoord,
+    /// Write the metres-scale review GLB: body plus palette-ranked layers.
+    ViewerExport,
 }
 
 impl CommandId {
@@ -122,6 +125,7 @@ impl CommandId {
             CommandId::ExportTri => "export.tri",
             CommandId::GltfResetWeights => "gltf.reset_weights",
             CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
+            CommandId::ViewerExport => "viewer.export",
         }
     }
 
@@ -498,6 +502,14 @@ const COMMANDS: &[Spec] = &[
         schema: handlers::glb_file_schema,
         handler: handlers::gltf_clamp_texcoord,
     },
+    Spec {
+        id: CommandId::ViewerExport,
+        summary: "Write the review GLB: the body OBJ plus palette-ranked garment layers, scaled to metres, one coloured mesh per part; a review artifact, not a fit result.",
+        mutates: true,
+        stub: false,
+        schema: viewer::schema,
+        handler: viewer::export,
+    },
 ];
 
 /// Every registry row, in declaration order.
@@ -603,6 +615,7 @@ mod tests {
             "mesh.densify",
             "gltf.reset_weights",
             "gltf.clamp_texcoord",
+            "viewer.export",
         ] {
             let error = dispatch(id, &Value::Null).expect_err("missing params are an error");
             assert_ne!(error.kind(), ErrorKind::NotImplemented, "{id} is not wired");

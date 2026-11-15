@@ -56,6 +56,8 @@ pub mod pack;
 
 pub mod profile;
 
+pub mod review;
+
 pub mod sanitize;
 
 mod rigged;
@@ -190,6 +192,15 @@ pub enum GltfError {
     Serialize(String),
     /// The GLB container failed to frame the chunks.
     Encode(String),
+    /// The review export received no parts at all; there is no scene to write.
+    ReviewNoParts,
+    /// A review part carries no geometry, so no primitive can be written.
+    ReviewPartEmpty {
+        /// The part name.
+        part: String,
+        /// Which attribute list is empty: `"vertices"` or `"triangles"`.
+        what: &'static str,
+    },
 }
 
 impl fmt::Display for GltfError {
@@ -276,6 +287,13 @@ impl fmt::Display for GltfError {
             ),
             Self::Serialize(detail) => write!(f, "GLB JSON failed: {detail}"),
             Self::Encode(detail) => write!(f, "GLB framing failed: {detail}"),
+            Self::ReviewNoParts => {
+                write!(f, "review export has no parts; there is no scene to write")
+            }
+            Self::ReviewPartEmpty { part, what } => write!(
+                f,
+                "review part '{part}' has no {what}; an invisible part is a defect, not a layer"
+            ),
         }
     }
 }
@@ -887,6 +905,28 @@ impl Writer {
             "componentType": component_type,
             "type": gltf_type,
             "count": count,
+        }));
+        self.accessors.len() - 1
+    }
+
+    /// [`Self::accessor`] plus the `min`/`max` bounds glTF requires on
+    /// `POSITION` accessors.
+    fn accessor_with_bounds(
+        &mut self,
+        view: usize,
+        component_type: u32,
+        gltf_type: &str,
+        count: usize,
+        min: [f32; 3],
+        max: [f32; 3],
+    ) -> usize {
+        self.accessors.push(json!({
+            "bufferView": view,
+            "componentType": component_type,
+            "type": gltf_type,
+            "count": count,
+            "min": min,
+            "max": max,
         }));
         self.accessors.len() - 1
     }

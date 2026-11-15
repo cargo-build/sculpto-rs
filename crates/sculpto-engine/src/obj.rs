@@ -411,6 +411,11 @@ fn obj_error(error: ObjError) -> CommandError {
     }
 }
 
+/// [`obj_error`] for callers outside this module: the same three-way contract.
+pub(crate) fn read_error(error: ObjError) -> CommandError {
+    obj_error(error)
+}
+
 /// Source NIF positions are Z-up; every OBJ here uses the `(x, z, -y)` display
 /// frame, so this is the one conversion between them.
 pub(crate) fn display_to_source([x, y, z]: [f32; 3]) -> [f32; 3] {

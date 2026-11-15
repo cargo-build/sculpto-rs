@@ -64,6 +64,7 @@ registry does not expose it. Query the catalogue before walking asset roots.
 | Goal | Existing entry / source | Boundary |
 |---|---|---|
 | Inspect BodySlide data | `inspect PATH`, `presets`, `sliders`; [core](crates/sculpto-core/src/lib.rs) | OSP, presets, OSD/BSD; family and ordered vertex identity matter |
+| Write the review GLB for the interactive viewer | registry `viewer.export` / `sculpto viewer export`; [review writer](crates/sculpto-gltf/src/review.rs) | Metres (71.4286 units/m), one palette-coloured mesh per part; a review artifact, never a fit result |
 | Bake shapes | `bake`, `batch`; [bake](crates/sculpto-bake/src/lib.rs) | Explicit set, preset and weight endpoint; a body bake is not a finished outfit |
 | Import/export assets | `export-obj`, `export-nif`, registry `export.nif` / `export.bundle` / `export.pair`; [NIF](crates/sculpto-nif/src/lib.rs), [GLB writer](crates/sculpto-gltf/src/lib.rs) | Supported subsets; do not infer every native format feature |
 | Fit and classify garments | `garment fit`, `follow`, `aura`, `classify`, `intake`; [mesh](crates/sculpto-mesh/src/lib.rs) | Authored topology/rest frame and declared preparation route |

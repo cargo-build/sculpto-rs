@@ -80,6 +80,9 @@ commands:
                         neutral diagnostic densify; boundaries and parts stay, not a fit result
   blender cloth-bake --request <json> [options]
                         run the pinned Blender cloth bake and validate its artifacts
+  viewer export --body <obj> --out <glb> [--layer <order>=<obj>]...
+                  [--outfit <layers.json>] [--report <json>]
+                  write the review GLB: metres, one palette-coloured mesh per part
   run --cmd <id>        dispatch one command id and print its JSON envelope
   commands [--json]     list every command id with its mutation class
   mcp                   serve the MCP surface (JSON-RPC 2.0 over stdio)
@@ -333,6 +336,9 @@ fn main() -> ExitCode {
             mesh_densify(rest)
         }
         [command, rest @ ..] if command == "blender" => blender::run(rest),
+        [command, action, rest @ ..] if command == "viewer" && action == "export" => {
+            viewer_export(rest)
+        }
         [command, rest @ ..] if command == "run" => run::run(rest),
         [command, rest @ ..] if command == "commands" => run::commands(rest),
         [command] if command == "mcp" => mcp::serve(),
@@ -689,6 +695,66 @@ fn body_seal_joints(args: &[String]) -> ExitCode {
         "seat_by_ring_centroid": seat_by_ring_centroid,
     });
     run::dispatch_payload("body.seal_joints", &input)
+}
+
+/// `viewer export`: the flags stay thin over the registry input. `--layer`
+/// repeats and carries its palette rank in the value (`<order>=<obj>`), so it
+/// is parsed here instead of through the single-value [`parse_flags`].
+fn viewer_export(args: &[String]) -> ExitCode {
+    let mut body: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut outfit: Option<String> = None;
+    let mut report: Option<String> = None;
+    let mut layers: Vec<serde_json::Value> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(key) = iter.next() {
+        let reject = |message: String| -> ExitCode {
+            eprintln!("viewer export: {message}");
+            ExitCode::from(2)
+        };
+        let Some(name) = key.strip_prefix("--") else {
+            return reject(format!("unexpected argument `{key}`"));
+        };
+        let Some(value) = iter.next() else {
+            return reject(format!("`--{name}` needs a value"));
+        };
+        match name {
+            "body" => body = Some(value.clone()),
+            "out" => out = Some(value.clone()),
+            "outfit" => outfit = Some(value.clone()),
+            "report" => report = Some(value.clone()),
+            "layer" => {
+                let Some((order, path)) = value.split_once('=') else {
+                    return reject(format!(
+                        "`--layer {value}` is not `<order>=<obj>`; the order picks the palette colour"
+                    ));
+                };
+                let Ok(order) = order.parse::<u32>() else {
+                    return reject(format!(
+                        "`--layer {value}` order `{order}` is not a palette rank number"
+                    ));
+                };
+                layers.push(serde_json::json!({ "order": order, "obj": path }));
+            }
+            other => return reject(format!("unknown option `--{other}`")),
+        }
+    }
+    let Some(body) = body else {
+        eprintln!("viewer export: `--body` is required");
+        return ExitCode::from(2);
+    };
+    let Some(out) = out else {
+        eprintln!("viewer export: `--out` is required");
+        return ExitCode::from(2);
+    };
+    let mut input = serde_json::json!({ "body": body, "out": out, "layers": layers });
+    if let Some(outfit) = outfit {
+        input["outfit"] = serde_json::json!(outfit);
+    }
+    if let Some(report) = report {
+        input["report"] = serde_json::json!(report);
+    }
+    run::dispatch_payload("viewer.export", &input)
 }
 
 fn outfit_inspect(args: &[String]) -> ExitCode {
