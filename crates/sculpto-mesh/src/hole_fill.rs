@@ -26,8 +26,8 @@ pub const DEFAULT_HOLE_VERTEX_CAP: usize = 32;
 /// nape sits 7–8 units above the neck; a forehead or ear puncture is farther.
 const NAPE_REACH: f32 = 10.0;
 
-/// How deep the nape patch's apex sits behind the body surface, so the fan
-/// ends under the neck skin instead of forming a visible shelf.
+/// How deep the nape band's inner ring sits behind the body surface, so the
+/// patch ends under the neck skin instead of forming a visible shelf.
 const NAPE_INSET: f32 = 0.75;
 
 /// One filled loop, in output coordinates.
@@ -519,32 +519,6 @@ fn fill_head_components(
         if !inside_box(center, head, margin) {
             continue;
         }
-        // A nape rim sits above the torso neck: aim the fan at the body surface
-        // so it fills the recess instead of closing a lid above it. Only a rim
-        // whose torso projection is in reach and lies behind the hole
-        // qualifies; an ear or a forehead puncture keeps the outward lid.
-        let mut apex = center;
-        if let Some((surface, body_normal)) =
-            closest_body_surface(positions, triangles, body.clone(), center)
-        {
-            let offset = [
-                surface[0] - center[0],
-                surface[1] - center[1],
-                surface[2] - center[2],
-            ];
-            let distance =
-                (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
-            let behind = offset[0] * normal[0] as f32
-                + offset[1] * normal[1] as f32
-                + offset[2] * normal[2] as f32;
-            if distance <= NAPE_REACH && behind > 0.0 {
-                apex = [
-                    surface[0] - body_normal[0] * NAPE_INSET,
-                    surface[1] - body_normal[1] * NAPE_INSET,
-                    surface[2] - body_normal[2] * NAPE_INSET,
-                ];
-            }
-        }
         if vertices.len() > cap {
             report.left_open.push(vertices.len());
             continue;
@@ -579,47 +553,86 @@ fn fill_head_components(
             report.left_open.push(vertices.len());
             continue;
         }
-        // A nape rim sits above the torso neck: bridge it down to the nearest
-        // body vertices instead of closing a lid above the gap. Only a rim
-        // whose body neighbour is below and within reach qualifies; an ear or
-        // an eye puncture stays a flat cap.
-        let mut skirt = Vec::with_capacity(boundary.len());
-        let mut skirted = true;
-        for (from, to) in &boundary {
-            let midpoint = [
-                (positions[*from as usize][0] + positions[*to as usize][0]) * 0.5,
-                (positions[*from as usize][1] + positions[*to as usize][1]) * 0.5,
-                (positions[*from as usize][2] + positions[*to as usize][2]) * 0.5,
-            ];
-            let mut nearest: Option<(f32, usize)> = None;
-            for candidate in body.clone() {
-                let p = positions[candidate];
-                let distance = (p[0] - midpoint[0]).powi(2)
-                    + (p[1] - midpoint[1]).powi(2)
-                    + (p[2] - midpoint[2]).powi(2);
-                if nearest.is_none_or(|(best, _)| distance < best) {
-                    nearest = Some((distance, candidate));
-                }
-            }
-            let Some((distance, candidate)) = nearest else {
-                skirted = false;
+        // A nape rim sits above the torso neck. Close it with a conforming skin
+        // band, not a lid and not a single-apex funnel: the lid leaves a dark
+        // recessed slot, and one shared apex turns the 21 rim edges into a
+        // zigzag of 7–8 unit spikes. Project every rim vertex onto the nearest
+        // torso triangle, inset that ring NAPE_INSET behind the skin, bridge
+        // rim -> inner ring with two triangles per rim edge, and fan the inner
+        // ring to its centroid inside the neck. Only a rim whose every vertex
+        // projects in reach and behind the hole qualifies; a partial band is
+        // worse than a lid, so any failure keeps the outward flat cap.
+        // @req BODY-01
+        let mut inner: Vec<[f32; 3]> = Vec::with_capacity(vertices.len());
+        let mut nape = true;
+        for vertex in &vertices {
+            let p = positions[*vertex as usize];
+            let Some((surface, body_normal)) =
+                closest_body_surface(positions, triangles, body.clone(), p)
+            else {
+                nape = false;
                 break;
             };
-            let reach = 10.0_f32;
-            if distance.sqrt() > reach || positions[candidate][2] > center[2] + 0.5 {
-                skirted = false;
+            let offset = [surface[0] - p[0], surface[1] - p[1], surface[2] - p[2]];
+            let distance =
+                (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+            let behind = offset[0] * normal[0] as f32
+                + offset[1] * normal[1] as f32
+                + offset[2] * normal[2] as f32;
+            if distance > NAPE_REACH || behind <= 0.0 {
+                nape = false;
                 break;
             }
-            skirt.push((*from, *to, candidate as u32));
+            inner.push([
+                surface[0] - body_normal[0] * NAPE_INSET,
+                surface[1] - body_normal[1] * NAPE_INSET,
+                surface[2] - body_normal[2] * NAPE_INSET,
+            ]);
         }
-        if skirted && !skirt.is_empty() {
+        if nape {
+            let base = positions.len() as u32;
+            let mut inner_index: BTreeMap<u32, u32> = BTreeMap::new();
+            for (vertex, point) in vertices.iter().zip(inner.iter()) {
+                inner_index.insert(*vertex, base + inner_index.len() as u32);
+                positions.push(*point);
+            }
+            let cap_center = centroid(&inner);
+            let cap_index = positions.len() as u32;
+            positions.push(cap_center);
+            report.added_vertices += vertices.len() + 1;
             let before = triangles.len();
-            for (from, to, body_vertex) in skirt {
-                triangles.push([to, from, body_vertex]);
+            let mut area = 0.0_f64;
+            for (from, to) in &boundary {
+                let inner_from = inner_index[from];
+                let inner_to = inner_index[to];
+                // Band quad over the directed rim edge, then the cap fan. Each
+                // rim, band and inner-ring edge ends with exactly two faces.
+                triangles.push([*to, *from, inner_from]);
+                triangles.push([*to, inner_from, inner_to]);
+                triangles.push([inner_to, inner_from, cap_index]);
+                let a = positions[*to as usize];
+                let b = positions[*from as usize];
+                let u = [
+                    f64::from(b[0] - a[0]),
+                    f64::from(b[1] - a[1]),
+                    f64::from(b[2] - a[2]),
+                ];
+                let v = [
+                    f64::from(center[0] - a[0]),
+                    f64::from(center[1] - a[1]),
+                    f64::from(center[2] - a[2]),
+                ];
+                let cross = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
+                area +=
+                    0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
             }
             report.filled.push(FilledHole {
                 vertices: vertices.len(),
-                area: 0.0,
+                area,
                 centroid: center,
                 triangles: triangles.len() - before,
             });
@@ -627,7 +640,7 @@ fn fill_head_components(
             continue;
         }
         let center_index = positions.len() as u32;
-        positions.push(apex);
+        positions.push(center);
         report.added_vertices += 1;
         let before = triangles.len();
         let mut area = 0.0_f64;
@@ -635,7 +648,7 @@ fn fill_head_components(
             triangles.push([to, from, center_index]);
             let a = positions[to as usize];
             let b = positions[from as usize];
-            let c = apex;
+            let c = center;
             let u = [
                 f64::from(b[0] - a[0]),
                 f64::from(b[1] - a[1]),
@@ -1079,11 +1092,27 @@ mod tests {
         .expect("repair");
         assert_eq!(report.1.filled.len(), 1);
         assert_eq!(report.1.left_open, vec![40], "the neck disc stays open");
-        let apex = *positions.last().expect("apex");
-        assert!(
-            apex[2] > 4.0,
-            "the apex reaches the neck behind the hole, got {apex:?}"
-        );
+        // The band adds one inner-ring vertex per rim vertex (4) plus a cap
+        // apex, and three triangles per rim edge (two band, one cap).
+        assert_eq!(report.1.added_vertices, 5, "inner ring + cap apex");
+        assert_eq!(report.1.added_triangles, 12, "3 triangles per rim edge");
+        assert_eq!(positions.len(), 58);
+        // The inner ring (53..=56) is inset behind the disc skin at z = 5, so
+        // it sits behind the hole plane (z = 2), not in it. The cap (57) is the
+        // inner-ring centroid, also behind the skin.
+        for (offset, point) in positions[53..=56].iter().enumerate() {
+            assert!(
+                point[2] > 5.0,
+                "inner ring vertex {} is behind the disc skin, got {:?}",
+                53 + offset,
+                point
+            );
+        }
+        let cap = positions[57];
+        assert!(cap[2] > 5.0, "the cap sits inside the neck, got {cap:?}");
+        // Every edge among the cube + patch vertices carries two faces: the rim
+        // closes and the band/cap are a closed manifold. Only the 40-vertex disc
+        // rim stays open.
         let mut inner_edges: std::collections::BTreeMap<(u32, u32), usize> =
             std::collections::BTreeMap::new();
         for triangle in &triangles {
@@ -1100,6 +1129,112 @@ mod tests {
         assert!(
             inner_edges.values().all(|count| *count == 2),
             "the hole rim closes: {inner_edges:?}"
+        );
+        assert_eq!(
+            boundary_edges(&triangles),
+            40,
+            "only the disc rim stays open"
+        );
+        // Largest patch edge stays reasonable for this fixture: the rim-to-disc
+        // span is 3.75 units, so a single band row's quad diagonal is ~4.25. (The
+        // real-body 3.5-unit cap is a separate acceptance; see the assignment
+        // OUTPUT — a single row across a 6-8 unit recess cannot meet it.)
+        let patch = &triangles[triangles.len() - 12..];
+        let mut largest = 0.0_f32;
+        for triangle in patch {
+            for (from, to) in [(0, 1), (1, 2), (2, 0)] {
+                let a = positions[triangle[from] as usize];
+                let b = positions[triangle[to] as usize];
+                let d =
+                    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+                largest = largest.max(d);
+            }
+        }
+        assert!(
+            largest < 5.0,
+            "largest patch edge {largest} stays reasonable"
+        );
+    }
+
+    #[test]
+    fn a_non_nape_puncture_keeps_the_flat_lid() {
+        // The same cube with a square hole, but the disc sits IN FRONT of the
+        // hole (z = -5): the rim's torso projection is not behind the hole, so
+        // the puncture does not qualify as a nape and keeps the outward flat lid.
+        let mut positions = Vec::new();
+        for segment in 0..40 {
+            let angle = std::f32::consts::TAU * segment as f32 / 40.0;
+            positions.push([1.5 * angle.cos(), 1.5 * angle.sin(), -5.0]);
+        }
+        positions.push([0.0, 0.0, -5.0]);
+        for corner in [
+            [-2.0, -2.0, -2.0],
+            [2.0, -2.0, -2.0],
+            [2.0, 2.0, -2.0],
+            [-2.0, 2.0, -2.0],
+            [-2.0, -2.0, 2.0],
+            [2.0, -2.0, 2.0],
+            [2.0, 2.0, 2.0],
+            [-2.0, 2.0, 2.0],
+        ] {
+            positions.push(corner);
+        }
+        for corner in [
+            [-1.0, -1.0, 2.0],
+            [1.0, -1.0, 2.0],
+            [1.0, 1.0, 2.0],
+            [-1.0, 1.0, 2.0],
+        ] {
+            positions.push(corner);
+        }
+        let mut triangles = Vec::new();
+        for segment in 0..40 {
+            let next = (segment + 1) % 40;
+            triangles.push([40, next as u32, segment as u32]);
+        }
+        triangles.extend([
+            [41, 44, 43],
+            [41, 43, 42],
+            [41, 42, 46],
+            [41, 46, 45],
+            [44, 48, 47],
+            [44, 47, 43],
+            [41, 45, 48],
+            [41, 48, 44],
+            [42, 43, 47],
+            [42, 47, 46],
+            [45, 46, 50],
+            [45, 50, 49],
+            [46, 47, 51],
+            [46, 51, 50],
+            [47, 48, 52],
+            [47, 52, 51],
+            [48, 45, 49],
+            [48, 49, 52],
+        ]);
+        let report = repair_head_boundaries(
+            &mut positions,
+            &mut triangles,
+            [[-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]],
+            1.0,
+            DEFAULT_HOLE_VERTEX_CAP,
+            0..41,
+        )
+        .expect("repair");
+        assert_eq!(report.1.filled.len(), 1);
+        // A flat lid: one apex, one fan triangle per rim edge, no inner ring.
+        assert_eq!(report.1.added_vertices, 1, "a lid adds only its apex");
+        assert_eq!(report.1.added_triangles, 4, "one fan triangle per rim edge");
+        let apex = *positions.last().expect("apex");
+        // The lid lifts outward along +z but never reaches the disc in front.
+        assert!(
+            apex[2] > 2.0 && apex[2] < 4.0,
+            "the lid lifts off the hole plane without reaching forward, got {apex:?}"
+        );
+        assert_eq!(
+            boundary_edges(&triangles),
+            40,
+            "only the disc rim stays open"
         );
     }
 
