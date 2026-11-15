@@ -6,8 +6,10 @@ Asset, preset, face and hairstyle catalogue kinds for the
 The crate owns the `asset` record and a read-only indexer for supplied game
 assets. It hashes regular files, lists `.7z`/`.zip`/`.rar` archives through the
 host `7z`, and records only catalogue-relevant members: `FaceGeom` meshes,
-`SliderPresets`, `SliderSets`, `.jslot` presets and hair meshes. It never
-extracts or rewrites a payload.
+`SliderPresets`, `SliderSets`, `.jslot` presets and hair meshes. For `.glb` and
+`.gltf` files it also records one `clip` row per embedded `animations[]` entry
+with measured channels, keyframes, duration, driven nodes and skin-joint
+coverage. It never extracts or rewrites a payload.
 
 Identity is derived from the source label and canonical host path; the file
 content digest stays in `sha256`. Two files with equal bytes at different paths

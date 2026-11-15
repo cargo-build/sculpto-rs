@@ -18,6 +18,7 @@ boethos index --root DIR [--root DIR ...] [--source LABEL] [--prune]
 boethos list [--category C] [--sex S] [--family F] [--source S] [--tag T]
              [--name TEXT] [--offset N] [--limit N] [--json]
 boethos get ID [--json]
+boethos clips --glb PATH [--json]
 boethos delete ID
 boethos stats [--json]
 boethos export PATH
@@ -25,7 +26,8 @@ boethos export PATH
 
 Commands are non-interactive and strict about arguments. Read commands open an
 existing database read-only; a missing database is a refusal, not an empty
-catalogue. `--json` prints one document; text `list` prints `id`, `category`,
+catalogue. `clips --glb PATH` reads an actor document directly and needs no
+database. `--json` prints one document; text `list` prints `id`, `category`,
 `sex`, `name` and `path`. `boethos --version` prints the binary version.
 
 Exit `0` on success and `2` on a classified refusal. Errors name the path and

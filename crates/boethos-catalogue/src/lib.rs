@@ -6,14 +6,16 @@
 
 mod archive;
 mod body_part;
+mod clip;
 mod index;
 mod model;
 mod raw_part;
 
 pub use archive::{ArchiveEntry, list_archive};
 pub use body_part::{BodyPartInput, body_part_asset};
+pub use clip::{ClipDocument, ClipInfo, clip_asset, read_clips};
 pub use index::{IndexOptions, IndexReport, index_root};
-pub use model::{Asset, Assets, Category, Sex, Status};
+pub use model::{Asset, Assets, Category, ClipDetails, Sex, Status};
 pub use raw_part::{RawPartInput, raw_part_asset};
 
 /// Origin label shared by directory indexing and manifest imports.

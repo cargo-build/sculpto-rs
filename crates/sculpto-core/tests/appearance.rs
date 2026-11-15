@@ -31,6 +31,7 @@ fn asset(id: &str, category: Category, name: &str, entry: Option<&str>, sex: Opt
         shape: None,
         vertices: None,
         triangles: None,
+        clip: None,
         sha256: None,
         source_sha256: None,
         bytes: None,

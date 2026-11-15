@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use boethos::Store;
 use boethos_catalogue::{
     Asset, Assets, BodyPartInput, Category, IndexOptions, RawPartInput, Sex, body_part_asset,
-    index_root, raw_part_asset,
+    index_root, raw_part_asset, read_clips,
 };
 
 fn main() -> ExitCode {
@@ -108,6 +108,12 @@ fn spec(command: &str) -> Option<Spec> {
             repeat: &[],
             max_positionals: 1,
         },
+        "clips" => Spec {
+            values: &["--glb"],
+            switches: &["--json"],
+            repeat: &[],
+            max_positionals: 0,
+        },
         "delete" => Spec {
             values: &[],
             switches: &[],
@@ -148,7 +154,7 @@ fn spec(command: &str) -> Option<Spec> {
     })
 }
 
-const VALUE_FLAGS: [&str; 11] = [
+const VALUE_FLAGS: [&str; 12] = [
     "--db",
     "--root",
     "--source",
@@ -160,6 +166,7 @@ const VALUE_FLAGS: [&str; 11] = [
     "--limit",
     "--offset",
     "--manifest",
+    "--glb",
 ];
 
 fn parse_args(mut arguments: Vec<String>) -> Result<Invocation, String> {
@@ -289,6 +296,9 @@ commands:
         list indexed assets; --name is a case-insensitive substring
   get ID [--json]
         print one asset; accepts an unambiguous 8+ character id prefix
+  clips --glb PATH [--json]
+        read the animations embedded in a glb/gltf actor: name, channels,
+        keyframes, duration, driven nodes and palette coverage
   delete ID
         remove one asset and, for an archive, its indexed members
   stats [--json]
@@ -306,7 +316,7 @@ database:
   else $HOME/.local/state/boethos/assets.redb
 
 categories:
-  body body-part outfit hair face animation preset face_preset project
+  body body-part outfit hair face animation clip preset face_preset project
   texture mesh image archive other
 
 sex:
@@ -324,6 +334,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         "index" => command_index(cli),
         "list" => command_list(cli),
         "get" => command_get(cli),
+        "clips" => command_clips(cli),
         "delete" => command_delete(cli),
         "stats" => command_stats(cli),
         "import-parts" => command_import_parts(cli),
@@ -365,6 +376,7 @@ fn command_index(cli: &Cli) -> Result<(), String> {
         report.files += root_report.files;
         report.archives += root_report.archives;
         report.members += root_report.members;
+        report.clips += root_report.clips;
         report.inserted += root_report.inserted;
         report.updated += root_report.updated;
         report.unchanged += root_report.unchanged;
@@ -382,6 +394,7 @@ fn command_index(cli: &Cli) -> Result<(), String> {
             "files": report.files,
             "archives": report.archives,
             "members": report.members,
+            "clips": report.clips,
             "inserted": report.inserted,
             "updated": report.updated,
             "unchanged": report.unchanged,
@@ -399,10 +412,11 @@ fn command_index(cli: &Cli) -> Result<(), String> {
         );
     } else {
         println!(
-            "indexed {} files, {} archives, {} members: inserted {}, updated {}, unchanged {}, pruned {}, errors {}",
+            "indexed {} files, {} archives, {} members, {} clips: inserted {}, updated {}, unchanged {}, pruned {}, errors {}",
             report.files,
             report.archives,
             report.members,
+            report.clips,
             report.inserted,
             report.updated,
             report.unchanged,
@@ -555,6 +569,61 @@ fn command_get(cli: &Cli) -> Result<(), String> {
         if let Some(triangles) = asset.triangles {
             println!("triangles:{triangles}");
         }
+        if let Some(clip) = &asset.clip {
+            println!("channels: {}", clip.channels);
+            println!("keyframes:{}", clip.keyframes);
+            println!("duration: {:.3}s", clip.duration_seconds);
+            println!("bones:    {}", clip.bones.join(", "));
+            println!(
+                "palette:  {} of {} skin joints",
+                clip.palette_coverage
+                    .map(|coverage| format!("{:.1}%", coverage * 100.0))
+                    .unwrap_or_else(|| "-".to_string()),
+                clip.palette_joints
+            );
+        }
+    }
+    Ok(())
+}
+
+fn command_clips(cli: &Cli) -> Result<(), String> {
+    let path = cli
+        .value("--glb")
+        .ok_or_else(|| "clips requires --glb PATH".to_string())?;
+    let document = read_clips(Path::new(path))?;
+    if cli.has("--json") {
+        let json = serde_json::json!({
+            "path": path,
+            "palette_joints": document.palette_joints,
+            "clips": document.clips,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "{}: {} clips, {} palette joints",
+            escape_field(path),
+            document.clips.len(),
+            document.palette_joints
+        );
+        for clip in &document.clips {
+            let coverage = match clip.palette_coverage {
+                Some(value) => format!("{:.1}%", value * 100.0),
+                None => "-".to_string(),
+            };
+            println!(
+                "{}\tchannels={}\tkeys={}\tduration={:.3}s\tdriven={}\tpalette={} of {}",
+                escape_field(&clip.name),
+                clip.channels,
+                clip.keyframes,
+                clip.duration_seconds,
+                clip.bones.len(),
+                coverage,
+                clip.palette_joints
+            );
+        }
     }
     Ok(())
 }
@@ -589,6 +658,24 @@ fn command_delete(cli: &Cli) -> Result<(), String> {
             .map(|(id, _)| id)
             .collect();
         for id in members {
+            if store
+                .delete::<Assets>(&id)
+                .map_err(|error| error.to_string())?
+            {
+                removed += 1;
+            }
+        }
+    }
+    if asset.category != Category::Clip {
+        let prefix = format!("{}::#", asset.path);
+        let clips: Vec<String> = store
+            .iter_kind::<Assets>()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|(_, row)| row.category == Category::Clip && row.path.starts_with(&prefix))
+            .map(|(id, _)| id)
+            .collect();
+        for id in clips {
             if store
                 .delete::<Assets>(&id)
                 .map_err(|error| error.to_string())?

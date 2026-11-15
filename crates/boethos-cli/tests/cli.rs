@@ -629,3 +629,135 @@ fn imports_raw_part_manifest() {
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }
+
+fn actor_glb() -> Vec<u8> {
+    let json = r#"{
+        "nodes": [{"name": "Root"}, {"name": "Hip"}, {"name": "Spine"}],
+        "skins": [{"joints": [1, 2]}],
+        "accessors": [
+            {"count": 3, "max": [1.5]},
+            {"count": 3, "max": [1.5]},
+            {"count": 2, "max": [0.5]}
+        ],
+        "animations": [
+            {
+                "name": "Walk",
+                "channels": [
+                    {"sampler": 0, "target": {"node": 1, "path": "rotation"}},
+                    {"sampler": 1, "target": {"node": 2, "path": "translation"}}
+                ],
+                "samplers": [{"input": 0, "output": 0}, {"input": 1, "output": 2}]
+            },
+            {
+                "name": "RootOnly",
+                "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}],
+                "samplers": [{"input": 2, "output": 0}]
+            }
+        ]
+    }"#;
+    let mut chunk = json.as_bytes().to_vec();
+    while !chunk.len().is_multiple_of(4) {
+        chunk.push(b' ');
+    }
+    let length = 12 + 8 + chunk.len();
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(b"glTF");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&(length as u32).to_le_bytes());
+    bytes.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+    bytes.extend_from_slice(&chunk);
+    bytes
+}
+
+#[test]
+fn clips_reads_animations_without_a_database_and_a_category_lists_them() {
+    let root = temp_dir("clips");
+    let actor = root.join("actor.glb");
+    fs::write(&actor, actor_glb()).expect("write");
+    let db = root.with_extension("redb");
+
+    let (code, stdout, stderr) = run(
+        &db,
+        &["clips", "--glb", actor.to_str().expect("path"), "--json"],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(document["palette_joints"], 2);
+    let clips = document["clips"].as_array().expect("clips");
+    assert_eq!(clips.len(), 2);
+    assert_eq!(clips[0]["name"], "Walk");
+    assert_eq!(clips[0]["channels"], 2);
+    assert_eq!(clips[0]["keyframes"], 3);
+    assert_eq!(clips[0]["duration_seconds"], 1.5);
+    assert_eq!(clips[0]["bones"], serde_json::json!(["Hip", "Spine"]));
+    assert_eq!(clips[0]["palette_coverage"], 1.0);
+    assert!(!db.exists(), "clips must not create a database");
+
+    let (code, stdout, stderr) = run(&db, &["clips", "--glb", actor.to_str().expect("path")]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("2 clips, 2 palette joints"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Walk\tchannels=2\tkeys=3"),
+        "stdout: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--root",
+            root.to_str().expect("root"),
+            "--no-archives",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(report["clips"], 2);
+    assert_eq!(report["inserted"], 3);
+
+    let (code, stdout, stderr) = run(&db, &["list", "--category", "clip", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let rows: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 2);
+    let walk = rows
+        .iter()
+        .find(|row| row["name"] == "Walk")
+        .expect("Walk row");
+    assert_eq!(walk["clip"]["channels"], 2);
+
+    let id = walk["id"].as_str().expect("id");
+    let (code, stdout, stderr) = run(&db, &["get", id]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("channels: 2"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("palette:  100.0% of 2 skin joints"),
+        "stdout: {stdout}"
+    );
+
+    fs::write(root.join("broken.glb"), b"not a glb").expect("write");
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "clips",
+            "--glb",
+            root.join("broken.glb").to_str().expect("path"),
+        ],
+    );
+    assert_eq!(code, 2);
+    assert!(stderr.contains("glb"), "stderr: {stderr}");
+
+    let (code, _, stderr) = run(&db, &["clips"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("clips requires --glb PATH"),
+        "stderr: {stderr}"
+    );
+    let _ = fs::remove_file(&db);
+    let _ = fs::remove_dir_all(root);
+}

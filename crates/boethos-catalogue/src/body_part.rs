@@ -91,6 +91,7 @@ pub fn body_part_asset(input: &BodyPartInput) -> Result<Asset, String> {
         shape: Some(input.shape.clone()),
         vertices: Some(input.vertices),
         triangles: Some(input.triangles),
+        clip: None,
         sha256: input.sha256.clone(),
         source_sha256: None,
         bytes: input.bytes,

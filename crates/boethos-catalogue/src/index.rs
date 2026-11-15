@@ -99,6 +99,8 @@ pub struct IndexReport {
     pub archives: usize,
     /// Archive members selected for the catalogue.
     pub members: usize,
+    /// Animation clips embedded in indexed `glb`/`gltf` files.
+    pub clips: usize,
     /// New identities.
     pub inserted: usize,
     /// Existing identities whose record changed.
@@ -180,6 +182,7 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
         };
         let path_text = path.to_string_lossy().into_owned();
         let bytes = fs::metadata(&path).ok().map(|meta| meta.len());
+        let status = status_from_path(&relative_text);
         let asset = Asset {
             id: crate::identity(&["file", source, &path_text]),
             category,
@@ -192,20 +195,52 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
             shape: None,
             vertices: None,
             triangles: None,
+            clip: None,
             sha256: Some(sha),
             source_sha256: None,
             bytes,
             sex: sex_from_path(&relative_text),
             family: family_from_path(&relative_text),
             tags: garment_tags(&relative_text, category, source),
-            status: status_from_path(&relative_text),
+            status,
         };
         write(store, &asset, &mut seen, &mut report);
+        if matches!(asset.format.as_str(), "glb" | "gltf") {
+            index_clips(store, &path, &asset, &mut seen, &mut report);
+        }
     }
     if options.prune {
         prune(store, root, source, &seen, &mut report);
     }
     report
+}
+
+fn index_clips(
+    store: &Store,
+    path: &Path,
+    actor: &Asset,
+    seen: &mut HashSet<String>,
+    report: &mut IndexReport,
+) {
+    let document = match crate::clip::read_clips(path) {
+        Ok(document) => document,
+        Err(error) => {
+            report.errors.push(error);
+            return;
+        }
+    };
+    for (index, clip) in document.clips.iter().enumerate() {
+        let asset = crate::clip::clip_asset(
+            &actor.source,
+            &actor.path,
+            actor.sha256.as_deref(),
+            index,
+            clip,
+            actor.status,
+        );
+        report.clips += 1;
+        write(store, &asset, seen, report);
+    }
 }
 
 fn walk(directory: &Path, files: &mut Vec<PathBuf>, report: &mut IndexReport) {
@@ -294,6 +329,7 @@ fn index_archive(
         shape: None,
         vertices: None,
         triangles: None,
+        clip: None,
         sha256: sha,
         source_sha256: None,
         bytes: fs::metadata(path).ok().map(|meta| meta.len()),
@@ -350,6 +386,7 @@ fn index_archive(
             shape: None,
             vertices: None,
             triangles: None,
+            clip: None,
             sha256: None,
             source_sha256: None,
             bytes: entry.size,

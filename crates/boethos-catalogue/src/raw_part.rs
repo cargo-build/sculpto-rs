@@ -90,6 +90,7 @@ pub fn raw_part_asset(input: &RawPartInput) -> Result<Asset, String> {
         shape: Some(input.part.clone()),
         vertices: Some(input.vertices),
         triangles: Some(input.triangles),
+        clip: None,
         sha256: input.sha256.clone(),
         source_sha256: input.source_sha256.clone(),
         bytes: input.bytes,

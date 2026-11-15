@@ -22,6 +22,8 @@ pub enum Category {
     Face,
     /// Motion clip or behavior.
     Animation,
+    /// One animation embedded in an actor `glb`/`gltf`.
+    Clip,
     /// BodySlide preset XML.
     Preset,
     /// RaceMenu `.jslot` face preset.
@@ -50,6 +52,7 @@ impl Category {
             Self::Hair => "hair",
             Self::Face => "face",
             Self::Animation => "animation",
+            Self::Clip => "clip",
             Self::Preset => "preset",
             Self::FacePreset => "face_preset",
             Self::Project => "project",
@@ -70,6 +73,7 @@ impl Category {
             "hair" => Self::Hair,
             "face" => Self::Face,
             "animation" => Self::Animation,
+            "clip" => Self::Clip,
             "preset" => Self::Preset,
             "face_preset" => Self::FacePreset,
             "project" => Self::Project,
@@ -148,6 +152,23 @@ pub enum Status {
     Unknown,
 }
 
+/// Measured animation data for a `clip` row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipDetails {
+    /// Number of animation channels.
+    pub channels: u64,
+    /// Largest sampler input key count.
+    pub keyframes: u64,
+    /// Longest sampler input time in seconds.
+    pub duration_seconds: f64,
+    /// Every targeted node, in node order.
+    pub bones: Vec<String>,
+    /// Number of distinct skin joints in the actor.
+    pub palette_joints: u64,
+    /// Fraction of skin joints the channels target; `None` without a skin.
+    pub palette_coverage: Option<f64>,
+}
+
 /// One indexed file, archive or archive member.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
@@ -176,6 +197,9 @@ pub struct Asset {
     /// Shape triangle count, when measured.
     #[serde(default)]
     pub triangles: Option<u64>,
+    /// Embedded animation details, when this row is a `clip`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<ClipDetails>,
     /// Content hash when the file was read; `None` for archive members.
     pub sha256: Option<String>,
     /// Digest of the source model a derived part came from.

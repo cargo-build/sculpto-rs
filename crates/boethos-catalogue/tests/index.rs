@@ -457,3 +457,103 @@ fn raw_part_asset_keeps_source_digest_and_part_tags() {
     }
     assert_eq!(asset.vertices, Some(197_966));
 }
+
+fn actor_glb() -> Vec<u8> {
+    let json = r#"{
+        "nodes": [{"name": "Root"}, {"name": "Hip"}, {"name": "Spine"}],
+        "skins": [{"joints": [1, 2]}],
+        "accessors": [
+            {"count": 3, "max": [1.5]},
+            {"count": 3, "max": [1.5]},
+            {"count": 2, "max": [0.5]}
+        ],
+        "animations": [
+            {
+                "name": "Walk",
+                "channels": [
+                    {"sampler": 0, "target": {"node": 1, "path": "rotation"}},
+                    {"sampler": 1, "target": {"node": 2, "path": "translation"}}
+                ],
+                "samplers": [{"input": 0, "output": 0}, {"input": 1, "output": 2}]
+            },
+            {
+                "name": "RootOnly",
+                "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}],
+                "samplers": [{"input": 2, "output": 0}]
+            }
+        ]
+    }"#;
+    let mut chunk = json.as_bytes().to_vec();
+    while !chunk.len().is_multiple_of(4) {
+        chunk.push(b' ');
+    }
+    let length = 12 + 8 + chunk.len();
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(b"glTF");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&(length as u32).to_le_bytes());
+    bytes.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+    bytes.extend_from_slice(&chunk);
+    bytes
+}
+
+#[test]
+fn indexes_embedded_actor_clips_and_prunes_them() {
+    let root = temp_dir("clips");
+    fs::write(root.join("actor.glb"), actor_glb()).expect("write");
+    let db = root.with_extension("redb");
+    let store = Store::open(&db).expect("store");
+    let options = IndexOptions {
+        archive_entries: false,
+        prune: true,
+    };
+    let report = index_root(&store, &root, "fixture", &options);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.files, 1);
+    assert_eq!(report.clips, 2);
+    assert_eq!(report.inserted, 3);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    let actor = rows
+        .iter()
+        .find(|(_, asset)| asset.name == "actor.glb")
+        .map(|(_, asset)| asset)
+        .expect("actor row");
+    let clip = |name: &str| {
+        rows.iter()
+            .find(|(_, asset)| asset.category == Category::Clip && asset.name == name)
+            .map(|(_, asset)| asset)
+            .expect(name)
+    };
+    let walk = clip("Walk");
+    assert_eq!(walk.path, format!("{}::#Walk", actor.path));
+    assert_eq!(walk.source_sha256, actor.sha256);
+    assert_eq!(walk.format, "clip");
+    let details = walk.clip.as_ref().expect("clip details");
+    assert_eq!(details.channels, 2);
+    assert_eq!(details.keyframes, 3);
+    assert_eq!(details.duration_seconds, 1.5);
+    assert_eq!(details.bones, ["Hip", "Spine"]);
+    assert_eq!(details.palette_joints, 2);
+    assert_eq!(details.palette_coverage, Some(1.0));
+    assert_eq!(
+        clip("RootOnly")
+            .clip
+            .as_ref()
+            .expect("details")
+            .palette_coverage,
+        Some(0.0)
+    );
+
+    let again = index_root(&store, &root, "fixture", &options);
+    assert_eq!(again.inserted, 0);
+    assert_eq!(again.clips, 2);
+    assert_eq!(again.unchanged, 3);
+
+    fs::remove_file(root.join("actor.glb")).expect("remove");
+    let pruned = index_root(&store, &root, "fixture", &options);
+    assert_eq!(pruned.pruned, 3);
+    assert!(store.iter_kind::<Assets>().expect("rows").is_empty());
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
