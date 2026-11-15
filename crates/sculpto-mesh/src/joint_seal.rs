@@ -465,7 +465,8 @@ pub struct JointReport {
     pub gap_max: f64,
     /// The pairing band in force (declared or derived).
     pub arc_band_used: f64,
-    /// Correspondence method string.
+    /// Correspondence method: `authored` (the part was already placed),
+    /// `kabsch_umeyama` (a solved seat) or `monotone_dp` (a discovered rim pair).
     pub correspondence: &'static str,
     /// Bridge triangles added.
     pub bridge_triangles: usize,
@@ -1643,14 +1644,45 @@ struct SeatSimilarity {
     max_residual: f64,
 }
 
+/// Merge a seated part's authored cuff onto the socket ring it already sits
+/// on: each cuff vertex is replaced by its paired ring vertex, so the two
+/// boundary loops become one shared loop. Returns the vertices merged. A
+/// ribbon between concentric rings has no span, so an authored-coincident
+/// joint is welded rather than bridged. @req BLD-13
+fn weld_seated_cuff(triangles: &mut Vec<[u32; 3]>, ring: &[u32], cuff: &[u32]) -> usize {
+    if ring.len() != cuff.len() {
+        return 0;
+    }
+    let identity: HashMap<u32, u32> = cuff
+        .iter()
+        .copied()
+        .zip(ring.iter().copied())
+        .filter(|&(from, to)| from != to)
+        .collect();
+    if identity.is_empty() {
+        return 0;
+    }
+    let merged = identity.len();
+    *triangles = triangles
+        .iter()
+        .map(|triangle| triangle.map(|vertex| *identity.get(&vertex).unwrap_or(&vertex)))
+        .filter(|triangle| {
+            triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[0] != triangle[2]
+        })
+        .collect();
+    merged
+}
+
 /// One seated joint's solved data the seal loop consumes: the report plus the
-/// extracted cycles to bridge. @req BLD-13
+/// cycles to bridge, in the seat's own correspondence order. @req BLD-13
 struct SeatedJoint {
     report: SeatReport,
-    /// Chosen socket wrist cycle, in boundary-walk order.
+    /// Socket wrist cycle; `wrist_cycle[k]` is the pair of `cuff_cycle[k]`.
     wrist_cycle: Vec<u32>,
-    /// Chosen part cuff cycle, in boundary-walk order.
+    /// Part cuff cycle in the solved correspondence order.
     cuff_cycle: Vec<u32>,
+    /// The part was already placed: the seat kept its authored transform.
+    authored: bool,
     handedness: &'static str,
 }
 
@@ -1994,54 +2026,6 @@ fn normalized_pair_cost(source: &[u32], target: &[u32], positions: &[[f32; 3]]) 
         }
     }
     best
-}
-
-/// The cuff→wrist correspondence: both rings centred, scaled to unit mean
-/// radius and put on the wrist cycle's plane basis; every cyclic shift in
-/// both walk directions is scored by Σ dist²; the cheapest (cost, shift,
-/// forward) wins. Returns the point arrays in correspondence order plus the
-/// flip flag. @req BLD-13
-fn order_correspondence(
-    cuff: &[u32],
-    wrist: &[u32],
-    positions: &[[f32; 3]],
-) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, bool) {
-    let points_of = |ring: &[u32]| -> Vec<[f64; 3]> {
-        ring.iter()
-            .map(|&vertex| point_of(positions, vertex).map(f64::from))
-            .collect()
-    };
-    let cuff_pts = points_of(cuff);
-    let wrist_pts = points_of(wrist);
-    let n = cuff.len();
-    let m = wrist.len();
-    let mut best: Option<(f64, usize, bool)> = None;
-    for flip in [false, true] {
-        for shift in 0..m {
-            let mut cost = 0.0;
-            for k in 0..n.min(m) {
-                let at = if flip { n - 1 - k } else { k };
-                let a = cuff_pts[at];
-                let b = wrist_pts[(shift + k) % m];
-                cost += (0..3).map(|lane| (a[lane] - b[lane]).powi(2)).sum::<f64>();
-            }
-            let key = (
-                cost, shift, flip, // forward first on ties
-            );
-            if best.is_none() || key < best.expect("checked") {
-                best = Some(key);
-            }
-        }
-    }
-    let (_, shift, flip) = best.unwrap_or((0.0, 0, false));
-    let order: Vec<usize> = if flip {
-        (0..n).rev().collect()
-    } else {
-        (0..n).collect()
-    };
-    let source: Vec<[f64; 3]> = order.iter().map(|&k| cuff_pts[k]).collect();
-    let target: Vec<[f64; 3]> = (0..n.min(m)).map(|k| wrist_pts[(shift + k) % m]).collect();
-    (source, target, flip)
 }
 
 /// The socket shell's candidate joint cycles: the shell's boundary graph is
@@ -2500,10 +2484,35 @@ fn seat_groups(
             );
         }
 
+        // The authored placement declares the pairing: a member already sitting
+        // on a cycle belongs to it. Without this the similarity search prefers a
+        // cheap cross-side flip on the 3BA wrists (measured rms 0.136 against
+        // the authored 0.18), and the authored gate never speaks.
+        let pins: Vec<Option<usize>> = members
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| {
+                candidates.iter().position(|cycle| {
+                    part_cycles[slot]
+                        .iter()
+                        .any(|cuff| authored_correspondence(cuff, cycle, positions).is_some())
+                })
+            })
+            .collect();
         // Every bijection member→cycle is scored by the summed RMS of its
         // best bulk-outward similarity solves; the cheapest wins outright
         // (warn when the runner-up is within SEAT_ASSIGNMENT_MARGIN).
-        let permutations = permutations_of(&pool);
+        let mut permutations: Vec<Vec<usize>> = permutations_of(&pool)
+            .into_iter()
+            .filter(|assignment| {
+                assignment.iter().enumerate().all(|(slot, at)| {
+                    pins[slot].is_none_or(|pin| !pool.contains(&pin) || pin == *at)
+                })
+            })
+            .collect();
+        if permutations.is_empty() {
+            permutations = permutations_of(&pool);
+        }
         #[allow(clippy::type_complexity)]
         let mut scored: Vec<(f64, &Vec<usize>, Vec<Option<SeatSolved>>)> = Vec::new();
         for assignment in &permutations {
@@ -2565,7 +2574,13 @@ fn seat_groups(
 
         for (slot, &index) in members.iter().enumerate() {
             let part = shell_of(&requests[index].part);
-            let Some(SeatSolved { similarity, cuff }) = best_solved[slot].as_ref() else {
+            let Some(SeatSolved {
+                similarity,
+                cuff,
+                wrist,
+                authored,
+            }) = best_solved[slot].as_ref()
+            else {
                 return Err(SealError::SeatUnreachable {
                     gap: f64::NAN,
                     band: 0.0,
@@ -2653,8 +2668,9 @@ fn seat_groups(
                     plane_dev,
                     ring_seat: None,
                 },
-                wrist_cycle: cycle.vertices.clone(),
-                cuff_cycle: cuff.to_vec(),
+                wrist_cycle: wrist.clone(),
+                cuff_cycle: cuff.clone(),
+                authored: *authored,
                 handedness,
             });
         }
@@ -2662,18 +2678,104 @@ fn seat_groups(
     Ok(seated)
 }
 
-/// One member's winning similarity solve plus the cycle it came from.
+/// One member's winning similarity solve plus the correspondence it solved,
+/// as vertex orders: `cuff[k]` pairs with `wrist[k]`. @req BLD-13
 struct SeatSolved {
     similarity: SeatSimilarity,
     cuff: Vec<u32>,
+    wrist: Vec<u32>,
+    /// The authored placement was kept instead of a solved similarity.
+    authored: bool,
+}
+
+/// The largest authored cuff gap, as a fraction of the socket ring's mean
+/// radius, that marks a part as already placed on its joint. The 3BA hands sit
+/// 0.002–0.10 r off their arm rims; the Bijin hands are authored in metres, so
+/// their cuff rings are an order of magnitude smaller than the rims they join.
+const SEAT_AUTHORED_GAP_RATIO: f64 = 0.25;
+
+/// The authored placement's correspondence, when the part is already in place:
+/// the cuff against the socket ring by position alone, over every walk
+/// direction and rotation, with the identity transform. A near-circular cuff
+/// fits a ~180° flip as well as the authored pose (measured rms 0.136 either
+/// way on the 3BA wrists, where the solve rotated the hands fingers-up), so
+/// this placement is measured instead of trusted to the similarity search.
+/// `None` unless both rings are comparable and the authored gap is inside the
+/// seam tolerance. @req BLD-13
+fn authored_correspondence(
+    cuff: &Rim,
+    cycle: &Rim,
+    positions: &[[f32; 3]],
+) -> Option<(SeatSimilarity, Vec<u32>, Vec<u32>)> {
+    let n = cuff.vertices.len();
+    let m = cycle.vertices.len();
+    if n != m || n < 3 {
+        return None;
+    }
+    let radius_mean = |ring: &[u32]| -> f64 {
+        let centre = centroid_of(ring, positions);
+        ring.iter()
+            .map(|&vertex| distance(point_of(positions, vertex), centre.map(|lane| lane as f32)))
+            .sum::<f64>()
+            / ring.len().max(1) as f64
+    };
+    let socket_radius = radius_mean(&cycle.vertices);
+    let scale_check = radius_mean(&cuff.vertices) / socket_radius.max(1e-300);
+    if !(0.5..=2.0).contains(&scale_check) {
+        return None;
+    }
+    let mut best: Option<(f64, f64, usize, bool)> = None;
+    for flip in [false, true] {
+        let source: Vec<u32> = if flip {
+            cuff.vertices.iter().rev().copied().collect()
+        } else {
+            cuff.vertices.clone()
+        };
+        for shift in 0..m {
+            let mut sum = 0.0f64;
+            let mut worst = 0.0f64;
+            for (k, &from) in source.iter().enumerate() {
+                let to = cycle.vertices[(shift + k) % m];
+                let gap = distance(point_of(positions, from), point_of(positions, to));
+                sum += gap * gap;
+                worst = worst.max(gap);
+            }
+            if best.as_ref().is_none_or(|(won, _, _, _)| sum < *won) {
+                best = Some((sum, worst, shift, flip));
+            }
+        }
+    }
+    let (sum, worst, shift, flip) = best?;
+    let rms = (sum / n as f64).sqrt();
+    if rms > SEAT_AUTHORED_GAP_RATIO * socket_radius {
+        return None;
+    }
+    let source: Vec<u32> = if flip {
+        cuff.vertices.iter().rev().copied().collect()
+    } else {
+        cuff.vertices.clone()
+    };
+    let target: Vec<u32> = (0..n).map(|k| cycle.vertices[(shift + k) % m]).collect();
+    Some((
+        SeatSimilarity {
+            scale: 1.0,
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation: [0.0; 3],
+            rms,
+            max_residual: worst,
+        },
+        source,
+        target,
+    ))
 }
 
 /// The best seatable similarity between one part's cycles and one socket
 /// cycle: every part cycle × walk direction × cyclic shift is solved; the
 /// solve must put the part's bulk on the socket cycle's outward side, and the
-/// cheapest (rms, shift, forward) wins. `Ok(None)` when no orientation
-/// passes; `Err` only when every correspondence of every part cycle is
-/// degenerate (an all-coincident ring). @req BLD-13
+/// cheapest rms wins. The winning correspondence is returned in its own order,
+/// because the bridge consumes this pairing rather than re-deriving one.
+/// `Ok(None)` when no orientation passes; `Err` only when every correspondence
+/// of every part cycle is degenerate (an all-coincident ring). @req BLD-13
 fn best_similarity(
     part_cycles: &[Rim],
     cycle: &Rim,
@@ -2683,84 +2785,114 @@ fn best_similarity(
 ) -> Result<Option<SeatSolved>, SealError> {
     let (normal, _, _) = outward_frame(&cycle.vertices, positions, socket_members);
     let centre = centroid_of(&cycle.vertices, positions);
-    let mut best: Option<(SeatSimilarity, Vec<u32>)> = None;
+    let mut best: Option<(SeatSimilarity, Vec<u32>, Vec<u32>)> = None;
     let mut attempted = 0usize;
     let mut solved_once = false;
     let mut degenerate: Option<SealError> = None;
-    // One candidate's solve, gated on the seated part hanging on the
-    // socket's outward side (measured +12.9 correct vs −12.9 inverted on
-    // Bijin; fingertips 16.3 below the wrist vs 12 above).
-    let mut evaluate =
-        |cuff: &Rim, source: &[[f64; 3]], target: &[[f64; 3]]| -> Result<(), SealError> {
-            attempted += 1;
-            let similarity = match solve_similarity(source, target) {
-                Ok(similarity) => similarity,
-                Err(error @ SealError::ScaleMismatch { .. }) => {
-                    degenerate = Some(error);
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            solved_once = true;
-            // Whole-part bulk probe: the seated part's centroid must sit on
-            // the socket cycle's outward side.
-            let mut mean = [0.0f64; 3];
-            for &vertex in part_members {
-                let point = positions[vertex].map(f64::from);
-                for (lane, lane_sum) in mean.iter_mut().enumerate() {
-                    let at = similarity.scale
-                        * (similarity.rotation[lane][0] * point[0]
-                            + similarity.rotation[lane][1] * point[1]
-                            + similarity.rotation[lane][2] * point[2])
-                        + similarity.translation[lane];
-                    *lane_sum += at;
-                }
-            }
-            let mean = mean.map(|lane| lane / part_members.len().max(1) as f64);
-            let seated_bulk: f64 = normal
+    // One candidate correspondence's solve, gated on the seated part hanging
+    // on the socket's outward side (measured +12.9 correct vs −12.9 inverted
+    // on Bijin; fingertips 16.3 below the wrist vs 12 above).
+    let mut evaluate = |source_order: &[u32], target_order: &[u32]| -> Result<(), SealError> {
+        attempted += 1;
+        let points = |order: &[u32]| -> Vec<[f64; 3]> {
+            order
                 .iter()
-                .zip(mean.iter().zip(centre.iter()))
-                .map(|(n_lane, (m, c))| n_lane * (m - c))
-                .sum();
-            if seated_bulk <= 0.0 {
+                .map(|&vertex| point_of(positions, vertex).map(f64::from))
+                .collect()
+        };
+        let similarity = match solve_similarity(&points(source_order), &points(target_order)) {
+            Ok(similarity) => similarity,
+            Err(error @ SealError::ScaleMismatch { .. }) => {
+                degenerate = Some(error);
                 return Ok(());
             }
-            if best
-                .as_ref()
-                .is_none_or(|(won, _)| similarity.rms < won.rms)
-            {
-                best = Some((similarity, cuff.vertices.clone()));
-            }
-            Ok(())
+            Err(error) => return Err(error),
         };
+        solved_once = true;
+        // Whole-part bulk probe: the seated part's centroid must sit on
+        // the socket cycle's outward side.
+        let mut mean = [0.0f64; 3];
+        for &vertex in part_members {
+            let point = positions[vertex].map(f64::from);
+            for (lane, lane_sum) in mean.iter_mut().enumerate() {
+                let at = similarity.scale
+                    * (similarity.rotation[lane][0] * point[0]
+                        + similarity.rotation[lane][1] * point[1]
+                        + similarity.rotation[lane][2] * point[2])
+                    + similarity.translation[lane];
+                *lane_sum += at;
+            }
+        }
+        let mean = mean.map(|lane| lane / part_members.len().max(1) as f64);
+        let seated_bulk: f64 = normal
+            .iter()
+            .zip(mean.iter().zip(centre.iter()))
+            .map(|(n_lane, (m, c))| n_lane * (m - c))
+            .sum();
+        if seated_bulk <= 0.0 {
+            return Ok(());
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(won, _, _)| similarity.rms < won.rms)
+        {
+            best = Some((similarity, source_order.to_vec(), target_order.to_vec()));
+        }
+        Ok(())
+    };
     for cuff in part_cycles {
         let n = cuff.vertices.len();
         let m = cycle.vertices.len();
         if n.min(m) < 3 || n != m {
             continue;
         }
-        // The normalized-cost correspondence is the natural first
-        // candidate; the sweep below guards it with every shift and both
-        // walk directions, keeping the first on exact ties.
-        let (ordered, target, _) = order_correspondence(&cuff.vertices, &cycle.vertices, positions);
-        evaluate(cuff, &ordered, &target)?;
+        // An authored-in-place part is never re-seated: the solve would rotate
+        // it, because a circular cuff admits the flipped fit as well as the
+        // authored pose.
+        if let Some((similarity, cuff_order, wrist_order)) =
+            authored_correspondence(cuff, cycle, positions)
+        {
+            if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+                eprintln!(
+                    "seat solve: authored placement kept, rms={:.4} pairs={}",
+                    similarity.rms,
+                    cuff_order.len()
+                );
+            }
+            return Ok(Some(SeatSolved {
+                similarity,
+                cuff: cuff_order,
+                wrist: wrist_order,
+                authored: true,
+            }));
+        }
         for flip in [false, true] {
+            let source_order: Vec<u32> = if flip {
+                cuff.vertices.iter().rev().copied().collect()
+            } else {
+                cuff.vertices.clone()
+            };
             for shift in 0..m {
-                let order: Vec<usize> = if flip {
-                    (0..n).rev().collect()
-                } else {
-                    (0..n).collect()
-                };
-                let source: Vec<[f64; 3]> = order
-                    .iter()
-                    .map(|&k| point_of(positions, cuff.vertices[k]).map(f64::from))
-                    .collect();
-                let target: Vec<[f64; 3]> = (0..n)
-                    .map(|k| point_of(positions, cycle.vertices[(shift + k) % m]).map(f64::from))
-                    .collect();
-                evaluate(cuff, &source, &target)?;
+                let target_order: Vec<u32> =
+                    (0..n).map(|k| cycle.vertices[(shift + k) % m]).collect();
+                evaluate(&source_order, &target_order)?;
             }
         }
+    }
+    if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some()
+        && let Some((similarity, cuff, _)) = best.as_ref()
+    {
+        let as_authored = part_cycles.iter().any(|cycle| &cycle.vertices == cuff);
+        eprintln!(
+            "seat solve: rms={:.4} pairs={} cuff_walk={}",
+            similarity.rms,
+            cuff.len(),
+            if as_authored {
+                "as-authored"
+            } else {
+                "reversed"
+            }
+        );
     }
     if attempted > 0
         && !solved_once
@@ -2768,9 +2900,11 @@ fn best_similarity(
     {
         return Err(error);
     }
-    Ok(best.map(|(similarity, vertices)| SeatSolved {
+    Ok(best.map(|(similarity, cuff, wrist)| SeatSolved {
         similarity,
-        cuff: vertices,
+        cuff,
+        wrist,
+        authored: false,
     }))
 }
 
@@ -2962,15 +3096,24 @@ fn seal_joints_mode(
             },
         }
         let joint_rims = if let Some(seat) = seated[index].as_ref() {
-            let merged = weld_joint_rims(
+            let mut merged = weld_joint_rims(
                 &mut triangles,
                 &seat.wrist_cycle,
                 &seat.cuff_cycle,
                 &positions,
             );
-            let ring = cut_ring_at(&seat.wrist_cycle, seat.cuff_cycle[0], &positions);
+            // An authored cuff already sits on the rim: welding the pair closes
+            // the joint, where a ribbon between concentric rings is a zero-span
+            // washer (measured on the 3BA wrists, where the seat had also
+            // rotated the hands fingers-up).
+            if seat.authored {
+                merged += weld_seated_cuff(&mut triangles, &seat.wrist_cycle, &seat.cuff_cycle);
+            }
+            // Both walks already are the seat's solved pairing (`cuff[k]` ↔
+            // `wrist[k]`); re-walking the ring here would rotate it against the
+            // cuff and buy a twisted ribbon.
             JointRims::Seated {
-                ring,
+                ring: seat.wrist_cycle.clone(),
                 collar: seat.cuff_cycle.clone(),
                 merged,
             }
@@ -3078,58 +3221,78 @@ fn seal_joints_mode(
                 pinch_edges
             );
         }
-        // Build the bridge; a same-sense rim pair retries the reversed
-        // collar walk, then refuses by name.
-        // The two rims can be authored in the same rotational sense; try both
-        // orders of each and keep the first ribbon that consumes every rim edge
-        // exactly once with opposite diagonals.
+        // Build the bridge. The two rims can be authored in the same
+        // rotational sense, so both walk directions are tried and the first
+        // ribbon that consumes every rim edge exactly once with opposite
+        // diagonals wins. A seated pair already carries the solved
+        // correspondence, so reversing one walk alone would rotate one ring
+        // against the other: its retry reverses both together, which leaves
+        // every pair in place.
+        let welded_pair = seated[index].as_ref().is_some_and(|seat| seat.authored);
         let ring_reversed: Vec<u32> = ring.iter().copied().rev().collect();
         let collar_reversed: Vec<u32> = collar.iter().copied().rev().collect();
-        let mut chosen: Option<(Vec<u32>, Vec<[u32; 3]>, usize)> = None;
-        for ring_try in [ring.clone(), ring_reversed] {
-            for collar_try in [collar.clone(), collar_reversed.clone()] {
-                for flip_arc in [false, true] {
-                    let (bridge_try, _) =
-                        bridge_rims(&ring_try, &collar_try, collar_closed, flip_arc, &positions);
-                    let (ring_bad, arc_bad) =
-                        rim_violations(&bridge_try, &face_dirs, &ring_try, &collar_try);
-                    if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
-                        eprintln!(
-                            "seal combo: ring_rev={} collar_rev={} flip_arc={} bad={ring_bad}/{} {arc_bad}/{}",
-                            ring_try[0] != ring[0],
-                            collar_try[0] != collar[0],
-                            flip_arc,
-                            ring_try.len(),
-                            collar_try.len()
-                        );
-                    }
-                    let arc_edges = if collar_closed {
+        let walk_orders: Vec<(&[u32], &[u32])> = if welded_pair {
+            Vec::new()
+        } else if seated[index].is_some() {
+            // The seat's own pairing comes first: a single reversed walk would
+            // rotate one ring against the other and twist the ribbon. A rim
+            // pair authored in one rotational sense still needs its reversal to
+            // wind at all, so that fallback stays behind it.
+            vec![
+                (&ring, &collar),
+                (&ring_reversed, &collar_reversed),
+                (&ring, &collar_reversed),
+                (&ring_reversed, &collar),
+            ]
+        } else {
+            vec![
+                (&ring, &collar),
+                (&ring, &collar_reversed),
+                (&ring_reversed, &collar),
+                (&ring_reversed, &collar_reversed),
+            ]
+        };
+        let mut chosen: Option<(Vec<u32>, Vec<[u32; 3]>, usize)> =
+            welded_pair.then(|| (ring.clone(), Vec::new(), 0));
+        for (ring_try, collar_try) in walk_orders {
+            for flip_arc in [false, true] {
+                let (bridge_try, _) =
+                    bridge_rims(ring_try, collar_try, collar_closed, flip_arc, &positions);
+                let (ring_bad, arc_bad) =
+                    rim_violations(&bridge_try, &face_dirs, ring_try, collar_try);
+                if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+                    eprintln!(
+                        "seal combo: ring_rev={} collar_rev={} flip_arc={} bad={ring_bad}/{} {arc_bad}/{}",
+                        ring_try[0] != ring[0],
+                        collar_try[0] != collar[0],
+                        flip_arc,
+                        ring_try.len(),
                         collar_try.len()
-                    } else {
-                        collar_try.len() - 1
-                    };
-                    // The rim direction is judged against the owning face, not the
-                    // loop order: `shell_rims` walks the boundary opposite to it.
-                    if ring_bad == 0
-                        && arc_bad == 0
-                        && verify_bridge(&bridge_try, &ring_try, &collar_try, collar_closed).is_ok()
-                    {
-                        chosen = Some((ring_try.clone(), bridge_try, 0));
+                    );
+                }
+                let arc_edges = if collar_closed {
+                    collar_try.len()
+                } else {
+                    collar_try.len() - 1
+                };
+                // The rim direction is judged against the owning face, not the
+                // loop order: `shell_rims` walks the boundary opposite to it.
+                if ring_bad == 0
+                    && arc_bad == 0
+                    && verify_bridge(&bridge_try, ring_try, collar_try, collar_closed).is_ok()
+                {
+                    chosen = Some((ring_try.to_vec(), bridge_try, 0));
+                    break;
+                }
+                if ring_bad == ring_try.len() && arc_bad == arc_edges {
+                    let mut flipped = bridge_try.clone();
+                    for triangle in &mut flipped {
+                        triangle.swap(1, 2);
+                    }
+                    if verify_bridge(&flipped, ring_try, collar_try, collar_closed).is_ok() {
+                        chosen = Some((ring_try.to_vec(), flipped, 0));
                         break;
                     }
-                    if ring_bad == ring_try.len() && arc_bad == arc_edges {
-                        let mut flipped = bridge_try.clone();
-                        for triangle in &mut flipped {
-                            triangle.swap(1, 2);
-                        }
-                        if verify_bridge(&flipped, &ring_try, &collar_try, collar_closed).is_ok() {
-                            chosen = Some((ring_try.clone(), flipped, 0));
-                            break;
-                        }
-                    }
-                }
-                if chosen.is_some() {
-                    break;
                 }
             }
             if chosen.is_some() {
@@ -3334,10 +3497,10 @@ fn seal_joints_mode(
             Some(_) => "part rim keeps its coincident seam-cut edges open".to_string(),
             None => "none on this joint".to_string(),
         };
-        let correspondence = if seated[index].is_some() {
-            "kabsch_umeyama"
-        } else {
-            "monotone_dp"
+        let correspondence = match seated[index].as_ref() {
+            Some(seat) if seat.authored => "authored",
+            Some(_) => "kabsch_umeyama",
+            None => "monotone_dp",
         };
         joints.push(JointReport {
             joint: format!("{}:{}", request.part, request.socket),
@@ -3353,14 +3516,18 @@ fn seal_joints_mode(
             arc_band_used,
             correspondence,
             bridge_triangles: bridge.len(),
-            edges_consumed: [
-                ring.len(),
-                if collar_closed {
-                    collar.len()
-                } else {
-                    collar.len() - 1
-                },
-            ],
+            edges_consumed: if welded_pair {
+                [0, 0]
+            } else {
+                [
+                    ring.len(),
+                    if collar_closed {
+                        collar.len()
+                    } else {
+                        collar.len() - 1
+                    },
+                ]
+            },
             boundary_ring_before,
             boundary_ring_after,
             boundary_arc_before: boundary_collar_before,
@@ -3372,10 +3539,14 @@ fn seal_joints_mode(
             non_manifold_before: non_manifold_total(&input_uses),
             non_manifold_after: non_manifold_total(&uses_final),
             winding_conflicts: conflicts,
-            min_bridge_area: areas
-                .iter()
-                .map(|area| area.0)
-                .fold(f64::INFINITY, f64::min),
+            min_bridge_area: if areas.is_empty() {
+                0.0
+            } else {
+                areas
+                    .iter()
+                    .map(|area| area.0)
+                    .fold(f64::INFINITY, f64::min)
+            },
             max_aspect: areas.iter().map(|area| area.1).fold(0.0, f64::max),
             merged_duplicates: 0,
             handedness: seated[index].as_ref().map_or("", |seat| seat.handedness),
@@ -3922,6 +4093,239 @@ mod tests {
         // The untouched centre tube stays its own component.
         assert_eq!(outcome.report.components_after, 3);
         assert_eq!(outcome.triangles.len(), triangles.len() + 40);
+    }
+
+    #[test]
+    fn an_authored_cuff_keeps_its_placement_instead_of_being_seated() {
+        // The 3BA hands are authored on their wrist rims, fingers down, and the
+        // similarity search rotated them ~180° fingers-up: a near-circular cuff
+        // fits the flipped pose as well as the authored one (measured rms 0.136
+        // either way). The authored placement must win whenever the cuff is
+        // already on the rim, and the cuff then welds instead of bridging.
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([2.0 * angle.cos(), 2.0 * angle.sin(), 0.0]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([1.8 * angle.cos(), 1.8 * angle.sin(), 4.0]);
+        }
+        let socket_ring: Vec<u32> = (0..10u32).collect();
+        let socket_top: Vec<u32> = (10..20u32).collect();
+        triangles.extend(prism(&socket_ring, &socket_top));
+        triangles.extend(cap(&socket_top));
+        // An authored-in-place hand: the cuff sits 0.06 and 2% off the rim, and
+        // the hand tapers away on the socket's outward side (z < 0).
+        let cuff_base = positions.len() as u32;
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([2.04 * angle.cos(), 2.04 * angle.sin(), -0.06]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([1.5 * angle.cos(), 1.5 * angle.sin(), -3.0]);
+        }
+        let cuff: Vec<u32> = (0..10u32).map(|k| cuff_base + k).collect();
+        let lower: Vec<u32> = (10..20u32).map(|k| cuff_base + k).collect();
+        let mut hand = prism(&cuff, &lower);
+        hand.extend(cap(&lower));
+        // The supplied hands wind their cuff opposite the arm rim, so the weld's
+        // shared edges must run one way each.
+        triangles.extend(hand.into_iter().map(|[a, b, c]| [a, c, b]));
+        let authored_part: Vec<[f32; 3]> = positions[cuff_base as usize..].to_vec();
+        let identities = parts::shell_identities(&positions, &triangles);
+        // The socket carries the fixture's first ring vertex; the hand is the
+        // other shell.
+        let socket = identities
+            .iter()
+            .find(|shell| shell.members.contains(&0))
+            .expect("a socket tube");
+        let part = identities
+            .iter()
+            .find(|shell| !shell.members.contains(&0))
+            .expect("a hand shell");
+        let requests = vec![JointRequest {
+            part: part.name.clone(),
+            socket: socket.name.clone(),
+            seat: true,
+        }];
+        let outcome = seal_joints(&positions, &triangles, &requests, &SealOptions::default())
+            .expect("the authored wrist keeps its placement and welds");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.correspondence, "authored");
+        let seat = joint.seat.expect("the authored seat is reported");
+        assert_eq!(seat.scale, 1.0, "the authored hand is not scaled");
+        assert_eq!(
+            seat.rotation,
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            "the authored hand is not rotated"
+        );
+        assert_eq!(seat.translation, [0.0, 0.0, 0.0]);
+        // Orientation witness: the hand stays where it was authored. Before the
+        // gate the solve moved it (the 3BA hands ended up fingers-up).
+        let seated: Vec<[f32; 3]> = outcome.positions[cuff_base as usize..].to_vec();
+        assert_eq!(seated, authored_part, "the authored hand must not move");
+        assert_eq!(joint.bridge_triangles, 0, "a coincident cuff welds");
+        assert_eq!(joint.edges_consumed, [0, 0]);
+        assert_eq!(joint.boundary_ring_after, 0, "wrist ring closed");
+        assert_eq!(joint.boundary_arc_after, 0, "cuff ring closed");
+        assert_eq!(joint.pinch_edges, 10, "the ten cuff vertices merged");
+        assert_eq!(joint.non_manifold_after, 0, "no edge above two faces");
+        // The weld must close the shell consistently, not just coincide: every
+        // shared edge is traversed once in each direction.
+        let mut directed: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+        for triangle in &outcome.triangles {
+            let [a, b, c] = *triangle;
+            for edge in [(a, b), (b, c), (c, a)] {
+                *directed.entry(edge).or_default() += 1;
+            }
+        }
+        let folded = directed.values().filter(|count| **count > 1).count();
+        assert_eq!(folded, 0, "a shared edge repeats its direction");
+    }
+
+    #[test]
+    fn a_reversed_cuff_walk_bridges_in_the_seated_correspondence() {
+        // The real 3BA pair: the part's cuff walk runs opposite the socket
+        // ring's, so the solved seat is the reversed correspondence. The
+        // bridge must consume that pairing; a fresh walk against one reversed
+        // ring twists the ribbon to the ring radius (measured 2.32 vs the
+        // 0.13 nearest gap on the fixtures) and the smoothing folds it.
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        // Socket: the open 10-v ring is the wrist, the taper above it puts the
+        // socket's outward side below the ring plane.
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([2.0 * angle.cos(), 2.0 * angle.sin(), 0.0]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([1.8 * angle.cos(), 1.8 * angle.sin(), 4.0]);
+        }
+        let socket_ring: Vec<u32> = (0..10u32).collect();
+        let socket_top: Vec<u32> = (10..20u32).collect();
+        triangles.extend(prism(&socket_ring, &socket_top));
+        triangles.extend(cap(&socket_top));
+        // A jittered cuff just below the ring plane (a real seat leaves a
+        // residual) with a hand that tapers away from it.
+        let cuff_base = positions.len() as u32;
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            let radius = 1.0 + 0.05 * (3.0 * angle).sin();
+            positions.push([radius * angle.cos(), radius * angle.sin(), -0.08]);
+        }
+        for k in 0..10usize {
+            let angle = k as f32 * (std::f32::consts::TAU / 10.0);
+            positions.push([0.92 * angle.cos(), 0.92 * angle.sin(), -0.8]);
+        }
+        let cuff: Vec<u32> = (0..10u32).map(|k| cuff_base + k).collect();
+        let lower: Vec<u32> = (10..20u32).map(|k| cuff_base + k).collect();
+        let mut hand = prism(&cuff, &lower);
+        hand.extend(cap(&lower));
+        // Inverted winding: the cuff's walk now opposes the socket ring's.
+        triangles.extend(hand.into_iter().map(|[a, b, c]| [a, c, b]));
+        let identities = parts::shell_identities(&positions, &triangles);
+        let open_ring_radius = |shell: &parts::ShellIdentity| -> f64 {
+            let members: BTreeSet<usize> = shell.members.iter().copied().collect();
+            let rims = shell_rims(&triangles, &members);
+            let rim = rims.first().expect("each fixture shell has a rim");
+            let centre = centroid_of(&rim.vertices, &positions);
+            rim.vertices
+                .iter()
+                .map(|&vertex| {
+                    distance(point_of(&positions, vertex), centre.map(|lane| lane as f32))
+                })
+                .sum::<f64>()
+                / rim.vertices.len() as f64
+        };
+        let (socket, part) = identities
+            .iter()
+            .fold((None, None), |(socket, part), shell| {
+                if open_ring_radius(shell) > 1.5 {
+                    (Some(shell), part)
+                } else {
+                    (socket, Some(shell))
+                }
+            });
+        let (socket, part) = (socket.expect("a socket tube"), part.expect("a hand shell"));
+        let requests = vec![JointRequest {
+            part: part.name.clone(),
+            socket: socket.name.clone(),
+            seat: true,
+        }];
+        // The band-2 smoothing legitimately spreads into the hand's own rings
+        // on a fixture this coarse; the seam shape is what this test reads.
+        let unsmoothed = seal_joints(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions {
+                smooth: false,
+                ..SealOptions::default()
+            },
+        )
+        .expect("the reversed-walk wrist seats and bridges");
+        let bridged = &unsmoothed.report.joints[0];
+        assert_eq!(bridged.correspondence, "kabsch_umeyama");
+        assert_eq!(bridged.boundary_ring_after, 0, "wrist ring closed");
+        assert_eq!(bridged.boundary_arc_after, 0, "cuff ring closed");
+        // The pairing witness, read before the smoothing moves either rim:
+        // every bridged cuff vertex must sit next to a socket vertex of the
+        // ribbon. A twist pairs it across the ring instead, at the ring radius.
+        let part_vertices: BTreeSet<u32> = part.members.iter().map(|&v| v as u32).collect();
+        let bridge = &unsmoothed.triangles[triangles.len()..];
+        let mut partner_gap: BTreeMap<u32, f64> = BTreeMap::new();
+        for triangle in bridge {
+            for (left, right) in [
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                let (cuff, socket) = match (
+                    part_vertices.contains(&left),
+                    part_vertices.contains(&right),
+                ) {
+                    (true, false) => (left, right),
+                    (false, true) => (right, left),
+                    _ => continue,
+                };
+                let length = distance(
+                    unsmoothed.positions[cuff as usize],
+                    unsmoothed.positions[socket as usize],
+                );
+                let entry = partner_gap.entry(cuff).or_insert(f64::INFINITY);
+                *entry = entry.min(length);
+            }
+        }
+        assert_eq!(partner_gap.len(), 10, "every cuff vertex is bridged");
+        let gap_mean = partner_gap.values().sum::<f64>() / partner_gap.len() as f64;
+        assert!(
+            gap_mean < 0.3,
+            "bridged cuff gap mean {gap_mean} twisted toward the ring radius 2.0"
+        );
+        // The smoothing must relax the seam, not fold it: the same bridge with
+        // the default pass stays inside the wrist target.
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions {
+                max_shift: Some(4.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("the reversed-walk wrist seats, bridges and smooths");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.boundary_ring_after, 0, "smoothed wrist ring closed");
+        assert_eq!(joint.boundary_arc_after, 0, "smoothed cuff ring closed");
+        assert!(
+            joint.smoothing.max_dihedral_after_deg <= 150.0,
+            "fold-back edge {}° over 150°",
+            joint.smoothing.max_dihedral_after_deg
+        );
     }
 
     #[test]
