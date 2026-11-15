@@ -137,7 +137,9 @@ body assemble manifest (version 1; source units, source Z-up frame, nothing infe
   `object` selects one `o` block. Placement is scale -> rotate -> translate,
   then `drop` (downward-only sugar on the up lane); a negative `scale` lane is a
   declared mirror and rewinds the part's faces. Nothing else moves a part, and
-  a joint resolves to the seal's own shell names. Ankles are not a joint role:
+  a joint resolves to the seal's own shell names, which the assemble report
+  shows as role-derived shell labels (`hand 1`/`hand 2`; `body seal-joints`
+  keeps the shell names). Ankles are not a joint role:
   feet are accepted as authored.
 
 body assemble options:

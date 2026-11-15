@@ -93,6 +93,26 @@ fn feet_text() -> String {
     builder.into_text()
 }
 
+/// Both hands in one file: a tube per wrist, each cuff a 1.9-radius ring
+/// centred on the 2.0 torso ring it welds to (0.1 away: near enough for the
+/// classifier's coincident-onto-torso rule, never exactly coincident, like
+/// a seat-transformed cuff). The far end is capped, so each hand owns one
+/// closed boundary cycle.
+fn hands_text() -> String {
+    let mut builder = Builder::default();
+    builder.object("HandBelow");
+    let cuff = builder.ring(1.9, 4.0);
+    let outer = builder.ring(1.9, 0.0);
+    builder.tube(&cuff, &outer);
+    builder.cap(&outer);
+    builder.object("HandAbove");
+    let cuff = builder.ring(1.9, 11.0);
+    let outer = builder.ring(1.9, 15.0);
+    builder.tube(&cuff, &outer);
+    builder.cap(&outer);
+    builder.into_text()
+}
+
 fn work_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "sculpto-body-assemble-{tag}-{}",
@@ -135,6 +155,74 @@ fn vertices_of(path: &Path) -> usize {
         .lines()
         .filter(|line| line.starts_with("v "))
         .count()
+}
+
+/// The assembled report names the hand shells by role: the pre-seat
+/// classifier calls the coincident cuffs `leg`/`leg 2` (BODY-01 00B0), and
+/// the report rows must show the declared role's labels instead, while the
+/// seal keeps the classifier names as its addressing keys, carries its own
+/// `handedness` verdict untouched, and welds the same numbers.
+#[test]
+fn the_report_names_hand_shells_by_role_not_by_the_classifier() {
+    let dir = work_dir("labels");
+    let body = write(&dir, "body.obj", &torso_text());
+    let hands = write(&dir, "hands.obj", &hands_text());
+    let out = dir.join("hands-assembled.obj");
+    let report = dir.join("hands-assembled.json");
+    let result = assemble(
+        json!({
+            "version": 1,
+            "parts": [part(&body, "body"), part(&hands, "hands")],
+            "joints": [{ "part": "hands", "socket": "body", "seat": true }],
+            "seal": { "smooth": false },
+        }),
+        &out,
+        &report,
+    )
+    .expect("the hands assemble, seat and weld");
+
+    // The joint row: role name at the top, role-derived labels per shell.
+    let joint = &result["joints"][0];
+    assert_eq!(joint["part"], "hands");
+    assert_eq!(joint["socket"], "body");
+    let shells = joint["shells"].as_array().expect("hand shells");
+    assert_eq!(
+        shells
+            .iter()
+            .map(|shell| shell["part"].as_str().expect("part label"))
+            .collect::<Vec<_>>(),
+        vec!["hand 1", "hand 2"],
+        "the shells carry role labels, not the classifier's `leg` names"
+    );
+    assert_eq!(shells[0]["socket"], "torso");
+
+    // The seal rows: same labels, the classifier socket name, the seal's own
+    // handedness verdict, and the 8↔8 ring weld unchanged.
+    let rows = result["seal"]["joints"].as_array().expect("seal rows");
+    assert_eq!(rows.len(), 2);
+    for (index, row) in rows.iter().enumerate() {
+        let label = format!("hand {}", index + 1);
+        assert_eq!(row["part"], label);
+        assert_eq!(row["joint"], format!("{label}:torso"));
+        assert_eq!(row["socket"], "torso");
+        let handedness = row["handedness"].as_str().expect("handedness row");
+        assert_eq!(
+            handedness, "undecided: ring geometry cannot detect a swap; verify by sheet",
+            "congruent cuffs cannot decide a swap; the marker must survive the relabel"
+        );
+        assert_eq!(row["correspondence"], "kabsch_umeyama");
+        assert_eq!(row["bridge_triangles"], 16, "8↔8 ring weld");
+        assert_eq!(row["boundary_ring_before"], 8);
+        assert_eq!(row["boundary_ring_after"], 0);
+    }
+
+    // The welds are the only added geometry: two 8-vertex rings, 16
+    // triangles each, no vertex gained or lost.
+    assert_eq!(result["assembled"]["vertices"], 48);
+    assert_eq!(result["assembled"]["triangles"], 60);
+    assert_eq!(result["output"]["vertices"], 48);
+    assert_eq!(result["output"]["triangles"], 92);
+    assert_eq!(vertices_of(&out), 48);
 }
 
 #[test]

@@ -16,8 +16,15 @@
 //! Ankles are not a joint role here: the feet are accepted as authored, and the
 //! seal's explicit ankle pair mispairs the leg chain (BODY-01 0020 §3), so a
 //! manifest cannot declare one.
+//!
+//! The report names shells by their declared role (`hand 1`/`hand 2`, the role
+//! name otherwise), never by the spatial classifier's pre-seat guess: the
+//! classifier calls a hand shell `leg R`/`leg L` in the export frame (BODY-01
+//! 00B0). The classifier names stay the seal's internal addressing keys and the
+//! `body seal-joints` contract.
 //! @req BODY-01
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -103,6 +110,21 @@ impl Role {
     /// Is this role a hand part the seat may move?
     fn is_hand(self) -> bool {
         matches!(self, Self::Hands | Self::HandLeft | Self::HandRight)
+    }
+
+    /// The report's display label for one of this role's shells (0-based).
+    ///
+    /// The classifier's spatial name stays the seal's lookup key and the
+    /// `body seal-joints` input contract; the assemble report shows the
+    /// declared role instead, because the pre-seat classifier names a hand
+    /// shell `leg R`/`leg L` (BODY-01 00B0). A multi-shell role numbers its
+    /// shells in assembly order; no anatomical side is invented — the seat's
+    /// `handedness` row stays the side authority.
+    fn shell_label(self, shell: usize) -> String {
+        match self {
+            Self::Hands => format!("hand {}", shell + 1),
+            other => other.name().to_owned(),
+        }
     }
 }
 
@@ -206,7 +228,19 @@ struct ResolvedJoint {
     part: Role,
     socket: Role,
     seat: bool,
-    shells: Vec<(String, String)>,
+    shells: Vec<ResolvedShell>,
+}
+
+/// One shell pair the seal addresses, with the label the report shows.
+struct ResolvedShell {
+    /// Classifier name of the part shell: the seal's lookup key, and the
+    /// `body seal-joints` contract. The assemble report never prints it as
+    /// the part — see [`Role::shell_label`].
+    part: String,
+    /// Classifier name of the socket shell (the torso); printed as-is.
+    socket: String,
+    /// Role-derived display label for the report rows.
+    label: String,
 }
 
 /// The command input schema. The manifest is a *file* here, so its own
@@ -716,13 +750,18 @@ fn resolve_joints(
             &named_shells(joint.socket, parts, &owned, identities),
         )?;
         let mut shells = Vec::with_capacity(part_shells.len());
-        for part_shell in &part_shells {
+        for (shell_index, part_shell) in part_shells.iter().enumerate() {
+            let socket = (*socket).to_string();
             requests.push(JointRequest {
                 part: (*part_shell).to_string(),
-                socket: (*socket).to_string(),
+                socket: socket.clone(),
                 seat,
             });
-            shells.push(((*part_shell).to_string(), (*socket).to_string()));
+            shells.push(ResolvedShell {
+                part: (*part_shell).to_string(),
+                socket,
+                label: joint.part.shell_label(shell_index),
+            });
         }
         resolved.push(ResolvedJoint {
             part: joint.part,
@@ -851,7 +890,7 @@ fn render(
             })
         })
         .collect();
-    let joints: Vec<Value> = joints
+    let joint_rows: Vec<Value> = joints
         .iter()
         .map(|joint| {
             json!({
@@ -861,18 +900,53 @@ fn render(
                 "shells": joint
                     .shells
                     .iter()
-                    .map(|(part_shell, socket_shell)| json!({
-                        "part": part_shell,
-                        "socket": socket_shell,
-                    }))
+                    .map(|shell| {
+                        json!({
+                            "part": shell.label,
+                            "socket": shell.socket,
+                        })
+                    })
                     .collect::<Vec<_>>(),
             })
         })
         .collect();
     let seal = sealed.map(|outcome| {
         let report = &outcome.report;
+        // The seal rows carry the classifier names they addressed; the
+        // assemble report shows the role-derived labels (see
+        // [`ResolvedShell`]). The classifier (part, socket) pair is unique
+        // per request, so it keys the rename without assuming row order.
+        let labels: HashMap<(&str, &str), &str> = joints
+            .iter()
+            .flat_map(|joint| {
+                joint.shells.iter().map(|shell| {
+                    (
+                        (shell.part.as_str(), shell.socket.as_str()),
+                        shell.label.as_str(),
+                    )
+                })
+            })
+            .collect();
+        let rows: Vec<Value> = report.joints.iter().map(joint_row).collect();
+        let rows = rows
+            .into_iter()
+            .map(|mut row| {
+                // Owned copies: the rename mutates the row the names came from.
+                let addressed = match (row["part"].as_str(), row["socket"].as_str()) {
+                    (Some(part), Some(socket)) => Some((part.to_owned(), socket.to_owned())),
+                    _ => None,
+                };
+                if let Some((part, socket)) = addressed
+                    && let Some(label) = labels.get(&(part.as_str(), socket.as_str()))
+                {
+                    row["joint"] = json!(format!("{label}:{socket}"));
+                    row["part"] = json!(label);
+                }
+                row
+            })
+            .collect::<Vec<_>>();
         json!({
-            "joints": report.joints.iter().map(joint_row).collect::<Vec<_>>(),
+            "joints": rows,
             "components_before": report.components_before,
             "components_after": report.components_after,
             "input_digest": report.input_digest,
@@ -891,7 +965,7 @@ fn render(
         "uv": "absent",
         "material": "not_carried",
         "parts": parts,
-        "joints": joints,
+        "joints": joint_rows,
         "assembled": {
             "vertices": assembled_vertices,
             "triangles": assembled_triangles,
