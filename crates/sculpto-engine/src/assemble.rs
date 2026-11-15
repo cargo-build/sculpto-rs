@@ -13,15 +13,20 @@
 //! `drop` stays the convenient non-negative downward case. A manifest that
 //! declares no seat is not given one; the seal refuses the joint instead.
 //!
-//! Ankles are not a joint role here: the feet are accepted as authored, and the
-//! seal's explicit ankle pair mispairs the leg chain (BODY-01 0020 §3), so a
-//! manifest cannot declare one.
+//! Ankles are a joint role: the seal cuts a leg chain's compound rim to its near
+//! run and welds it to the foot collar (BLD-13 0290), so a manifest may declare
+//! one. The feet are the one role that cannot be addressed by role alone: a foot
+//! part carries seven shells per side (two soles and five toe caps), so an ankle
+//! joint names the pairs it bridges (`sole R:leg R`) instead of assuming the role
+//! has one shell, and a multi-shell role with no declared pairs stays refused.
 //!
 //! The report names shells by their declared role (`hand 1`/`hand 2`, the role
 //! name otherwise), never by the spatial classifier's pre-seat guess: the
 //! classifier calls a hand shell `leg R`/`leg L` in the export frame (BODY-01
-//! 00B0). The classifier names stay the seal's internal addressing keys and the
-//! `body seal-joints` contract.
+//! 00B0). A joint that declares `shells` labels its rows by the declared part
+//! shell instead, because the manifest chose that name and it is also the seal's
+//! addressing key. The classifier names stay the seal's internal addressing keys
+//! and the `body seal-joints` contract.
 //! @req BODY-01
 
 use std::collections::HashMap;
@@ -119,7 +124,9 @@ impl Role {
     /// declared role instead, because the pre-seat classifier names a hand
     /// shell `leg R`/`leg L` (BODY-01 00B0). A multi-shell role numbers its
     /// shells in assembly order; no anatomical side is invented — the seat's
-    /// `handedness` row stays the side authority.
+    /// `handedness` row stays the side authority. A joint that declares
+    /// [`JointSpec::shells`] labels each row by the declared shell name
+    /// instead, since the manifest chose it, not the classifier.
     fn shell_label(self, shell: usize) -> String {
         match self {
             Self::Hands => format!("hand {}", shell + 1),
@@ -163,6 +170,22 @@ struct JointSpec {
     socket: Role,
     /// Seat the part before bridging: the hands path, never the neck.
     seat: Option<bool>,
+    /// Shell pairs this joint bridges, when the role holds more than one
+    /// addressable shell (the feet). Each pair names the part shell and the
+    /// socket shell exactly as `body seal-joints` addresses them; nothing else
+    /// is inferred, and every shell a joint bridges must be listed. Absent: the
+    /// role's single shell pairs against the socket's measured torso.
+    shells: Option<Vec<JointShell>>,
+}
+
+/// One declared shell pair of a joint.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JointShell {
+    /// Addressable part-shell name (`sole R`), as `body audit-parts` prints it.
+    part: String,
+    /// Addressable socket-shell name (`leg R`).
+    socket: String,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -441,12 +464,30 @@ fn validate(manifest: &Manifest) -> Result<(), CommandError> {
                 ),
             ));
         }
-        if joint.part == Role::Feet || joint.socket == Role::Feet {
-            return Err(CommandError::new(
-                ErrorKind::InvalidParams,
-                "assemble_feet_joint",
-                "feet are accepted as authored: the seal's explicit ankle pair mispairs the leg chain, so the prepared body declares no ankle joint",
-            ));
+        if let Some(shells) = &joint.shells {
+            let named = format!("joint `{}:{}`", joint.part.name(), joint.socket.name());
+            if shells.is_empty() {
+                return Err(CommandError::new(
+                    ErrorKind::InvalidParams,
+                    "assemble_joint_shells",
+                    format!(
+                        "{named} declares an empty `shells` list; name every pair it bridges, or omit `shells` to pair the role's single shell"
+                    ),
+                ));
+            }
+            if let Some(blank) = shells
+                .iter()
+                .find(|pair| pair.part.trim().is_empty() || pair.socket.trim().is_empty())
+            {
+                return Err(CommandError::new(
+                    ErrorKind::InvalidParams,
+                    "assemble_joint_shells",
+                    format!(
+                        "{named} declares a blank shell name (`{}` / `{}`)",
+                        blank.part, blank.socket
+                    ),
+                ));
+            }
         }
         if joint.seat.unwrap_or(false) && !joint.part.is_hand() {
             return Err(CommandError::new(
@@ -724,17 +765,6 @@ fn resolve_joints(
                 ),
             ));
         }
-        if joint.part != Role::Hands && part_shells.len() != 1 {
-            return Err(CommandError::new(
-                ErrorKind::Refused,
-                "assemble_part_shells",
-                format!(
-                    "joint part role `{}` resolves to {} addressable shells; exactly one is required",
-                    joint.part.name(),
-                    part_shells.len()
-                ),
-            ));
-        }
         if joint.part == Role::Body && !part_shells.contains(&TORSO) {
             return Err(CommandError::new(
                 ErrorKind::Refused,
@@ -745,22 +775,13 @@ fn resolve_joints(
                 ),
             ));
         }
-        let socket = socket_shell(
-            joint.socket,
-            &named_shells(joint.socket, parts, &owned, identities),
-        )?;
-        let mut shells = Vec::with_capacity(part_shells.len());
-        for (shell_index, part_shell) in part_shells.iter().enumerate() {
-            let socket = (*socket).to_string();
+        let socket_shells = named_shells(joint.socket, parts, &owned, identities);
+        let shells = joint_shells(joint, &part_shells, &socket_shells)?;
+        for shell in &shells {
             requests.push(JointRequest {
-                part: (*part_shell).to_string(),
-                socket: socket.clone(),
+                part: shell.part.clone(),
+                socket: shell.socket.clone(),
                 seat,
-            });
-            shells.push(ResolvedShell {
-                part: (*part_shell).to_string(),
-                socket,
-                label: joint.part.shell_label(shell_index),
             });
         }
         resolved.push(ResolvedJoint {
@@ -771,6 +792,120 @@ fn resolve_joints(
         });
     }
     Ok((requests, resolved))
+}
+
+/// The shell pairs one joint bridges, in the order the manifest declares them.
+///
+/// Two shapes are legal. A joint that declares no [`JointSpec::shells`] pairs
+/// the role's single shell against the socket's measured torso — the neck, and
+/// the hands' two cuffs. A joint that declares them pairs exactly the named
+/// shells and nothing else: the feet hold fourteen addressable shells (two
+/// soles and five toe caps per side), so the ankle joint has to say `sole R`
+/// against `leg R` rather than let the assembly guess which sole is an ankle.
+/// An unlisted shell is left as authored; it is never paired by proximity.
+fn joint_shells(
+    joint: &JointSpec,
+    part_shells: &[&str],
+    socket_shells: &[&str],
+) -> Result<Vec<ResolvedShell>, CommandError> {
+    let Some(declared) = &joint.shells else {
+        if joint.part != Role::Hands && part_shells.len() != 1 {
+            return Err(CommandError::new(
+                ErrorKind::Refused,
+                "assemble_part_shells",
+                format!(
+                    "joint part role `{}` resolves to {} addressable shells; declare the pairs it bridges in `shells`, available: [{}]",
+                    joint.part.name(),
+                    part_shells.len(),
+                    part_shells.join(", ")
+                ),
+            ));
+        }
+        let socket = socket_shell(joint.socket, socket_shells)?;
+        return Ok(part_shells
+            .iter()
+            .enumerate()
+            .map(|(index, part)| ResolvedShell {
+                part: (*part).to_owned(),
+                socket: socket.to_owned(),
+                label: joint.part.shell_label(index),
+            })
+            .collect());
+    };
+    let mut shells: Vec<ResolvedShell> = Vec::with_capacity(declared.len());
+    for pair in declared {
+        let named = format!("joint `{}:{}`", joint.part.name(), joint.socket.name());
+        let part = role_shell(joint.part, &pair.part, part_shells)?;
+        let socket = role_shell(joint.socket, &pair.socket, socket_shells)?;
+        if shells.iter().any(|shell| shell.part == part) {
+            return Err(CommandError::new(
+                ErrorKind::InvalidParams,
+                "assemble_joint_shells",
+                format!("{named} declares part shell `{part}` twice"),
+            ));
+        }
+        if shells.iter().any(|shell| shell.socket == socket) {
+            return Err(CommandError::new(
+                ErrorKind::InvalidParams,
+                "assemble_joint_shells",
+                format!(
+                    "{named} declares socket shell `{socket}` twice; one rim pair per socket shell"
+                ),
+            ));
+        }
+        shells.push(ResolvedShell {
+            part: part.to_owned(),
+            socket: socket.to_owned(),
+            label: pair.part.clone(),
+        });
+    }
+    Ok(shells)
+}
+
+/// The role's shell a declared name addresses.
+///
+/// The classifier names a shell from its class and side plus an occurrence
+/// counter, so one anatomical shell is `leg R` in one assembly and `leg R 2` in
+/// another: the hands' cuffs are also coincident onto the torso before the seat,
+/// and they take `leg R` first. The manifest keeps the anatomical name; the
+/// report prints the shell actually addressed. A name that matches nothing, or a
+/// base shared by two of the role's shells, refuses — the assembly never picks
+/// between candidates.
+fn role_shell<'a>(role: Role, declared: &str, shells: &[&'a str]) -> Result<&'a str, CommandError> {
+    if let Some(exact) = shells.iter().find(|name| **name == declared) {
+        return Ok(exact);
+    }
+    let prefix = format!("{declared} ");
+    let numbered: Vec<&str> = shells
+        .iter()
+        .copied()
+        .filter(|name| {
+            name.strip_prefix(&prefix)
+                .is_some_and(|counter| counter.parse::<usize>().is_ok())
+        })
+        .collect();
+    match numbered.as_slice() {
+        [only] => Ok(only),
+        [] => Err(CommandError::new(
+            ErrorKind::Refused,
+            "assemble_joint_shell",
+            format!(
+                "joint shell `{declared}` is not a shell of role `{}`; available: [{}]",
+                role.name(),
+                shells.join(", ")
+            ),
+        )),
+        several => Err(CommandError::new(
+            ErrorKind::Refused,
+            "assemble_joint_shell",
+            format!(
+                "joint shell `{declared}` names {} shells of role `{}`: [{}]; the classifier's counters are not a choice between them",
+                several.len(),
+                role.name(),
+                several.join(", ")
+            ),
+        )),
+    }
 }
 
 /// The one shell a joint pairs against: the measured torso when the role
@@ -1157,5 +1292,30 @@ mod tests {
             translate: None,
             drop: None,
         }
+    }
+
+    #[test]
+    fn a_declared_shell_name_takes_the_exact_shell_or_its_one_numbered_twin() {
+        // The classifier adds an occurrence counter when a class-and-side name
+        // repeats: the hands' pre-seat cuffs take `leg R`, so the body's own leg
+        // inside this role is `leg R 2`. Declaring the anatomical name must
+        // reach it, and an exact match must never be overridden by a twin.
+        let owns = [&["leg R 2", "leg L"][..], &["sole R", "sole R 2"][..]];
+        assert_eq!(
+            role_shell(Role::Body, "leg R", owns[0]).expect("the numbered twin"),
+            "leg R 2"
+        );
+        assert_eq!(
+            role_shell(Role::Feet, "sole R", owns[1]).expect("the exact shell wins"),
+            "sole R"
+        );
+        let error = role_shell(Role::Feet, "sole L", owns[1]).expect_err("absent");
+        assert_eq!(error.code(), "assemble_joint_shell");
+        assert!(error.message().contains("sole R 2"), "{}", error.message());
+
+        // Two numbered twins of one name are not a choice the assembly makes.
+        let twins = ["leg R 2", "leg R 3"];
+        let error = role_shell(Role::Body, "leg R", &twins).expect_err("ambiguous");
+        assert!(error.message().contains("2 shells"), "{}", error.message());
     }
 }

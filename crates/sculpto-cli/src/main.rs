@@ -145,15 +145,19 @@ body assemble manifest (version 1; source units, source Z-up frame, nothing infe
               \"rotate\": {\"axis\": \"x\", \"degrees\": -90.0}},
              {\"path\": \"<hands-obj>\", \"role\": \"hands\"}],
    \"joints\": [{\"part\": \"head\", \"socket\": \"body\"},
-              {\"part\": \"hands\", \"socket\": \"body\", \"seat\": true}]}
+              {\"part\": \"hands\", \"socket\": \"body\", \"seat\": true},
+              {\"part\": \"feet\", \"socket\": \"body\",
+               \"shells\": [{\"part\": \"sole R\", \"socket\": \"leg R\"},
+                           {\"part\": \"sole L\", \"socket\": \"leg L\"}]}]}
   roles: body | feet | head | hands | hand-left | hand-right; `feet` may repeat.
   `object` selects one `o` block. Placement is scale -> rotate -> translate,
   then `drop` (downward-only sugar on the up lane); a negative `scale` lane is a
   declared mirror and rewinds the part's faces. Nothing else moves a part, and
   a joint resolves to the seal's own shell names, which the assemble report
   shows as role-derived shell labels (`hand 1`/`hand 2`; `body seal-joints`
-  keeps the shell names). Ankles are not a joint role:
-  feet are accepted as authored.
+  keeps the shell names). `shells` lists the pairs a multi-shell role bridges
+  (the ankle: `sole R` against `leg R`); an unlisted shell is left as authored,
+  and a multi-shell role with no `shells` is refused.
 
 body assemble options:
   --manifest <json>  versioned part/joint manifest (above)

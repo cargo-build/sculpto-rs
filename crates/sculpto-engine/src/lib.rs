@@ -46,7 +46,8 @@ pub enum CommandId {
     BodyAssemble,
     /// Audit attached body parts against their sockets; read-only.
     BodyAuditParts,
-    /// Seal open joint rims (neck, wrists) into one watertight, smoothed seam.
+    /// Seal open joint rims (neck, wrists, ankles) into one watertight, smoothed
+    /// seam.
     BodySealJoints,
     /// Bind a garment to its authored body and fit it to a bake.
     OutfitFit,

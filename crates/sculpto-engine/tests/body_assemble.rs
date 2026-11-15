@@ -27,12 +27,18 @@ impl Builder {
 
     /// Append one octagon ring; returns its 1-based vertex ids.
     fn ring(&mut self, radius: f64, z: f64) -> Vec<usize> {
+        self.ring_at(radius, z, 0.0)
+    }
+
+    /// Append one octagon ring centred on `x`, at height `z`.
+    fn ring_at(&mut self, radius: f64, z: f64, x: f64) -> Vec<usize> {
         let mut ids = Vec::with_capacity(SIDES);
         for k in 0..SIDES {
             let angle = k as f64 * std::f64::consts::FRAC_PI_4;
-            let (x, y) = (radius * angle.cos(), radius * angle.sin());
+            let (dx, y) = (radius * angle.cos(), radius * angle.sin());
             self.vertices += 1;
-            self.text.push_str(&format!("v {x:.6} {z:.6} {:.6}\n", -y));
+            self.text
+                .push_str(&format!("v {:.6} {z:.6} {:.6}\n", x + dx, -y));
             ids.push(self.vertices);
         }
         ids
@@ -89,6 +95,39 @@ fn feet_text() -> String {
         let top = builder.ring(radius, 1.5);
         builder.tube(&bottom, &top);
         builder.cap(&top);
+    }
+    builder.into_text()
+}
+
+/// The torso plus two leg sockets, one per side: each leg is a closed tube whose
+/// only open rim faces down at z 2.0, the socket an ankle pairs against. The
+/// classifier names these synthetic sockets from their authored slot (here
+/// `arm R`/`arm L`), which is why the test reads the names instead of assuming
+/// anatomical ones.
+fn torso_and_legs_text() -> String {
+    let mut builder = Builder::default();
+    builder.object("BaseShape");
+    let bottom = builder.ring(2.0, 4.0);
+    let top = builder.ring(2.0, 11.0);
+    builder.tube(&bottom, &top);
+    for x in [-1.2, 1.2] {
+        let low = builder.ring_at(0.6, 2.0, x);
+        let high = builder.ring_at(0.6, 5.0, x);
+        builder.tube(&low, &high);
+        builder.cap(&high);
+    }
+    builder.into_text()
+}
+
+/// Two foot shells in one file, each a capped tube whose single open rim sits
+/// 0.1 under its leg socket — the ankle seam the seal bridges.
+fn ankle_feet_text() -> String {
+    let mut builder = Builder::default();
+    for x in [-1.2, 1.2] {
+        let low = builder.ring_at(0.6, 0.6, x);
+        let high = builder.ring_at(0.6, 1.9, x);
+        builder.tube(&low, &high);
+        builder.cap(&low);
     }
     builder.into_text()
 }
@@ -155,6 +194,36 @@ fn vertices_of(path: &Path) -> usize {
         .lines()
         .filter(|line| line.starts_with("v "))
         .count()
+}
+
+/// Read a written OBJ back into the source frame.
+///
+/// [`Builder`] writes the display frame (`[x, z, -y]`); the classifier names a
+/// shell from its measured class and side in the source Z-up frame, so the test
+/// measures the same frame the seal addresses.
+fn source_mesh(path: &Path) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let text = std::fs::read_to_string(path).expect("written OBJ");
+    let mut positions = Vec::new();
+    let mut triangles = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("v") => {
+                let lane: Vec<f32> = fields
+                    .map(|value| value.parse().expect("coordinate"))
+                    .collect();
+                positions.push([lane[0], -lane[2], lane[1]]);
+            }
+            Some("f") => {
+                let corners: Vec<u32> = fields
+                    .map(|value| value.parse::<u32>().expect("corner") - 1)
+                    .collect();
+                triangles.push([corners[0], corners[1], corners[2]]);
+            }
+            _ => {}
+        }
+    }
+    (positions, triangles)
 }
 
 /// The assembled report names the hand shells by role: the pre-seat
@@ -306,6 +375,159 @@ fn assemble_places_concatenates_and_seals_the_neck() {
             .expect("report JSON");
     assert_eq!(written["seal"]["joints"][0]["bridge_triangles"], 16);
     assert_eq!(written["output"], result["output"]);
+}
+
+#[test]
+fn both_ankles_seal_from_the_declared_foot_shells() {
+    // The feet are the one role that cannot be addressed by role alone: a foot
+    // part holds several shells per side, so the ankle joint names the pairs it
+    // bridges. The names here are the classifier's, read off the unsealed
+    // assembly (the frame `body seal-joints` addresses), never assumed.
+    let dir = work_dir("ankles");
+    let body = write(&dir, "body.obj", &torso_and_legs_text());
+    let feet = write(&dir, "feet.obj", &ankle_feet_text());
+    let unsealed = dir.join("ankles-unsealed.obj");
+    let assembled = assemble(
+        json!({
+            "version": 1,
+            "parts": [part(&body, "body"), part(&feet, "feet")],
+            "joints": [],
+        }),
+        &unsealed,
+        &dir.join("ankles-unsealed.json"),
+    )
+    .expect("the parts concatenate");
+
+    // Shell ownership is topological: a shell belongs to the part whose vertex
+    // range holds all its members, and the parts are concatenated in order.
+    let body_end = assembled["parts"][0]["vertices"]
+        .as_u64()
+        .expect("body vertices") as usize;
+    let (positions, triangles) = source_mesh(&unsealed);
+    let identities = sculpto_mesh::parts::shell_identities(&positions, &triangles);
+    let owned = |shaft: std::ops::Range<usize>| -> Vec<String> {
+        identities
+            .iter()
+            .filter(|shell| shell.members.iter().all(|&member| shaft.contains(&member)))
+            .filter(|shell| !shell.name.is_empty())
+            .map(|shell| shell.name.clone())
+            .collect()
+    };
+    let body_shells = owned(0..body_end);
+    let feet_shells = owned(body_end..positions.len());
+    assert_eq!(body_shells[0], "torso");
+    let legs: Vec<&String> = body_shells.iter().filter(|name| *name != "torso").collect();
+    assert_eq!(legs.len(), 2, "two leg sockets: {body_shells:?}");
+    assert_eq!(feet_shells.len(), 2, "two foot shells: {feet_shells:?}");
+
+    let out = dir.join("ankles.obj");
+    let report = dir.join("ankles.json");
+    let result = assemble(
+        json!({
+            "version": 1,
+            "parts": [part(&body, "body"), part(&feet, "feet")],
+            "joints": [{
+                "part": "feet",
+                "socket": "body",
+                "shells": [
+                    { "part": feet_shells[0], "socket": legs[0] },
+                    { "part": feet_shells[1], "socket": legs[1] },
+                ],
+            }],
+            "seal": { "smooth": false },
+        }),
+        &out,
+        &report,
+    )
+    .expect("both ankles seal from the declared shells, without a refusal");
+
+    // The joint row keeps the manifest's names; the seal row prints the shell it
+    // addressed, which may carry the classifier's occurrence counter.
+    let shells = result["joints"][0]["shells"]
+        .as_array()
+        .expect("shell rows");
+    assert_eq!(shells.len(), 2);
+    for (index, shell) in shells.iter().enumerate() {
+        assert_eq!(shell["part"], feet_shells[index].as_str());
+        assert_eq!(
+            shell["socket"].as_str().expect("socket shell"),
+            legs[index].as_str()
+        );
+    }
+
+    let rows = result["seal"]["joints"].as_array().expect("seal rows");
+    assert_eq!(rows.len(), 2, "one row per ankle");
+    let mut bridged = 0;
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row["part"], feet_shells[index].as_str());
+        assert_eq!(
+            row["joint"],
+            format!(
+                "{}:{}",
+                feet_shells[index],
+                shells[index]["socket"].as_str().unwrap()
+            )
+        );
+        let triangles = row["bridge_triangles"].as_u64().expect("bridge triangles");
+        assert!(triangles > 0, "the ankle is bridged, not left open");
+        bridged += triangles;
+        assert_eq!(row["boundary_ring_after"], 0);
+        assert_eq!(row["boundary_arc_after"], 0);
+        assert_eq!(row["non_manifold_after"], 0);
+    }
+    assert_eq!(
+        result["output"]["triangles"].as_u64().expect("triangles"),
+        result["assembled"]["triangles"]
+            .as_u64()
+            .expect("assembled")
+            + bridged,
+        "each ankle bridge adds exactly its own triangles"
+    );
+}
+
+#[test]
+fn a_multi_shell_role_without_declared_pairs_refuses() {
+    let dir = work_dir("ankle-refusals");
+    let body = write(&dir, "body.obj", &torso_and_legs_text());
+    let feet = write(&dir, "feet.obj", &ankle_feet_text());
+    let out = dir.join("refused.obj");
+    let report = dir.join("refused.json");
+
+    // Four addressable shells and no declaration: the assembly will not guess
+    // which sole is an ankle.
+    let error = assemble(
+        json!({
+            "version": 1,
+            "parts": [part(&body, "body"), part(&feet, "feet")],
+            "joints": [{ "part": "feet", "socket": "body" }],
+        }),
+        &out,
+        &report,
+    )
+    .expect_err("an undeclared multi-shell role is refused");
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert_eq!(error.code(), "assemble_part_shells");
+    assert!(error.message().contains("shells"), "{}", error.message());
+
+    // A declared shell the role does not own is refused with the available
+    // names; nothing is paired by proximity.
+    let error = assemble(
+        json!({
+            "version": 1,
+            "parts": [part(&body, "body"), part(&feet, "feet")],
+            "joints": [{
+                "part": "feet",
+                "socket": "body",
+                "shells": [{ "part": "sole R", "socket": "leg R" }],
+            }],
+        }),
+        &out,
+        &report,
+    )
+    .expect_err("an undeclared shell name is refused");
+    assert_eq!(error.kind(), ErrorKind::Refused);
+    assert_eq!(error.code(), "assemble_joint_shell");
+    assert!(error.message().contains("available"), "{}", error.message());
 }
 
 #[test]
@@ -564,9 +786,9 @@ fn manifest_defects_are_named_before_any_part_is_read() {
             json!({
                 "version": 1,
                 "parts": [part(&body, "body"), part(&body, "feet")],
-                "joints": [{ "part": "feet", "socket": "body" }],
+                "joints": [{ "part": "feet", "socket": "body", "shells": [] }],
             }),
-            "assemble_feet_joint",
+            "assemble_joint_shells",
         ),
         (
             json!({
