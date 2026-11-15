@@ -94,3 +94,11 @@ load), `SCULPTO_VIEWER_VIEWS=front,side,back,quarter` shoots each pose from
 several cameras on consecutive ticks, `SCULPTO_VIEWER_DIR` receives
 `pose<tick>_<view>.png`. One view per tick, so views of a pose differ by
 ~1/60 s of animation.
+
+## Review lighting
+
+The interactive viewer spawns a three-point rig (key, fill, rim): one light leaves
+the far side black and reads as a hole. `L` toggles lit/flat at runtime; flat
+hides the rig and renders every material unlit, so a review shows the silhouette,
+the seams and the layer palette without a shadow that can be mistaken for a
+defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds.

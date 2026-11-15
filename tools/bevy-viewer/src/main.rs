@@ -61,8 +61,19 @@ struct ViewerConfig {
     report_mode: bool,
     debug_scene: bool,
     interactive: bool,
+    /// Seed for the review lighting: flat hides the light rig and renders
+    /// unlit materials. `L` flips it at runtime in the interactive viewer.
+    flat: bool,
     asset_file: String,
 }
+
+/// Runtime lit/flat state; `SCULPTO_VIEWER_FLAT` seeds it and `L` flips it.
+#[derive(Resource, Clone, Copy)]
+struct FlatMode(bool);
+
+/// Marks the review lights so flat mode can hide the rig without touching it.
+#[derive(Component)]
+struct ReviewLight;
 
 struct CliOptions {
     report: bool,
@@ -156,6 +167,7 @@ fn main() {
         report_mode: options.report,
         debug_scene: options.debug_scene,
         interactive: options.interactive,
+        flat: std::env::var("SCULPTO_VIEWER_FLAT").is_ok(),
         asset_file,
     };
     let asset_plugin = AssetPlugin {
@@ -170,7 +182,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title:
-                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset"
+                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset, L lit/flat"
                                 .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -195,7 +207,8 @@ fn main() {
             );
     }
 
-    app.insert_resource(Units(options.units))
+    app.insert_resource(FlatMode(config.flat))
+        .insert_resource(Units(options.units))
         .insert_resource(Bench(options.bench))
         .insert_resource(config)
         .register_type::<Transform>()
@@ -245,9 +258,47 @@ fn main() {
                 debug_scene,
                 debug_playback,
                 orbit_controls,
+                toggle_flat,
+                apply_flat_mode,
             ),
         )
         .run();
+}
+
+/// `L` flips lit/flat in the interactive viewer; the capture path keeps its
+/// seeded state.
+fn toggle_flat(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut flat: ResMut<FlatMode>,
+) {
+    if config.interactive && keys.just_pressed(KeyCode::KeyL) {
+        flat.0 = !flat.0;
+    }
+}
+
+/// Flat review hides the light rig and renders unlit materials: silhouette,
+/// seams and layer colours, with nothing that reads as a defect. Runs every
+/// frame because glTF materials stream in after startup.
+fn apply_flat_mode(
+    flat: Res<FlatMode>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut lights: Query<&mut Visibility, With<ReviewLight>>,
+) {
+    let want = if flat.0 { Visibility::Hidden } else { Visibility::Visible };
+    for mut visibility in &mut lights {
+        if *visibility != want {
+            *visibility = want;
+        }
+    }
+    if !flat.0 {
+        return;
+    }
+    for (_, material) in materials.iter_mut() {
+        if !material.unlit {
+            material.unlit = true;
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -329,22 +380,21 @@ fn setup(
     } else {
         commands.insert_resource(OrbitCamera::looking_at(camera_eye, camera_target));
     }
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 10_000.0,
-            ..default()
-        },
-        Transform::from_xyz(3.0, 5.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    if config.interactive {
-        // A second, weaker fill from the opposite side keeps the garment's
-        // back faces readable while the orbit camera moves.
+    // Three-point review rig: key, fill and rim. One light leaves the far side
+    // black and reads as a hole; the rim separates the garment edge from the
+    // body. Flat mode hides all three together.
+    for (illuminance, position) in [
+        (10_000.0_f32, Vec3::new(3.0, 5.0, 2.0)),
+        (3_500.0, Vec3::new(-3.0, 2.0, -2.5)),
+        (6_000.0, Vec3::new(0.0, 3.0, -4.0)),
+    ] {
         commands.spawn((
             DirectionalLight {
-                illuminance: 3_000.0,
+                illuminance,
                 ..default()
             },
-            Transform::from_xyz(-3.0, 2.0, -2.5).looking_at(Vec3::ZERO, Vec3::Y),
+            Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y),
+            ReviewLight,
         ));
     }
 
