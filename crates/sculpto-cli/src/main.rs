@@ -71,6 +71,8 @@ commands:
   garment push [options]  move visible depth violations out to just under a tolerance
   garment stack [options] grade a declared ordered layer stack by contact type
   garment trim [options]  cut away garment triangles that intersect the body
+  garment drop-strands [options]
+                        remove thin pieces the layer hangs off the body unsupported
   garment cover [options] body coverage per height band (<=2/<=8/<=20 units)
   garment control-exterior [options] keep the outward control surface of a thick shell
   garment control-repair [options] plan corner-flare and incidental-loop repair
@@ -163,6 +165,9 @@ export-actor options:
                           nearest declared source owns each vertex (repeatable; the
                           body shape is always the first source)
   --layer <rank>=<obj>    ranked underwear or garment OBJ (repeatable; rank 1..=5)
+  --drop-strands-layer <rank>
+                          remove thin pieces that layer hangs off the body unsupported
+                          before the weld and the bind (repeatable; opt-in per layer)
   --skeleton <path>       family skeleton NIF that completes the authored rig
   --clips <path>          source actor GLB whose clips are mapped by bone name
   --clip <name>           clip to write (repeatable; the written order is this order)
@@ -1392,6 +1397,7 @@ fn export_actor(args: &[String]) -> ExitCode {
     let mut clip_names: Vec<String> = Vec::new();
     let mut extremity: Vec<String> = Vec::new();
     let mut sources: Vec<serde_json::Value> = Vec::new();
+    let mut strand_layers: Vec<u32> = Vec::new();
     let mut out: Option<String> = None;
     let mut report: Option<String> = None;
     let mut units: Option<f64> = None;
@@ -1427,6 +1433,14 @@ fn export_actor(args: &[String]) -> ExitCode {
                     Err(_) => return reject(format!("`--layer {value}`: `{rank}` is not a rank")),
                 },
                 _ => return reject(format!("`--layer {value}` needs <rank>=<obj>")),
+            },
+            "drop-strands-layer" => match value.parse::<u32>() {
+                Ok(rank) => strand_layers.push(rank),
+                Err(_) => {
+                    return reject(format!(
+                        "`--drop-strands-layer {value}`: `{value}` is not a rank"
+                    ));
+                }
             },
             "skeleton" => skeleton = Some(value.clone()),
             "clips" => clips = Some(value.clone()),
@@ -1476,6 +1490,17 @@ fn export_actor(args: &[String]) -> ExitCode {
     let (Some(nif), Some(body_shape), Some(body), Some(out)) = (nif, body_shape, body, out) else {
         return reject("`--nif`, `--body-shape`, `--body` and `--out` are required".to_string());
     };
+    for rank in &strand_layers {
+        let Some(layer) = layers
+            .iter_mut()
+            .find(|layer| layer["order"].as_u64() == Some(u64::from(*rank)))
+        else {
+            return reject(format!(
+                "`--drop-strands-layer {rank}` names no declared `--layer`"
+            ));
+        };
+        layer["drop_strands"] = serde_json::json!(true);
+    }
     let mut input = serde_json::json!({
         "nif": nif,
         "body_shape": body_shape,
@@ -1519,7 +1544,7 @@ fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
 
 fn garment(args: &[String]) -> ExitCode {
     let usage = "usage: sculpto garment fit --nif <path> --shape <name> [--body-shape <name>] --body <obj> --out <obj> [--body-ref <obj>] [--manifest <json>] [--collision <obj> --collision-frame source-scene]\n       sculpto garment aura --body <obj> --garment <obj> --out <obj> [--class auto|<kind>]
-       sculpto garment dress --body <obj> --garment <obj> [--against <layers.json>] --out <obj> [--clearance <units>] [--contact <units>] [--cuts <n>] [--iterations <n>] [--max-step <units>] [--relax <weight>] [--rounds <n>] [--poke-passes <n>] [--tolerance <units> [--passes <n>]] [--report <json>] [--json]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
+       sculpto garment dress --body <obj> --garment <obj> [--against <layers.json>] --out <obj> [--clearance <units>] [--contact <units>] [--cuts <n>] [--iterations <n>] [--max-step <units>] [--relax <weight>] [--rounds <n>] [--poke-passes <n>] [--tolerance <units> [--passes <n>]] [--report <json>] [--json]\n       sculpto garment classify --body <obj> --garment <obj>\n       sculpto garment intake --body <obj> --garment <obj>\n       sculpto garment strip --body <obj> --garment <obj> --out <obj>\n       sculpto garment drop-strands --body <obj> --garment <obj> --out <obj> [--attach-epsilon <units>] [--support-distance <units>] [--min-unsupported-share <share>] [--max-area-share <share>] [--max-thickness <units>] [--max-attachment-span-share <share>] [--slices <n>] [--report <json>]\n       sculpto garment proxies --body <obj> --out <obj>\n       sculpto garment check --body <obj> --garment <obj> [--self 1]
        sculpto garment depth --body <obj> --garment <obj> [--json] [--tolerance <units>]
        sculpto garment push --body <obj> --garment <obj> --tolerance <units> --out <obj> [--passes <n>] [--json]
        sculpto garment stack --outfit <layers.json> [--body <obj>] --tolerance <units> [--json]
@@ -1544,6 +1569,7 @@ fn garment(args: &[String]) -> ExitCode {
         [action, rest @ ..] if action == "push" => garment_push_inner(rest),
         [action, rest @ ..] if action == "stack" => garment_stack_inner(rest),
         [action, rest @ ..] if action == "trim" => garment_trim_inner(rest),
+        [action, rest @ ..] if action == "drop-strands" => garment_drop_strands_inner(rest),
         [action, rest @ ..] if action == "cover" => garment_cover_inner(rest),
         [action, rest @ ..] if action == "control-exterior" => {
             garment_control::exterior_inner(rest)
@@ -2271,6 +2297,153 @@ fn garment_cover_inner(args: &[String]) -> Result<(), String> {
             band[2] as f32 / total as f32 * 100.0,
             band[3] as f32 / total as f32 * 100.0
         );
+    }
+    Ok(())
+}
+
+/// Remove thin pieces the layer hangs off the body unsupported.
+fn garment_drop_strands_inner(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let body_path = PathBuf::from(required(&flags, "body")?);
+    let garment_path = PathBuf::from(required(&flags, "garment")?);
+    let out = PathBuf::from(required(&flags, "out")?);
+    let (body_display, body_triangles) = read_obj(&body_path)?;
+    let (garment_display, garment_triangles) = read_obj(&garment_path)?;
+    let defaults = sculpto_mesh::strand::StrandOptions::default();
+    let options = sculpto_mesh::strand::StrandOptions {
+        attach_epsilon: flag_f32(&flags, "attach-epsilon", defaults.attach_epsilon)?,
+        support_distance: flag_f32(&flags, "support-distance", defaults.support_distance)?,
+        min_unsupported_share: flag_f32(
+            &flags,
+            "min-unsupported-share",
+            defaults.min_unsupported_share,
+        )?,
+        max_area_share: flag_f32(&flags, "max-area-share", defaults.max_area_share)?,
+        max_thickness: flag_f32(&flags, "max-thickness", defaults.max_thickness)?,
+        max_attachment_span_share: flag_f32(
+            &flags,
+            "max-attachment-span-share",
+            defaults.max_attachment_span_share,
+        )?,
+        slices: flag_usize(&flags, "slices", defaults.slices)?,
+    };
+    // Both files arrive in the display frame; the rule is frame-agnostic, so it
+    // runs there and `write_obj` converts the result back unchanged.
+    let dropped = sculpto_mesh::strand::drop_unsupported_strands(
+        &to_source(&garment_display),
+        &garment_triangles,
+        &to_source(&body_display),
+        &body_triangles,
+        &options,
+    )
+    .map_err(|error| error.to_string())?;
+    write_obj(&out, &to_source(&dropped.positions), &dropped.triangles)
+        .map_err(|error| format!("{}: {error}", out.display()))?;
+    println!(
+        "{} against {}: {} pieces, {} triangles, area {:.2}",
+        garment_path.display(),
+        body_path.display(),
+        dropped.source_pieces,
+        dropped.source_triangles,
+        dropped.source_area
+    );
+    for strand in &dropped.removed {
+        println!(
+            "  removed pieces {:?}: {} triangles, area {:.2} ({:.2} %), thickness {:.2}, \
+             extent {:.2}, unsupported {:.0} %, tip {:.2}, attached over {:.2} % of the extent",
+            strand.pieces,
+            strand.triangles,
+            strand.area,
+            f64::from(strand.area_share) * 100.0,
+            strand.thickness,
+            strand.extent,
+            strand.unsupported_share * 100.0,
+            strand.tip_distance,
+            f64::from(strand.attachment_span_share) * 100.0
+        );
+    }
+    for kept in &dropped.kept {
+        println!(
+            "  kept pieces {:?}: area {:.2} %, thickness {:.2}, unsupported {:.0} % — {}",
+            kept.pieces,
+            f64::from(kept.area_share) * 100.0,
+            kept.thickness,
+            kept.unsupported_share * 100.0,
+            kept.refusal.as_str()
+        );
+    }
+    println!(
+        "  boundary edges {} -> {}, pieces {} -> {}, kept {:.2} of {:.2} area",
+        dropped.boundary_edges_before,
+        dropped.boundary_edges_after,
+        dropped.source_pieces,
+        dropped.kept_pieces,
+        dropped.kept_area,
+        dropped.source_area
+    );
+    if dropped.boundary_edges_after > dropped.boundary_edges_before {
+        return Err(format!(
+            "removing strands added {} boundary edges; the rule refuses to open a seam",
+            dropped.boundary_edges_after - dropped.boundary_edges_before
+        ));
+    }
+    println!(
+        "{}: {} vertices, {} triangles, {} strand(s), {} removed triangles",
+        out.display(),
+        dropped.positions.len(),
+        dropped.triangles.len(),
+        dropped.removed.len(),
+        dropped.removed_triangles()
+    );
+    if let Some(report) = flags.get("report") {
+        let text = serde_json::json!({
+            "garment": garment_path.display().to_string(),
+            "body": body_path.display().to_string(),
+            "out": out.display().to_string(),
+            "options": {
+                "attach_epsilon": options.attach_epsilon,
+                "support_distance": options.support_distance,
+                "min_unsupported_share": options.min_unsupported_share,
+                "max_area_share": options.max_area_share,
+                "max_thickness": options.max_thickness,
+                "max_attachment_span_share": options.max_attachment_span_share,
+                "slices": options.slices,
+            },
+            "source_vertices": dropped.source_vertices,
+            "source_referenced": dropped.source_referenced,
+            "source_triangles": dropped.source_triangles,
+            "source_pieces": dropped.source_pieces,
+            "source_area": dropped.source_area,
+            "kept_pieces": dropped.kept_pieces,
+            "kept_triangles": dropped.triangles.len(),
+            "kept_area": dropped.kept_area,
+            "boundary_edges_before": dropped.boundary_edges_before,
+            "boundary_edges_after": dropped.boundary_edges_after,
+            "removed": dropped.removed.iter().map(|strand| serde_json::json!({
+                "pieces": strand.pieces,
+                "triangles": strand.triangles,
+                "vertices": strand.vertices,
+                "area": strand.area,
+                "area_share": strand.area_share,
+                "thickness": strand.thickness,
+                "extent": strand.extent,
+                "unsupported_share": strand.unsupported_share,
+                "tip_distance": strand.tip_distance,
+                "attachment_span_share": strand.attachment_span_share,
+            })).collect::<Vec<_>>(),
+            "kept": dropped.kept.iter().map(|kept| serde_json::json!({
+                "pieces": kept.pieces,
+                "area_share": kept.area_share,
+                "thickness": kept.thickness,
+                "unsupported_share": kept.unsupported_share,
+                "refusal": kept.refusal.as_str(),
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            report,
+            serde_json::to_string_pretty(&text).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("{report}: {error}"))?;
     }
     Ok(())
 }

@@ -51,6 +51,7 @@ pub mod rig;
 pub mod seam;
 pub mod silhouette;
 pub mod spatial_split;
+pub mod strand;
 pub mod surface;
 mod surface_util;
 mod topology;

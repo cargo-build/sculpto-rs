@@ -74,6 +74,10 @@ fn params(case: &Value, out_dir: &Path) -> ExportActorParams {
             .map(|layer| ActorLayer {
                 order: layer["order"].as_u64().expect("order") as u32,
                 obj: path(layer, "obj"),
+                drop_strands: layer
+                    .get("drop_strands")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
             .collect(),
         skeleton: Some(path(case, "skeleton")),

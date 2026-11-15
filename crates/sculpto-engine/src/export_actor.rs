@@ -59,6 +59,7 @@ use sculpto_mesh::check::surface_distances;
 use sculpto_mesh::dress::{SEAM_WELD_EPSILON, SeamWeldReport, seam_weld};
 use sculpto_mesh::garment::{Influences, TransferError, TransferOptions, transfer};
 use sculpto_mesh::mask::VertexMask;
+use sculpto_mesh::strand::{DropStrands, StrandOptions, drop_unsupported_strands};
 use sculpto_mesh::weight_norm::{MAX_INFLUENCES, SUM_TOLERANCE, pack_influences};
 use sculpto_nif::ShapePlacement;
 
@@ -167,6 +168,11 @@ pub struct ActorLayer {
     pub order: u32,
     /// Layer OBJ in the body's frame.
     pub obj: PathBuf,
+    /// Remove thin pieces this layer hangs off the body unsupported — a
+    /// drawstring end, a loose strap tail — before the weld and the bind.
+    /// Opt-in per layer because the rule deletes authored geometry.
+    #[serde(default)]
+    pub drop_strands: bool,
 }
 
 /// One authored weight source: a shape whose skin the parts may copy.
@@ -290,6 +296,8 @@ struct SourcePart {
     /// What the seam merge did to an authored garment layer; `None` for the
     /// body, whose joints the seal already owns.
     seam_weld: Option<SeamWeldReport>,
+    /// What the opt-in strand rule removed from this layer, if it ran.
+    strands: Option<DropStrands>,
 }
 
 /// What one part copied from one weight source.
@@ -362,6 +370,7 @@ struct PartRow {
     triangles: Range<usize>,
     partition: u16,
     seam_weld: Option<SeamWeldReport>,
+    strands: Option<DropStrands>,
 }
 
 /// Export one rigged, coloured actor GLB and render its report.
@@ -537,13 +546,22 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
     // Read every part in the body's own skin frame, once. A garment layer is
     // authored as separate pieces whose seam copies abut exactly, so the dress
     // weld merges them here, before any weight is bound.
-    let mut parts = vec![read_part(&params.body, "body", 0, BODY_COLOR, &placement)?];
+    let body_surface = read_obj_surface(&params.body)?;
+    let mut parts = vec![read_part(
+        &params.body,
+        "body",
+        0,
+        BODY_COLOR,
+        &body_surface.0,
+        &body_surface.1,
+        &placement,
+    )?];
     let mut ordered = params.layers.clone();
     ordered.sort_by_key(|layer| layer.order);
     for layer in ordered {
         let rank = u8::try_from(layer.order).expect("the palette gate validated 1..=5");
         let color = review_palette(rank).expect("the palette gate validated 1..=5");
-        parts.push(read_layer(&layer.obj, layer.order, color, &placement)?);
+        parts.push(read_layer(&layer, color, &body_surface, &placement)?);
     }
     let mut seen = BTreeSet::new();
     for part in &parts {
@@ -618,6 +636,7 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
             triangles: first_triangle..arena.triangles.len(),
             partition,
             seam_weld: part.seam_weld.clone(),
+            strands: part.strands.clone(),
         });
         rows.extend(skin.rows.iter().cloned());
         part_skins.push(skin);
@@ -917,6 +936,40 @@ fn part_value(part: &PartRow, skin: &BoundPart) -> Value {
             }))
             .collect::<Vec<_>>(),
     });
+    if let Some(strands) = &part.strands {
+        value["strand_drop"] = json!({
+            "source_vertices": strands.source_vertices,
+            "source_triangles": strands.source_triangles,
+            "source_pieces": strands.source_pieces,
+            "kept_pieces": strands.kept_pieces,
+            "source_area": strands.source_area,
+            "kept_area": strands.kept_area,
+            "removed_vertices": strands.removed_vertices(),
+            "removed_triangles": strands.removed_triangles(),
+            "removed_area": strands.removed_area(),
+            "boundary_edges_before": strands.boundary_edges_before,
+            "boundary_edges_after": strands.boundary_edges_after,
+            "removed": strands.removed.iter().map(|strand| json!({
+                "pieces": strand.pieces,
+                "triangles": strand.triangles,
+                "vertices": strand.vertices,
+                "area": strand.area,
+                "area_share": strand.area_share,
+                "thickness": strand.thickness,
+                "extent": strand.extent,
+                "unsupported_share": strand.unsupported_share,
+                "tip_distance": strand.tip_distance,
+                "attachment_span_share": strand.attachment_span_share,
+            })).collect::<Vec<_>>(),
+            "kept": strands.kept.iter().map(|kept| json!({
+                "pieces": kept.pieces,
+                "area_share": kept.area_share,
+                "thickness": kept.thickness,
+                "unsupported_share": kept.unsupported_share,
+                "refusal": kept.refusal.as_str(),
+            })).collect::<Vec<_>>(),
+        });
+    }
     if let Some(seam) = &part.seam_weld {
         value["seam_weld"] = json!({
             "tolerance": seam.tolerance,
@@ -1049,15 +1102,16 @@ fn fallback_slots(
     Ok((candidates.into_iter().collect(), extremity))
 }
 
-/// Read one OBJ part and move it into the body's skin frame.
+/// Move one already-read OBJ part into the body's skin frame.
 fn read_part(
     path: &Path,
     role: &'static str,
     order: u32,
     color: [f32; 4],
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
     placement: &ShapePlacement,
 ) -> Result<SourcePart, CommandError> {
-    let (positions, triangles) = read_obj_surface(path)?;
     if positions.is_empty() || triangles.is_empty() {
         return Err(refused(
             "export_actor_empty_part",
@@ -1077,19 +1131,21 @@ fn read_part(
             .iter()
             .map(|&point| placement.position_in_mesh(point))
             .collect(),
-        triangles,
+        triangles: triangles.to_vec(),
         seam_weld: None,
+        strands: None,
     })
 }
 
 /// Read one garment layer, merge its authored seam copies and move it into the
 /// body's skin frame.
 fn read_layer(
-    path: &Path,
-    order: u32,
+    layer: &ActorLayer,
     color: [f32; 4],
+    body: &(Vec<[f32; 3]>, Vec<[u32; 3]>),
     placement: &ShapePlacement,
 ) -> Result<SourcePart, CommandError> {
+    let path = &layer.obj;
     let (positions, triangles) = read_obj_surface(path)?;
     if positions.is_empty() || triangles.is_empty() {
         return Err(refused(
@@ -1097,6 +1153,32 @@ fn read_layer(
             format!("{} has no geometry to write", path.display()),
         ));
     }
+    // The strand rule runs on the authored pieces, before the weld merges them,
+    // and against the assembled body in the same frame: only a body surface can
+    // say whether a piece hangs unsupported.
+    let (positions, triangles, strands) = match layer.drop_strands {
+        true => {
+            let dropped = drop_unsupported_strands(
+                &positions,
+                &triangles,
+                &body.0,
+                &body.1,
+                &StrandOptions::default(),
+            )
+            .map_err(|error| {
+                refused(
+                    "export_actor_strand_rule",
+                    format!("{}: {error}", path.display()),
+                )
+            })?;
+            (
+                dropped.positions.clone(),
+                dropped.triangles.clone(),
+                Some(dropped),
+            )
+        }
+        false => (positions, triangles, None),
+    };
     let (welded, welded_triangles, seam_weld) = weld_layer(&positions, &triangles);
     let name = path
         .file_stem()
@@ -1105,7 +1187,7 @@ fn read_layer(
     Ok(SourcePart {
         name,
         role: "layer",
-        order,
+        order: layer.order,
         color,
         positions: welded
             .iter()
@@ -1113,6 +1195,7 @@ fn read_layer(
             .collect(),
         triangles: welded_triangles,
         seam_weld: Some(seam_weld),
+        strands,
     })
 }
 
