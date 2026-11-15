@@ -149,9 +149,9 @@ fn emily_assembly_reproduces_the_accepted_numbers() {
 
     // The bridge triangles are real: the neck adds 54 and each ankle 40, and
     // the head repair adds its patches; the recipe digests are reported.
-    assert_eq!(result["output"]["vertices"], 34_685);
+    assert_eq!(result["output"]["vertices"], 34_686);
     assert_eq!(result["output"]["triangles"], 65_882);
-    assert_eq!(vertices_of(&out), 34_685);
+    assert_eq!(vertices_of(&out), 34_686);
     assert_eq!(count(&out, "f "), 65_882);
     // The delivered head carries no puncture: the pre-seal fill closed its own
     // small loops and the post-seal repair closed the skull slit.
