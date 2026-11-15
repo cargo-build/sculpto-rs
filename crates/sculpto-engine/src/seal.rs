@@ -186,6 +186,8 @@ pub(crate) fn joint_row(joint: &JointReport) -> Value {
         "min_bridge_area": joint.min_bridge_area,
         "max_aspect": joint.max_aspect,
         "merged_duplicates": joint.merged_duplicates,
+        "cycle_dedupe_epsilon": joint.cycle_dedupe_epsilon,
+        "cycle_dedupe_merged": joint.cycle_dedupe_merged,
         "handedness": joint.handedness,
         "seat": joint.seat.as_ref().map(seat_row),
         "smoothing": smoothing_row(&joint.smoothing),

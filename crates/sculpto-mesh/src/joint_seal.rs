@@ -74,6 +74,14 @@ pub const SEAT_ASSIGNMENT_MARGIN: f64 = 0.10;
 /// ring radius 3.763 = 1.17, Bijin 0.265 = 0.07; a collar parked on the wrong
 /// opening needs a multiple of the ring size. @req BLD-13
 pub const SEAT_CENTROID_MAX_SHIFT_RATIO: f64 = 3.0;
+/// Cycle-extraction dedupe band: boundary vertices closer than this merge
+/// into one cycle node and one weld target. Justified from the measured
+/// bodies: authored slit copies are exact (0.0) and the near-copies the
+/// authoring export leaves sit at 2.3e-6..3.3e-6 (Mike's right wrist
+/// v7/v9079 at 3.16e-6, ankles 2.27e-6/3.27e-6) — four orders below the real
+/// ring spacing (~1.7 u on the 10-position wrist circles), so 1e-4 cannot
+/// fuse distinct ring nodes. @req BLD-13
+pub const SEAL_CYCLE_DEDUPE_EPSILON: f32 = 1e-4;
 /// Why the unique-position collar wins over the proximity arc; printed in
 /// every joint row so the choice is auditable. @req BLD-13
 pub const SEAM_CHOICE: &str = "proximity arc (29 v with coincident ends); the full 86-v loop is not a neck ring and its slit duplicates are never bridged";
@@ -494,6 +502,13 @@ pub struct JointReport {
     pub max_aspect: f64,
     /// Exactly coincident boundary vertices merged beyond the pinch.
     pub merged_duplicates: usize,
+    /// Cycle-extraction dedupe band in force
+    /// ([`SEAL_CYCLE_DEDUPE_EPSILON`]): boundary copies inside it merge into
+    /// their ring node at cycle discovery and at the seated rim weld.
+    pub cycle_dedupe_epsilon: f32,
+    /// Boundary copies the dedupe band merged beyond exact coincidence on
+    /// this joint (Mike's right wrist: 1).
+    pub cycle_dedupe_merged: usize,
     /// Cross-side pairing verdict of a seated group: decisive, undecided
     /// (warn: ring geometry cannot detect a swap), or n/a for single parts.
     pub handedness: &'static str,
@@ -2061,15 +2076,50 @@ fn socket_cycles(
     // Coincidence groups over the boundary vertices, ordered by vertex id:
     // a pass arriving at one twin leaves through the next-by-id twin's
     // out-edge, which closes the spliced opening and chains the exterior.
-    let mut groups: BTreeMap<[u32; 3], Vec<u32>> = BTreeMap::new();
-    for &(from, to) in edges.keys() {
-        for vertex in [from, to] {
-            let key = position_key(point_of(positions, vertex));
-            let group = groups.entry(key).or_default();
-            if !group.contains(&vertex) {
-                group.push(vertex);
+    // Exact twins and authored near-copies within
+    // [`SEAL_CYCLE_DEDUPE_EPSILON`] merge alike (union-find keeps the
+    // grouping transitive, with no quantization bins to straddle): Mike's
+    // wrist copy at 3.16e-6 must splice like an exact slit twin, or the
+    // 10-position ring walks as a 12-node cycle and refuses the authored
+    // 10-cuff.
+    let boundary: BTreeSet<u32> = edges.keys().flat_map(|&(from, to)| [from, to]).collect();
+    let ids: Vec<u32> = boundary.iter().copied().collect();
+    let band_sq = f64::from(SEAL_CYCLE_DEDUPE_EPSILON) * f64::from(SEAL_CYCLE_DEDUPE_EPSILON);
+    let mut parent: HashMap<u32, u32> = ids.iter().map(|&id| (id, id)).collect();
+    let find = |parent: &mut HashMap<u32, u32>, mut id: u32| -> u32 {
+        while parent[&id] != id {
+            let up = parent[&id];
+            parent.insert(id, parent[&up]);
+            id = up;
+        }
+        id
+    };
+    for (at, &left) in ids.iter().enumerate() {
+        for &right in &ids[at + 1..] {
+            let (a, b) = (point_of(positions, left), point_of(positions, right));
+            let offset = [
+                f64::from(a[0] - b[0]),
+                f64::from(a[1] - b[1]),
+                f64::from(a[2] - b[2]),
+            ];
+            let square = offset.iter().map(|lane| lane * lane).sum::<f64>();
+            if square > band_sq {
+                continue;
+            }
+            let left_root = find(&mut parent, left);
+            let right_root = find(&mut parent, right);
+            // The smaller id roots the group, so every group stays ascending.
+            if left_root < right_root {
+                parent.insert(right_root, left_root);
+            } else {
+                parent.insert(left_root, right_root);
             }
         }
+    }
+    let root_of: HashMap<u32, u32> = ids.iter().map(|&id| (id, find(&mut parent, id))).collect();
+    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &id in &ids {
+        groups.entry(root_of[&id]).or_default().push(id);
     }
     let merged: usize = groups.values().map(|group| group.len() - 1).sum();
     // A pass arriving at one twin leaves through the other twin's out-edge,
@@ -2078,8 +2128,7 @@ fn socket_cycles(
     // larger coincident groups keep the plain walk — the residual gate
     // refuses any seam that would misuse them.
     let next_in_group = |vertex: u32| -> Option<u32> {
-        let key = position_key(point_of(positions, vertex));
-        let group = groups.get(&key)?;
+        let group = groups.get(&root_of[&vertex])?;
         if group.len() != 2 {
             return None;
         }
@@ -2297,17 +2346,18 @@ fn seat_by_ring_centroid(
     Ok(seated)
 }
 
-/// Merge exactly coincident boundary vertex pairs of ONE joint's two rims
-/// (the run's closing twins and slit pinches), rewiring every non-rim twin
-/// onto the rim vertex so the cycles' vertex lists stay valid; returns the
-/// merged pair count. Scoped to the paired rims — never a whole-shell merge.
-/// @req BLD-13
+/// Merge coincident boundary vertex pairs of ONE joint's two rims (the run's
+/// closing twins and slit pinches), rewiring every non-rim twin onto the rim
+/// vertex so the cycles' vertex lists stay valid; returns the
+/// exact-coincident merge count and the count merged only by the
+/// [`SEAL_CYCLE_DEDUPE_EPSILON`] band. Scoped to the paired rims — never a
+/// whole-shell merge. @req BLD-13
 fn weld_joint_rims(
     triangles: &mut Vec<[u32; 3]>,
     ring: &[u32],
     collar: &[u32],
     positions: &[[f32; 3]],
-) -> usize {
+) -> (usize, usize) {
     let rim_keys: BTreeMap<[u32; 3], u32> = ring
         .iter()
         .chain(collar)
@@ -2319,12 +2369,45 @@ fn weld_joint_rims(
         .flat_map(|(edge, _)| [edge.0, edge.1])
         .collect();
     let mut identity: HashMap<u32, u32> = HashMap::new();
-    for vertex in boundary {
-        let key = position_key(point_of(positions, vertex));
+    for vertex in &boundary {
+        let key = position_key(point_of(positions, *vertex));
         if let Some(&kept) = rim_keys.get(&key)
-            && kept != vertex
+            && kept != *vertex
         {
-            identity.insert(vertex, kept);
+            identity.insert(*vertex, kept);
+        }
+    }
+    // The dedupe band also welds: an authored near-copy of a rim vertex
+    // (Mike's wrist twin at 3.16e-6) rewires onto its rim vertex, or the
+    // welded ring keeps the twin's boundary edges open. Measured authored
+    // cuffs (>= 1e-3 off) sit above the band and weld by correspondence
+    // instead.
+    let rim_ids: Vec<u32> = ring.iter().chain(collar).copied().collect();
+    let band_sq = f64::from(SEAL_CYCLE_DEDUPE_EPSILON) * f64::from(SEAL_CYCLE_DEDUPE_EPSILON);
+    let mut band_merged = 0usize;
+    for vertex in &boundary {
+        if identity.contains_key(vertex) || rim_ids.contains(vertex) {
+            continue;
+        }
+        let point = point_of(positions, *vertex);
+        let nearest = rim_ids
+            .iter()
+            .filter_map(|&kept| {
+                let target = point_of(positions, kept);
+                let offset = [
+                    f64::from(target[0] - point[0]),
+                    f64::from(target[1] - point[1]),
+                    f64::from(target[2] - point[2]),
+                ];
+                let square = offset.iter().map(|lane| lane * lane).sum::<f64>();
+                (square <= band_sq).then_some((square, kept))
+            })
+            // Nearest wins; the id breaks exact ties, so the weld is
+            // deterministic.
+            .min_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+        if let Some((_, kept)) = nearest {
+            identity.insert(*vertex, kept);
+            band_merged += 1;
         }
     }
     let merged = identity.len();
@@ -2339,7 +2422,7 @@ fn weld_joint_rims(
             })
             .collect();
     }
-    merged
+    (merged - band_merged, band_merged)
 }
 
 /// Solve and apply the seated hands groups: extract the socket shell's joint
@@ -3095,6 +3178,7 @@ fn seal_joints_mode(
                 ring: Vec<u32>,
                 collar: Vec<u32>,
                 merged: usize,
+                dedupe_merged: usize,
             },
             Discovered {
                 socket_rim: Rim,
@@ -3105,7 +3189,7 @@ fn seal_joints_mode(
             },
         }
         let joint_rims = if let Some(seat) = seated[index].as_ref() {
-            let mut merged = weld_joint_rims(
+            let (exact_merged, dedupe_merged) = weld_joint_rims(
                 &mut triangles,
                 &seat.wrist_cycle,
                 &seat.cuff_cycle,
@@ -3115,6 +3199,7 @@ fn seal_joints_mode(
             // the joint, where a ribbon between concentric rings is a zero-span
             // washer (measured on the 3BA wrists, where the seat had also
             // rotated the hands fingers-up).
+            let mut merged = exact_merged;
             if seat.authored {
                 merged += weld_seated_cuff(&mut triangles, &seat.wrist_cycle, &seat.cuff_cycle);
             }
@@ -3125,6 +3210,7 @@ fn seal_joints_mode(
                 ring: seat.wrist_cycle.clone(),
                 collar: seat.cuff_cycle.clone(),
                 merged,
+                dedupe_merged,
             }
         } else {
             let (part_rims, socket_rims, part_rim_at, socket_rim_at) =
@@ -3155,6 +3241,9 @@ fn seal_joints_mode(
                 merged,
             }
         };
+        // Boundary copies the dedupe band merged at the rim weld (seated
+        // joints only; zero on the discovered path).
+        let mut cycle_dedupe_merged = 0usize;
         let (
             ring,
             collar,
@@ -3169,10 +3258,12 @@ fn seal_joints_mode(
                 ring,
                 collar,
                 merged,
+                dedupe_merged,
             } => {
                 let socket_facts = rim_facts(&ring, &positions, true);
                 let part_facts = rim_facts(&collar, &positions, true);
                 let before = ring.len();
+                cycle_dedupe_merged = dedupe_merged;
                 (
                     ring,
                     collar,
@@ -3558,6 +3649,8 @@ fn seal_joints_mode(
             },
             max_aspect: areas.iter().map(|area| area.1).fold(0.0, f64::max),
             merged_duplicates: 0,
+            cycle_dedupe_epsilon: SEAL_CYCLE_DEDUPE_EPSILON,
+            cycle_dedupe_merged,
             handedness: seated[index].as_ref().map_or("", |seat| seat.handedness),
             seat,
             smoothing,
@@ -4778,5 +4871,169 @@ mod tests {
             [0.0, 0.0, -0.5],
             1e-4
         ));
+    }
+
+    /// The socket shell whose single boundary loop carries the measured Mike
+    /// wrist defect: an open-bottom tube whose bottom row walks
+    /// `[o, r0..r9, twin, copy]` — the outboard `o` (slit bottom, off-ring),
+    /// the 10-position ring, `twin`, a near-copy of `r0` at `twin_offset`
+    /// (the artefact sits 3.16e-6 off on Mike's right wrist) — and `copy`,
+    /// an exact copy of `o` across the slit. Every bottom vertex carries its
+    /// own wall column, so the tube's only boundary is the defect loop.
+    fn twin_socket(twin_offset: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let mut bottom: Vec<[f32; 3]> = vec![[5.73, 0.0, 0.0]]; // o, off-ring
+        bottom.extend(ring(10, 2.73, 0.0)); // r0..r9
+        bottom.push([2.73 + twin_offset[0], twin_offset[1], twin_offset[2]]);
+        bottom.push([5.73, 0.0, 0.0]); // exact copy of o
+        let top: Vec<[f32; 3]> = bottom.iter().map(|p| [p[0], p[1], 4.0]).collect();
+        let bottom_ids: Vec<u32> = (0..bottom.len() as u32).collect();
+        let top_ids: Vec<u32> = (bottom.len() as u32..(2 * bottom.len()) as u32).collect();
+        let mut positions = bottom;
+        positions.extend(top);
+        let mut triangles = prism(&bottom_ids, &top_ids);
+        triangles.extend(cap(&top_ids));
+        (positions, triangles)
+    }
+
+    /// A cuff tube whose open bottom ring sits `lift` above the socket ring's
+    /// positions (authored-coincident at 0.001, far above the dedupe band),
+    /// capped at the far end: one clean 10-cuff.
+    fn cuff_shell(offset: u32, lift: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let bottom: Vec<u32> = (0..10u32).map(|k| offset + k).collect();
+        let top: Vec<u32> = (10..20u32).map(|k| offset + k).collect();
+        let mut positions = ring(10, 2.73, lift);
+        positions.extend(ring(10, 2.73, lift + 1.5));
+        let mut triangles = prism(&bottom, &top);
+        triangles.extend(cap(&top));
+        (positions, triangles)
+    }
+
+    /// The twin socket plus the cuff shell as one mesh, with the seated
+    /// joint request resolved from the member counts (26 = the socket tube,
+    /// 20 = the cuff tube).
+    fn twin_fixture(twin_offset: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[u32; 3]>, JointRequest) {
+        let (socket_positions, socket_triangles) = twin_socket(twin_offset);
+        let socket_vertices = socket_positions.len();
+        let (cuff_positions, cuff_triangles) = cuff_shell(socket_vertices as u32, 0.001);
+        let mut positions = socket_positions;
+        positions.extend(cuff_positions);
+        let mut triangles = socket_triangles;
+        triangles.extend(cuff_triangles);
+        let identities = parts::shell_identities(&positions, &triangles);
+        let socket = identities
+            .iter()
+            .find(|shell| shell.members.len() == socket_vertices)
+            .expect("the socket shell");
+        let cuff = identities
+            .iter()
+            .find(|shell| shell.members.len() == 20)
+            .expect("the cuff shell");
+        (
+            positions,
+            triangles,
+            JointRequest {
+                part: cuff.name.clone(),
+                socket: socket.name.clone(),
+                seat: true,
+            },
+        )
+    }
+
+    #[test]
+    fn cycle_extraction_merges_a_near_coincident_twin_into_the_ring() {
+        // Mike's right wrist measured: the artefact copy sits 3.16e-6 off r0.
+        let (positions, triangles) = twin_socket([0.0, 3.16e-6, 0.0]);
+        let members: BTreeSet<usize> = (0..positions.len()).collect();
+        let (rims, merged) = socket_cycles(&triangles, &members, &positions);
+        assert_eq!(merged, 2, "the twin pair and the exact copy merge");
+        let rings: Vec<&Rim> = rims
+            .iter()
+            .filter(|rim| rim.closed && unique_positions(&rim.vertices, &positions) >= 3)
+            .collect();
+        assert_eq!(rings.len(), 1, "one clean cycle survives the filter");
+        let ring = rings[0];
+        assert_eq!(ring.vertices.len(), 10, "the twin merged into the ring");
+        assert_eq!(unique_positions(&ring.vertices, &positions), 10);
+    }
+
+    #[test]
+    fn a_genuine_distinct_node_keeps_the_cycle_irregular() {
+        // The same loop with the 11th vertex at its own ring position
+        // (spacing ~0.86, four orders above the band): the cycle stays 12
+        // nodes over 11 unique positions and only the exact copy merges.
+        let angle = std::f32::consts::TAU / 20.0;
+        let (positions, triangles) =
+            twin_socket([2.73 * angle.cos() - 2.73, 2.73 * angle.sin(), 0.0]);
+        let members: BTreeSet<usize> = (0..positions.len()).collect();
+        let (rims, merged) = socket_cycles(&triangles, &members, &positions);
+        assert_eq!(merged, 1, "only the exact slit copy merges");
+        let rings: Vec<&Rim> = rims
+            .iter()
+            .filter(|rim| rim.closed && unique_positions(&rim.vertices, &positions) >= 3)
+            .collect();
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].vertices.len(), 12, "the distinct node stays");
+        // o' spliced into o; o, r0..r9 and the distinct 11th node stay apart.
+        assert_eq!(unique_positions(&rings[0].vertices, &positions), 12);
+    }
+
+    #[test]
+    fn the_twin_wrist_seats_and_welds_like_the_clean_one() {
+        let (positions, triangles, request) = twin_fixture([0.0, 3.16e-6, 0.0]);
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &[request],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                max_shift: Some(10.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("the near-coincident twin must not refuse the authored cuff");
+        let joint = &outcome.report.joints[0];
+        assert_eq!(joint.rings[0].vertices, 10, "the merged socket cycle");
+        assert_eq!(joint.rings[1].vertices, 10);
+        assert_eq!(joint.correspondence, "authored");
+        assert_eq!(
+            joint.bridge_triangles, 0,
+            "an authored pair welds, no washer"
+        );
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.non_manifold_after, 0);
+        assert_eq!(joint.winding_conflicts, 0);
+        assert_eq!(joint.cycle_dedupe_epsilon, SEAL_CYCLE_DEDUPE_EPSILON);
+        assert_eq!(joint.cycle_dedupe_merged, 1, "the twin merged at the weld");
+        // The welded pair shares the seam (rings 0, no non-manifold, no
+        // winding conflicts above); `components_after` additionally counts
+        // the weld's orphaned vertex ids as singleton groups, so it is not a
+        // join indicator here.
+    }
+
+    #[test]
+    fn a_genuine_irregular_ring_refuses_the_seat_by_code() {
+        // The 11th node at a real ring position: no 10-cuff correspondence
+        // exists, so the seat refuses by wire code — never a silent repair.
+        let angle = std::f32::consts::TAU / 20.0;
+        let (positions, triangles, request) =
+            twin_fixture([2.73 * angle.cos() - 2.73, 2.73 * angle.sin(), 0.0]);
+        let error = seal_joints(
+            &positions,
+            &triangles,
+            &[request],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                max_shift: Some(10.0),
+                ..SealOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "seal_seat_unreachable", "{error}");
+        assert!(
+            !error.parameter_problem(),
+            "a genuine refusal, not a misuse"
+        );
     }
 }
