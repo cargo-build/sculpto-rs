@@ -3,12 +3,15 @@
 //! the same one the argv surface builds.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use schemars::JsonSchema;
+use sculpto_mesh::check;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::errors;
+use crate::obj::{ObjError, ObjMesh, read_obj_mesh};
 use crate::ops;
 use crate::{CommandError, ErrorKind};
 
@@ -128,6 +131,256 @@ pub fn blender_cloth_bake(input: &Value) -> Result<Value, CommandError> {
             "result_json",
             format!("cannot serialize the bake result: {error}"),
         )
+    })
+}
+
+/// Parameters of `blender.cloth_check`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ClothCheckParams {
+    /// Path to the `result.json` written by `blender.cloth_bake`.
+    pub result: PathBuf,
+}
+
+/// Schema of the deep cloth-result check.
+pub fn blender_cloth_check_schema() -> Value {
+    schema_for::<ClothCheckParams>()
+}
+
+/// One frame's contact counts for one shell.
+#[derive(Debug, Clone, Serialize)]
+struct ClothFramePairs {
+    frame: u32,
+    shell: String,
+    body_pairs: usize,
+    self_pairs: usize,
+}
+
+/// Count body and self contacts for every sampled frame of a bake result.
+///
+/// The result is read back from disk, not trusted: every frame is re-hashed
+/// against its recorded digest before it is parsed, so a stale or edited
+/// artifact is refused instead of silently analysed.
+pub fn blender_cloth_check(input: &Value) -> Result<Value, CommandError> {
+    let params: ClothCheckParams = serde_json::from_value(input.clone()).map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidRequest,
+            "result_json",
+            format!("cloth-check input does not match the schema: {error}"),
+        )
+    })?;
+    let path = &params.result;
+    let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
+    let result: sculpto_blender::ClothBakeResult =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            CommandError::new(
+                ErrorKind::InvalidRequest,
+                "result_json",
+                format!("{} is not a cloth-bake result: {error}", path.display()),
+            )
+        })?;
+    if result.schema != sculpto_blender::RESULT_SCHEMA {
+        return Err(CommandError::new(
+            ErrorKind::Unsupported,
+            "result_schema",
+            format!(
+                "{} declares schema `{}`, expected `{}`",
+                path.display(),
+                result.schema,
+                sculpto_blender::RESULT_SCHEMA
+            ),
+        ));
+    }
+    if result.version > sculpto_blender::RESULT_VERSION {
+        return Err(CommandError::new(
+            ErrorKind::Unsupported,
+            "result_version",
+            format!(
+                "{} has result version {}, this engine reads at most {}",
+                path.display(),
+                result.version,
+                sculpto_blender::RESULT_VERSION
+            ),
+        ));
+    }
+    if result.status != sculpto_blender::RunStatus::Ok {
+        let code = result
+            .error
+            .as_ref()
+            .map_or("unknown", |error| error.code.as_str());
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "result_refused",
+            format!(
+                "{} is a refused bake (`{code}`); there is nothing to check",
+                path.display()
+            ),
+        ));
+    }
+    let frames = result.frames.as_ref().ok_or_else(|| {
+        CommandError::new(
+            ErrorKind::InvalidRequest,
+            "result_incomplete",
+            format!("{} has no sampled frames", path.display()),
+        )
+    })?;
+    if result.body_frames.is_empty() {
+        return Err(CommandError::new(
+            ErrorKind::InvalidRequest,
+            "body_frames_missing",
+            format!(
+                "{} carries no body frames; re-run the bake with body-frame export",
+                path.display()
+            ),
+        ));
+    }
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let body_frames: BTreeMap<u32, &sculpto_blender::FrameArtifact> = result
+        .body_frames
+        .iter()
+        .map(|frame| (frame.frame, frame))
+        .collect();
+    let mut bodies: BTreeMap<u32, ObjMesh> = BTreeMap::new();
+    let mut rows = Vec::new();
+    for sampled in &frames.sampled {
+        let body_artifact = body_frames.get(sampled).ok_or_else(|| {
+            CommandError::new(
+                ErrorKind::InvalidRequest,
+                "body_frame_missing",
+                format!("the result has no body frame {sampled}"),
+            )
+        })?;
+        let body_path = verified_artifact(
+            base,
+            &body_artifact.path,
+            &body_artifact.sha256,
+            body_artifact.bytes,
+        )?;
+        if !bodies.contains_key(sampled) {
+            bodies.insert(*sampled, read_frame_obj(&body_path)?);
+        }
+        let (body_positions, body_triangles) = &bodies[sampled];
+        for shell in &result.shells {
+            let frame_artifact = shell
+                .frames
+                .iter()
+                .find(|candidate| candidate.frame == *sampled)
+                .ok_or_else(|| {
+                    CommandError::new(
+                        ErrorKind::InvalidRequest,
+                        "frame_missing",
+                        format!("shell `{}` has no frame {sampled}", shell.name),
+                    )
+                })?;
+            let garment_path = verified_artifact(
+                base,
+                &frame_artifact.path,
+                &frame_artifact.sha256,
+                frame_artifact.bytes,
+            )?;
+            let (garment_positions, garment_triangles) = read_frame_obj(&garment_path)?;
+            rows.push(ClothFramePairs {
+                frame: *sampled,
+                shell: shell.name.clone(),
+                body_pairs: check::intersection_pairs(
+                    &garment_positions,
+                    &garment_triangles,
+                    body_positions,
+                    body_triangles,
+                ),
+                self_pairs: check::self_intersection_pairs(&garment_positions, &garment_triangles),
+            });
+        }
+    }
+    let body_pairs: usize = rows.iter().map(|row| row.body_pairs).sum();
+    let self_pairs: usize = rows.iter().map(|row| row.self_pairs).sum();
+    let worst_body_pairs = rows.iter().map(|row| row.body_pairs).max().unwrap_or(0);
+    let worst_self_pairs = rows.iter().map(|row| row.self_pairs).max().unwrap_or(0);
+    Ok(json!({
+        "schema": "sculpto.blender.cloth_check",
+        "version": 1,
+        "run_id": result.run_id,
+        "solver": result.solver,
+        "frames": rows,
+        "summary": {
+            "sampled_frames": frames.sampled.len(),
+            "shells": result.shells.len(),
+            "checks": rows.len(),
+            "body_pairs": body_pairs,
+            "self_pairs": self_pairs,
+            "worst_body_pairs": worst_body_pairs,
+            "worst_self_pairs": worst_self_pairs,
+        },
+    }))
+}
+
+/// Resolve and re-hash one artifact under the result directory.
+fn verified_artifact(
+    base: &Path,
+    relative: &str,
+    sha256: &str,
+    bytes: u64,
+) -> Result<PathBuf, CommandError> {
+    let mut clean = PathBuf::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            _ => {
+                return Err(CommandError::new(
+                    ErrorKind::InvalidParams,
+                    "artifact_path",
+                    format!("artifact path `{relative}` is not relative to the run directory"),
+                ));
+            }
+        }
+    }
+    let path = base.join(clean);
+    let metadata = std::fs::metadata(&path).map_err(|error| errors::io(&path, error))?;
+    if metadata.len() != bytes {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "artifact_size",
+            format!(
+                "{} is {} bytes, the result records {bytes}",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+    let actual = crate::ops::file_sha256(&path)?;
+    if actual != sha256 {
+        return Err(CommandError::new(
+            ErrorKind::Refused,
+            "artifact_digest",
+            format!(
+                "{} has sha256 {actual}, the result records {sha256}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+/// Read one exported frame in the shared display frame.
+fn read_frame_obj(path: &Path) -> Result<ObjMesh, CommandError> {
+    read_obj_mesh(path).map_err(|error| match error {
+        ObjError::Io(message) => CommandError::new(
+            ErrorKind::Io,
+            "frame_unreadable",
+            format!("{}: {message}", path.display()),
+        ),
+        ObjError::Malformed(message) => CommandError::new(
+            ErrorKind::InvalidParams,
+            "frame_malformed",
+            format!("{}: {message}", path.display()),
+        ),
+        ObjError::MissingObject { .. } => CommandError::new(
+            ErrorKind::InvalidParams,
+            "frame_malformed",
+            format!(
+                "{}: unexpected named object in a frame export",
+                path.display()
+            ),
+        ),
     })
 }
 

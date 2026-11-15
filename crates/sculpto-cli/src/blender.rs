@@ -12,12 +12,16 @@ use sculpto_blender::ClothBakeRequest;
 
 const USAGE: &str = "\
 usage: sculpto blender cloth-bake --request <json> [options]
+       sculpto blender cloth-check --result <json>
 
-options:
+cloth-bake options:
   --request <json>    versioned sculpto.blender.cloth_bake request
   --out <dir>         override output.directory
   --blender <exe>     override the Blender executable
   --runner <py>       override the runner script (digest is recomputed)
+
+cloth-check options:
+  --result <json>     result.json written by cloth-bake
 ";
 
 /// Dispatch the `blender` argv family.
@@ -26,11 +30,59 @@ pub fn run(args: &[String]) -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    if action != "cloth-bake" {
+    match action.as_str() {
+        "cloth-bake" => cloth_bake(&args[1..]),
+        "cloth-check" => cloth_check(&args[1..]),
+        _ => {
+            eprint!("{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cloth_check(args: &[String]) -> ExitCode {
+    let mut result_path = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = &args[index];
+        let value = match args.get(index + 1) {
+            Some(value) => PathBuf::from(value),
+            None => {
+                eprintln!("{flag} requires a value");
+                return ExitCode::from(2);
+            }
+        };
+        match flag.as_str() {
+            "--result" => result_path = Some(value),
+            other => {
+                eprintln!("unknown option {other}");
+                eprint!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 2;
+    }
+    let Some(result_path) = result_path else {
         eprint!("{USAGE}");
         return ExitCode::from(2);
+    };
+    let input = serde_json::json!({ "result": result_path });
+    match sculpto_engine::dispatch("blender.cloth_check", &input) {
+        Ok(report) => match serde_json::to_string_pretty(&report) {
+            Ok(text) => {
+                println!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("cannot print the check report: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
-    cloth_bake(&args[1..])
 }
 
 fn cloth_bake(args: &[String]) -> ExitCode {

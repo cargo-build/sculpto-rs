@@ -39,6 +39,8 @@ pub enum CommandId {
     Bake,
     /// Run a pinned Blender cloth bake and return its validated result.
     BlenderClothBake,
+    /// Count body and self contacts in a cloth-bake result.
+    BlenderClothCheck,
     /// Build the prepared body from declared parts and seal its joints.
     BodyAssemble,
     /// Audit attached body parts against their sockets; read-only.
@@ -94,6 +96,7 @@ impl CommandId {
             CommandId::CommandsList => "commands.list",
             CommandId::Bake => "bake",
             CommandId::BlenderClothBake => "blender.cloth_bake",
+            CommandId::BlenderClothCheck => "blender.cloth_check",
             CommandId::BodyAssemble => "body.assemble",
             CommandId::BodyAuditParts => "body.audit_parts",
             CommandId::BodySealJoints => "body.seal_joints",
@@ -299,6 +302,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: handlers::blender_cloth_bake_schema,
         handler: handlers::blender_cloth_bake,
+    },
+    Spec {
+        id: CommandId::BlenderClothCheck,
+        summary: "Count body and self contacts for every sampled frame of a cloth-bake result.",
+        mutates: false,
+        stub: false,
+        schema: handlers::blender_cloth_check_schema,
+        handler: handlers::blender_cloth_check,
     },
     Spec {
         id: CommandId::BodyAssemble,
@@ -561,6 +572,7 @@ mod tests {
         for id in [
             "bake",
             "blender.cloth_bake",
+            "blender.cloth_check",
             "outfit.fit",
             "outfit.stack_fit",
             "outfit.dress",
