@@ -1155,30 +1155,31 @@ fn read_layer(
     }
     // The strand rule runs on the authored pieces, before the weld merges them,
     // and against the assembled body in the same frame: only a body surface can
-    // say whether a piece hangs unsupported.
-    let (positions, triangles, strands) = match layer.drop_strands {
-        true => {
-            let dropped = drop_unsupported_strands(
-                &positions,
-                &triangles,
-                &body.0,
-                &body.1,
-                &StrandOptions::default(),
+    // say whether a piece hangs unsupported. A layer the rule leaves alone keeps
+    // its authored vertex order, so opting in changes no byte when the layer
+    // carries no strand.
+    let (mut positions, mut triangles) = (positions, triangles);
+    let mut strands = None;
+    if layer.drop_strands {
+        let dropped = drop_unsupported_strands(
+            &positions,
+            &triangles,
+            &body.0,
+            &body.1,
+            &StrandOptions::default(),
+        )
+        .map_err(|error| {
+            refused(
+                "export_actor_strand_rule",
+                format!("{}: {error}", path.display()),
             )
-            .map_err(|error| {
-                refused(
-                    "export_actor_strand_rule",
-                    format!("{}: {error}", path.display()),
-                )
-            })?;
-            (
-                dropped.positions.clone(),
-                dropped.triangles.clone(),
-                Some(dropped),
-            )
+        })?;
+        if dropped.removed_triangles() > 0 {
+            positions.clone_from(&dropped.positions);
+            triangles.clone_from(&dropped.triangles);
         }
-        false => (positions, triangles, None),
-    };
+        strands = Some(dropped);
+    }
     let (welded, welded_triangles, seam_weld) = weld_layer(&positions, &triangles);
     let name = path
         .file_stem()
