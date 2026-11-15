@@ -256,3 +256,18 @@ pub fn run_host(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Real-host smoke test. It is ignored by default; `SCULPTO_BLENDER` is
+    /// the same variable `Blender::discover` reads at runtime.
+    #[test]
+    #[ignore = "needs a real Blender executable; set SCULPTO_BLENDER"]
+    fn real_blender_reports_a_version() {
+        let Some(path) = std::env::var_os("SCULPTO_BLENDER") else {
+            return;
+        };
+        let version = super::read_version(std::path::Path::new(&path)).expect("version");
+        assert!(!version.is_empty());
+    }
+}
