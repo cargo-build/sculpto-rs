@@ -460,6 +460,9 @@ fn setup(
         commands.spawn((
             DirectionalLight {
                 illuminance,
+                // Only the key casts shadows: every shadow-casting light costs
+                // a map, and the fill/rim exist to keep the far side readable.
+                shadow_maps_enabled: illuminance > 9_000.0,
                 ..default()
             },
             Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y),
