@@ -9,18 +9,25 @@ use gltf::animation::{Interpolation, Property};
 use super::{Actor, ActorError, Pose, Transform, decode, invalid, unsupported};
 
 #[derive(Debug)]
-struct Channel {
-    node: usize,
-    property: Property,
-    times: Vec<f64>,
-    values: Values,
-    step: bool,
+pub(super) struct Channel {
+    pub(super) node: usize,
+    pub(super) property: Property,
+    pub(super) times: Vec<f64>,
+    pub(super) values: Values,
+    pub(super) step: bool,
 }
 
 #[derive(Debug)]
-enum Values {
+pub(super) enum Values {
     Vector(Vec<DVec3>),
     Rotation(Vec<DQuat>),
+}
+
+/// Every validated channel of one clip plus its authored time span.
+pub(super) struct Read {
+    pub(super) channels: Vec<Channel>,
+    pub(super) start: f64,
+    pub(super) end: f64,
 }
 
 pub(super) fn worlds(
@@ -68,6 +75,26 @@ fn apply(
     time: f64,
     transforms: &mut [Transform],
 ) -> Result<(), ActorError> {
+    let Read {
+        channels,
+        start,
+        end,
+    } = read(actor, clip, selected)?;
+    match time.is_finite() && time >= start && time <= end {
+        true => {}
+        false => return Err(ActorError::Time { time, start, end }),
+    }
+    channels
+        .into_iter()
+        .try_for_each(|channel| evaluate(channel, time, transforms))
+}
+
+/// Decode and validate one clip's channels without applying them.
+pub(super) fn read(
+    actor: &Actor,
+    clip: &gltf::Animation<'_>,
+    selected: &[usize],
+) -> Result<Read, ActorError> {
     let mut targets = HashSet::new();
     let mut start = f64::INFINITY;
     let mut end = f64::NEG_INFINITY;
@@ -118,7 +145,7 @@ fn apply(
                 Interpolation::Step => true,
                 value => return Err(unsupported(&context, format!("{value:?} interpolation"))),
             };
-            match transforms[node] {
+            match actor.transforms[node] {
                 Transform::Matrix(_) => {
                     return Err(invalid(&context, "animation targets a static matrix node"));
                 }
@@ -171,14 +198,11 @@ fn apply(
             }))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    match time.is_finite() && time >= start && time <= end {
-        true => {}
-        false => return Err(ActorError::Time { time, start, end }),
-    }
-    channels
-        .into_iter()
-        .flatten()
-        .try_for_each(|channel| evaluate(channel, time, transforms))
+    Ok(Read {
+        channels: channels.into_iter().flatten().collect(),
+        start,
+        end,
+    })
 }
 
 fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result<(), ActorError> {

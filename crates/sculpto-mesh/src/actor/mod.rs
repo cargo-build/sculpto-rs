@@ -1,11 +1,13 @@
 //! Explicit actor selection and f64 world-space glTF motion. @req DECL0013
 
 mod animation;
+mod clips;
 mod decode;
 mod geometry;
 mod packing;
 mod rig;
 
+pub use clips::{LocalRest, SourceChannel, SourceClip, SourceProperty, SourceValues};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
 
 use std::fmt;

@@ -44,6 +44,7 @@ commands:
   export-obj [options]  read a NIF and write one shape as an OBJ
   export-nif [options]  re-encode NIF shapes for a Skyrim target (one shape or a bundle)
   export-tri [options]  write sparse morph targets as a Skyrim `.tri` slider file
+  export-glb [options]  merge a skinned NIF's body and garments into one clipped actor GLB
   body assemble --manifest <json> --out <obj> [--report <json>]
                         place and concatenate the declared parts, then seal the joints
   body audit-parts [options]
@@ -136,6 +137,19 @@ export-nif options:
 export-tri options:
   --spec <json>      morph document: `shape`, `vertex_count` and `morphs`
   --out <path>       output `.tri`
+
+export-glb options:
+  --nif <path>            skinned NIF carrying the body and its garment shapes
+  --body-shape <name>     the body shape; it owns the skin frame and the rest basis
+  --garment-shape <name>  additional skinned shape to merge (repeatable, merged in order)
+  --skeleton <path>       family skeleton NIF that completes the authored rig
+  --clips <path>          source actor GLB whose clips are mapped by bone name
+  --clip <name>           clip to write (repeatable; the written order is this order)
+  --units-per-metre <n>   scale the written file to metres (BodySlide sources: 71.4286)
+  --rest-translation-tolerance <n>    admitted rest bone-position residual, relative to the skeleton extent (default 0.05)
+  --rest-scale-tolerance <n>          admitted spread of per-bone unit ratios (default 0.02)
+  --out <glb>             output GLB
+  --report <json>         also write the report JSON
 
 body assemble manifest (version 1; source units, source Z-up frame, nothing inferred):
   {\"version\": 1,
@@ -314,6 +328,7 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "export-obj" => export_obj(rest),
         [command, rest @ ..] if command == "export-nif" => export_nif(rest),
         [command, rest @ ..] if command == "export-tri" => export_tri(rest),
+        [command, rest @ ..] if command == "export-glb" => export_glb(rest),
         [command, action, rest @ ..] if command == "body" && action == "assemble" => {
             body_assemble(rest)
         }
@@ -1243,9 +1258,96 @@ fn export_tri(args: &[String]) -> ExitCode {
     }
 }
 
+/// `export-glb`: repeated `--garment-shape`/`--clip` flags, so the flags are
+/// parsed here instead of through the single-value [`parse_flags`].
+fn export_glb(args: &[String]) -> ExitCode {
+    let mut nif: Option<String> = None;
+    let mut body_shape: Option<String> = None;
+    let mut garments: Vec<String> = Vec::new();
+    let mut skeleton: Option<String> = None;
+    let mut clips: Option<String> = None;
+    let mut clip_names: Vec<String> = Vec::new();
+    let mut out: Option<String> = None;
+    let mut report: Option<String> = None;
+    let mut units: Option<f64> = None;
+    let mut translation: Option<f64> = None;
+    let mut spread: Option<f64> = None;
+    let mut iter = args.iter();
+    let reject = |message: String| -> ExitCode {
+        eprintln!("export-glb: {message}");
+        ExitCode::from(2)
+    };
+    let number = |name: &str, value: &str| -> Result<f64, ExitCode> {
+        value
+            .parse::<f64>()
+            .map_err(|_| reject(format!("`--{name} {value}` is not a number")))
+    };
+    while let Some(key) = iter.next() {
+        let Some(name) = key.strip_prefix("--") else {
+            return reject(format!("unexpected argument `{key}`"));
+        };
+        let Some(value) = iter.next() else {
+            return reject(format!("`--{name}` needs a value"));
+        };
+        match name {
+            "nif" => nif = Some(value.clone()),
+            "body-shape" => body_shape = Some(value.clone()),
+            "garment-shape" => garments.push(value.clone()),
+            "skeleton" => skeleton = Some(value.clone()),
+            "clips" => clips = Some(value.clone()),
+            "clip" => clip_names.push(value.clone()),
+            "out" => out = Some(value.clone()),
+            "report" => report = Some(value.clone()),
+            "units-per-metre" => match number(name, value) {
+                Ok(parsed) => units = Some(parsed),
+                Err(code) => return code,
+            },
+            "rest-translation-tolerance" => match number(name, value) {
+                Ok(parsed) => translation = Some(parsed),
+                Err(code) => return code,
+            },
+            "rest-scale-tolerance" => match number(name, value) {
+                Ok(parsed) => spread = Some(parsed),
+                Err(code) => return code,
+            },
+            other => return reject(format!("unknown option `--{other}`")),
+        }
+    }
+    let Some(nif) = nif else {
+        return reject("`--nif` is required".to_string());
+    };
+    let Some(body_shape) = body_shape else {
+        return reject("`--body-shape` is required".to_string());
+    };
+    let Some(out) = out else {
+        return reject("`--out` is required".to_string());
+    };
+    let mut input = serde_json::json!({
+        "nif": nif,
+        "body_shape": body_shape,
+        "garment_shapes": garments,
+        "clip_names": clip_names,
+        "out": out,
+    });
+    for (key, value) in [("skeleton", skeleton), ("clips", clips), ("report", report)] {
+        if let Some(value) = value {
+            input[key] = serde_json::json!(value);
+        }
+    }
+    for (key, value) in [
+        ("units_per_metre", units),
+        ("rest_translation_tolerance", translation),
+        ("rest_scale_tolerance", spread),
+    ] {
+        if let Some(value) = value {
+            input[key] = serde_json::json!(value);
+        }
+    }
+    run::dispatch_payload("export.glb", &input)
+}
+
 /// Positions plus triangles, the shape an OBJ carries in the display frame.
 type Mesh = (Vec<[f32; 3]>, Vec<[u32; 3]>);
-
 /// Inverse of the `(x, z, -y)` display conversion `write_obj` applies.
 fn to_source(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
     positions.iter().map(|[x, y, z]| [*x, -*z, *y]).collect()

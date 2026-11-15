@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 mod assemble;
 mod component;
 pub mod errors;
+pub mod export_glb;
 mod handlers;
 pub mod obj;
 pub mod ops;
@@ -83,6 +84,8 @@ pub enum CommandId {
     ExportNif,
     /// Re-encode all or selected NIF shapes into one multi-shape bundle.
     ExportBundle,
+    /// Merge a skinned NIF's body and garments into one checked, clipped GLB.
+    ExportGlb,
     /// Write sparse morph targets as a Skyrim `.tri` slider file.
     ExportTri,
     /// Zero a GLB's default morph weights.
@@ -123,6 +126,7 @@ impl CommandId {
             CommandId::MeshDensify => "mesh.densify",
             CommandId::ExportNif => "export.nif",
             CommandId::ExportBundle => "export.bundle",
+            CommandId::ExportGlb => "export.glb",
             CommandId::ExportTri => "export.tri",
             CommandId::GltfResetWeights => "gltf.reset_weights",
             CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
@@ -480,6 +484,14 @@ const COMMANDS: &[Spec] = &[
         handler: handlers::export_bundle,
     },
     Spec {
+        id: CommandId::ExportGlb,
+        summary: "Merge a NIF's skinned body and garment shapes into one checked actor GLB, with named clips mapped by bone name under a measured rest gate.",
+        mutates: true,
+        stub: false,
+        schema: export_glb::schema,
+        handler: export_glb::export,
+    },
+    Spec {
         id: CommandId::ExportTri,
         summary: "Write sparse morph targets as a Skyrim `.tri` slider file.",
         mutates: true,
@@ -611,6 +623,7 @@ mod tests {
             "export.pair",
             "export.nif",
             "export.bundle",
+            "export.glb",
             "export.tri",
             "intake.check",
             "mesh.densify",
