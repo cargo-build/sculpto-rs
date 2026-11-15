@@ -1,5 +1,6 @@
 //! File and serialization surface for the pure actor sampler. @req DECL0013
 
+mod fit;
 mod gait;
 mod pack;
 mod pose;
@@ -17,7 +18,9 @@ use sculpto_mesh::actor::{Actor, Pose, Sample};
 const USAGE: &str = "usage: sculpto actor sample --input actor.glb --part NAME [--part NAME ...] \
     (--rest | --clip NAME --time SECONDS) --out actor.obj [--report actor.json]
 usage: sculpto actor stress --input actor.glb --body NAME --garment NAME [--garment NAME ...] \
-    (--rest | --clip NAME --frames N) --tolerance UNITS [--out report.json]";
+    (--rest | --clip NAME --frames N) --tolerance UNITS [--out report.json]
+usage: sculpto actor fit --input actor.glb --out fitted.glb [--report fitted.json] \
+    [--lengths flesh|preserve] [--part NAME ...]";
 
 #[derive(Debug)]
 struct Arguments<'arg> {
@@ -43,6 +46,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "gait") {
         return gait::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "fit") {
+        return fit::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,

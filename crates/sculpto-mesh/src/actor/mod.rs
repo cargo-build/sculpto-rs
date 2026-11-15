@@ -3,6 +3,7 @@
 mod animation;
 mod clips;
 mod decode;
+mod fit;
 mod gait;
 mod geometry;
 mod packing;
@@ -11,6 +12,10 @@ mod rig;
 mod stress;
 
 pub use clips::{LocalRest, SourceChannel, SourceClip, SourceProperty, SourceValues};
+pub use fit::{
+    ChainFit, FitOutcome, FittedFrame, Flexion, JointFit, LengthMode, UnfittedChain, extent, fit,
+    write_fit,
+};
 pub use gait::{GaitOutcome, GaitParameters, JointRange, gait, write_gait_clip};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
 pub use pose::{Axis, JointPose, JointProbe, PoseOutcome, PosedJoint, probe, write_probe_clip};

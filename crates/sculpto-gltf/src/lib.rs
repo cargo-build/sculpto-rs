@@ -52,6 +52,8 @@
 //!   Joint lanes are `u16`; weights are normalized across the complete row
 //!   and encoded as `f32`. The authored source is unchanged.
 
+pub mod frame;
+
 pub mod pack;
 
 pub mod profile;

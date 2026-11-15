@@ -123,7 +123,7 @@ pub(super) fn sample(
     Ok(sample)
 }
 
-fn joint_matrices(
+pub(super) fn joint_matrices(
     actor: &Actor,
     skin: gltf::Skin<'_>,
     worlds: &[DMat4],
