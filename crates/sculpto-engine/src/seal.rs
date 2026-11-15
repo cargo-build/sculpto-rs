@@ -48,6 +48,11 @@ struct Params {
     smooth: Option<bool>,
     /// Merge exactly coincident boundary copies beyond the pinch (default false).
     weld_coincident: Option<bool>,
+    /// Compute a translation-only seat first: put the part's collar-cycle
+    /// centroid on the socket ring's centroid before the seam is discovered
+    /// (default false). The neck never declares `seat`; this is the computed
+    /// head seat, and a declared `seat` joint still wins.
+    seat_by_ring_centroid: Option<bool>,
 }
 
 pub(crate) fn schema() -> Value {
@@ -78,8 +83,12 @@ pub(crate) fn seal(input: &Value) -> Result<Value, CommandError> {
         smooth: params.smooth.unwrap_or(defaults.smooth),
         weld_coincident: params.weld_coincident.unwrap_or(defaults.weld_coincident),
     };
-    let outcome =
-        joint_seal::seal_joints(&positions, &triangles, &requests, &options).map_err(seal_error)?;
+    let outcome = if params.seat_by_ring_centroid.unwrap_or(false) {
+        joint_seal::seal_joints_by_ring_centroid(&positions, &triangles, &requests, &options)
+    } else {
+        joint_seal::seal_joints(&positions, &triangles, &requests, &options)
+    }
+    .map_err(seal_error)?;
     write_obj(&params.out, &outcome.positions, &outcome.triangles).map_err(|error| {
         CommandError::new(
             ErrorKind::Io,
@@ -137,6 +146,13 @@ fn seat_row(seat: &joint_seal::SeatReport) -> Value {
         "rms": seat.rms,
         "max_residual": seat.max_residual,
         "plane_dev": seat.plane_dev,
+        "ring_seat": seat.ring_seat.map(|ring| json!({
+            "socket_centre": ring.socket_centre,
+            "collar_centre": ring.collar_centre,
+            "translation": ring.translation,
+            "collar_vertices": ring.collar_vertices,
+            "gap_before": ring.gap_before,
+        })),
     })
 }
 

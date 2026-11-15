@@ -22,6 +22,17 @@
 //! geometry cannot tell a swap), welds the rims' exactly coincident twins and
 //! then smooths. Smoothing moves only the bridge band plus `band` rings of
 //! neighbours, under a bound that refuses rather than clips.
+//!
+//! [`seal_joints_by_ring_centroid`] adds the computed neck seat: before the
+//! seam snapshot it translates each non-seated part so its collar-cycle
+//! centroid lands on the socket ring's centroid, taking both cycles from
+//! `socket_cycles` (unique positions, so the authored slit twins do not bias
+//! the centroid). The measured 3BA head starts 3.55 up and 2.59 laterally off
+//! its neck ring, which a downward [`SealOptions::head_drop`] cannot express.
+//! The seat is translation-only by construction — the same head solved as a
+//! similarity shrinks to 89 % — and refuses by name when either side has no
+//! clean cycle, when two cycles compete, or when the translation leaves its
+//! declared bound.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -58,6 +69,11 @@ pub const SEAT_RESIDUAL_RATIO: f64 = 0.25;
 /// Two cuff→socket assignments this close in fit are indistinguishable: the
 /// winner stands but the report warns instead of claiming a side.
 pub const SEAT_ASSIGNMENT_MARGIN: f64 = 0.10;
+/// Hard bound on the computed centroid seat, as a fraction of the socket
+/// ring's mean radius. Measured (BODY-01 0050): the 3BA head needs 4.393 at
+/// ring radius 3.763 = 1.17, Bijin 0.265 = 0.07; a collar parked on the wrong
+/// opening needs a multiple of the ring size. @req BLD-13
+pub const SEAT_CENTROID_MAX_SHIFT_RATIO: f64 = 3.0;
 /// Why the unique-position collar wins over the proximity arc; printed in
 /// every joint row so the choice is auditable. @req BLD-13
 pub const SEAM_CHOICE: &str = "proximity arc (29 v with coincident ends); the full 86-v loop is not a neck ring and its slit duplicates are never bridged";
@@ -114,6 +130,12 @@ pub enum SealError {
     HandednessAmbiguous { parts: Vec<String> },
     /// A seated part still does not reach its socket band.
     SeatUnreachable { gap: f64, band: f64 },
+    /// A side of a computed centroid seat holds no clean closed cycle.
+    SeatCycleAbsent { shell: String },
+    /// Two collar-cycle candidates compete inside the ambiguity margin.
+    SeatCycleAmbiguous { best: f64, second: f64 },
+    /// The computed centroid translation exceeds its declared bound.
+    SeatShiftLimit { shift: f64, bound: f64 },
     /// A caller-supplied option is outside its documented range.
     InvalidOption { option: &'static str, value: String },
 }
@@ -139,6 +161,9 @@ impl SealError {
             Self::WristCrossPair { .. } => "seal_wrist_cross_pair",
             Self::HandednessAmbiguous { .. } => "seal_handedness_ambiguous",
             Self::SeatUnreachable { .. } => "seal_seat_unreachable",
+            Self::SeatCycleAbsent { .. } => "seal_seat_cycle_absent",
+            Self::SeatCycleAmbiguous { .. } => "seal_seat_cycle_ambiguous",
+            Self::SeatShiftLimit { .. } => "seal_seat_shift_limit",
             Self::InvalidOption { .. } => "seal_invalid_option",
         }
     }
@@ -241,6 +266,18 @@ impl fmt::Display for SealError {
                 formatter,
                 "seated part still sits {gap:.4} from its socket, beyond the band {band:.4}"
             ),
+            Self::SeatCycleAbsent { shell } => write!(
+                formatter,
+                "shell `{shell}` holds no clean closed cycle to seat by centroid"
+            ),
+            Self::SeatCycleAmbiguous { best, second } => write!(
+                formatter,
+                "two collar cycles compete: {best:.4} and {second:.4} inside {AMBIGUITY_GAP}"
+            ),
+            Self::SeatShiftLimit { shift, bound } => write!(
+                formatter,
+                "the centroid seat translates the part {shift:.4}, beyond the declared bound {bound:.4}"
+            ),
         }
     }
 }
@@ -317,6 +354,23 @@ pub struct RingFacts {
     pub closed: bool,
 }
 
+/// The computed centroid seat of one joint, when that pre-pass ran: the two
+/// rim centroids the translation came from, so the seat is auditable without
+/// re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingSeatReport {
+    /// Socket ring centroid, input frame.
+    pub socket_centre: [f64; 3],
+    /// Part collar-cycle centroid before the seat, input frame.
+    pub collar_centre: [f64; 3],
+    /// Translation applied to the part: `socket_centre - collar_centre`.
+    pub translation: [f64; 3],
+    /// Collar-cycle vertices the centroid was taken over.
+    pub collar_vertices: usize,
+    /// Min collar-to-ring vertex distance the cycle pair was selected on.
+    pub gap_before: f64,
+}
+
 /// The seat steps of one joint, when any ran.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeatReport {
@@ -327,7 +381,8 @@ pub struct SeatReport {
     pub scale: f64,
     /// Row-major similarity rotation; identity for a translation-only seat.
     pub rotation: [[f64; 3]; 3],
-    /// Translation of the part onto its socket, in input units.
+    /// Total translation applied to the part: the similarity solve, or the
+    /// explicit drop plus any computed centroid seat, in input units.
     pub translation: [f64; 3],
     /// Residual part-to-socket gap after the seat.
     pub gap: f64,
@@ -338,6 +393,8 @@ pub struct SeatReport {
     /// Max seated-cuff deviation from the wrist plane: the falsifying check
     /// a scale+translate-only seat fails (measured 1.95 vs 0.097 on Bijin).
     pub plane_dev: f64,
+    /// The computed centroid seat, when that pre-pass moved this part.
+    pub ring_seat: Option<RingSeatReport>,
 }
 
 /// The smoothing block of one joint's report.
@@ -2089,6 +2146,173 @@ fn socket_cycles(
     (rims, merged)
 }
 
+/// Distinct positions on a cycle: the engine's own "a clean collar holds at
+/// least three" rule, shared by the seated-cycle filters and the centroid
+/// seat so both read the collars the same way. @req BLD-13
+fn unique_positions(ring: &[u32], positions: &[[f32; 3]]) -> usize {
+    ring.iter()
+        .map(|&vertex| position_key(point_of(positions, vertex)))
+        .collect::<BTreeSet<[u32; 3]>>()
+        .len()
+}
+
+/// The computed neck seat: translate each non-seated part so its collar
+/// cycle's centroid lands on its socket ring's centroid, before the seam
+/// snapshot the collar discovery reads. Both cycles come from
+/// [`socket_cycles`] — position-independent, so it works at any head
+/// placement — and the winner is the closed pair with the smallest vertex gap,
+/// which is decisive on the measured bodies (margin 3.94 / 7.92).
+///
+/// Translation only, with no rotation or scale: the neck's 26↔29 rim pairs
+/// cannot be solved as a similarity (the measured solve shrinks the head to
+/// 89 % and the wrist residual gate would pass it). A declared similarity seat
+/// wins: `request.seat` joints are skipped.
+///
+/// # Errors
+/// [`SealError::SeatCycleAbsent`] when either side has no closed cycle of at
+/// least three distinct positions, [`SealError::SeatCycleAmbiguous`] when two
+/// cycle pairs compete inside [`AMBIGUITY_GAP`], and
+/// [`SealError::SeatShiftLimit`] when the translation exceeds `bound_ratio`
+/// times the socket ring's mean radius. @req BLD-13
+fn seat_by_ring_centroid(
+    positions: &mut [[f32; 3]],
+    triangles: &[[u32; 3]],
+    identities: &[ShellIdentity],
+    requests: &[JointRequest],
+    bound_ratio: f64,
+) -> Result<Vec<Option<RingSeatReport>>, SealError> {
+    let mut seated: Vec<Option<RingSeatReport>> = requests.iter().map(|_| None).collect();
+    let shell_of = |name: &str| -> &ShellIdentity {
+        identities
+            .iter()
+            .find(|shell| shell.name == name)
+            .expect("resolved earlier")
+    };
+    for (index, request) in requests.iter().enumerate() {
+        if request.seat {
+            continue;
+        }
+        let part = shell_of(&request.part);
+        let socket = shell_of(&request.socket);
+        let part_members: BTreeSet<usize> = part.members.iter().copied().collect();
+        let socket_members: BTreeSet<usize> = socket.members.iter().copied().collect();
+        // The cycle choice reads the positions and never moves them, so the
+        // immutable view ends with this block.
+        let (part_cycles, socket_cycles, gap_before, part_at, socket_at) = {
+            let read: &[[f32; 3]] = positions;
+            let clean = |cycles: Vec<Rim>| -> Vec<Rim> {
+                cycles
+                    .into_iter()
+                    .filter(|rim| rim.closed && unique_positions(&rim.vertices, read) >= 3)
+                    .collect()
+            };
+            let part_cycles = clean(socket_cycles(triangles, &part_members, read).0);
+            if part_cycles.is_empty() {
+                return Err(SealError::SeatCycleAbsent {
+                    shell: part.name.clone(),
+                });
+            }
+            let socket_cycles = clean(socket_cycles(triangles, &socket_members, read).0);
+            if socket_cycles.is_empty() {
+                return Err(SealError::SeatCycleAbsent {
+                    shell: socket.name.clone(),
+                });
+            }
+            // Every cycle pair, ranked by vertex gap; ties fall back to the
+            // walk order, so a repeat run cannot choose differently.
+            let mut ranked: Vec<(f64, usize, usize)> = part_cycles
+                .iter()
+                .enumerate()
+                .flat_map(|(part_at, collar)| {
+                    socket_cycles
+                        .iter()
+                        .enumerate()
+                        .map(move |(socket_at, ring)| {
+                            (
+                                rim_gap(&collar.vertices, &ring.vertices, read).0,
+                                part_at,
+                                socket_at,
+                            )
+                        })
+                })
+                .collect();
+            ranked.sort_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.cmp(&right.2))
+            });
+            let Some(&(gap_before, part_at, socket_at)) = ranked.first() else {
+                return Err(SealError::SeatCycleAbsent {
+                    shell: part.name.clone(),
+                });
+            };
+            if let Some(&(second, _, _)) = ranked.get(1)
+                && second - gap_before <= AMBIGUITY_GAP
+            {
+                return Err(SealError::SeatCycleAmbiguous {
+                    best: gap_before,
+                    second,
+                });
+            }
+            (part_cycles, socket_cycles, gap_before, part_at, socket_at)
+        };
+        let collar = &part_cycles[part_at].vertices;
+        let ring = &socket_cycles[socket_at].vertices;
+        let collar_centre = centroid_of(collar, positions);
+        let socket_centre = centroid_of(ring, positions);
+        let translation = [
+            socket_centre[0] - collar_centre[0],
+            socket_centre[1] - collar_centre[1],
+            socket_centre[2] - collar_centre[2],
+        ];
+        let shift = translation
+            .iter()
+            .map(|lane| lane * lane)
+            .sum::<f64>()
+            .sqrt();
+        let bound = bound_ratio * rim_facts(ring, positions, true).radius_mean;
+        if !shift.is_finite() || shift > bound {
+            return Err(SealError::SeatShiftLimit { shift, bound });
+        }
+        if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
+            eprintln!(
+                "centroid seat: `{}` collar={} v centre={:?} gap={gap_before:.3} -> `{}` ring={} v centre={:?} translation={translation:?}",
+                part.name,
+                collar.len(),
+                collar_centre,
+                socket.name,
+                ring.len(),
+                socket_centre
+            );
+        }
+        // The part moves as one surface: its exact-coincident twins outside
+        // the part go with it, or the seat tears the authored slit open.
+        let part_keys: BTreeSet<[u32; 3]> = part_members
+            .iter()
+            .map(|&vertex| position_key(positions[vertex]))
+            .collect();
+        for (vertex, position) in positions.iter_mut().enumerate() {
+            let in_part = part_members.contains(&vertex);
+            let twin = !in_part && part_keys.contains(&position_key(*position));
+            if !(in_part || twin) {
+                continue;
+            }
+            for lane in 0..3 {
+                position[lane] += translation[lane] as f32;
+            }
+        }
+        seated[index] = Some(RingSeatReport {
+            socket_centre,
+            collar_centre,
+            translation,
+            collar_vertices: collar.len(),
+            gap_before,
+        });
+    }
+    Ok(seated)
+}
+
 /// Merge exactly coincident boundary vertex pairs of ONE joint's two rims
 /// (the run's closing twins and slit pinches), rewiring every non-rim twin
 /// onto the rim vertex so the cycles' vertex lists stay valid; returns the
@@ -2177,16 +2401,7 @@ fn seat_groups(
         let (cycles, _) = socket_cycles(triangles, &socket_members, positions);
         let candidates: Vec<&Rim> = cycles
             .iter()
-            .filter(|rim| {
-                rim.closed && {
-                    let keys: BTreeSet<[u32; 3]> = rim
-                        .vertices
-                        .iter()
-                        .map(|&vertex| position_key(point_of(positions, vertex)))
-                        .collect();
-                    keys.len() >= 3
-                }
-            })
+            .filter(|rim| rim.closed && unique_positions(&rim.vertices, positions) >= 3)
             .collect();
         if candidates.is_empty() {
             return Err(SealError::RingAbsent {
@@ -2436,6 +2651,7 @@ fn seat_groups(
                     rms: similarity.rms,
                     max_residual: similarity.max_residual,
                     plane_dev,
+                    ring_seat: None,
                 },
                 wrist_cycle: cycle.vertices.clone(),
                 cuff_cycle: cuff.to_vec(),
@@ -2619,6 +2835,38 @@ pub fn seal_joints(
     requests: &[JointRequest],
     options: &SealOptions,
 ) -> Result<SealOutcome, SealError> {
+    seal_joints_mode(positions, triangles, requests, options, false)
+}
+
+/// [`seal_joints`] with the computed centroid seat enabled: every joint that
+/// does not declare `seat` is first translated so its collar-cycle centroid
+/// lands on its socket ring's centroid (see
+/// [`SEAT_CENTROID_MAX_SHIFT_RATIO`]). The transform is translation only and
+/// the joint keeps the discovered proximity-arc bridge, so the neck stays
+/// 26↔29 = 54 triangles; a declared similarity seat still wins. The seat is
+/// reported per joint as [`SeatReport::ring_seat`] beside the total
+/// translation, and an explicit [`SealOptions::head_drop`] still applies on top
+/// of it.
+///
+/// # Errors
+/// [`seal_joints`]'s refusals plus [`SealError::SeatCycleAbsent`],
+/// [`SealError::SeatCycleAmbiguous`] and [`SealError::SeatShiftLimit`]. @req BLD-13
+pub fn seal_joints_by_ring_centroid(
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+    requests: &[JointRequest],
+    options: &SealOptions,
+) -> Result<SealOutcome, SealError> {
+    seal_joints_mode(positions, triangles, requests, options, true)
+}
+
+fn seal_joints_mode(
+    positions: &[[f32; 3]],
+    triangles: &[[u32; 3]],
+    requests: &[JointRequest],
+    options: &SealOptions,
+    ring_centroid_seat: bool,
+) -> Result<SealOutcome, SealError> {
     validate(positions, triangles)?;
     validate_options(options)?;
     let input_digest = geometry_digest(positions, triangles);
@@ -2641,6 +2889,17 @@ pub fn seal_joints(
         &requests,
         SEAL_ARC_BAND_RATIO,
     )?;
+    let ring_seats = if ring_centroid_seat {
+        seat_by_ring_centroid(
+            &mut positions,
+            &triangles,
+            &identities,
+            &requests,
+            SEAT_CENTROID_MAX_SHIFT_RATIO,
+        )?
+    } else {
+        vec![None; requests.len()]
+    };
     let axis = up_axis(&positions);
 
     let authored_positions: Vec<[f32; 3]> = positions.clone();
@@ -3003,11 +3262,31 @@ pub fn seal_joints(
             positions = moved;
         }
 
-        // The seat record: the solved similarity when the joint seated, the
-        // head-drop translation when only a drop ran.
-        let seat = match (seated[index].as_ref(), options.head_drop > 0.0) {
+        // The seat record: the solved similarity when the joint seated, or the
+        // translation steps that moved it (a computed centroid seat and/or the
+        // explicit drop).
+        let seat = match (seated[index].as_ref(), ring_seats[index]) {
             (Some(seated), _) => Some(seated.report),
-            (None, true) => {
+            (None, Some(ring_seat)) => {
+                // The seam is already bridged: its own rims carry the post-seat
+                // gap, and the bridged mesh no longer holds the socket ring the
+                // band was derived from.
+                let gap = rim_gap(&collar, &ring, &positions).0;
+                let mut translation = ring_seat.translation;
+                translation[axis] -= f64::from(options.head_drop);
+                Some(SeatReport {
+                    head_drop: f64::from(options.head_drop),
+                    scale: 1.0,
+                    rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    translation,
+                    gap,
+                    rms: 0.0,
+                    max_residual: 0.0,
+                    plane_dev: 0.0,
+                    ring_seat: Some(ring_seat),
+                })
+            }
+            (None, None) if options.head_drop > 0.0 => {
                 let band = options.arc_band.unwrap_or_else(|| {
                     options_band(&triangles, &positions, part, socket, SEAL_ARC_BAND_RATIO)
                 });
@@ -3032,6 +3311,7 @@ pub fn seal_joints(
                     rms: 0.0,
                     max_residual: 0.0,
                     plane_dev: 0.0,
+                    ring_seat: None,
                 })
             }
             _ => None,
@@ -3883,5 +4163,207 @@ mod tests {
             ),
             "compound loop must refuse, got {error}"
         );
+    }
+
+    /// `two_tubes` with the head shell moved, so the centroid seat has a real
+    /// translation to compute instead of an already-seated pair.
+    fn offset_tubes(shift: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let (mut positions, triangles) = two_tubes();
+        for position in positions.iter_mut().take(34) {
+            for (lane, delta) in shift.iter().enumerate() {
+                position[lane] += delta;
+            }
+        }
+        (positions, triangles)
+    }
+
+    fn lanes_close(left: [f64; 3], right: [f64; 3], tolerance: f64) -> bool {
+        left.iter()
+            .zip(right)
+            .all(|(a, b)| (a - b).abs() <= tolerance)
+    }
+
+    /// The fixture's head and torso from their member ranges, never from the
+    /// classifier's naming.
+    fn tube_requests(
+        positions: &[[f32; 3]],
+        triangles: &[[u32; 3]],
+        seat: bool,
+    ) -> Vec<JointRequest> {
+        let identities = parts::shell_identities(positions, triangles);
+        let head = identities
+            .iter()
+            .find(|shell| shell.members[0] < 34)
+            .expect("the head shell");
+        let torso = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 34)
+            .expect("the torso shell");
+        vec![JointRequest {
+            part: head.name.clone(),
+            socket: torso.name.clone(),
+            seat,
+        }]
+    }
+
+    #[test]
+    fn centroid_seat_lands_an_off_axis_head_and_bridges_whole_rims() {
+        // The head sits 5 lateral and 2 up: outside the derived 1.26 pairing
+        // band, and inexpressible by the downward-only `head_drop`.
+        let (positions, triangles) = offset_tubes([5.0, 0.0, 2.0]);
+        let error = seal_joints(&positions, &triangles, &[], &SealOptions::default()).unwrap_err();
+        assert_eq!(error.code(), "seal_ring_too_far", "{error}");
+        let outcome = seal_joints_by_ring_centroid(
+            &positions,
+            &triangles,
+            &[],
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                max_shift: Some(10.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("the computed seat lands the off-axis head");
+        let joint = &outcome.report.joints[0];
+        let seat = joint.seat.expect("the seat is reported");
+        let ring_seat = seat.ring_seat.expect("the computed seat ran");
+        assert_eq!(ring_seat.collar_vertices, 17, "the head's whole open ring");
+        assert!(
+            lanes_close(ring_seat.translation, [-5.0, 0.0, -2.5], 1e-4),
+            "translation {:?}",
+            ring_seat.translation
+        );
+        assert!(
+            lanes_close(ring_seat.socket_centre, [0.0, 0.0, 4.0], 1e-4),
+            "socket centre {:?}",
+            ring_seat.socket_centre
+        );
+        assert!(
+            lanes_close(ring_seat.collar_centre, [5.0, 0.0, 6.5], 1e-4),
+            "collar centre {:?}",
+            ring_seat.collar_centre
+        );
+        assert!(
+            ring_seat.gap_before > 3.0,
+            "authored gap {}",
+            ring_seat.gap_before
+        );
+        // Translation only: no scale, identity rotation, no drop, and the total
+        // translation is the computed seat.
+        assert_eq!(seat.scale, 1.0);
+        assert_eq!(
+            seat.rotation,
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        );
+        assert_eq!(seat.head_drop, 0.0);
+        assert_eq!(seat.translation, ring_seat.translation);
+        // The discovered arc path is kept: whole rims, 17 + 8 triangles.
+        assert_eq!(joint.bridge_triangles, 25);
+        assert_eq!(joint.edges_consumed, [8, 17], "socket ring, then collar");
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.boundary_arc_after, 0);
+        assert_eq!(joint.winding_conflicts, 0);
+        assert_eq!(outcome.report.components_after, 1);
+    }
+
+    #[test]
+    fn centroid_seat_refuses_without_a_clean_cycle() {
+        // A capped head has no boundary cycle to take a centroid over.
+        let (positions, mut triangles) = two_tubes();
+        triangles.extend(cap(&(0..17u32).collect::<Vec<u32>>()));
+        let requests = tube_requests(&positions, &triangles, false);
+        let error = seal_joints_by_ring_centroid(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "seal_seat_cycle_absent", "{error}");
+        assert!(
+            error.to_string().contains("no clean closed cycle"),
+            "{error}"
+        );
+        // A fully closed torso has no socket ring either.
+        let (positions, mut triangles) = two_tubes();
+        triangles.extend(cap(&(34..42u32).collect::<Vec<u32>>()));
+        triangles.extend(cap(&(42..50u32).collect::<Vec<u32>>()));
+        let requests = tube_requests(&positions, &triangles, false);
+        let error = seal_joints_by_ring_centroid(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "seal_seat_cycle_absent", "{error}");
+    }
+
+    #[test]
+    fn centroid_seat_refuses_beyond_its_shift_bound() {
+        // 10.0 of lateral error is 5 ring radii: a collar on the wrong opening,
+        // not a family spread.
+        let (positions, triangles) = offset_tubes([10.0, 0.0, 2.0]);
+        let requests = tube_requests(&positions, &triangles, false);
+        let error = seal_joints_by_ring_centroid(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "seal_seat_shift_limit", "{error}");
+        assert!(
+            matches!(
+                error,
+                SealError::SeatShiftLimit { shift, bound }
+                    if shift > bound
+                        && (bound - SEAT_CENTROID_MAX_SHIFT_RATIO * 2.0).abs() < 1e-3
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_declared_seat_skips_the_centroid_pre_pass() {
+        // `seat` is the similarity path; the neck's unequal rims cannot be
+        // solved there, and the refusal proves the centroid pre-pass stayed out
+        // of a declared seat.
+        let (positions, triangles) = two_tubes();
+        let requests = tube_requests(&positions, &triangles, true);
+        let error = seal_joints_by_ring_centroid(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SealError::SeatUnreachable { .. } | SealError::RingAbsent { .. }
+            ),
+            "a declared seat must not fall through to the centroid seat: {error}"
+        );
+        // The same fixture seats by centroid when the joint declares no seat.
+        let requests = tube_requests(&positions, &triangles, false);
+        let outcome = seal_joints_by_ring_centroid(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions {
+                max_shift: Some(10.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("the computed seat runs for an undeclared part");
+        let seat = outcome.report.joints[0].seat.expect("the seat is reported");
+        assert!(seat.ring_seat.is_some(), "the centroid seat ran");
+        assert!(lanes_close(
+            seat.ring_seat.expect("seated").translation,
+            [0.0, 0.0, -0.5],
+            1e-4
+        ));
     }
 }

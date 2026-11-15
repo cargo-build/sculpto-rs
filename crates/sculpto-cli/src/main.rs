@@ -159,6 +159,9 @@ body seal-joints options:
   --head-drop <units> explicit vertical seat of the part shell before pairing (default 0)
   --no-smooth         bridge only, no Laplacian smoothing
   --weld-coincident   merge exactly coincident boundary copies beyond the pinch
+  --seat-by-ring-centroid  compute a translation-only seat first: put the part's
+                      collar-cycle centroid on the socket ring's centroid (the
+                      computed neck seat; a declared `:seat` joint still wins)
 
 garment fit options:
   --nif <path>         garment NIF
@@ -571,6 +574,7 @@ fn body_seal_joints(args: &[String]) -> ExitCode {
     let mut head_drop: Option<f32> = None;
     let mut smooth: Option<bool> = None;
     let mut weld_coincident: Option<bool> = None;
+    let mut seat_by_ring_centroid: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(key) = iter.next() {
         let reject = |message: String| -> ExitCode {
@@ -586,6 +590,10 @@ fn body_seal_joints(args: &[String]) -> ExitCode {
         }
         if name == "weld-coincident" {
             weld_coincident = Some(true);
+            continue;
+        }
+        if name == "seat-by-ring-centroid" {
+            seat_by_ring_centroid = Some(true);
             continue;
         }
         let Some(value) = iter.next() else {
@@ -651,6 +659,7 @@ fn body_seal_joints(args: &[String]) -> ExitCode {
         "head_drop": head_drop,
         "smooth": smooth,
         "weld_coincident": weld_coincident,
+        "seat_by_ring_centroid": seat_by_ring_centroid,
     });
     run::dispatch_payload("body.seal_joints", &input)
 }
