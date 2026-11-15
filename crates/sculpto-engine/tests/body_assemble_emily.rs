@@ -84,18 +84,18 @@ fn emily_assembly_reproduces_the_accepted_numbers() {
         .iter()
         .map(|part| part["vertices"].as_u64().expect("vertex count"))
         .collect();
-    assert_eq!(counts, vec![18_436, 8_876, 996, 6_374]);
+    assert_eq!(counts, vec![18_436, 8_876, 997, 6_374]);
     let offsets: Vec<u64> = parts
         .iter()
         .map(|part| part["vertex_offset"].as_u64().expect("vertex offset"))
         .collect();
-    assert_eq!(offsets, vec![0, 18_436, 27_312, 28_308]);
+    assert_eq!(offsets, vec![0, 18_436, 27_312, 28_309]);
     for part in parts {
         let digest = part["sha256"].as_str().expect("part digest");
         assert!(!digest.is_empty(), "part {} carries a digest", part["role"]);
     }
-    assert_eq!(result["assembled"]["vertices"], 34_682);
-    assert_eq!(result["assembled"]["triangles"], 65_674);
+    assert_eq!(result["assembled"]["vertices"], 34_683);
+    assert_eq!(result["assembled"]["triangles"], 65_730);
 
     // One neck row, two wrist rows, two ankle rows: the hands joint expands to
     // one seal request per hand shell and the feet joint to one per declared
@@ -147,12 +147,22 @@ fn emily_assembly_reproduces_the_accepted_numbers() {
         assert_eq!(ankle["non_manifold_after"], 0);
     }
 
-    // The bridge triangles are real: the mesh gains exactly 54 + 40 + 40 and
-    // loses no vertex, and the recipe digests are reported.
-    assert_eq!(result["output"]["vertices"], 34_682);
-    assert_eq!(result["output"]["triangles"], 65_808);
-    assert_eq!(vertices_of(&out), 34_682);
-    assert_eq!(count(&out, "f "), 65_808);
+    // The bridge triangles are real: the neck adds 54 and each ankle 40, and
+    // the head repair adds its patches; the recipe digests are reported.
+    assert_eq!(result["output"]["vertices"], 34_686);
+    assert_eq!(result["output"]["triangles"], 65_882);
+    assert_eq!(vertices_of(&out), 34_686);
+    assert_eq!(count(&out, "f "), 65_882);
+    // The delivered head carries no puncture: the pre-seal fill closed its own
+    // small loops and the post-seal repair closed the skull slit.
+    let holes = &result["head_holes"];
+    assert!(!holes["filled"].as_array().expect("filled").is_empty());
+    let repair = &result["head_seal_repair"];
+    assert!(
+        repair["filled"].as_u64().expect("repair count") >= 2,
+        "the skull slit breaks into at least two punctures"
+    );
+    assert_eq!(repair["left_open"].as_array().expect("left open").len(), 0);
     let input_digest = result["seal"]["input_digest"]
         .as_str()
         .expect("input digest");

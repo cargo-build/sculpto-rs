@@ -38,6 +38,7 @@ pub mod delta_conform;
 pub mod densify;
 pub mod dress;
 pub mod garment;
+pub mod hole_fill;
 pub mod intake;
 pub mod intake_gltf;
 pub mod joint_seal;

@@ -36,6 +36,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use sculpto_mesh::hole_fill::{self, DEFAULT_HOLE_VERTEX_CAP, HoleFillReport};
 use sculpto_mesh::joint_seal::{self, JointRequest, SealOptions, SealOutcome};
 use sculpto_mesh::parts::{self, ShellIdentity};
 
@@ -241,6 +242,11 @@ struct PlacedPart {
     sha256: String,
     positions: Vec<[f32; 3]>,
     triangles: Vec<[u32; 3]>,
+    /// Coincident boundary copies welded on the head before its punctures.
+    weld: hole_fill::WeldReport,
+    /// Small punctures the head carries beside its declared collar. Only the
+    /// head role is closed here; a body may legitimately hold cuffs and hems.
+    holes: HoleFillReport,
     vertex_offset: usize,
     triangle_offset: usize,
     placement: Value,
@@ -286,7 +292,7 @@ pub(crate) fn assemble(input: &Value) -> Result<Value, CommandError> {
     let (positions, triangles) = concatenate(&parts);
     let identities = parts::shell_identities(&positions, &triangles);
     let (requests, joints) = resolve_joints(&manifest, &parts, &identities)?;
-    let sealed = if requests.is_empty() {
+    let mut sealed = if requests.is_empty() {
         None
     } else {
         Some(
@@ -298,6 +304,46 @@ pub(crate) fn assemble(input: &Value) -> Result<Value, CommandError> {
             )
             .map_err(seal_failure)?,
         )
+    };
+    // The neck seal bridges one collar arc; the rest of the head's authored
+    // loop remains as a slit around the skull. Weld its coincident copies and
+    // fill the punctures, on head vertices only, after the seal.
+    let head_box = parts
+        .iter()
+        .find(|part| part.role == Role::Head)
+        .map(|part| {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for position in &part.positions {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(position[axis]);
+                    max[axis] = max[axis].max(position[axis]);
+                }
+            }
+            let margin = 0.02
+                * (0..3)
+                    .map(|axis| max[axis] - min[axis])
+                    .fold(0.0_f32, f32::max);
+            (min, max, margin)
+        });
+    let head_seal_repair = match (sealed.as_mut(), head_box) {
+        (Some(outcome), Some((min, max, margin))) => Some(
+            hole_fill::repair_head_boundaries(
+                &mut outcome.positions,
+                &mut outcome.triangles,
+                [min, max],
+                margin,
+                DEFAULT_HOLE_VERTEX_CAP,
+            )
+            .map_err(|error| {
+                CommandError::new(
+                    ErrorKind::InvalidParams,
+                    "assemble_head_seal_repair",
+                    error.to_string(),
+                )
+            })?,
+        ),
+        _ => None,
     };
     let (out_positions, out_triangles) = sealed
         .as_ref()
@@ -311,7 +357,14 @@ pub(crate) fn assemble(input: &Value) -> Result<Value, CommandError> {
             format!("{}: {error}", params.out.display()),
         )
     })?;
-    let report = render(&params, &manifest, &parts, &joints, sealed.as_ref());
+    let report = render(
+        &params,
+        &manifest,
+        &parts,
+        &joints,
+        sealed.as_ref(),
+        head_seal_repair.as_ref(),
+    );
     if let Some(path) = &params.report {
         write_report(path, &report)?;
     }
@@ -503,6 +556,14 @@ fn validate(manifest: &Manifest) -> Result<(), CommandError> {
     Ok(())
 }
 
+fn head_hole_error(spec: &PartSpec, error: hole_fill::HoleFillError) -> CommandError {
+    CommandError::new(
+        ErrorKind::InvalidParams,
+        "assemble_head_holes",
+        format!("part `{}`: {error}", spec.role.name()),
+    )
+}
+
 fn read_parts(manifest: &Manifest) -> Result<Vec<PlacedPart>, CommandError> {
     let mut parts: Vec<PlacedPart> = Vec::with_capacity(manifest.parts.len());
     let mut vertex_offset = 0usize;
@@ -525,6 +586,21 @@ fn read_parts(manifest: &Manifest) -> Result<Vec<PlacedPart>, CommandError> {
             ));
         }
         place(&mut positions, spec);
+        let (weld, holes) = if spec.role == Role::Head {
+            // Pre-seal: close the head's own punctures beside its collar. The
+            // authored skull slit is repaired after the neck seal, where the
+            // collar is no longer a boundary; welding it here would pinch the
+            // ring the seal has to address.
+            let holes = hole_fill::close_punctures_beside_collar(
+                &mut positions,
+                &mut triangles,
+                DEFAULT_HOLE_VERTEX_CAP,
+            )
+            .map_err(|error| head_hole_error(spec, error))?;
+            (Default::default(), holes)
+        } else {
+            (Default::default(), HoleFillReport::unchanged())
+        };
         let sha256 = file_sha256(&spec.path).map_err(|error| part_hash_failure(spec, error))?;
         parts.push(PlacedPart {
             order,
@@ -534,6 +610,8 @@ fn read_parts(manifest: &Manifest) -> Result<Vec<PlacedPart>, CommandError> {
             sha256,
             positions,
             triangles,
+            weld,
+            holes,
             vertex_offset,
             triangle_offset,
             placement: placement_row(spec),
@@ -1001,12 +1079,45 @@ fn render(
     parts: &[PlacedPart],
     joints: &[ResolvedJoint],
     sealed: Option<&SealOutcome>,
+    head_seal_repair: Option<&(hole_fill::WeldReport, HoleFillReport)>,
 ) -> Value {
     let assembled_vertices: usize = parts.iter().map(|part| part.positions.len()).sum();
     let assembled_triangles: usize = parts.iter().map(|part| part.triangles.len()).sum();
     let (output_vertices, output_triangles) = sealed
         .map_or((assembled_vertices, assembled_triangles), |outcome| {
             (outcome.positions.len(), outcome.triangles.len())
+        });
+    let head_holes = parts
+        .iter()
+        .find(|part| part.role == Role::Head)
+        .map(|part| {
+            json!({
+                "filled": part.holes.filled.iter().map(|hole| json!({
+                    "vertices": hole.vertices,
+                    "area": hole.area,
+                    "centroid": hole.centroid,
+                    "triangles": hole.triangles,
+                })).collect::<Vec<_>>(),
+                "weld_groups": part.weld.groups,
+                "weld_merged": part.weld.merged_vertices,
+                "left_open": part.holes.left_open,
+                "added_vertices": part.holes.added_vertices,
+                "added_triangles": part.holes.added_triangles,
+            })
+        });
+    let head_box = parts
+        .iter()
+        .find(|part| part.role == Role::Head)
+        .map(|part| {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for position in &part.positions {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(position[axis]);
+                    max[axis] = max[axis].max(position[axis]);
+                }
+            }
+            json!({ "min": min, "max": max })
         });
     let parts: Vec<Value> = parts
         .iter()
@@ -1101,6 +1212,16 @@ fn render(
         "material": "not_carried",
         "parts": parts,
         "joints": joint_rows,
+        "head_holes": head_holes,
+        "head_box": head_box,
+        "head_seal_repair": head_seal_repair.map(|(weld, holes)| json!({
+            "weld_groups": weld.groups,
+            "weld_merged": weld.merged_vertices,
+            "filled": holes.filled.len(),
+            "left_open": holes.left_open,
+            "added_vertices": holes.added_vertices,
+            "added_triangles": holes.added_triangles,
+        })),
         "assembled": {
             "vertices": assembled_vertices,
             "triangles": assembled_triangles,
