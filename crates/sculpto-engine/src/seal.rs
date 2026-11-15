@@ -163,6 +163,7 @@ pub(crate) fn joint_row(joint: &JointReport) -> Value {
         "socket": joint.socket_shell,
         "rings": [ring(&joint.rings[0]), ring(&joint.rings[1])],
         "selected_collar": joint.selected_collar,
+        "selected_ring": joint.selected_ring,
         "seam_choice": joint.seam_choice,
         "pinch_edges": joint.pinch_edges,
         "gap_min": joint.gap_min,

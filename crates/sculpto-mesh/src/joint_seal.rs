@@ -463,6 +463,9 @@ pub struct JointReport {
     pub rings: [RingFacts; 2],
     /// Collar vertices actually bridged, when the compound loop was trimmed.
     pub selected_collar: Option<usize>,
+    /// Socket loop vertices actually bridged, when the compound socket rim
+    /// was trimmed to its near run (the 3BA ankle: the distal leg ring).
+    pub selected_ring: Option<usize>,
     /// Why this seam was chosen over the proximity arc.
     pub seam_choice: &'static str,
     /// Coincident boundary edges closed by the default pinch merge.
@@ -1052,12 +1055,12 @@ fn cut_ring_at(ring: &[u32], collar_first: u32, positions: &[[f32; 3]]) -> Vec<u
     (0..n).map(|k| ring[(at + k) % n]).collect()
 }
 
-/// Bridge a socket ring with a part rim (closed ring or open arc) by a
+/// Bridge a socket loop with a part rim (each closed or an open arc) by a
 /// monotone minimum-cost alignment: every rim edge is consumed exactly once,
 /// in the reverse direction of its owning triangle. Adds no vertices, moves
 /// none; ties consume the socket edge first. Closed ↔ closed emits n + m
-/// triangles (26 ↔ 26 → 52; 20 ↔ 10 → 30); closed ↔ open arc emits
-/// n + m − 1. @req BLD-13
+/// triangles (26 ↔ 26 → 52; 20 ↔ 10 → 30); any open side emits n + m − 1
+/// per open side. @req BLD-13
 /// The directed traversal each mesh face gives an undirected edge. A bridge
 /// triangle must traverse a boundary edge opposite to its owning face. @req BLD-13
 fn face_directions(triangles: &[[u32; 3]]) -> HashMap<(u32, u32), (u32, u32)> {
@@ -1107,20 +1110,33 @@ fn rim_violations(
 fn bridge_rims(
     ring: &[u32],
     arc: &[u32],
+    ring_closed: bool,
     arc_closed: bool,
     flip_arc: bool,
     positions: &[[f32; 3]],
 ) -> (Vec<[u32; 3]>, [usize; 2]) {
-    let ring_edges = ring.len();
+    let ring_edges = if ring_closed {
+        ring.len()
+    } else {
+        ring.len().saturating_sub(1)
+    };
     let arc_edges = if arc_closed {
         arc.len()
     } else {
         arc.len().saturating_sub(1)
     };
     let arc_at = |j: usize| arc[j % arc.len()];
+    // An open side stops at its last vertex; a closed side wraps.
+    let ring_at = |i: usize| {
+        if ring_closed {
+            ring[i % ring.len()]
+        } else {
+            ring[i.min(ring.len() - 1)]
+        }
+    };
     let diagonal = |i: usize, j: usize| {
         distance(
-            point_of(positions, ring[i % ring_edges]),
+            point_of(positions, ring_at(i)),
             point_of(positions, arc_at(j)),
         )
         .powi(2)
@@ -1168,7 +1184,7 @@ fn bridge_rims(
     let (mut ci, mut cj) = (0usize, 0usize);
     for ring_step in steps {
         if ring_step {
-            let consumed = (ring[cj % ring_edges], ring[(cj + 1) % ring_edges]);
+            let consumed = (ring_at(cj), ring_at(cj + 1));
             strip.push((true, consumed, [arc_at(ci), consumed.1, consumed.0]));
             cj += 1;
         } else {
@@ -1177,9 +1193,9 @@ fn bridge_rims(
                 false,
                 consumed,
                 if flip_arc {
-                    [ring[cj % ring_edges], consumed.0, consumed.1]
+                    [ring_at(cj), consumed.0, consumed.1]
                 } else {
-                    [ring[cj % ring_edges], consumed.1, consumed.0]
+                    [ring_at(cj), consumed.1, consumed.0]
                 },
             ));
             ci += 1;
@@ -1221,6 +1237,7 @@ fn verify_bridge(
     bridge: &[[u32; 3]],
     ring: &[u32],
     arc: &[u32],
+    ring_closed: bool,
     arc_closed: bool,
 ) -> Result<usize, SealError> {
     for triangle in bridge {
@@ -1264,7 +1281,7 @@ fn verify_bridge(
         return Err(SealError::NonManifoldWeld { edge, uses: count });
     }
     let mut conflicts = 0usize;
-    for (vertices, closed) in [(ring, true), (arc, arc_closed)] {
+    for (vertices, closed) in [(ring, ring_closed), (arc, arc_closed)] {
         let n = vertices.len();
         for k in 0..n.saturating_sub(if closed { 0 } else { 1 }) {
             let (from, to) = (vertices[k], vertices[(k + 1) % n]);
@@ -3185,6 +3202,9 @@ fn seal_joints_mode(
                 part_rim: Rim,
                 collar: Vec<u32>,
                 collar_closed: bool,
+                ring: Vec<u32>,
+                ring_closed: bool,
+                ring_cut: bool,
                 merged: usize,
             },
         }
@@ -3223,6 +3243,22 @@ fn seal_joints_mode(
                 &authored_positions,
                 arc_band_used,
             )?;
+            // The socket rim can be a compound loop too (the 3BA ankle: a slit
+            // chain whose near run is the distal leg ring, the rest authored
+            // thigh and slit). Cut it against the part collar with the same
+            // proximity rule; a strict subset then bridges as an open arc
+            // instead of the whole chain. A rim with no near run keeps the
+            // typed refusal instead of a silent trim.
+            let (ring, ring_closed, ring_cut) = if socket_rim.closed
+                && collar.len() < socket_rim.vertices.len()
+            {
+                match extract_arc(&socket_rim, &collar, &authored_positions, arc_band_used)? {
+                    (run, false, _) if run.len() < socket_rim.vertices.len() => (run, false, true),
+                    _ => (socket_rim.vertices.clone(), socket_rim.closed, false),
+                }
+            } else {
+                (socket_rim.vertices.clone(), socket_rim.closed, false)
+            };
             // An open collar keeps its two authored coincident endpoints, so
             // no edges are merged; a closed collar's pinch is welded and the
             // count is the boundary edges that merge actually removed.
@@ -3238,6 +3274,9 @@ fn seal_joints_mode(
                 part_rim,
                 collar,
                 collar_closed,
+                ring,
+                ring_closed,
+                ring_cut,
                 merged,
             }
         };
@@ -3248,6 +3287,8 @@ fn seal_joints_mode(
             ring,
             collar,
             collar_closed,
+            ring_closed,
+            ring_cut,
             pinch_edges,
             socket_facts,
             part_facts,
@@ -3268,6 +3309,8 @@ fn seal_joints_mode(
                     ring,
                     collar,
                     true,
+                    true,
+                    false,
                     merged,
                     socket_facts,
                     part_facts,
@@ -3280,20 +3323,32 @@ fn seal_joints_mode(
                 part_rim,
                 collar,
                 collar_closed,
+                ring: cut_ring,
+                ring_closed,
+                ring_cut,
                 merged,
             } => {
                 let socket_facts = rim_facts(&socket_rim.vertices, &positions, socket_rim.closed);
                 let part_facts = rim_facts(&part_rim.vertices, &positions, part_rim.closed);
-                let ring = if socket_rim.closed {
+                let ring = if ring_cut {
+                    // Already the near run in rim-walk order.
+                    cut_ring
+                } else if socket_rim.closed {
                     cut_ring_at(&socket_rim.vertices, collar[0], &positions)
                 } else {
                     socket_rim.vertices.clone()
                 };
-                let before = socket_rim.edges().len();
+                let before = if ring_cut {
+                    ring.len() - 1
+                } else {
+                    socket_rim.edges().len()
+                };
                 (
                     ring,
                     collar,
                     collar_closed,
+                    ring_closed,
+                    ring_cut,
                     merged,
                     socket_facts,
                     part_facts,
@@ -3305,16 +3360,16 @@ fn seal_joints_mode(
         let selected_collar = (pinch_edges > 0
             || collar.len() != part_rim.as_ref().map_or(0, |rim| rim.vertices.len()))
         .then_some(collar.len());
+        let selected_ring = ring_cut.then_some(ring.len());
         // Gap facts belong to the seam actually bridged, not the whole
         // compound loop with its mouth slit far above the collar.
         let (gap_min, gap_mean, gap_max) = rim_gap(&collar, &ring, &positions);
 
         if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
             eprintln!(
-                "seal: ring={} collar={} closed={} band={:.3} gap={:.3}..{:.3} pinch_edges={}",
+                "seal: ring={} collar={} ring_closed={ring_closed} collar_closed={collar_closed} band={:.3} gap={:.3}..{:.3} pinch_edges={}",
                 ring.len(),
                 collar.len(),
-                collar_closed,
                 arc_band_used,
                 gap_min,
                 gap_max,
@@ -3356,8 +3411,14 @@ fn seal_joints_mode(
             welded_pair.then(|| (ring.clone(), Vec::new(), 0));
         for (ring_try, collar_try) in walk_orders {
             for flip_arc in [false, true] {
-                let (bridge_try, _) =
-                    bridge_rims(ring_try, collar_try, collar_closed, flip_arc, &positions);
+                let (bridge_try, _) = bridge_rims(
+                    ring_try,
+                    collar_try,
+                    ring_closed,
+                    collar_closed,
+                    flip_arc,
+                    &positions,
+                );
                 let (ring_bad, arc_bad) =
                     rim_violations(&bridge_try, &face_dirs, ring_try, collar_try);
                 if std::env::var_os("SCULPTO_SEAL_DEBUG").is_some() {
@@ -3370,6 +3431,11 @@ fn seal_joints_mode(
                         collar_try.len()
                     );
                 }
+                let ring_edges = if ring_closed {
+                    ring_try.len()
+                } else {
+                    ring_try.len() - 1
+                };
                 let arc_edges = if collar_closed {
                     collar_try.len()
                 } else {
@@ -3379,17 +3445,26 @@ fn seal_joints_mode(
                 // loop order: `shell_rims` walks the boundary opposite to it.
                 if ring_bad == 0
                     && arc_bad == 0
-                    && verify_bridge(&bridge_try, ring_try, collar_try, collar_closed).is_ok()
+                    && verify_bridge(
+                        &bridge_try,
+                        ring_try,
+                        collar_try,
+                        ring_closed,
+                        collar_closed,
+                    )
+                    .is_ok()
                 {
                     chosen = Some((ring_try.to_vec(), bridge_try, 0));
                     break;
                 }
-                if ring_bad == ring_try.len() && arc_bad == arc_edges {
+                if ring_bad == ring_edges && arc_bad == arc_edges {
                     let mut flipped = bridge_try.clone();
                     for triangle in &mut flipped {
                         triangle.swap(1, 2);
                     }
-                    if verify_bridge(&flipped, ring_try, collar_try, collar_closed).is_ok() {
+                    if verify_bridge(&flipped, ring_try, collar_try, ring_closed, collar_closed)
+                        .is_ok()
+                    {
                         chosen = Some((ring_try.to_vec(), flipped, 0));
                         break;
                     }
@@ -3437,7 +3512,7 @@ fn seal_joints_mode(
         let ring_rim = Rim {
             vertices: ring.clone(),
             simple: true,
-            closed: true,
+            closed: ring_closed,
         };
         let boundary_ring_after = ring_rim
             .edges()
@@ -3454,10 +3529,17 @@ fn seal_joints_mode(
             .saturating_sub(boundary_collar_before);
 
         // Smoothing: the bridge corners plus `band` rings of neighbours,
-        // under the declared or derived bound.
+        // under the declared or derived bound. The bound follows the ring
+        // that was actually bridged: on a cut compound socket rim the raw
+        // rim's radius spans the whole slit chain, not the seam.
+        let seam_radius_mean = if ring_cut {
+            rim_facts(&ring, &positions, ring_closed).radius_mean
+        } else {
+            socket_facts.radius_mean
+        };
         let max_shift_used = options
             .max_shift
-            .unwrap_or((SEAL_MAX_SHIFT_RATIO * socket_facts.radius_mean) as f32);
+            .unwrap_or((SEAL_MAX_SHIFT_RATIO * seam_radius_mean) as f32);
         let mut smoothing = SmoothingReport {
             enabled: false,
             iterations: options.iterations,
@@ -3592,10 +3674,14 @@ fn seal_joints_mode(
                 )
             })
             .collect();
-        let remaining = match selected_collar {
-            Some(_) if seated[index].is_some() => "none on this joint".to_string(),
-            Some(_) => "part rim keeps its coincident seam-cut edges open".to_string(),
-            None => "none on this joint".to_string(),
+        let remaining = match (selected_collar, selected_ring, seated[index].is_some()) {
+            (Some(_), _, true) => "none on this joint".to_string(),
+            (Some(_), Some(_), false) => "both rims keep their non-seam remainder open".to_string(),
+            (Some(_), None, false) => {
+                "part rim keeps its coincident seam-cut edges open".to_string()
+            }
+            (None, Some(_), _) => "socket rim keeps its non-seam remainder open".to_string(),
+            (None, None, _) => "none on this joint".to_string(),
         };
         let correspondence = match seated[index].as_ref() {
             Some(seat) if seat.authored => "authored",
@@ -3608,6 +3694,7 @@ fn seal_joints_mode(
             socket_shell: request.socket.clone(),
             rings: [socket_facts, part_facts],
             selected_collar,
+            selected_ring,
             seam_choice: SEAM_CHOICE,
             pinch_edges,
             gap_min,
@@ -3620,7 +3707,11 @@ fn seal_joints_mode(
                 [0, 0]
             } else {
                 [
-                    ring.len(),
+                    if ring_closed {
+                        ring.len()
+                    } else {
+                        ring.len() - 1
+                    },
                     if collar_closed {
                         collar.len()
                     } else {
@@ -5035,5 +5126,122 @@ mod tests {
             !error.parameter_problem(),
             "a genuine refusal, not a misuse"
         );
+    }
+
+    /// One outward-facing quad column between two equal rings, column 0
+    /// removed: the shell rim becomes one compound loop
+    /// `[bottom ring] + [top ring] + two slit verticals` (the authored slit
+    /// chain the 3BA leg and foot ship). @req BLD-13
+    fn slit_tube(bottom: &[u32], top: &[u32]) -> Vec<[u32; 3]> {
+        (1..bottom.len())
+            .flat_map(|k| {
+                let next = (k + 1) % bottom.len();
+                let (b0, b1, t0, t1) = (bottom[k], bottom[next], top[k], top[next]);
+                [[b0, b1, t1], [b0, t1, t0]]
+            })
+            .collect()
+    }
+
+    /// The portable ankle: a slit leg tube (36-v distal ring at z 0, 36-v
+    /// thigh ring at z 12, one compound rim) under a slit foot tube (46-v
+    /// opening at z 0, 46-v heel ring at z −12). The near runs are 36 ↔ 46,
+    /// the rest of each rim is authored slit that must stay open. @req BLD-13
+    fn ankle_fixture() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let leg_bottom: Vec<u32> = (0..36u32).collect();
+        let leg_top: Vec<u32> = (36..72u32).collect();
+        let foot_top: Vec<u32> = (72..118u32).collect();
+        let foot_bottom: Vec<u32> = (118..164u32).collect();
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        positions.extend(ring(36, 1.2, 0.0));
+        positions.extend(ring(36, 1.4, 12.0));
+        positions.extend(ring(46, 1.0, 0.0));
+        positions.extend(ring(46, 1.0, -12.0));
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        triangles.extend(slit_tube(&leg_bottom, &leg_top));
+        triangles.extend(slit_tube(&foot_top, &foot_bottom));
+        (positions, triangles)
+    }
+
+    /// The fixture's foot (part) and leg (socket) names from member ranges,
+    /// never from the classifier's naming. @req BLD-13
+    fn ankle_requests(positions: &[[f32; 3]], triangles: &[[u32; 3]]) -> Vec<JointRequest> {
+        let identities = parts::shell_identities(positions, triangles);
+        let part = identities
+            .iter()
+            .find(|shell| shell.members[0] >= 72)
+            .expect("the foot shell");
+        let socket = identities
+            .iter()
+            .find(|shell| shell.members[0] < 72)
+            .expect("the leg shell");
+        vec![JointRequest {
+            part: part.name.clone(),
+            socket: socket.name.clone(),
+            seat: false,
+        }]
+    }
+
+    #[test]
+    fn ankle_slit_rims_cut_to_36_and_46_and_bridge_bounded() {
+        let (positions, triangles) = ankle_fixture();
+        let requests = ankle_requests(&positions, &triangles);
+        let outcome = seal_joints(
+            &positions,
+            &triangles,
+            &requests,
+            &SealOptions {
+                iterations: 2,
+                band: 1,
+                // The fixture's slit is one long edge, so the smoothing band
+                // reaches the sparse thigh ring; the declared bound must
+                // absorb that drag, and the strip itself stays small.
+                max_shift: Some(20.0),
+                ..SealOptions::default()
+            },
+        )
+        .expect("the ankle slit rims pair");
+        let joint = &outcome.report.joints[0];
+        // The compound rims trim to the near runs: distal leg 36, foot top 46.
+        assert_eq!(joint.selected_ring, Some(36), "{}", joint.seam_choice);
+        assert_eq!(joint.selected_collar, Some(46));
+        // Open arcs: 35 ring edges + 45 collar edges, bounded near 60 + tails.
+        assert_eq!(joint.bridge_triangles, 80);
+        assert_eq!(joint.edges_consumed, [35, 45]);
+        assert_eq!(joint.boundary_ring_after, 0);
+        assert_eq!(joint.boundary_arc_after, 0);
+        assert_eq!(joint.non_manifold_after, 0);
+        assert_eq!(joint.winding_conflicts, 0);
+        assert_eq!(outcome.report.components_after, 1);
+        assert_eq!(outcome.triangles.len(), triangles.len() + 80);
+        assert!(
+            joint.gap_min > 0.0 && joint.gap_max < 0.6,
+            "{}",
+            joint.gap_max
+        );
+        assert!(joint.min_bridge_area > 0.0);
+        assert!(joint.smoothing.enabled);
+        assert!(joint.smoothing.max_displacement <= f64::from(joint.smoothing.max_shift));
+        assert!(
+            joint.smoothing.max_displacement < 10.0,
+            "{}",
+            joint.smoothing.max_displacement
+        );
+        assert!(joint.smoothing.changed_outside_band == 0);
+        assert!(joint.remaining_boundary.contains("open"));
+    }
+
+    #[test]
+    fn ankle_refuses_a_branched_rim_instead_of_trimming() {
+        // The slit leg plus one hanging triangle: the distal-ring vertex 0
+        // carries four boundary edges, so the winning rim is not a cycle and
+        // the seal must refuse instead of trimming the chain.
+        let (mut positions, mut triangles) = ankle_fixture();
+        let tip = positions.len() as u32;
+        positions.push([0.0, 0.0, -2.0]);
+        triangles.push([0, tip, 1]);
+        let requests = ankle_requests(&positions, &triangles);
+        let error =
+            seal_joints(&positions, &triangles, &requests, &SealOptions::default()).unwrap_err();
+        assert_eq!(error.code(), "seal_ring_not_simple", "{error}");
     }
 }
