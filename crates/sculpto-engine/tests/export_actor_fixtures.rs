@@ -11,7 +11,7 @@ use serde_json::Value;
 const FIXTURE: &str = "SCULPTO_ACTOR_FIXTURES";
 
 fn fixture() -> Option<Value> {
-    let path = std::env::var(FIXTURE).ok()?;
+    let path = std::env::var("SCULPTO_ACTOR_FIXTURES").ok()?;
     let text = std::fs::read_to_string(&path).expect("the declared fixture JSON");
     Some(serde_json::from_str(&text).expect("the fixture JSON parses"))
 }
