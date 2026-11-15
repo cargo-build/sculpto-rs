@@ -65,6 +65,9 @@ struct ViewerConfig {
     /// unlit materials. `L` flips it at runtime in the interactive viewer.
     flat: bool,
     asset_file: String,
+    /// Operator-facing status of the result on screen: `ReadyToShowProgress`
+    /// when it is finished and verified, `InProgress` while it is not.
+    status: String,
 }
 
 /// Runtime lit/flat state; `SCULPTO_VIEWER_FLAT` seeds it and `L` flips it.
@@ -250,6 +253,7 @@ fn main() {
         interactive: options.interactive,
         flat: std::env::var("SCULPTO_VIEWER_FLAT").is_ok(),
         asset_file,
+        status: std::env::var("SCULPTO_VIEWER_STATUS").unwrap_or_else(|_| "InProgress".to_string()),
     };
     let asset_plugin = AssetPlugin {
         file_path: asset_dir,
@@ -262,9 +266,10 @@ fn main() {
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
-                        title:
-                            "Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, H help"
-                                .to_string(),
+                        title: format!(
+                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, H help",
+                            config.status
+                        ),
                         resolution: (1280, 900).into(),
                         ..default()
                     }),
@@ -681,6 +686,18 @@ fn setup(
                 HelpOverlay,
             ))
             .with_children(|card| {
+                let (status_colour, status_line) = match config.status.as_str() {
+                    "ReadyToShowProgress" => (Color::srgb(0.18, 0.80, 0.44), "ReadyToShowProgress"),
+                    _ => (Color::srgb(0.95, 0.77, 0.20), "InProgress"),
+                };
+                card.spawn((
+                    Text::new(status_line),
+                    TextFont {
+                        font_size: bevy::text::FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(status_colour),
+                ));
                 for line in [
                     "Drag LMB orbit · RMB pan · wheel zoom",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
@@ -799,13 +816,13 @@ fn fit_camera_to_scene(
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     for (aabb, transform) in &meshes {
-        let center = aabb.center();
-        let half = aabb.half_extents();
+        let center = aabb.center;
+        let half = aabb.half_extents;
         for x in [-1.0_f32, 1.0] {
             for y in [-1.0_f32, 1.0] {
                 for z in [-1.0_f32, 1.0] {
-                    let local = center + Vec3::new(x * half.x, y * half.y, z * half.z);
-                    let world = transform.transform_point(local);
+                    let local = center + Vec3A::new(x * half.x, y * half.y, z * half.z);
+                    let world = transform.transform_point(local.into());
                     min = min.min(world);
                     max = max.max(world);
                 }
@@ -827,7 +844,7 @@ fn fit_camera_to_scene(
         camera.translation = target + rotation * Vec3::Z * distance;
         camera.look_at(target, Vec3::Y);
     }
-    let width = (max.x - min.x).max(max.z - min.z);
+    let width = (max.x - min.x).max(max.z - min.z).max(radius * 2.0);
     for mut ground in &mut grounds {
         ground.translation = Vec3::new(target.x, min.y - 0.01, target.z);
         ground.scale = Vec3::new(width / 4.0, 1.0, width / 4.0);
@@ -1349,6 +1366,7 @@ mod tests {
             interactive,
             flat,
             asset_file: String::new(),
+            status: "InProgress".to_string(),
         }
     }
 
@@ -1567,5 +1585,20 @@ mod tests {
             Vec3::new(1.1, 0.2, 2.0),
             "Ctrl+RMB offsets the figure from its home"
         );
+    }
+
+    #[test]
+    fn fit_widens_the_zoom_range_for_large_assets() {
+        let mut orbit = OrbitCamera::looking_at(Vec3::new(2.2, 1.3, 2.8), Vec3::new(0.0, 0.9, 0.0));
+        orbit.fit(Vec3::new(0.0, 10.0, 0.0), 400.0);
+        assert_eq!(orbit.distance, 400.0);
+        assert_eq!(orbit.target, Vec3::new(0.0, 10.0, 0.0));
+        assert!(
+            orbit.max_distance >= 400.0,
+            "a 100-unit asset must zoom out past its opening distance"
+        );
+        assert!(orbit.min_distance > 0.0);
+        orbit.reset();
+        assert_eq!(orbit.distance, 400.0, "R restores the fitted frame");
     }
 }
