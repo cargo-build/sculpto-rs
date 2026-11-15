@@ -9,6 +9,14 @@ orbited and inspected instead of captured from one fixed view: drag **LMB** to
 orbit, **RMB** to pan, wheel to zoom, **R** to reset. The review window is the
 fast inspection loop; the 13-view contact sheet remains the fit evidence.
 
+The interactive camera frames the loaded scene from its world bounds: once
+geometry exists it measures the AABB, puts the orbit target at its centre and
+derives the opening distance and the zoom range from that radius, so a 1.8 m
+character and the 100-unit Khronos Fox both open readable and zoom out to the
+whole model. Framing never rescales the asset — `SCULPTO_VIEWER_SCALE` remains
+the source-unit conversion. `SCULPTO_VIEWER_AUTOFIT=0` keeps the fixed review
+camera; headless captures always use the fixed camera.
+
 Standalone crate (not a workspace member): it pulls Bevy, which is unrelated
 to the sculpto crates.
 
@@ -64,8 +72,9 @@ The asset, the two clip indices and the output PNG are env-driven because
 every combined GLB renumbers its clips (the cloth weight track is animation
 0, actor clips follow alphabetically): `SCULPTO_VIEWER_ASSET` (default
 `combined.glb`), `SCULPTO_VIEWER_ACTOR_ANIMATION` (default `4`),
-`SCULPTO_VIEWER_CLOTH_ANIMATION` (default `0`) and `SCULPTO_VIEWER_PNG`
-(default `/tmp/sculpto-classify/cloth/bevy_combined_240.png`). Print the
+`SCULPTO_VIEWER_CLOTH_ANIMATION` (no default: the extra clip loads only when
+this is set, so an unnamed `Animation0` is not blended over the actor) and
+`SCULPTO_VIEWER_PNG` (default `/tmp/sculpto-classify/cloth/bevy_combined_240.png`). Print the
 index list from the GLB's JSON chunk before a capture.
 
 `SCULPTO_VIEWER_DEBUG_SCENE=1` replaces the capture with a consumer-limit

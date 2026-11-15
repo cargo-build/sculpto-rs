@@ -93,7 +93,7 @@ fn pieces_of(triangles: &[[u32; 3]], vertices: usize) -> Vec<Vec<usize>> {
 
 #[test]
 fn the_authored_panels_weld_into_shared_seams() {
-    let Ok(path) = std::env::var(FIXTURE) else {
+    let Ok(path) = std::env::var("SCULPTO_ACTOR_FIXTURES") else {
         eprintln!("SKIP panel weld topology: {FIXTURE} is not set");
         return;
     };

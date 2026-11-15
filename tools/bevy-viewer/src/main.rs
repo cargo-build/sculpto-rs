@@ -355,6 +355,7 @@ fn main() {
                 benchmark,
                 debug_scene,
                 debug_playback,
+                fit_camera_to_scene,
                 orbit_controls,
                 light_controls,
                 toggle_flat,
@@ -631,17 +632,22 @@ fn setup(
     commands.insert_resource(GltfRoot(gltf_handle));
 
     if !config.report_mode {
-        let cloth_animation = env_or("SCULPTO_VIEWER_CLOTH_ANIMATION", "0");
         let actor_idle = asset_server.load(format!("{}#Animation0", config.asset_file));
         let actor_walk = asset_server.load(format!("{}#Animation1", config.asset_file));
-        let cloth_clip =
-            asset_server.load(format!("{}#Animation{cloth_animation}", config.asset_file));
         let (mut graph, actor_idle_node) = AnimationGraph::from_clip(actor_idle);
         let actor_walk_node = graph.add_clip(actor_walk, 1.0, graph.root);
-        let cloth_node = graph.add_clip(cloth_clip, 1.0, graph.root);
+        // A separate cloth clip exists only when the file carries one and the
+        // caller names it. Defaulting it to `Animation0` played the actor's own
+        // idle clip a second time at full weight, blending two clips on the same
+        // skeleton — the figure trembled and the walk was diluted by half.
+        let mut nodes = vec![actor_idle_node, actor_walk_node];
+        if let Ok(index) = std::env::var("SCULPTO_VIEWER_CLOTH_ANIMATION") {
+            let cloth_clip = asset_server.load(format!("{}#Animation{index}", config.asset_file));
+            nodes.push(graph.add_clip(cloth_clip, 1.0, graph.root));
+        }
         commands.insert_resource(PlayerGraph {
             handle: graphs.add(graph),
-            nodes: vec![actor_idle_node, actor_walk_node, cloth_node],
+            nodes,
         });
     }
 
@@ -727,6 +733,8 @@ struct OrbitCamera {
     yaw: f32,
     pitch: f32,
     distance: f32,
+    min_distance: f32,
+    max_distance: f32,
     home: (Vec3, f32, f32, f32),
 }
 
@@ -741,8 +749,21 @@ impl OrbitCamera {
             yaw,
             pitch,
             distance,
+            min_distance: 0.2,
+            max_distance: 30.0,
             home: (target, yaw, pitch, distance),
         }
+    }
+
+    /// Frame the measured scene once, keeping the review direction but widening
+    /// the zoom range with the asset. A 100-unit Fox must not inherit the
+    /// human-scale 30-unit cap.
+    fn fit(&mut self, target: Vec3, distance: f32) {
+        self.target = target;
+        self.distance = distance;
+        self.min_distance = (distance * 0.05).max(0.01);
+        self.max_distance = (distance * 20.0).max(30.0);
+        self.home = (target, self.yaw, self.pitch, distance);
     }
 
     fn reset(&mut self) {
@@ -752,6 +773,67 @@ impl OrbitCamera {
         self.pitch = pitch;
         self.distance = distance;
     }
+}
+
+/// Frame the first loaded scene from its world bounds so a 1.8 m character and
+/// a 100-unit Fox both open at a readable distance. The model itself is never
+/// rescaled; `SCULPTO_VIEWER_SCALE` still controls source-unit conversion.
+/// Interactive only, so headless captures keep their fixed review camera.
+fn fit_camera_to_scene(
+    config: Res<ViewerConfig>,
+    mut fitted: Local<bool>,
+    orbit: Option<ResMut<OrbitCamera>>,
+    meshes: Query<
+        (&bevy::camera::primitives::Aabb, &GlobalTransform),
+        (With<Mesh3d>, Without<ReviewGround>),
+    >,
+    mut cameras: Query<&mut Transform, With<Camera3d>>,
+    mut grounds: Query<&mut Transform, (With<ReviewGround>, Without<Camera3d>)>,
+) {
+    if *fitted || !config.interactive || env_f32("SCULPTO_VIEWER_AUTOFIT", 1.0) == 0.0 {
+        return;
+    }
+    let Some(mut orbit) = orbit else {
+        return;
+    };
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for (aabb, transform) in &meshes {
+        let center = aabb.center();
+        let half = aabb.half_extents();
+        for x in [-1.0_f32, 1.0] {
+            for y in [-1.0_f32, 1.0] {
+                for z in [-1.0_f32, 1.0] {
+                    let local = center + Vec3::new(x * half.x, y * half.y, z * half.z);
+                    let world = transform.transform_point(local);
+                    min = min.min(world);
+                    max = max.max(world);
+                }
+            }
+        }
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return;
+    }
+    let radius = (max - min).length() * 0.5;
+    if radius < 1e-6 {
+        return;
+    }
+    let target = (min + max) * 0.5;
+    let distance = radius / (std::f32::consts::FRAC_PI_8).tan() * 1.15;
+    orbit.fit(target, distance);
+    if let Ok(mut camera) = cameras.single_mut() {
+        let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+        camera.translation = target + rotation * Vec3::Z * distance;
+        camera.look_at(target, Vec3::Y);
+    }
+    let width = (max.x - min.x).max(max.z - min.z);
+    for mut ground in &mut grounds {
+        ground.translation = Vec3::new(target.x, min.y - 0.01, target.z);
+        ground.scale = Vec3::new(width / 4.0, 1.0, width / 4.0);
+    }
+    *fitted = true;
+    info!("viewer: auto-fit target={target:?} radius={radius:.3} distance={distance:.3}");
 }
 
 /// Interactive-only orbit camera: LMB drag orbits, RMB drag pans, wheel zooms,
@@ -800,7 +882,8 @@ fn orbit_controls(
         orbit.target += (-right * delta.x + up * delta.y) * pan_scale;
     }
     if zoom.abs() > f32::EPSILON {
-        orbit.distance = (orbit.distance * (1.0 - zoom * 0.12)).clamp(0.2, 30.0);
+        orbit.distance =
+            (orbit.distance * (1.0 - zoom * 0.12)).clamp(orbit.min_distance, orbit.max_distance);
     }
 
     let Ok(mut transform) = cameras.single_mut() else {
@@ -966,7 +1049,9 @@ fn advance_animation(
     let selection = selection.0.min(1);
     for (entity, mut player) in &mut players {
         player.play(graph.nodes[selection]).repeat();
-        player.play(graph.nodes[2]).repeat();
+        if let Some(cloth) = graph.nodes.get(2) {
+            player.play(*cloth).repeat();
+        }
         commands
             .entity(entity)
             .insert(AnimationGraphHandle(graph.handle.clone()));
@@ -1004,7 +1089,9 @@ fn select_clip(
     for mut player in &mut players {
         player.stop_all();
         player.play(graph.nodes[wanted]).repeat();
-        player.play(graph.nodes[2]).repeat();
+        if let Some(cloth) = graph.nodes.get(2) {
+            player.play(*cloth).repeat();
+        }
     }
 }
 
