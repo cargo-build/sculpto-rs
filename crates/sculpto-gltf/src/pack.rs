@@ -95,6 +95,18 @@ pub struct AccessorCopy<'input> {
     pub bytes: &'input [u8],
 }
 
+/// One node-local track of an inserted animation, one value per shared time.
+///
+/// The variant selects the glTF channel path: `Vector` drives `translation`,
+/// `Rotation` drives `rotation` (quaternion `x, y, z, w`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Track {
+    /// Local translation samples (`VEC3`).
+    Translation { node: usize, values: Vec<[f32; 3]> },
+    /// Local rotation quaternion samples (`VEC4`).
+    Rotation { node: usize, values: Vec<[f32; 4]> },
+}
+
 /// Appends to one embedded GLB: the base JSON and BIN plus its copy caches.
 pub struct PackWriter {
     json: Value,
@@ -308,6 +320,64 @@ impl PackWriter {
         Ok(())
     }
 
+    /// Insert one node-local TRS animation at `position`, keeping every other
+    /// clip and shifting later ones back. Returns the inserted clip index.
+    ///
+    /// All tracks share `times`; each becomes one `LINEAR` sampler and channel.
+    /// Admission (which nodes may be driven, sample validity) stays with the
+    /// caller; this only writes the container. `position` is clamped to the
+    /// current clip count, so an actor with no clips gains its first at 0.
+    pub fn insert_animation(
+        &mut self,
+        position: usize,
+        name: &str,
+        times: &[f32],
+        tracks: &[Track],
+    ) -> Result<usize, PackError> {
+        if times.len() < 2 || tracks.is_empty() {
+            return Err(PackError::invalid(
+                "inserted animation",
+                "need at least two shared times and one track",
+            ));
+        }
+        let input = self.floats(times, true)?;
+        let mut channels = Vec::new();
+        let mut samplers = Vec::new();
+        for track in tracks {
+            let (node, path, output) = match track {
+                Track::Translation { node, values } => {
+                    let flat: Vec<f32> = values.iter().flatten().copied().collect();
+                    (
+                        *node,
+                        "translation",
+                        self.vec_floats(&flat, 3, values.len())?,
+                    )
+                }
+                Track::Rotation { node, values } => {
+                    let flat: Vec<f32> = values.iter().flatten().copied().collect();
+                    (*node, "rotation", self.vec_floats(&flat, 4, values.len())?)
+                }
+            };
+            let sampler = samplers.len();
+            samplers.push(json!({"input": input, "output": output, "interpolation": "LINEAR"}));
+            channels.push(json!({"sampler": sampler, "target": {"node": node, "path": path}}));
+        }
+        let animation = json!({"name": name, "channels": channels, "samplers": samplers});
+        let root = self
+            .json
+            .as_object_mut()
+            .ok_or_else(|| PackError::invalid("packed JSON", "expected object"))?;
+        let slot = root
+            .entry("animations".to_owned())
+            .or_insert_with(|| json!([]));
+        let animations = slot
+            .as_array_mut()
+            .ok_or_else(|| PackError::invalid("animations", "expected array"))?;
+        let position = position.min(animations.len());
+        animations.insert(position, animation);
+        Ok(position)
+    }
+
     /// Write the buffer length, frame the JSON and BIN chunks and return the GLB.
     pub fn finish(mut self) -> Result<Vec<u8>, PackError> {
         let buffer = self
@@ -398,6 +468,37 @@ impl PackWriter {
             accessor["max"] = json!([values.last()]);
         }
         self.append("accessors", accessor)
+    }
+
+    /// Append one `VEC3`/`VEC4` float accessor for an animation output.
+    ///
+    /// glTF requires `min`/`max` only on animation *input* accessors, so the
+    /// output carries none; `components` is 3 (translation) or 4 (rotation).
+    fn vec_floats(
+        &mut self,
+        values: &[f32],
+        components: usize,
+        count: usize,
+    ) -> Result<usize, PackError> {
+        let bytes: Vec<_> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let view = self.view(&bytes, &json!({}))?;
+        let kind = match components {
+            3 => "VEC3",
+            4 => "VEC4",
+            _ => {
+                return Err(PackError::invalid(
+                    "animation output",
+                    "expected VEC3 or VEC4",
+                ));
+            }
+        };
+        self.append(
+            "accessors",
+            json!({"bufferView": view, "componentType": 5126, "type": kind, "count": count}),
+        )
     }
 
     fn append(&mut self, array: &str, value: Value) -> Result<usize, PackError> {

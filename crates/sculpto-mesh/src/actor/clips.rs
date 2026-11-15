@@ -204,4 +204,15 @@ impl Actor {
     pub fn node_name(&self, node: usize) -> Option<&str> {
         self.document.nodes().nth(node).and_then(|node| node.name())
     }
+
+    /// Unique names of every mesh-bearing node, for sampling the whole actor.
+    pub fn mesh_parts(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        self.document
+            .nodes()
+            .filter(|node| node.mesh().is_some())
+            .filter_map(|node| node.name())
+            .filter(|name| seen.insert(*name))
+            .collect()
+    }
 }

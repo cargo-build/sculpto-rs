@@ -36,6 +36,8 @@ commands:
   actor sample [options] sample explicit GLB mesh nodes at REST or clip/time
   actor rig [options]   sample parts plus reduced rig graph/influences JSON
   actor pack-cloth [options] pack baked cloth into an unchanged GLB actor
+  actor pose [options]  probe named joints at explicit angles; posed GLB + report
+  actor gait [options]  generate a symmetric walk cycle from parameters; GLB + report
   inspect <path>        parse a document or a `.osd`/`.bsd` morph data file
   bake [options]        resolve a preset, apply it to a body NIF, write an OBJ
   batch [options]       bake every matching set in a project to OBJ files

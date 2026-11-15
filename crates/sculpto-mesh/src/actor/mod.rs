@@ -3,13 +3,17 @@
 mod animation;
 mod clips;
 mod decode;
+mod gait;
 mod geometry;
 mod packing;
+mod pose;
 mod rig;
 mod stress;
 
 pub use clips::{LocalRest, SourceChannel, SourceClip, SourceProperty, SourceValues};
+pub use gait::{GaitOutcome, GaitParameters, JointRange, gait, write_gait_clip};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
+pub use pose::{Axis, JointPose, JointProbe, PoseOutcome, PosedJoint, probe, write_probe_clip};
 pub use stress::{
     FrameRow, GarmentRow, PartAddress, StressError, StressPlan, StressPose, StressReport, stress,
 };

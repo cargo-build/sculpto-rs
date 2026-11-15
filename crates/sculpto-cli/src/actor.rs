@@ -1,6 +1,8 @@
 //! File and serialization surface for the pure actor sampler. @req DECL0013
 
+mod gait;
 mod pack;
+mod pose;
 mod rig;
 mod stress;
 
@@ -35,6 +37,12 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "stress") {
         return stress::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "pose") {
+        return pose::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "gait") {
+        return gait::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,
@@ -131,7 +139,7 @@ fn sample(arguments: Arguments<'_>) -> Result<(), String> {
     Ok(())
 }
 
-fn write_obj(path: &Path, sample: &Sample) -> Result<(), String> {
+pub(super) fn write_obj(path: &Path, sample: &Sample) -> Result<(), String> {
     let file = File::create(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut output = BufWriter::new(file);
     let write = |output: &mut BufWriter<File>| -> std::io::Result<()> {

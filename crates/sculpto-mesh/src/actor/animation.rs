@@ -56,6 +56,17 @@ pub(super) fn worlds(
             apply(actor, clip, selected, time, &mut transforms)?;
         }
     }
+    compose_worlds(actor, &transforms)
+}
+
+/// Parent-before-child world transforms for an explicit local-transform set.
+///
+/// Shared by clip evaluation and the joint-pose probe so both compose the same
+/// hierarchy the same way. @req DECL0013
+pub(super) fn compose_worlds(
+    actor: &Actor,
+    transforms: &[Transform],
+) -> Result<Vec<DMat4>, ActorError> {
     let mut worlds = vec![DMat4::IDENTITY; transforms.len()];
     actor.order.iter().try_for_each(|&index| {
         let local = transforms[index].matrix();

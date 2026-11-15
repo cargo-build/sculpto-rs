@@ -10,9 +10,9 @@ use super::{
 };
 
 /// A requested joint name resolved to its unique graph node.
-struct Resolved {
-    name: String,
-    node: usize,
+pub(super) struct Resolved {
+    pub(super) name: String,
+    pub(super) node: usize,
 }
 
 /// Sample the parts, then describe skin correspondence in a reduced rig.
@@ -46,7 +46,7 @@ pub(super) fn sample(
 }
 
 /// Requested joints are exact node names, each unique in the graph.
-fn resolve(actor: &Actor, joints: &[&str]) -> Result<Vec<Resolved>, ActorError> {
+pub(super) fn resolve(actor: &Actor, joints: &[&str]) -> Result<Vec<Resolved>, ActorError> {
     if joints.is_empty() {
         return Err(invalid(
             "actor rig selection",
