@@ -100,7 +100,8 @@ several cameras on consecutive ticks, `SCULPTO_VIEWER_DIR` receives
 Lighting is runtime PBR, not baked into the exported GLB (`viewer export` writes
 albedo and normals only). The interactive viewer defaults to **one key light** with
 `shadow_maps_enabled`, and spawns a matte ground so the cast shadow is visible: turn
-the figure with `T` and the shading and shadow move with the surface. `3` toggles the
+the figure with the default LMB drag and the shading and shadow move with the
+surface; `T` switches the drag to camera orbit. `3` toggles the
 optional three-point rig (fill and rim) when the far side is too dark to read;
 `SCULPTO_VIEWER_THREE_POINT` seeds it. `L` toggles lit/flat; flat hides the whole rig
 and ground and renders every material unlit, so a review shows the silhouette, the

@@ -222,7 +222,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title:
-                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset, L lit/flat, T turntable, 3 rig"
+                            "Sculpto cloth review — drag turns the figure (T camera orbit), RMB pan, wheel zoom, R reset, L lit/flat, 3 rig"
                                 .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -249,7 +249,10 @@ fn main() {
 
     app.insert_resource(FlatFlipped::default())
         .insert_resource(Turntable {
-            enabled: std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
+            // Interactive review starts in turntable: dragging turns the
+            // figure under the fixed key light, so the shading and the cast
+            // shadow move with it. `T` switches the drag to camera orbit.
+            enabled: config.interactive || std::env::var("SCULPTO_VIEWER_TURNTABLE").is_ok(),
             yaw: env_f32("SCULPTO_VIEWER_TURNTABLE_YAW", 0.0),
             pitch: 0.0,
         })
@@ -318,8 +321,8 @@ fn main() {
         .run();
 }
 
-/// `T` flips camera-orbit / turntable: a turntable turns the figure under a
-/// fixed key light, so the shading and the shadows move with the surface.
+/// `T` flips turntable / camera-orbit: the default drag turns the figure under
+/// a fixed key light, so the shading and the shadows move with the surface.
 fn toggle_turntable(
     config: Res<ViewerConfig>,
     keys: Res<ButtonInput<KeyCode>>,
