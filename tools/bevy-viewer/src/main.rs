@@ -169,8 +169,9 @@ fn main() {
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
-                        title: "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset"
-                            .to_string(),
+                        title:
+                            "Sculpto cloth review — drag LMB orbit, RMB pan, wheel zoom, R reset"
+                                .to_string(),
                         resolution: (1280, 900).into(),
                         ..default()
                     }),
@@ -301,6 +302,10 @@ fn setup(
             "viewer: morph_max={MAX_MORPH_WEIGHTS} at_cap_ok={at_cap} over_cap_error={over_cap:?}"
         );
     }
+    // Lab fixtures are authored in BodySlide units (71.4286 per metre), so the
+    // fixed review camera sits inside them. Scaling the loaded scene keeps the
+    // camera, lights and orbit speeds in metres for any source unit.
+    let scene_scale = env_f32("SCULPTO_VIEWER_SCALE", 1.0);
     let count = units.0.max(1);
     let columns = (count as f32).sqrt().ceil() as usize;
     let rows = count.div_ceil(columns);
@@ -369,7 +374,7 @@ fn setup(
         let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
         commands.spawn((
             bevy::world_serialization::WorldAssetRoot(scene.clone()),
-            Transform::from_xyz(x, 0.0, z),
+            Transform::from_xyz(x, 0.0, z).with_scale(Vec3::splat(scene_scale)),
         ));
     }
 }

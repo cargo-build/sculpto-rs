@@ -4,6 +4,11 @@ Headless Bevy proof harness for the baked cloth GLB. Loads the actor GLB and
 the `export_cloth_glb.py` output, renders one offscreen frame and writes
 `/tmp/sculpto-classify/cloth/bevy_cloth.png`.
 
+`--interactive` opens the same scene in a window so a baked result can be
+orbited and inspected instead of captured from one fixed view: drag **LMB** to
+orbit, **RMB** to pan, wheel to zoom, **R** to reset. The review window is the
+fast inspection loop; the 13-view contact sheet remains the fit evidence.
+
 Standalone crate (not a workspace member): it pulls Bevy, which is unrelated
 to the sculpto crates.
 
@@ -14,6 +19,27 @@ LD_LIBRARY_PATH=/run/opengl-driver/lib:<64-bit vulkan-loader>/lib \
 VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json \
 WGPU_BACKEND=vulkan ./target/debug/cloth-viewer
 ```
+
+The build needs the window, X11 and Vulkan development inputs that NixOS does
+not expose in a plain shell. Build and run inside the shipped shell, and pass
+the runtime ICD through:
+
+```sh
+nix-shell shell.nix --run 'cargo build -j 2'
+nix-shell shell.nix --run '
+  LD_LIBRARY_PATH=/run/opengl-driver/lib:$(echo "$NIX_LDFLAGS" |
+    grep -o -- "-L[^ ]*" | sed "s/^-L//" | paste -sd:):$LD_LIBRARY_PATH \
+  VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json \
+  WGPU_BACKEND=vulkan \
+  ./target/debug/cloth-viewer --interactive \
+    --glb ~/Models/sculpto-cloth-fixture-20261115/peanut-r105.glb'
+```
+
+`SCULPTO_VIEWER_SCALE` multiplies the loaded scene before the fixed camera and
+lights see it. BodySlide-authored fixtures are in lab units (71.4286 per
+metre), so the peanut bake needs `SCULPTO_VIEWER_SCALE=0.014`; a metre-scale
+GLB keeps the default `1.0`. The scale applies to `--report` too, where it
+does not change counts.
 
 Two animation facts learned the hard way (2026-11-02, after every capture
 turned out to be a frozen still): Bevy's facade feature `bevy_animation`
