@@ -304,9 +304,10 @@ pub fn repair_head_boundaries(
     head: [[f32; 3]; 2],
     margin: f32,
     cap: usize,
+    body: std::ops::Range<usize>,
 ) -> Result<(WeldReport, HoleFillReport), HoleFillError> {
     let weld = weld_head_components(positions, triangles, head, margin)?;
-    let holes = fill_head_components(positions, triangles, head, margin, cap)?;
+    let holes = fill_head_components(positions, triangles, head, margin, cap, &body)?;
     Ok((weld, holes))
 }
 
@@ -482,6 +483,7 @@ fn fill_head_components(
     head: [[f32; 3]; 2],
     margin: f32,
     cap: usize,
+    body: &std::ops::Range<usize>,
 ) -> Result<HoleFillReport, HoleFillError> {
     let components = boundary_components(triangles, positions)?;
     let mut report = HoleFillReport::default();
@@ -495,7 +497,10 @@ fn fill_head_components(
                 .iter()
                 .map(|vertex| {
                     let p = positions[*vertex as usize];
-                    ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2) + (p[2] - center[2]).powi(2)).sqrt()
+                    ((p[0] - center[0]).powi(2)
+                        + (p[1] - center[1]).powi(2)
+                        + (p[2] - center[2]).powi(2))
+                    .sqrt()
                 })
                 .fold(0.0_f32, f32::max);
             let lift = 0.30 * radius;
@@ -538,6 +543,53 @@ fn fill_head_components(
             .collect();
         if boundary.len() < 3 {
             report.left_open.push(vertices.len());
+            continue;
+        }
+        // A nape rim sits above the torso neck: bridge it down to the nearest
+        // body vertices instead of closing a lid above the gap. Only a rim
+        // whose body neighbour is below and within reach qualifies; an ear or
+        // an eye puncture stays a flat cap.
+        let mut skirt = Vec::with_capacity(boundary.len());
+        let mut skirted = true;
+        for (from, to) in &boundary {
+            let midpoint = [
+                (positions[*from as usize][0] + positions[*to as usize][0]) * 0.5,
+                (positions[*from as usize][1] + positions[*to as usize][1]) * 0.5,
+                (positions[*from as usize][2] + positions[*to as usize][2]) * 0.5,
+            ];
+            let mut nearest: Option<(f32, usize)> = None;
+            for candidate in body.clone() {
+                let p = positions[candidate];
+                let distance = (p[0] - midpoint[0]).powi(2)
+                    + (p[1] - midpoint[1]).powi(2)
+                    + (p[2] - midpoint[2]).powi(2);
+                if nearest.is_none_or(|(best, _)| distance < best) {
+                    nearest = Some((distance, candidate));
+                }
+            }
+            let Some((distance, candidate)) = nearest else {
+                skirted = false;
+                break;
+            };
+            let reach = 10.0_f32;
+            if distance.sqrt() > reach || positions[candidate][2] > center[2] + 0.5 {
+                skirted = false;
+                break;
+            }
+            skirt.push((*from, *to, candidate as u32));
+        }
+        if skirted && !skirt.is_empty() {
+            let before = triangles.len();
+            for (from, to, body_vertex) in skirt {
+                triangles.push([to, from, body_vertex]);
+            }
+            report.filled.push(FilledHole {
+                vertices: vertices.len(),
+                area: 0.0,
+                centroid: center,
+                triangles: triangles.len() - before,
+            });
+            report.added_triangles += triangles.len() - before;
             continue;
         }
         let center_index = positions.len() as u32;

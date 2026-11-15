@@ -326,6 +326,11 @@ pub(crate) fn assemble(input: &Value) -> Result<Value, CommandError> {
                     .fold(0.0_f32, f32::max);
             (min, max, margin)
         });
+    let body_range = parts
+        .iter()
+        .find(|part| part.role == Role::Head)
+        .map(|part| 0..part.vertex_offset)
+        .unwrap_or(0..0);
     let head_seal_repair = match (sealed.as_mut(), head_box) {
         (Some(outcome), Some((min, max, margin))) => Some(
             hole_fill::repair_head_boundaries(
@@ -334,6 +339,7 @@ pub(crate) fn assemble(input: &Value) -> Result<Value, CommandError> {
                 [min, max],
                 margin,
                 DEFAULT_HOLE_VERTEX_CAP,
+                body_range.clone(),
             )
             .map_err(|error| {
                 CommandError::new(
