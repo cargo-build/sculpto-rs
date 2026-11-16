@@ -354,6 +354,19 @@ impl Actor {
         animation::locals(self, &[], pose)
     }
 
+    /// Every node's local translation and rotation at one pose.
+    ///
+    /// The pair a compensated application needs: the rotation for the bone's
+    /// frame, the translation for its child's pivot, so a world delta can be
+    /// turned into a direction instead of rotating whatever axis this rig's bones
+    /// happen to use.
+    ///
+    /// # Errors
+    /// The same clip refusals as [`Actor::skeleton_worlds`].
+    pub fn skeleton_transforms(&self, pose: Pose<'_>) -> Result<Vec<(DVec3, DQuat)>, ActorError> {
+        animation::local_poses(self, &[], pose)
+    }
+
     /// Reduced skin correspondence for the same explicit parts and pose.
     /// @req DECL0013
     pub fn rig_sample(

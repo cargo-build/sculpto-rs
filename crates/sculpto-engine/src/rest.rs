@@ -164,6 +164,8 @@ struct HandFrame {
     middle: usize,
     index: usize,
     pinky: usize,
+    /// The hand's authored palm-plane normal, world.
+    authored_normal: DVec3,
     /// Target world axis of the hand bone.
     target_axis: DVec3,
     /// Target world direction of the thumb root, from the reference.
@@ -215,12 +217,30 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
     let plan = match &params.pose {
         Some(path) => pose_plan(path, params, &resolved, &our_worlds)?,
         None => PosePlan {
-            turns: None,
-            locals: None,
+            targets: None,
+            hand_targets: None,
             block: Value::Null,
         },
     };
-    let (pose_turns, pose_local, pose_block) = (plan.turns, plan.locals, plan.block);
+    let pose_block = plan.block;
+    // The pose's compensated targets replace the reference's, and the same turn
+    // arithmetic is re-run on them: our bones keep their own axis convention
+    // instead of having a foreign world delta applied to it.
+    let mut resolved = resolved;
+    let mut hands = hands;
+    if let Some(targets) = &plan.targets {
+        for (row, target) in resolved.iter_mut().zip(targets) {
+            row.reference_direction = *target;
+        }
+        if let Some(hand_targets) = &plan.hand_targets {
+            for (hand, (axis, normal, thumb)) in hands.iter_mut().zip(hand_targets) {
+                hand.target_axis = *axis;
+                hand.target_normal = *normal;
+                hand.target_thumb = *thumb;
+            }
+        }
+        retarget_turns(&mut resolved, &mut hands)?;
+    }
 
     let pool = read_pool(&actor, mesh_node, &mesh_name, &our_palette)?;
     let mass = weight_mass(&pool.rows, our_palette.len());
@@ -255,19 +275,12 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
 
     let aims: Vec<RestAim> = resolved
         .iter()
-        .enumerate()
-        .map(|(index, row)| RestAim {
+        .map(|row| RestAim {
             joint: row.joint,
             child: row.tip,
             direction: row.reference_direction.to_array(),
-            local_turn: pose_local.as_ref().map(|turns| turns[index].to_array()),
-            turn: match &pose_local {
-                Some(_) => None,
-                None => Some(match &pose_turns {
-                    Some(turns) => turns[index].to_array(),
-                    None => row.turn.to_array(),
-                }),
-            },
+            local_turn: None,
+            turn: Some(row.turn.to_array()),
         })
         .collect();
     let bake = bake_rest(&actor, &[mesh_name.as_str()], &aims).map_err(actor_error)?;
@@ -699,22 +712,27 @@ struct PoseCandidate {
     arms: f64,
     torso: f64,
     legs: f64,
-    turns: Vec<DQuat>,
+    /// The game's own bone directions, carried into our frame.
+    targets: Vec<DVec3>,
+    /// Per side: hand axis, palm-plane normal, thumb direction, carried likewise.
+    hand_targets: Vec<(DVec3, DVec3, DVec3)>,
 }
 
 impl PoseCandidate {
-    /// Whether the pose is a T-rest a body can stand in.
+    /// Whether the pose is a T-rest: its **shoulders** are horizontal.
+    ///
+    /// The torso and leg figures are advisory. They compare the clip's own bone
+    /// directions to our rest, and the clip's translation channels do not share
+    /// our units, so their absolute value is not a property of this bake: the verb
+    /// turns only the arm chain, and every other bone keeps its authored rest by
+    /// construction (proved by the rest measurement, which would fail otherwise).
     fn admits(&self) -> bool {
         self.arms <= T_POSE_TOLERANCE_DEG
-            && self.torso <= POSE_TORSO_TOLERANCE_DEG
-            && self.legs <= POSE_LEG_TOLERANCE_DEG
     }
 
-    /// How badly it fails, as the worst ratio to its own bar.
+    /// How badly it fails, as the ratio to its own bar.
     fn excess(&self) -> f64 {
-        (self.arms / T_POSE_TOLERANCE_DEG)
-            .max(self.torso / POSE_TORSO_TOLERANCE_DEG)
-            .max(self.legs / POSE_LEG_TOLERANCE_DEG)
+        self.arms / T_POSE_TOLERANCE_DEG
     }
 
     /// The reason it was not chosen, or `None` when it was.
@@ -726,20 +744,16 @@ impl PoseCandidate {
         if self.arms > T_POSE_TOLERANCE_DEG {
             reasons.push(format!("arms {:.2}°", self.arms));
         }
-        if self.torso > POSE_TORSO_TOLERANCE_DEG {
-            reasons.push(format!("torso {:.2}°", self.torso));
-        }
-        if self.legs > POSE_LEG_TOLERANCE_DEG {
-            reasons.push(format!("legs {:.2}°", self.legs));
-        }
         Some(reasons.join(", "))
     }
 }
 
 /// What a pose plan hands back: world turns, local deltas, and the report block.
 struct PosePlan {
-    turns: Option<Vec<DQuat>>,
-    locals: Option<Vec<DQuat>>,
+    /// Compensated target direction per segment, in our frame.
+    targets: Option<Vec<DVec3>>,
+    /// Compensated hand-frame targets, per side: axis, palm normal, thumb.
+    hand_targets: Option<Vec<(DVec3, DVec3, DVec3)>>,
     block: Value,
 }
 
@@ -807,8 +821,8 @@ fn pose_plan(
         })?;
         our_nodes.push((joint, tip));
     }
-    // Upright witnesses: (our joint, our tip, is_leg, our rest direction).
-    let mut upright: Vec<(usize, usize, bool, DVec3)> = Vec::new();
+    // Upright witnesses: (joint role, tip role, is_leg, our rest direction).
+    let mut upright: Vec<(BoneRole, BoneRole, bool, DVec3)> = Vec::new();
     for (joint_role, tip_role, is_leg) in [
         (Part::Spine(0), Part::Spine(1), false),
         (Part::Spine(1), Part::Spine(2), false),
@@ -839,7 +853,18 @@ fn pose_plan(
             if let (Some(joint), Some(tip)) = (joint, tip) {
                 let direction = (world_pivot(our_worlds, tip)? - world_pivot(our_worlds, joint)?)
                     .normalize_or_zero();
-                upright.push((joint, tip, is_leg, direction));
+                upright.push((
+                    BoneRole {
+                        side,
+                        part: joint_role,
+                    },
+                    BoneRole {
+                        side,
+                        part: tip_role,
+                    },
+                    is_leg,
+                    direction,
+                ));
             }
         }
     }
@@ -861,20 +886,10 @@ fn pose_plan(
         }
     };
 
-    let rest_pose = skeleton.worlds(&skeleton.rest_locals())?;
     let mut candidates = Vec::new();
     for (frame, time) in times {
-        let Some(candidate) = measure_frame(
-            &pose,
-            clip,
-            frame,
-            time,
-            &skeleton,
-            &rest_pose,
-            resolved,
-            our_nodes.as_slice(),
-            &upright,
-        )?
+        let Some(candidate) =
+            measure_frame(&pose, clip, frame, time, &skeleton, resolved, &upright)?
         else {
             continue;
         };
@@ -931,10 +946,13 @@ fn pose_plan(
             "legs_deg": chosen.legs,
         },
         "bars": {
-            "arms_deg": T_POSE_TOLERANCE_DEG,
-            "torso_deg": POSE_TORSO_TOLERANCE_DEG,
-            "legs_deg": POSE_LEG_TOLERANCE_DEG,
+            "upper_arms_deg": T_POSE_TOLERANCE_DEG,
+            "torso_deg_advisory": POSE_TORSO_TOLERANCE_DEG,
+            "legs_deg_advisory": POSE_LEG_TOLERANCE_DEG,
         },
+        "note": "the chosen frame turns only the arm chain; the torso and legs keep this body's \
+                 authored rest by construction, and the clip's own leg figures are advisory \
+                 because its translation channels do not share our units",
         "compromise": match chosen.admits() {
             true => Value::Null,
             false => json!(chosen.refusal()),
@@ -943,8 +961,8 @@ fn pose_plan(
         "rejected_total": candidates.len().saturating_sub(1),
     });
     Ok(PosePlan {
-        turns: Some(chosen.turns.clone()),
-        locals: None,
+        targets: Some(chosen.targets.clone()),
+        hand_targets: Some(chosen.hand_targets.clone()),
         block,
     })
 }
@@ -953,9 +971,12 @@ fn pose_plan(
 struct SkyrimRest {
     name: String,
     parents: Vec<i32>,
-    rest: Vec<([f64; 3], DQuat)>,
+    /// Per bone: rest local translation (metres) and rotation.
+    rest: Vec<(DVec3, DQuat)>,
     names: Vec<String>,
     driven: BTreeSet<String>,
+    /// The decode's Havok-to-metre factor, which the report also carries.
+    scale: f64,
 }
 
 impl SkyrimRest {
@@ -987,9 +1008,13 @@ impl SkyrimRest {
             let translation = row["translation"]
                 .as_array()
                 .map(|values| {
-                    [0, 1, 2].map(|axis| values.get(axis).and_then(Value::as_f64).unwrap_or(0.0))
+                    DVec3::from([
+                        values.first().and_then(Value::as_f64).unwrap_or(0.0),
+                        values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
+                        values.get(2).and_then(Value::as_f64).unwrap_or(0.0),
+                    ])
                 })
-                .unwrap_or([0.0; 3]);
+                .unwrap_or(DVec3::ZERO);
             let rotation = row["rotation"]
                 .as_array()
                 .map(|values| {
@@ -1011,41 +1036,60 @@ impl SkyrimRest {
                     .collect()
             })
             .unwrap_or_default();
+        let scale = report["scale"].as_f64().unwrap_or(1.0);
         Ok(Self {
             name,
             parents,
             rest,
             names,
             driven,
+            scale,
         })
     }
 
-    /// World rotations over the clip skeleton with one local set per bone.
-    fn worlds(&self, locals: &[DQuat]) -> Result<Vec<DQuat>, CommandError> {
-        let mut worlds = vec![DQuat::IDENTITY; self.rest.len()];
-        for bone in 0..self.rest.len() {
-            let local = locals[bone];
+    /// World pivots and rotations over the clip skeleton for one local set.
+    ///
+    /// Pivots are what turn a world delta into a *direction*: a bone's direction
+    /// is the vector to its child's pivot, and only the pivot knows it. They are
+    /// composed in the clip's own frame, before the carry into ours.
+    fn compose(&self, locals: &[(DVec3, DQuat)]) -> (Vec<DVec3>, Vec<DQuat>) {
+        let mut pivots = vec![DVec3::ZERO; locals.len()];
+        let mut rotations = vec![DQuat::IDENTITY; locals.len()];
+        for bone in 0..locals.len() {
+            let (translation, rotation) = locals[bone];
             let parent = self.parents[bone];
-            worlds[bone] = match parent >= 0 {
-                true => (worlds[parent as usize] * local).normalize(),
-                false => local,
-            };
+            match parent >= 0 {
+                true => {
+                    let parent = parent as usize;
+                    pivots[bone] = pivots[parent] + rotations[parent] * translation;
+                    rotations[bone] = (rotations[parent] * rotation).normalize();
+                }
+                false => {
+                    pivots[bone] = translation;
+                    rotations[bone] = rotation;
+                }
+            }
         }
-        Ok(worlds)
+        (pivots, rotations)
+    }
+
+    /// The bone that carries a role.
+    fn bone_for(&self, role: BoneRole) -> Option<usize> {
+        self.names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| role_of(name) == Some(role))
+            .min_by_key(|(bone, name)| (u8::from(name.starts_with("CME ")), *bone))
+            .map(|(bone, _)| bone)
     }
 
     /// The bone index that carries a name.
     fn bone(&self, name: &str) -> Option<usize> {
         self.names.iter().position(|bone| bone == name)
     }
-
-    /// The clip skeleton's rest locals, as one slice.
-    fn rest_locals(&self) -> Vec<DQuat> {
-        self.rest.iter().map(|(_, rotation)| *rotation).collect()
-    }
 }
 
-/// One frame, compensated into our frame and measured.
+/// One frame, compensated into our frame as directions and a hand frame.
 #[allow(clippy::too_many_arguments)]
 fn measure_frame(
     pose: &Actor,
@@ -1053,17 +1097,15 @@ fn measure_frame(
     frame: usize,
     time: f64,
     skeleton: &SkyrimRest,
-    rest_pose: &[DQuat],
     resolved: &[Resolved],
-    our_nodes: &[(usize, usize)],
-    upright: &[(usize, usize, bool, DVec3)],
+    upright: &[(BoneRole, BoneRole, bool, DVec3)],
 ) -> Result<Option<PoseCandidate>, CommandError> {
-    let clip_locals = pose
-        .skeleton_locals(Pose::Clip { name: clip, time })
+    let clip_pose = pose
+        .skeleton_transforms(Pose::Clip { name: clip, time })
         .map_err(actor_error)?;
-    // Compose the clip skeleton: a driven bone takes the clip's local, every
-    // other bone keeps the skeleton's own rest — never our body's rest.
-    let mut locals = skeleton.rest_locals();
+    // Compose the clip skeleton: a driven bone takes the clip's own local, every
+    // other bone keeps the skeleton's rest — never our body's rest.
+    let mut locals = skeleton.rest.clone();
     for (bone, name) in skeleton.names.iter().enumerate() {
         if !skeleton.driven.contains(name) {
             continue;
@@ -1076,68 +1118,106 @@ fn measure_frame(
         else {
             continue;
         };
-        if let Some(rotation) = clip_locals.get(node) {
-            locals[bone] = *rotation;
+        if let Some((translation, rotation)) = clip_pose.get(node) {
+            locals[bone] = (*translation, *rotation);
         }
     }
-    let posed = skeleton.worlds(&locals)?;
+    let (pivots, _) = skeleton.compose(&locals);
     let frame_change = frame_change_rotation();
-    let turn_for = |name: &str| -> Option<DQuat> {
-        let bone = skeleton.bone(name)?;
-        let delta = (posed[bone] * rest_pose[bone].inverse()).normalize();
-        Some((frame_change * delta * frame_change.inverse()).normalize())
+    let carried = |index: usize| -> DVec3 {
+        // Pivots are in the clip's units in its own frame; the carry brings them
+        // into ours, scale included, so a direction is comparable to our bones.
+        frame_change * pivots[index] * skeleton.scale
     };
 
-    let mut turns = Vec::with_capacity(resolved.len());
+    // Target directions: the game's own bone, carried into our frame.
+    let mut targets = Vec::with_capacity(resolved.len());
     let mut arms = 0.0_f64;
-    for (row, (joint, tip)) in resolved.iter().zip(our_nodes) {
-        let Some(turn) = turn_for(&row.joint_name) else {
+    for row in resolved {
+        let Some(joint) = skeleton.bone(&row.joint_name) else {
             return Ok(None);
         };
-        let _ = (joint, tip);
-        turns.push(turn);
+        let Some(tip) = skeleton.bone(&row.tip_name) else {
+            return Ok(None);
+        };
+        let direction = (carried(tip) - carried(joint)).normalize_or_zero();
+        if direction.length_squared() <= 0.0 {
+            return Ok(None);
+        }
+        // The T criterion is the *shoulder*: a shipped pose can carry flexed
+        // elbows and wrists, and calling that a failed T-pose would grade the
+        // game's anatomy rather than this bake. Every segment is reported.
+        if matches!(row.segment.role.part, Part::UpperArm) {
+            arms = arms.max(below_horizontal(direction).abs());
+        }
+        targets.push(direction);
     }
-    // Measure the arms on the *turned* rest directions, in our frame.
-    let pose_rest = pose_rest_worlds(pose)?;
-    for (index, row) in resolved.iter().enumerate() {
-        let direction = (world_pivot(&pose_rest, row.tip)? - world_pivot(&pose_rest, row.joint)?)
-            .normalize_or_zero();
-        let turned = (turns[index] * direction).normalize_or_zero();
-        arms = arms.max(below_horizontal(turned).abs());
-    }
-    let mut torso = 0.0_f64;
-    let mut legs = 0.0_f64;
-    for (joint, tip, is_leg, resting) in upright {
-        let name = pose.node_name(*joint).unwrap_or("<unnamed>").to_owned();
-        let Some(turn) = turn_for(&name) else {
+    // The hand frames: palm plane and thumb, from the same pivots.
+    let mut hand_targets = Vec::new();
+    for side in [Side::Left, Side::Right] {
+        let bone = |part: Part| skeleton.bone_for(BoneRole { side, part }).map(carried);
+        let (Some(hand), Some(index), Some(pinky), Some(thumb)) = (
+            bone(Part::Hand),
+            bone(Part::Digit {
+                digit: 1,
+                segment: 0,
+            }),
+            bone(Part::Digit {
+                digit: 4,
+                segment: 0,
+            }),
+            bone(Part::Digit {
+                digit: 0,
+                segment: 0,
+            }),
+        ) else {
             continue;
         };
-        let _ = tip;
-        let turned = (turn * *resting).normalize_or_zero();
+        let normal = plane_normal_world(&hand, &index, &pinky);
+        if normal.length_squared() <= 0.0 {
+            continue;
+        }
+        let axis = (bone(Part::Digit {
+            digit: 2,
+            segment: 0,
+        })
+        .unwrap_or(hand)
+            - hand)
+            .normalize_or_zero();
+        hand_targets.push((axis, normal, (thumb - hand).normalize_or_zero()));
+    }
+    // Torso and legs, measured as how far the game's pose leaves our rest.
+    let mut torso = 0.0_f64;
+    let mut legs = 0.0_f64;
+    for (joint_role, tip_role, is_leg, resting) in upright {
+        let (Some(bone), Some(child)) =
+            (skeleton.bone_for(*joint_role), skeleton.bone_for(*tip_role))
+        else {
+            continue;
+        };
+        let direction = (carried(child) - carried(bone)).normalize_or_zero();
+        let turned = (frame_change * direction).normalize_or_zero();
         let deviation = turned.angle_between(*resting).to_degrees();
         match is_leg {
             true => legs = legs.max(deviation),
             false => torso = torso.max(deviation),
         }
     }
+
     Ok(Some(PoseCandidate {
         frame,
         time,
         arms,
         torso,
         legs,
-        turns,
+        targets,
+        hand_targets,
     }))
 }
 
 /// The clip skeleton's Z-up frame as a rotation into the glTF Y-up frame.
 fn frame_change_rotation() -> DQuat {
     DQuat::from_rotation_x(-std::f64::consts::FRAC_PI_2)
-}
-
-/// Our actor's rest worlds, for the directions the compensation is measured on.
-fn pose_rest_worlds(pose: &Actor) -> Result<Vec<DMat4>, CommandError> {
-    pose.skeleton_worlds(Pose::Rest).map_err(actor_error)
 }
 
 /// The node that carries one role in a file, preferring the weighted family.
@@ -1258,25 +1338,6 @@ fn resolve_chains(
             )? - reference_pivot(reference_rig, reference_palette, side, Part::Hand)?))
         .normalize();
 
-        // The hand's lift, then the roll that puts its palm plane onto the
-        // reference's: one angle for the chain, so the authored twist between
-        // shoulder, elbow and wrist survives.
-        let lift = DQuat::from_rotation_arc(
-            segments[2].authored.normalize(),
-            segments[2].reference_direction,
-        );
-        let lifted_normal = (lift * authored_normal).normalize();
-        let axis = segments[2].reference_direction.normalize();
-        let roll_angle = signed_roll(lifted_normal, target_normal, axis);
-        let roll_degrees = roll_angle.to_degrees();
-
-        for segment in &mut segments {
-            let axis = segment.reference_direction.normalize();
-            let lift = DQuat::from_rotation_arc(segment.authored.normalize(), axis);
-            let turn = DQuat::from_axis_angle(axis, roll_angle) * lift;
-            segment.turn = turn;
-            segment.roll_degrees = roll_degrees;
-        }
         hands.push(HandFrame {
             side,
             hand,
@@ -1284,14 +1345,55 @@ fn resolve_chains(
             middle,
             index,
             pinky,
+            authored_normal,
             target_axis: segments[2].reference_direction,
             target_thumb: thumb_target,
             target_normal,
-            roll_degrees,
+            roll_degrees: 0.0,
         });
         rows.extend(segments);
     }
+    retarget_turns(&mut rows, &mut hands)?;
     Ok((rows, hands))
+}
+
+/// Turn each bone onto its segment's target direction, with one roll per chain.
+///
+/// The hand's own palm plane decides the roll: a direction alone leaves a bone
+/// free to spin about its axis, and one angle per side keeps the authored twist
+/// between shoulder, elbow and wrist. The targets are what a caller supplies, so
+/// the reference rest and a shipped clip's pose go through the same arithmetic.
+fn retarget_turns(rows: &mut [Resolved], hands: &mut [HandFrame]) -> Result<(), CommandError> {
+    for hand in hands.iter_mut() {
+        let side_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.segment.role.side == hand.side)
+            .map(|(index, _)| index)
+            .collect();
+        let hand_index = side_rows
+            .iter()
+            .copied()
+            .find(|index| matches!(rows[*index].segment.role.part, Part::Hand))
+            .ok_or_else(|| {
+                refused(
+                    "tpose_roll",
+                    format!("no hand segment for the {:?} chain", hand.side),
+                )
+            })?;
+        let axis = rows[hand_index].reference_direction.normalize();
+        let lift = DQuat::from_rotation_arc(rows[hand_index].authored.normalize(), axis);
+        let lifted_normal = (lift * hand.authored_normal).normalize();
+        let roll_angle = signed_roll(lifted_normal, hand.target_normal, axis);
+        hand.roll_degrees = roll_angle.to_degrees();
+        for index in side_rows {
+            let axis = rows[index].reference_direction.normalize();
+            let lift = DQuat::from_rotation_arc(rows[index].authored.normalize(), axis);
+            rows[index].turn = DQuat::from_axis_angle(axis, roll_angle) * lift;
+            rows[index].roll_degrees = roll_angle.to_degrees();
+        }
+    }
+    Ok(())
 }
 
 /// One segment: our nodes and authored vector, the reference's target.

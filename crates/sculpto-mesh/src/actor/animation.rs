@@ -96,6 +96,50 @@ pub(super) fn locals(
         .collect())
 }
 
+/// One pose's own local translation and rotation per node.
+///
+/// A retarget needs both halves: the rotation carries a bone's frame, the
+/// translation carries its child's pivot, and only the pivot turns a world delta
+/// into a direction.
+pub(super) fn local_poses(
+    actor: &Actor,
+    selected: &[usize],
+    pose: Pose<'_>,
+) -> Result<Vec<(DVec3, DQuat)>, ActorError> {
+    let mut transforms = actor.transforms.clone();
+    if let Pose::Clip { name, time } = pose {
+        let clips: Vec<_> = actor
+            .document()
+            .animations()
+            .filter(|clip| clip.name() == Some(name))
+            .collect();
+        let clip = match clips.as_slice() {
+            [clip] => clip,
+            _ => {
+                return Err(ActorError::Clip {
+                    name: name.to_owned(),
+                    matches: clips.len(),
+                });
+            }
+        };
+        apply(actor, clip, selected, time, &mut transforms)?;
+    }
+    Ok(transforms
+        .into_iter()
+        .map(|transform| match transform {
+            Transform::Matrix(matrix) => {
+                let (_, rotation, translation) = matrix.to_scale_rotation_translation();
+                (translation, rotation)
+            }
+            Transform::Trs {
+                translation,
+                rotation,
+                ..
+            } => (translation, rotation),
+        })
+        .collect())
+}
+
 /// Parent-before-child world transforms for an explicit local-transform set.
 ///
 /// Shared by clip evaluation and the joint-pose probe so both compose the same
