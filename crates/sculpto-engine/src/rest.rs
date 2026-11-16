@@ -800,30 +800,23 @@ fn pose_plan(
     let (_, end) = pose.clip_span(clip).map_err(actor_error)?;
     let frames = ((end * SKYRIM_CLIP_FPS).round() as usize).max(1);
     let skeleton = SkyrimRest::read(rest_path)?;
-
-    // The pose file carries our nodes; the clip's values are the clip skeleton's.
-    let node_by_name = |name: &str| -> Option<usize> {
-        pose.document()
-            .nodes()
-            .find(|node| node.name() == Some(name))
-            .map(|node| node.index())
-    };
-    let mut our_nodes = Vec::new();
-    for row in resolved {
-        let joint = node_by_name(&row.joint_name).ok_or_else(|| {
-            refused(
-                "tpose_pose",
-                format!("the pose file carries no bone {:?}", row.joint_name),
-            )
-        })?;
-        let tip = node_by_name(&row.tip_name).ok_or_else(|| {
-            refused(
-                "tpose_pose",
-                format!("the pose file carries no bone {:?}", row.tip_name),
-            )
-        })?;
-        our_nodes.push((joint, tip));
+    if skeleton.driven.is_empty() {
+        return Err(refused(
+            "tpose_pose",
+            format!(
+                "{} binds no clip track to any palette bone, so its pose would be the skeleton's \
+                 rest and the bake would look like a no-op; decode the clip with --actor set to \
+                 an actor that carries the clip skeleton's own bone names",
+                rest_path.display()
+            ),
+        ));
     }
+
+    // Nothing here is resolved by *our* bone names: the pose file is the clip
+    // skeleton's own document, and the body this bakes onto may name the same
+    // anatomy differently (`mixamorig:LeftArm` against `NPC L UpperArm [LUar]`).
+    // Every lookup below goes through a role.
+
     // Upright witnesses: (joint role, tip role, is_leg, our rest direction).
     let mut upright: Vec<(BoneRole, BoneRole, bool, DVec3)> = Vec::new();
     for (joint_role, tip_role, is_leg) in [
