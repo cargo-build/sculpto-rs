@@ -72,6 +72,13 @@ fn align(bin: &mut Vec<u8>) {
 
 /// Build one skinned, animated GLB whose clip is named `walk`.
 fn skeleton(bones: &[Bone], clip: &[Channel]) -> Vec<u8> {
+    let (document, bin) = skeleton_document(bones, clip);
+    frame(document, bin)
+}
+
+/// The document before the GLB container wraps it, so a test can extend the
+/// node list — the duplicate rig copy does.
+fn skeleton_document(bones: &[Bone], clip: &[Channel]) -> (Value, Vec<u8>) {
     let mut bin: Vec<u8> = Vec::new();
     let mut views: Vec<Value> = Vec::new();
     let mut accessors: Vec<Value> = Vec::new();
@@ -282,7 +289,7 @@ fn skeleton(bones: &[Bone], clip: &[Channel]) -> Vec<u8> {
             false => json!([{"name": "walk", "channels": channels, "samplers": samplers}]),
         },
     });
-    frame(document, bin)
+    (document, bin)
 }
 
 /// The synthetic body: a `COM` root carrying the spine beside the pelvis, so
@@ -349,6 +356,48 @@ fn write_artifact(name: &str, bones: &[Bone], clip: &[Channel]) -> std::path::Pa
     let path = std::env::temp_dir().join(format!("sculpto-rig-regression-test-{name}.glb"));
     std::fs::write(&path, skeleton(bones, clip)).expect("a test artifact writes");
     path
+}
+
+/// The museum fixture's shape: the skin-bound armature plus a duplicate rig
+/// copy that repeats every bone name, referenced by no skin and no mesh.
+/// Returns the document node index of the copy's first bone.
+fn write_duplicate_named_source(
+    name: &str,
+    bones: &[Bone],
+    clip: &[Channel],
+) -> (std::path::PathBuf, usize) {
+    let (mut document, bin) = skeleton_document(bones, clip);
+    let count = bones.len();
+    // Document nodes: 0 armature, 1..=count bones, count+1 mesh, so the
+    // copy starts right after the mesh node.
+    let offset = count + 2;
+    let nodes = document["nodes"].as_array_mut().expect("nodes");
+    let copy_roots: Vec<usize> = bones
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| definition.parent.is_none())
+        .map(|(index, _)| offset + index)
+        .collect();
+    for (index, definition) in bones.iter().enumerate() {
+        let children: Vec<usize> = bones
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| other.parent == Some(index))
+            .map(|(child, _)| offset + child)
+            .collect();
+        nodes.push(json!({
+            "name": definition.name,
+            "translation": definition.translation,
+            "children": children,
+        }));
+    }
+    let armature_children = nodes[0]["children"]
+        .as_array_mut()
+        .expect("armature children");
+    armature_children.extend(copy_roots.iter().map(|root| json!(root)));
+    let path = std::env::temp_dir().join(format!("sculpto-rig-regression-test-{name}.glb"));
+    std::fs::write(&path, frame(document, bin)).expect("a test artifact writes");
+    (path, offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +756,81 @@ fn the_harness_names_the_rows_the_broken_transfer_breaks() {
         failed,
         vec!["synthetic/adapted:spine_lateral"],
         "the whole verdict: {report}"
+    );
+}
+
+/// The museum Mixamo fixture carries two nodes per bone name — a duplicate
+/// rig copy beside the animation armature — and every name-keyed lookup
+/// refused, so the `mixamo-source` rows reported `unavailable`. The
+/// resolution binds the skin-referenced node, the reference block says which
+/// node won, and the rows measure. @req BODY-01 (0161)
+#[test]
+fn a_duplicate_named_source_resolves_to_the_skin_and_the_row_measures() {
+    let bones = body();
+    let plain = write_artifact("dupref-plain", &bones, &carriage(31));
+    let (duplicate, offset) = write_duplicate_named_source("dupref-source", &bones, &carriage(31));
+    // `Hips` is bone 1: the skin's node 2, the copy's node offset + 1.
+    let params = RegressionParams {
+        actors: vec![RegressionActor {
+            name: "synthetic".to_owned(),
+            default: plain.clone(),
+            adapted: plain,
+            default_clip: "walk".to_owned(),
+            adapted_clip: "walk".to_owned(),
+            stress_anchor_clip: None,
+            stress_clips: Vec::new(),
+            body: "Body".to_owned(),
+            garments: Vec::new(),
+            source: Some(duplicate),
+            source_clip: Some("walk".to_owned()),
+            native: None,
+            native_clip: None,
+        }],
+        frames: 8,
+        tolerance: 0.0021,
+        report: None,
+    };
+    let report = run_params(&params).expect("the duplicate-named source measures");
+    let reference = &report["actors"][0]["source_reference"];
+    assert!(
+        reference["spine"]["peak_lateral_tilt_deg"].is_number()
+            && reference["clearance"].is_object(),
+        "the reference row measures instead of reporting unavailable: {reference}"
+    );
+    let resolution = &reference["joint_resolution"];
+    let rows = resolution["disambiguated"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a resolution report: {reference}"));
+    assert_eq!(
+        rows.len(),
+        bones.len(),
+        "the copy repeats every bone name, so every name tie-breaks: {resolution}"
+    );
+    assert_eq!(
+        resolution["palette_joints"],
+        json!(bones.len()),
+        "the palette stays the skin's joint list"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["chosen"]["is_skin_joint"] == json!(true)
+                && row["refused"][0]["is_skin_joint"] == json!(false)),
+        "the skin always wins over the detached copy"
+    );
+    let hips = rows
+        .iter()
+        .find(|row| row["name"] == json!("Hips"))
+        .expect("the pelvis row");
+    // `Hips` is bone 1: the skin's node 2, the copy's node offset + 1.
+    assert_eq!(
+        hips["chosen"],
+        json!({"node": 2, "is_skin_joint": true, "parent_depth": 2}),
+        "the skin-referenced node wins and the report carries its evidence"
+    );
+    assert_eq!(
+        hips["refused"],
+        json!([{"node": offset + 1, "is_skin_joint": false, "parent_depth": 2}]),
+        "the duplicate copy is named and rejected"
     );
 }
 

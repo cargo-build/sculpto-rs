@@ -5,14 +5,31 @@ use std::collections::{HashMap, HashSet};
 use glam::DMat4;
 
 use super::{
-    Actor, ActorError, Influence, Pose, RequestedJoint, RigNode, RigRole, RigSample, Sample,
-    animation, geometry, invalid, unsupported,
+    Actor, ActorError, Influence, JointCandidate, JointDisambiguation, Pose, RequestedJoint,
+    RigNode, RigRole, RigSample, Sample, animation, geometry, invalid, unsupported,
 };
 
 /// A requested joint name resolved to its unique graph node.
 pub(super) struct Resolved {
     pub(super) name: String,
     pub(super) node: usize,
+}
+
+/// Every node the selected parts' skins reference: the set that may break a
+/// duplicate-name tie. An export that ships a duplicate rig copy alongside
+/// the animation armature duplicates names outside this set only.
+fn skin_electorate(actor: &Actor, selected: &[usize]) -> HashSet<usize> {
+    selected
+        .iter()
+        .filter_map(|&node| {
+            actor
+                .document
+                .nodes()
+                .nth(node)
+                .and_then(|node| node.skin())
+        })
+        .flat_map(|skin| skin.joints().map(|joint| joint.index()))
+        .collect()
 }
 
 /// Sample the parts, then describe skin correspondence in a reduced rig.
@@ -24,7 +41,8 @@ pub(super) fn sample(
     joints: &[&str],
 ) -> Result<RigSample, ActorError> {
     let selected = geometry::select(&actor.document, parts)?;
-    let requested = resolve(actor, joints)?;
+    let electorate = skin_electorate(actor, &selected);
+    let (requested, disambiguated) = resolve_with(actor, joints, &electorate)?;
     let worlds = animation::worlds(actor, &selected, pose)?;
     let sample = geometry::sample(actor, &selected, &worlds)?;
     let (rig, index) = graph(actor, &requested, &worlds)?;
@@ -42,11 +60,33 @@ pub(super) fn sample(
         rig,
         requested,
         influences,
+        disambiguated,
     })
 }
 
-/// Requested joints are exact node names, each unique in the graph.
+/// Resolve joint names against every skin the document carries: the
+/// electorate for verbs that drive joints without sampling parts. The
+/// resolved records only; the tie-break notes stay with [`resolve_with`].
 pub(super) fn resolve(actor: &Actor, joints: &[&str]) -> Result<Vec<Resolved>, ActorError> {
+    let skin_joints: HashSet<usize> = actor
+        .document
+        .skins()
+        .flat_map(|skin| skin.joints().map(|joint| joint.index()))
+        .collect();
+    let (resolved, _) = resolve_with(actor, joints, &skin_joints)?;
+    Ok(resolved)
+}
+
+/// Requested joints are exact node names. The name is the label; the node
+/// index is the address. When several nodes carry one name, the skin breaks
+/// the tie: exactly one skin-referenced match wins and the choice is
+/// reported, every other shape stays a refusal that names the candidates.
+/// @req DECL0013
+pub(super) fn resolve_with(
+    actor: &Actor,
+    joints: &[&str],
+    skin_joints: &HashSet<usize>,
+) -> Result<(Vec<Resolved>, Vec<JointDisambiguation>), ActorError> {
     if joints.is_empty() {
         return Err(invalid(
             "actor rig selection",
@@ -54,7 +94,8 @@ pub(super) fn resolve(actor: &Actor, joints: &[&str]) -> Result<Vec<Resolved>, A
         ));
     }
     let mut seen = HashSet::new();
-    joints
+    let mut disambiguated = Vec::new();
+    let resolved = joints
         .iter()
         .map(|&name| {
             match seen.insert(name) {
@@ -76,13 +117,48 @@ pub(super) fn resolve(actor: &Actor, joints: &[&str]) -> Result<Vec<Resolved>, A
                     name: name.to_owned(),
                     node: *node,
                 }),
-                _ => Err(ActorError::JointSelection {
-                    name: name.to_owned(),
-                    matches: matches.len(),
-                }),
+                _ => {
+                    let candidates: Vec<JointCandidate> = matches
+                        .iter()
+                        .map(|&node| JointCandidate {
+                            node,
+                            is_skin_joint: skin_joints.contains(&node),
+                            parent_depth: chain(actor, node).len().saturating_sub(1),
+                        })
+                        .collect();
+                    let mut skin = candidates
+                        .iter()
+                        .filter(|candidate| candidate.is_skin_joint);
+                    match (skin.next(), skin.next()) {
+                        (Some(chosen), None) => {
+                            disambiguated.push(JointDisambiguation {
+                                name: name.to_owned(),
+                                chosen: chosen.clone(),
+                                refused: candidates
+                                    .iter()
+                                    .filter(|candidate| !candidate.is_skin_joint)
+                                    .cloned()
+                                    .collect(),
+                            });
+                            Ok(Resolved {
+                                name: name.to_owned(),
+                                node: chosen.node,
+                            })
+                        }
+                        // Two skin-referenced nodes with one name is a
+                        // genuinely ambiguous file; no skin reference at all
+                        // leaves the lookup without a tie-break.
+                        _ => Err(ActorError::JointSelection {
+                            name: name.to_owned(),
+                            matches: matches.len(),
+                            candidates,
+                        }),
+                    }
+                }
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((resolved, disambiguated))
 }
 
 /// Retain every node on each requested path to the shared lowest ancestor.

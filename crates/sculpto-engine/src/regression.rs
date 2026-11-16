@@ -41,7 +41,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use sculpto_mesh::actor::{Actor, Pose, StressPlan, stress};
+use sculpto_mesh::actor::{Actor, JointCandidate, Pose, StressPlan, stress};
 
 pub(crate) use crate::adapt::source_clip_name;
 use crate::export_actor::CLIP_ROLES;
@@ -1830,8 +1830,10 @@ fn reference_block(
         "artifact": artifact.to_string_lossy(),
         "clip": block["clip"],
         "status": "measured",
+        "joint_resolution": block["joint_resolution"],
         "spine": block["spine"],
         "spine_frame_joint": block["spine_frame_joint"],
+        "shoulder": block["shoulder"],
         "clearance": block["clearance"],
         "stance": block["stance"],
         "edge_stretch": block["edge_stretch"],
@@ -1854,6 +1856,7 @@ fn measure_reference_inner(
         None => source_clip_name(&actor, None)?,
     };
     let joints = resolve_joints(&palette)?;
+    let resolution = joint_resolution(&actor, &palette)?;
     let motion = measure_motion(&actor, &clip, frames, &joints, &palette)?;
     let toes: Vec<String> = palette
         .iter()
@@ -1869,8 +1872,10 @@ fn measure_reference_inner(
     let motion_rows = motion_ranges(&actor, &clip, palette_role)?;
     Ok(json!({
         "clip": clip,
+        "joint_resolution": resolution,
         "spine": motion.spine,
         "spine_frame_joint": motion.frame_joint,
+        "shoulder": motion.shoulder,
         "clearance": motion.clearance,
         "stance": stance,
         "edge_stretch": stretch,
@@ -1889,6 +1894,44 @@ fn actor_read(path: &Path, error: sculpto_mesh::actor::ActorError) -> CommandErr
         "rig_regression_glb_invalid",
         format!("{}: {error}", path.display()),
     )
+}
+
+/// Which nodes the palette's names actually bound to, measured once at rest
+/// with the whole palette requested. A file that ships duplicate rig copies
+/// reports each tie-break here: the chosen node with its skin evidence and
+/// the matches it beat. A genuinely ambiguous file refuses instead and the
+/// reference block reports `unavailable` with the candidates named.
+fn joint_resolution(actor: &Actor, palette: &[String]) -> Result<Value, CommandError> {
+    let parts = measurable_parts(actor);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let sample = actor
+        .rig_sample(
+            &parts,
+            Pose::Rest,
+            &palette.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .map_err(crate::measures::actor_error)?;
+    let candidate = |joint: &JointCandidate| {
+        json!({
+            "node": joint.node,
+            "is_skin_joint": joint.is_skin_joint,
+            "parent_depth": joint.parent_depth,
+        })
+    };
+    Ok(json!({
+        "palette_joints": palette.len(),
+        "disambiguated": sample
+            .disambiguated
+            .iter()
+            .map(|row| {
+                json!({
+                    "name": row.name,
+                    "chosen": candidate(&row.chosen),
+                    "refused": row.refused.iter().map(candidate).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    }))
 }
 
 /// Run the regression over every declared actor.

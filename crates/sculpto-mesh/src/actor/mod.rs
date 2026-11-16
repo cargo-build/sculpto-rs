@@ -101,6 +101,32 @@ pub struct Influence {
     pub weight: f64,
 }
 
+/// One ambiguous joint name's candidate node, with the evidence the
+/// resolution rule reads. @req DECL0013
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct JointCandidate {
+    /// The candidate's graph node index.
+    pub node: usize,
+    /// Whether the selected parts' skins reference this node.
+    pub is_skin_joint: bool,
+    /// Ancestors between the node and its graph root, exclusive.
+    pub parent_depth: usize,
+}
+
+/// An ambiguous joint name the skin resolved, kept so a report can say which
+/// node won and why. @req DECL0013
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct JointDisambiguation {
+    /// The requested name; it stays a label, the node is the address.
+    pub name: String,
+    /// The skin-referenced node the resolution bound.
+    pub chosen: JointCandidate,
+    /// The other matches the rule did not choose.
+    pub refused: Vec<JointCandidate>,
+}
+
 /// Sampled geometry plus its reduced rig correspondence. @req DECL0013
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -109,6 +135,8 @@ pub struct RigSample {
     pub rig: Vec<RigNode>,
     pub requested: Vec<RequestedJoint>,
     pub influences: Vec<Vec<Influence>>,
+    /// Names shared by several nodes that the skin tie-break resolved.
+    pub disambiguated: Vec<JointDisambiguation>,
 }
 
 /// Classified input failures retain their source location. @req DECL0013
@@ -116,15 +144,39 @@ pub struct RigSample {
 #[non_exhaustive]
 pub enum ActorError {
     Decode(gltf::Error),
-    Invalid { context: String, reason: String },
-    Unsupported { context: String, feature: String },
-    Selection { name: String, matches: usize },
-    DuplicatePart { name: String },
-    JointSelection { name: String, matches: usize },
-    DuplicateJoint { name: String },
+    Invalid {
+        context: String,
+        reason: String,
+    },
+    Unsupported {
+        context: String,
+        feature: String,
+    },
+    Selection {
+        name: String,
+        matches: usize,
+    },
+    DuplicatePart {
+        name: String,
+    },
+    JointSelection {
+        name: String,
+        matches: usize,
+        candidates: Vec<JointCandidate>,
+    },
+    DuplicateJoint {
+        name: String,
+    },
     DisconnectedRig,
-    Clip { name: String, matches: usize },
-    Time { time: f64, start: f64, end: f64 },
+    Clip {
+        name: String,
+        matches: usize,
+    },
+    Time {
+        time: f64,
+        start: f64,
+        end: f64,
+    },
 }
 
 impl fmt::Display for ActorError {
@@ -142,11 +194,33 @@ impl fmt::Display for ActorError {
                 )
             }
             Self::DuplicatePart { name } => write!(f, "duplicate actor part {name:?}"),
-            Self::JointSelection { name, matches } => {
+            Self::JointSelection {
+                name,
+                matches,
+                candidates,
+            } => {
                 write!(
                     f,
                     "actor joint {name:?}: expected one node, found {matches}"
-                )
+                )?;
+                if candidates.is_empty() {
+                    return Ok(());
+                }
+                let evidence = candidates
+                    .iter()
+                    .map(|candidate| {
+                        let skin = match candidate.is_skin_joint {
+                            true => "skin joint",
+                            false => "no skin reference",
+                        };
+                        format!(
+                            "node {} ({skin}, parent depth {})",
+                            candidate.node, candidate.parent_depth
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "; candidates: {evidence}")
             }
             Self::DuplicateJoint { name } => write!(f, "duplicate actor joint {name:?}"),
             Self::DisconnectedRig => {

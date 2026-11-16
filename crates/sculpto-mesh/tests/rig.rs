@@ -247,10 +247,6 @@ fn unskinned_donors_and_joint_selection_fail_contextually() {
         .push(json!({"name": "Hand"}));
     let actor = Actor::from_glb(&ambiguous.bytes()).unwrap();
     assert!(matches!(
-        actor.rig_sample(&["Body"], Pose::Rest, &["Hand"]),
-        Err(ActorError::JointSelection { matches: 2, .. })
-    ));
-    assert!(matches!(
         actor.rig_sample(&["Body"], Pose::Rest, &["missing"]),
         Err(ActorError::JointSelection { matches: 0, .. })
     ));
@@ -263,6 +259,108 @@ fn unskinned_donors_and_joint_selection_fail_contextually() {
         actor.rig_sample(&["Body"], Pose::Rest, &[]),
         Err(ActorError::Invalid { .. })
     ));
+}
+
+/// The exported-duplicate-rig shape (0161): a skin-bound armature plus a
+/// detached duplicate rig copy repeating its names — the museum Mixamo
+/// export's layout. `copy_in_skin` models the genuinely ambiguous file,
+/// where the skin references both matches.
+fn duplicate_rig_fixture(copy_in_skin: bool) -> Fixture {
+    let mut fixture = Fixture::triangle();
+    let mut joints = vec![1, 2, 3];
+    if copy_in_skin {
+        joints.push(5);
+    }
+    fixture.json["nodes"] = json!([
+        {"name": "Armature", "translation": [10., 0., 0.], "children": [1, 4, 5]},
+        {"name": "Spine", "translation": [0., 1., 0.], "children": [2]},
+        {"name": "Hand", "translation": [0., 2., 0.], "children": [3]},
+        {"name": "FingerL", "translation": [0., 0., 3.]},
+        {"name": "Body", "mesh": 0, "skin": 0, "translation": [99., 0., 0.]},
+        {"name": "Hand"},
+    ]);
+    fixture.json["skins"] = json!([{"joints": joints}]);
+    let joints = fixture.accessor(&[2, 0, 0, 0].repeat(3), 5121, "VEC4", 3);
+    let weights = fixture.floats(&[1.0, 0., 0., 0.].repeat(3), "VEC4", 3);
+    fixture.json["meshes"][0]["primitives"][0]["attributes"]["JOINTS_0"] = json!(joints);
+    fixture.json["meshes"][0]["primitives"][0]["attributes"]["WEIGHTS_0"] = json!(weights);
+    fixture
+}
+
+/// The exported-duplicate-rig case (0161): two nodes carry one name and
+/// exactly one is a skin joint. The resolution must bind the skin's node —
+/// the node is the address, the name only the label — and report the
+/// tie-break with its evidence, so a future fixture cannot silently pick
+/// the wrong node.
+#[test]
+fn a_duplicate_name_binds_the_skin_referenced_node() {
+    let actor = Actor::from_glb(&duplicate_rig_fixture(false).bytes()).unwrap();
+    let rig = actor
+        .rig_sample(&["Body"], Pose::Rest, &["Hand"])
+        .expect("the skin breaks the tie");
+    assert_eq!(
+        rig.requested[0].node, 2,
+        "the skin-referenced Hand wins, not the first match"
+    );
+    let [row] = rig.disambiguated.as_slice() else {
+        panic!("one tie-break record, got {:?}", rig.disambiguated);
+    };
+    assert_eq!(row.name, "Hand");
+    assert_eq!(row.chosen.node, 2);
+    assert!(row.chosen.is_skin_joint);
+    assert_eq!(row.chosen.parent_depth, 2, "Hand → Spine → Armature");
+    assert_eq!(
+        row.refused
+            .iter()
+            .map(|candidate| candidate.node)
+            .collect::<Vec<_>>(),
+        [5]
+    );
+    assert!(!row.refused[0].is_skin_joint);
+    assert_eq!(
+        row.refused[0].parent_depth, 1,
+        "the copy hangs under Armature"
+    );
+    // Only the skin node is retained, so name lookups downstream stay unique.
+    assert_eq!(
+        rig.rig
+            .iter()
+            .filter(|node| node.name.as_deref() == Some("Hand"))
+            .count(),
+        1
+    );
+}
+
+/// Two skin-referenced nodes with one name is a genuinely ambiguous file:
+/// the refusal stays and names both indices with their evidence.
+#[test]
+fn two_skin_referenced_nodes_with_one_name_stay_a_refusal() {
+    let actor = Actor::from_glb(&duplicate_rig_fixture(true).bytes()).unwrap();
+    match actor.rig_sample(&["Body"], Pose::Rest, &["Hand"]) {
+        Err(
+            ref error @ ActorError::JointSelection {
+                matches,
+                ref candidates,
+                ..
+            },
+        ) => {
+            assert_eq!(matches, 2);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.node)
+                    .collect::<Vec<_>>(),
+                [2, 5],
+                "both indices are named"
+            );
+            assert!(candidates.iter().all(|candidate| candidate.is_skin_joint));
+            let message = error.to_string();
+            assert!(message.contains("node 2"), "{message}");
+            assert!(message.contains("node 5"), "{message}");
+            assert!(message.contains("skin joint"), "{message}");
+        }
+        other => panic!("genuine ambiguity must refuse, got {other:?}"),
+    }
 }
 
 #[test]

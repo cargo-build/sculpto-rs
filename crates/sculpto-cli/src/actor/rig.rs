@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 
-use sculpto_mesh::actor::{Actor, Pose, RigRole, RigSample};
+use sculpto_mesh::actor::{Actor, JointCandidate, Pose, RigRole, RigSample};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: sculpto actor rig --input actor.glb --part NAME [--part NAME ...] \
@@ -151,6 +151,11 @@ fn report(sample: &RigSample, pose: Pose<'_>) -> Result<Value, String> {
         "requested": sample.requested.iter().map(|joint| json!({
             "name": joint.name, "node": joint.node, "rig": joint.rig,
         })).collect::<Vec<_>>(),
+        "disambiguated": sample.disambiguated.iter().map(|row| json!({
+            "name": row.name,
+            "chosen": candidate_json(&row.chosen),
+            "refused": row.refused.iter().map(candidate_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
         "influences": sample.influences.iter().enumerate().map(|(vertex, bindings)| json!({
             "vertex": vertex,
             "bindings": bindings.iter().map(|binding| json!({
@@ -158,4 +163,12 @@ fn report(sample: &RigSample, pose: Pose<'_>) -> Result<Value, String> {
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     }))
+}
+
+fn candidate_json(candidate: &JointCandidate) -> Value {
+    json!({
+        "node": candidate.node,
+        "is_skin_joint": candidate.is_skin_joint,
+        "parent_depth": candidate.parent_depth,
+    })
 }
