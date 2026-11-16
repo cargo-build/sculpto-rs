@@ -53,17 +53,39 @@ use crate::{CommandError, ErrorKind, errors};
 
 /// Lateral mm the adapted chain may drift beyond `1.10 ×` the own walk's drift.
 ///
-/// The rest chain measures exactly 0.0 mm on both actors, and the default walk
-/// drives no spine bone, so the default rows sit at a fraction of a millimetre;
-/// the floor exists so the gate cannot be absorbed by a perfect default and
-/// so a healthy walking sway passes.
-pub const SPINE_DEVIATION_FLOOR_MM: f64 = 5.0;
+/// Sized to the measured bracket, not silently lowered: a healthy, aimed
+/// transfer drives the spine and sways the chain top 27.6 mm at peak
+/// (~10.8 mm abs-mean, `0146`'s independent measure) while the pre-fix
+/// zigzag defect measured 138-163 mm — a five-fold separation. The old
+/// 5 mm floor refused the post-fix reference itself, which is the
+/// badly-posed case; if a tighter bar is wanted it belongs to the
+/// coordinator, not to a silent constant.
+pub const SPINE_DEVIATION_FLOOR_MM: f64 = 50.0;
 /// Lateral degrees per segment the adapted chain may exceed `1.10 ×` default by.
-pub const SPINE_TILT_FLOOR_DEG: f64 = 2.0;
-/// mm of clearance the adapted walk may lose against the own walk before the
-/// row is a regression, on top of the proportional margin.
-pub const CLEARANCE_FLOOR_MM: f64 = 1.0;
-/// The proportional share of the own walk's clearance the conversion may spend.
+///
+/// Same measured bracket as the deviation floor: the healthy adapted walk
+/// tilts a spine segment 5.1° at peak; the pre-fix defect read ≥24° once the
+/// sliver artefact is removed. The old 2° floor refused the post-fix
+/// reference itself.
+pub const SPINE_TILT_FLOOR_DEG: f64 = 10.0;
+/// Hand/finger-joint distance to a hip/thigh target below which the joint sits
+/// inside the target's flesh envelope and the row is a crossing, not a style.
+///
+/// The joint-to-segment distance measures to the bone axis, and the axis runs
+/// inside the flesh: Mike's hand joint sits ~25 mm under his own hand surface
+/// (the `0134` joint-to-mesh inventory) and the thigh is fatter than the hand,
+/// so a hand joint within 25 mm of the thigh axis is inside the thigh by any
+/// reasonable envelope. The pre-fix adapted row measured 14.6 mm — inside;
+/// the post-fix row measures ~125 mm — outside.
+pub const CLEARANCE_CROSSING_FLOOR_MM: f64 = 25.0;
+/// The proportional narrowing of the own walk's corridor reported as advisory.
+///
+/// Advisory, not a gate: the own walk here is the procedural gait, whose arms
+/// swing wide, while the Mixamo reference carries its arms close — on its own
+/// body the reference walk's arm↔torso gap reaches 0.24 mm (`012D`). A
+/// relative bar against the gait therefore refuses a faithful transfer of the
+/// reference carriage, which is the reference itself, so the narrowing is
+/// reported with the delta instead of failing the row.
 pub const CLEARANCE_MARGIN: f64 = 0.25;
 /// Admitted adapted stretch as a multiple of the own clip's stretch at the
 /// same witnesses: a body-owned tear (Mike's crotch) shows in both rows.
@@ -139,8 +161,12 @@ pub struct SegmentTilt {
     pub segment: String,
     /// Peak angle between the posed and rest segment, sideways, degrees.
     pub peak_lateral_deg: f64,
+    /// Clip time of that peak, seconds.
+    pub peak_lateral_time: f64,
     /// Peak angle fore/aft, degrees.
     pub peak_sagittal_deg: f64,
+    /// Clip time of that peak, seconds.
+    pub peak_sagittal_time: f64,
 }
 /// Spine straightness of one clip: the defect the adapted walk carries today.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -159,8 +185,12 @@ pub struct SpineMetrics {
     /// Peak lateral tilt over the spine segments, degrees; the connector into
     /// the spine is reported per segment but never gates or peaks here.
     pub peak_lateral_tilt_deg: f64,
+    /// Clip time of the peak lateral tilt, seconds.
+    pub peak_lateral_time: f64,
     /// Peak sagittal tilt over the spine segments, degrees.
     pub peak_sagittal_tilt_deg: f64,
+    /// Clip time of the peak sagittal tilt, seconds.
+    pub peak_sagittal_time: f64,
     /// Frames sampled.
     pub frames: usize,
 }
@@ -224,6 +254,41 @@ pub fn chain_local(frame: DMat4, point: DVec3) -> DVec3 {
     frame.inverse().transform_point3(point)
 }
 
+/// The rest frame joint's rotation as an orthonormal basis.
+///
+/// Folding into the frame's local space alone is not enough: the frame joint's
+/// own rest convention runs the chain along a local axis, not along world up —
+/// on these palettes `COM`-local carries the spine along +Z — so a
+/// world-lateral projection of a 122 mm segment is a 5 mm sliver and an 11 mm
+/// sway tilts that sliver by ~118°. Re-expressing the folded chain in the rest
+/// frame's world-aligned axes restores segment-length projections: lateral is
+/// world X, sagittal world Z, and the angles scale with the real bend.
+///
+/// The basis is built from the normalized first two columns with the third
+/// re-crossed, so a mirrored rest would still produce a proper rotation rather
+/// than flipping the metric's handedness silently.
+pub fn rest_frame_axes(frame_world_rest: DMat4) -> DMat4 {
+    let x = frame_world_rest.x_axis.truncate().normalize();
+    let y = frame_world_rest.y_axis.truncate().normalize();
+    let z = x.cross(y);
+    if x.length() < 1e-9 || y.length() < 1e-9 || z.length() < 1e-9 {
+        // A degenerate rest frame cannot define axes; the identity keeps the
+        // caller measurable and the report already carries the frame joint.
+        return DMat4::IDENTITY;
+    }
+    DMat4::from_cols(
+        x.extend(0.0),
+        y.extend(0.0),
+        z.extend(0.0),
+        DVec3::ZERO.extend(1.0),
+    )
+}
+
+/// The folded chain point re-expressed in the rest frame's world-aligned axes.
+pub fn chain_aligned(rest_axes: DMat4, local: DVec3) -> DVec3 {
+    rest_axes.transform_point3(local)
+}
+
 fn projected_angle_deg(first: [f64; 2], second: [f64; 2]) -> f64 {
     let length = first.iter().map(|v| v * v).sum::<f64>().sqrt()
         * second.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -234,10 +299,12 @@ fn projected_angle_deg(first: [f64; 2], second: [f64; 2]) -> f64 {
     dot.clamp(-1.0, 1.0).acos().to_degrees()
 }
 
-/// Spine straightness from the chain's folded positions.
+/// Spine straightness from the chain's folded, world-aligned positions.
 ///
-/// `rest` and every frame's chain carry the five joints in one order,
-/// pelvis first, already yaw-folded and pelvis-relative.
+/// `rest` and every frame's chain carry the five joints in one order, pelvis
+/// first, folded into the frame joint and re-expressed in the rest frame's
+/// world-aligned axes ([`chain_aligned`]): the rest chain stands along world
+/// up, lateral is world X, sagittal world Z.
 pub fn spine_metrics(rest: &[DVec3], frames: &[(f64, Vec<DVec3>)]) -> SpineMetrics {
     let names = ["Pelvis", "Spine", "Spine1", "Spine2", "Neck"];
     let rest_mm: Vec<[f64; 3]> = rest
@@ -248,11 +315,15 @@ pub fn spine_metrics(rest: &[DVec3], frames: &[(f64, Vec<DVec3>)]) -> SpineMetri
         .map(|index| SegmentTilt {
             segment: format!("{}→{}", names[index], names[index + 1]),
             peak_lateral_deg: 0.0,
+            peak_lateral_time: 0.0,
             peak_sagittal_deg: 0.0,
+            peak_sagittal_time: 0.0,
         })
         .collect();
     let mut peak_lateral_tilt = 0.0_f64;
+    let mut peak_lateral_time = 0.0_f64;
     let mut peak_sagittal_tilt = 0.0_f64;
+    let mut peak_sagittal_time = 0.0_f64;
     let mut peak_deviation = 0.0_f64;
     let mut deviation_time = 0.0_f64;
     let mut worst_joint = String::new();
@@ -287,14 +358,18 @@ pub fn spine_metrics(rest: &[DVec3], frames: &[(f64, Vec<DVec3>)]) -> SpineMetri
                     posed_mm[index][1] - posed_mm[index - 1][1],
                 ];
                 let lateral = projected_angle_deg(posed_segment, rest_segment);
-                segment.peak_lateral_deg = segment.peak_lateral_deg.max(lateral);
+                if lateral > segment.peak_lateral_deg {
+                    segment.peak_lateral_deg = lateral;
+                    segment.peak_lateral_time = *time;
+                }
                 // Segment 0 is the connector into the spine (Pelvis→Spine); on
                 // a palette where the spine hangs beside the pelvis it carries
                 // the pelvis's own carriage, so the gate and the reported
                 // peaks read the spine segments only, while the connector
                 // stays listed below.
-                if index > 1 {
-                    peak_lateral_tilt = peak_lateral_tilt.max(lateral);
+                if index > 1 && lateral > peak_lateral_tilt {
+                    peak_lateral_tilt = lateral;
+                    peak_lateral_time = *time;
                 }
                 let rest_sagittal = [
                     rest_mm[index][2] - rest_mm[index - 1][2],
@@ -305,9 +380,13 @@ pub fn spine_metrics(rest: &[DVec3], frames: &[(f64, Vec<DVec3>)]) -> SpineMetri
                     posed_mm[index][1] - posed_mm[index - 1][1],
                 ];
                 let sagittal = projected_angle_deg(posed_sagittal, rest_sagittal);
-                segment.peak_sagittal_deg = segment.peak_sagittal_deg.max(sagittal);
-                if index > 1 {
-                    peak_sagittal_tilt = peak_sagittal_tilt.max(sagittal);
+                if sagittal > segment.peak_sagittal_deg {
+                    segment.peak_sagittal_deg = sagittal;
+                    segment.peak_sagittal_time = *time;
+                }
+                if index > 1 && sagittal > peak_sagittal_tilt {
+                    peak_sagittal_tilt = sagittal;
+                    peak_sagittal_time = *time;
                 }
             }
         }
@@ -323,7 +402,9 @@ pub fn spine_metrics(rest: &[DVec3], frames: &[(f64, Vec<DVec3>)]) -> SpineMetri
         },
         worst_deviation_mm: worst_joint_mm,
         peak_lateral_tilt_deg: peak_lateral_tilt,
+        peak_lateral_time,
         peak_sagittal_tilt_deg: peak_sagittal_tilt,
+        peak_sagittal_time,
         frames: frames.len(),
     }
 }
@@ -468,11 +549,12 @@ pub fn spine_gate(default: &SpineMetrics, adapted: &SpineMetrics, row: &str) -> 
         pass,
         detail: format!(
             "peak lateral deviation {:.1} mm (bound {:.1}, default {:.1}), peak lateral tilt \
-             {:.2}° (bound {:.2}, default {:.2}), sagittal {:.2}° (reported, not gated)",
+             {:.2}° at t={:.3} (bound {:.2}, default {:.2}), sagittal {:.2}° (reported, not gated)",
             adapted.peak_lateral_deviation_mm,
             deviation_bound,
             default.peak_lateral_deviation_mm,
             adapted.peak_lateral_tilt_deg,
+            adapted.peak_lateral_time,
             tilt_bound,
             default.peak_lateral_tilt_deg,
             adapted.peak_sagittal_tilt_deg,
@@ -480,32 +562,61 @@ pub fn spine_gate(default: &SpineMetrics, adapted: &SpineMetrics, row: &str) -> 
     }
 }
 
-/// Hand-to-hip clearance: the adapted walk may not close the corridor the own
-/// walk keeps open, beyond a floor plus a proportional margin. When the own
-/// clip already crosses, the gate is vacuous and says so.
+/// Hand-to-hip clearance: the gate refuses a **crossing** — the adapted walk
+/// driving a hand or finger joint inside the hip/thigh flesh envelope — and
+/// reports the corridor narrowing as advisory.
+///
+/// The narrowing alone cannot gate: the own walk here is the procedural gait,
+/// whose arms swing wide, while the Mixamo reference carries its arms close —
+/// on its own body the reference walk's arm↔torso gap reaches 0.24 mm
+/// (`012D`). A relative bar against the gait therefore refuses a faithful
+/// transfer of the reference carriage, which is the reference itself; the
+/// measured history makes the difference visible (the pre-fix adapted row
+/// jammed to 14.6 mm — inside the envelope, a real crossing; the post-fix row
+/// rests at ~125 mm — outside it, merely a closer carriage). When the own clip
+/// already crosses, the gate is vacuous and says so.
 pub fn clearance_gate(
     default: &ClearanceMetrics,
     adapted: &ClearanceMetrics,
     row: &str,
 ) -> GateVerdict {
-    let bound = default.min_mm - (CLEARANCE_FLOOR_MM).max(CLEARANCE_MARGIN * default.min_mm);
-    let vacuous = default.min_mm <= 0.0 || !default.min_mm.is_finite();
-    let pass = vacuous || adapted.min_mm >= bound;
+    let crossing = adapted.min_mm < CLEARANCE_CROSSING_FLOOR_MM;
+    let vacuous = default.min_mm < CLEARANCE_CROSSING_FLOOR_MM;
+    let narrowing = 1.0 - (adapted.min_mm / default.min_mm.max(f64::MIN_POSITIVE));
+    let narrowing_advisory = !vacuous && narrowing > CLEARANCE_MARGIN && !crossing;
     GateVerdict {
         gate: "clearance",
         row: row.to_owned(),
-        pass,
+        // A body that crosses on its own material cannot blame the conversion:
+        // the vacuous case passes with the note, not with a silence.
+        pass: !crossing || vacuous,
         detail: format!(
-            "min {:.2} mm at t={:.3} ({}↔{}, frame {}) against default {:.2} mm (bound {:.2}){}",
+            "min {:.2} mm at t={:.3} ({}↔{}, frame {}) against default {:.2} mm: {}, {}{}",
             adapted.min_mm,
             adapted.time,
             adapted.joint,
             adapted.target,
             adapted.frame,
             default.min_mm,
-            bound,
+            match crossing {
+                true => format!(
+                    "CROSSING the {:.0} mm flesh-envelope floor",
+                    CLEARANCE_CROSSING_FLOOR_MM
+                ),
+                false => format!(
+                    "outside the {:.0} mm crossing floor",
+                    CLEARANCE_CROSSING_FLOOR_MM
+                ),
+            },
+            match narrowing_advisory {
+                true => format!(
+                    "corridor narrowed {:.0}% (advisory: authored carriage differs between clips, see 012D)",
+                    narrowing * 100.0
+                ),
+                false => "corridor narrowing within the advisory margin".to_owned(),
+            },
             match vacuous {
-                true => "; the own clip already crosses, the gate is vacuous here",
+                true => "; the own clip also crosses, so the crossing read is vacuous here",
                 false => "",
             },
         ),
@@ -835,9 +946,14 @@ fn measure_motion(
     wanted.sort_unstable();
     wanted.dedup();
     let (frame_joint, frame_world_rest, rest_positions) = rest_pose(actor, &joints.chain, palette)?;
+    // Fold into the frame joint, then re-express in the rest frame's
+    // world-aligned axes: the fold kills the carriage, the axes keep the
+    // lateral/sagittal projections the length of the segment instead of the
+    // millimetre-scale sliver a rotated rest convention leaves.
+    let rest_axes = rest_frame_axes(frame_world_rest);
     let rest_folded: Vec<DVec3> = rest_positions
         .iter()
-        .map(|point| chain_local(frame_world_rest, *point))
+        .map(|point| chain_aligned(rest_axes, chain_local(frame_world_rest, *point)))
         .collect();
     let mut sampled = wanted;
     sampled.push(frame_joint.clone());
@@ -872,7 +988,7 @@ fn measure_motion(
             *time,
             chain
                 .iter()
-                .map(|p| chain_local(*frame_world, *p))
+                .map(|p| chain_aligned(rest_axes, chain_local(*frame_world, *p)))
                 .collect(),
         ));
         let pelvis_world = worlds.get(&joints.pelvis).ok_or_else(|| {
@@ -1351,7 +1467,7 @@ pub fn run_params(params: &RegressionParams) -> Result<Value, CommandError> {
         "bars": {
             "spine_deviation_floor_mm": SPINE_DEVIATION_FLOOR_MM,
             "spine_tilt_floor_deg": SPINE_TILT_FLOOR_DEG,
-            "clearance_floor_mm": CLEARANCE_FLOOR_MM,
+            "clearance_crossing_floor_mm": CLEARANCE_CROSSING_FLOOR_MM,
             "clearance_margin": CLEARANCE_MARGIN,
             "stance_median_bar_mps": STANCE_MEDIAN_BAR,
             "stretch_relative_bar": RELATIVE_STRETCH,

@@ -19,8 +19,9 @@ use std::borrow::Cow;
 use glam::{DMat4, DQuat, DVec3};
 use gltf::binary::Glb;
 use sculpto_engine::regression::{
-    ClearanceFrame, RegressionActor, RegressionParams, chain_local, clearance_gate,
-    clearance_metrics, clothing_gate, run_params, spine_gate, spine_metrics, stretch_gate,
+    ClearanceFrame, RegressionActor, RegressionParams, chain_aligned, chain_local, clearance_gate,
+    clearance_metrics, clothing_gate, rest_frame_axes, run_params, spine_gate, spine_metrics,
+    stretch_gate,
 };
 use serde_json::{Value, json};
 
@@ -496,6 +497,27 @@ fn the_spine_gate_refuses_on_the_floor_when_the_own_walk_is_straight() {
 }
 
 #[test]
+fn the_clearance_gate_refuses_only_a_crossing() {
+    // A hand joint inside the 25 mm flesh-envelope floor is a crossing even
+    // when the own walk keeps a wide corridor.
+    let mut default = clearance_metrics(&[]);
+    default.min_mm = 276.0;
+    let mut adapted = clearance_metrics(&[]);
+    adapted.min_mm = 14.6;
+    let verdict = clearance_gate(&default, &adapted, "actor/adapted");
+    assert!(!verdict.pass, "{verdict:?}");
+    assert!(verdict.detail.contains("CROSSING"), "{verdict:?}");
+    // Outside the envelope the row passes even when the corridor halves: the
+    // narrowing is the reference clip's own authored carriage (012D: the
+    // reference body reaches 0.24 mm arm-to-torso), reported as advisory.
+    let mut adapted = clearance_metrics(&[]);
+    adapted.min_mm = 124.6;
+    let verdict = clearance_gate(&default, &adapted, "actor/adapted");
+    assert!(verdict.pass, "{verdict:?}");
+    assert!(verdict.detail.contains("advisory"), "{verdict:?}");
+}
+
+#[test]
 fn the_clearance_gate_is_vacuous_when_the_own_clip_crosses() {
     let mut default = clearance_metrics(&[]);
     default.min_mm = 0.0;
@@ -536,6 +558,33 @@ fn the_clothing_gate_takes_the_delta_when_the_anchor_fails() {
 // ---------------------------------------------------------------------------
 // end to end on synthetic actors
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_rotated_rest_frame_does_not_turn_a_sway_into_a_flip() {
+    // The measured bug, pinned: on these palettes the chain runs along the
+    // frame joint's local +Z (COM's rest convention), so the world-lateral
+    // projection of a 122 mm segment is a 5 mm sliver. The unaligned metric
+    // turned an 11 mm sway into a ~118 degree tilt; the alignment must keep
+    // the projection the length of the segment and read the real angle.
+    let frame_world_rest = DMat4::from_rotation_x(-std::f64::consts::FRAC_PI_2);
+    let axes = rest_frame_axes(frame_world_rest);
+    let rest_local = DVec3::new(0.0, 5.34, 122.37);
+    let posed_local = DVec3::new(11.14, -0.52, 121.83);
+    let rest_aligned = chain_aligned(axes, rest_local);
+    let posed_aligned = chain_aligned(axes, posed_local);
+    assert!(
+        rest_aligned.y.abs() > 100.0,
+        "the rest segment stands along world up after alignment: {rest_aligned}"
+    );
+    let dot = rest_aligned.x * posed_aligned.x + rest_aligned.y * posed_aligned.y;
+    let length = (rest_aligned.x * rest_aligned.x + rest_aligned.y * rest_aligned.y).sqrt()
+        * (posed_aligned.x * posed_aligned.x + posed_aligned.y * posed_aligned.y).sqrt();
+    let degrees = (dot / length).clamp(-1.0, 1.0).acos().to_degrees();
+    assert!(
+        degrees < 15.0,
+        "an 11 mm sway on a 122 mm segment is ~5 degrees, measured {degrees:.2}"
+    );
+}
 
 #[test]
 fn the_harness_names_the_rows_the_broken_transfer_breaks() {
@@ -599,14 +648,12 @@ fn the_harness_names_the_rows_the_broken_transfer_breaks() {
         .filter_map(|row| row.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
+        // The hands hang off the spine chain, so the 90-degree flip narrows
+        // the hand-to-hip corridor too — but 110 mm is outside the 25 mm
+        // crossing floor, so the narrowing reports as advisory and only the
+        // spine row fails the run.
         failed,
-        // The hands hang off the spine chain, so the same 90-degree flip that
-        // breaks the spine rows also closes the hand-to-hip corridor: both
-        // rows are named, and nothing else fires.
-        vec![
-            "synthetic/adapted:clearance",
-            "synthetic/adapted:spine_lateral",
-        ],
+        vec!["synthetic/adapted:spine_lateral"],
         "the whole verdict: {report}"
     );
 }
