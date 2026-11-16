@@ -724,6 +724,7 @@ fn a_clip_that_covers_no_required_role_is_refused_by_the_admission_gate() {
         &palette,
         &required,
         true,
+        true,
         ClipTolerances::default().translation_relative,
     )
     .expect_err("a role no mapped bone carries refuses the export");

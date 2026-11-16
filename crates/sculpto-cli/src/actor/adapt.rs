@@ -81,15 +81,17 @@ fn job(params: &AdaptParams) -> Result<(), String> {
     let report = adapt_run(params).map_err(|error| error.to_string())?;
     let clip = &report["written_clip"];
     println!(
-        "actor adapt: {} · {} copy · {} bones of {} · pose error {:.2}° median / {:.2}° max · \
-         rest residual {:.4} · stance foot {:.3} m/s · edge stretch {:.2}x",
+        "actor adapt: {} · {} copy · {} bones of {} · rest residual {:.4} · \
+         stance median {:.3} m/s (max {:.3}) · edge stretch {:.2}x (relative {:.3}) · \
+         pose error {:.2}° median / {:.2}° max (advisory)",
         verdict(&report),
         clip["semantics"].as_str().unwrap_or("?"),
         clip["mapped_bones"],
         report["admission"]["palette_bones"],
-        clip["pose_error_median_degrees"].as_f64().unwrap_or(0.0),
-        clip["pose_error_max_degrees"].as_f64().unwrap_or(0.0),
         clip["max_rest_translation_residual"]
+            .as_f64()
+            .unwrap_or(0.0),
+        report["gates"]["stance_foot"]["worst_median_speed"]
             .as_f64()
             .unwrap_or(0.0),
         report["gates"]["stance_foot"]["max_horizontal_speed"]
@@ -98,6 +100,11 @@ fn job(params: &AdaptParams) -> Result<(), String> {
         report["gates"]["edge_stretch"]["max_ratio"]
             .as_f64()
             .unwrap_or(0.0),
+        report["gates"]["edge_stretch"]["baseline"]["relative"]
+            .as_f64()
+            .unwrap_or(0.0),
+        clip["pose_error_median_degrees"].as_f64().unwrap_or(0.0),
+        clip["pose_error_max_degrees"].as_f64().unwrap_or(0.0),
     );
     Ok(())
 }

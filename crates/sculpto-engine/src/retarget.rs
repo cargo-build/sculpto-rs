@@ -1175,6 +1175,7 @@ pub fn role_coverage(correspondence: &Correspondence) -> RoleCoverage {
         let Some(role) = pair.role else { continue };
         let token = match role.part {
             Part::Pelvis | Part::Thigh => "hips",
+            Part::Spine(_) => "spine",
             Part::Calf => "knees",
             Part::Foot => "ankles",
             Part::Toe => "toes",

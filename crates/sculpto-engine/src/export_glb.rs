@@ -41,6 +41,7 @@ use sculpto_gltf::{Clip, ClipChannel, GltfError, write_rigged_glb};
 use sculpto_mesh::actor::{Actor, ActorError, SourceClip, SourceProperty, SourceValues};
 use sculpto_nif::{NifDocument, NifShape};
 
+use crate::retarget::Correspondence;
 use crate::{CommandError, ErrorKind, errors};
 
 /// Admitted rest bone-position residual, as a fraction of the skeleton extent.
@@ -247,6 +248,31 @@ pub struct ClipPlan {
     pub scale_shared: f64,
     /// Offsets whose ratio does not share the rig's unit, reported, not hidden.
     pub scale_outliers: Vec<ScaleOutlier>,
+    /// The semantics the clip was converted with.
+    pub semantics: ClipSemantics,
+    /// Median rest world-orientation difference after the fitted frame, degrees:
+    /// the measured convention gap between the two skeletons' bone frames.
+    pub axis_convention_degrees: f64,
+    /// Median bone-direction error against the source's own direction, degrees.
+    pub direction_error_median_degrees: f64,
+    /// Worst bone-direction error, degrees.
+    pub direction_error_max_degrees: f64,
+    /// Median written-world orientation error against the source pose, degrees.
+    pub pose_error_median_degrees: f64,
+    /// Worst written-world orientation error against the source pose, degrees.
+    pub pose_error_max_degrees: f64,
+    /// Bone carrying the worst pose error.
+    pub pose_error_outlier: String,
+    /// The root-motion policy applied.
+    pub root_motion: RootMotion,
+    /// Palette bone the travel is written on, when one was resolved.
+    pub root_motion_bone: Option<String>,
+    /// Source bone whose travel is read, when one was resolved.
+    pub source_root_bone: Option<String>,
+    /// Distance the linear ramp carried off the pelvis, rig units.
+    pub root_motion_travel: f64,
+    /// Distance the pelvis travels over the clip, rig units.
+    pub root_travel: f64,
 }
 
 /// Admitted clip rest differences.
@@ -1328,6 +1354,56 @@ fn missing_source(shape: usize, shape_definition: &NifShape) -> CommandError {
     )
 }
 
+/// Which pose transfer a clip is converted with.
+///
+/// The two are not variations of one another: a motion copy writes the rig's rest
+/// rotated by the clip's motion (exact per joint, and it carries the rest
+/// difference of the two skeletons into every frame), while a pose copy writes the
+/// clip's own world orientation with one fitted frame folded in (it reproduces the
+/// source's pose, at the cost of a measured residual).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ClipSemantics {
+    /// The rig's rest pose moved by the clip's motion since its reference.
+    #[default]
+    Motion,
+    /// The clip's own pose, one fitted frame folded in at the root.
+    Pose,
+}
+
+impl ClipSemantics {
+    /// Stable report token.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Motion => "motion",
+            Self::Pose => "pose",
+        }
+    }
+}
+
+/// What the conversion does with the body's travel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RootMotion {
+    /// Keep the whole trajectory on the pelvis; the actor root follows it.
+    #[default]
+    Keep,
+    /// Zero the pelvis translation: an in-place cycle, which slides the stance
+    /// foot at the clip's own speed and is reported as such.
+    Zero,
+    /// Split the linear ramp off as root motion and leave the residual sway.
+    Split,
+}
+
+impl RootMotion {
+    /// Stable report token.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Zero => "zero",
+            Self::Split => "split",
+        }
+    }
+}
+
 /// Convert a mapped source clip onto the rig's rest and units.
 ///
 /// Bone *rotations* are imported as world-space deltas applied to the
@@ -1353,39 +1429,122 @@ pub fn plan_clip(
     palette: &[String],
     tolerances: &ClipTolerances,
 ) -> Result<ClipPlan, CommandError> {
+    plan_clip_with(
+        source,
+        actor,
+        anchor,
+        rig,
+        palette,
+        tolerances,
+        None,
+        ClipSemantics::Motion,
+        RootMotion::Keep,
+    )
+}
+
+/// Convert one source clip with an explicit correspondence and semantics.
+///
+/// `correspondence` replaces name lookup with the resolved source-to-palette
+/// map, so a clip authored on another skeleton reaches the palette; a channel
+/// whose node drives nothing is counted, not refused. `semantics` chooses
+/// between a motion copy (the destination rest rotated by the clip's motion) and
+/// a pose copy (the clip's own world orientation, one fitted frame folded in),
+/// and the plan reports the error each one produced.
+///
+/// # Errors
+/// The same refusals [`plan_clip`] states, plus a unit or frame the mapped bones
+/// cannot define.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_clip_with(
+    source: &SourceClip,
+    actor: &Actor,
+    anchor: &ClipAnchor,
+    rig: &Rig,
+    palette: &[String],
+    tolerances: &ClipTolerances,
+    correspondence: Option<&Correspondence>,
+    semantics: ClipSemantics,
+    root_motion: RootMotion,
+) -> Result<ClipPlan, CommandError> {
     let slots: BTreeMap<&str, usize> = palette
         .iter()
         .enumerate()
         .map(|(slot, name)| (name.as_str(), slot))
         .collect();
+    // The resolved map: source node -> palette slot, name and folded segments.
+    let resolved: BTreeMap<usize, (usize, String, Vec<usize>)> = match correspondence {
+        Some(correspondence) => correspondence
+            .mapping()
+            .into_iter()
+            .map(|(node, slot, name)| (node, (slot, name, correspondence.fold_of(slot).to_vec())))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    // Every rotation channel, by node: a folded segment is not a track of its
+    // own, but its local rotation still has to reach the bone it folds into.
+    let mut rotations: BTreeMap<usize, Vec<[f64; 4]>> = BTreeMap::new();
+    if correspondence.is_some() {
+        for channel in &source.channels {
+            if let (SourceProperty::Rotation, SourceValues::Rotation(values)) =
+                (channel.property, &channel.values)
+            {
+                rotations.insert(channel.node, values.clone());
+            }
+        }
+    }
     let mut missing: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     let mut tracks: Vec<Track> = Vec::new();
     for channel in &source.channels {
-        let name = channel.node_name.as_deref().ok_or_else(|| {
-            refused(
-                "export_glb_clip_bone_absent",
-                format!(
-                    "clip {:?} channel targets unnamed node {}",
-                    source.name, channel.node
-                ),
-            )
-        })?;
-        let Some(&slot) = slots.get(name) else {
-            match rig.joint_by_name(name) {
-                // A bone the rig names but no vertex weights: it cannot deform
-                // this skin, so its channel is dropped and counted.
-                Ok(_) => dropped.push(name.to_owned()),
-                Err(_) => missing.push(name.to_owned()),
+        let (slot, name, fold) = match correspondence {
+            Some(_) => match resolved.get(&channel.node) {
+                Some(entry) => entry.clone(),
+                None => {
+                    dropped.push(
+                        channel
+                            .node_name
+                            .clone()
+                            .unwrap_or_else(|| format!("node {}", channel.node)),
+                    );
+                    continue;
+                }
+            },
+            None => {
+                let name = channel.node_name.as_deref().ok_or_else(|| {
+                    refused(
+                        "export_glb_clip_bone_absent",
+                        format!(
+                            "clip {:?} channel targets unnamed node {}",
+                            source.name, channel.node
+                        ),
+                    )
+                })?;
+                let Some(&slot) = slots.get(name) else {
+                    match rig.joint_by_name(name) {
+                        // A bone the rig names but no vertex weights: it cannot
+                        // deform this skin, so its channel is dropped and counted.
+                        Ok(_) => dropped.push(name.to_owned()),
+                        Err(_) => missing.push(name.to_owned()),
+                    }
+                    continue;
+                };
+                (slot, name.to_owned(), Vec::new())
             }
-            continue;
         };
-        let joint = rig.joint_by_name(name).map_err(|error| {
-            refused(
-                "export_glb_clip_bone_absent",
-                format!("clip {:?} bone {name:?}: {error}", source.name),
-            )
-        })?;
+        let joint = match correspondence.is_some() {
+            true => rig.joint_by_name(&name).map_err(|error| {
+                refused(
+                    "export_glb_clip_bone_absent",
+                    format!("clip {:?} palette bone {name:?}: {error}", source.name),
+                )
+            })?,
+            false => rig.joint_by_name(&name).map_err(|error| {
+                refused(
+                    "export_glb_clip_bone_absent",
+                    format!("clip {:?} bone {name:?}: {error}", source.name),
+                )
+            })?,
+        };
         let entry = match tracks.iter_mut().find(|track| track.node == channel.node) {
             Some(entry) => entry,
             None => {
@@ -1393,10 +1552,12 @@ pub fn plan_clip(
                     node: channel.node,
                     slot,
                     joint,
-                    name: name.to_owned(),
+                    name: name.clone(),
                     translation: None,
                     rotation: None,
                     scale: None,
+                    fold,
+                    derived: false,
                 });
                 tracks.last_mut().expect("just pushed")
             }
@@ -1448,6 +1609,141 @@ pub fn plan_clip(
         ));
     }
 
+    // Twist helpers are the palette's own machinery: no source skeleton of this
+    // family carries them, and a fixed fraction of the parent-to-child roll is
+    // what Unity, Rigify and Bulletproof all use (0.5 default, split by chain
+    // position here). Holding them at rest shears the skin band at the elbow and
+    // wrist; letting one own the whole rotation candy-wraps it.
+    if let Some(correspondence) = correspondence {
+        let mut twists: Vec<(usize, usize, String, JointId)> = correspondence
+            .pairs
+            .iter()
+            .filter(|pair| pair.method == crate::retarget::Method::Derived)
+            .map(|pair| {
+                (
+                    pair.slot,
+                    pair.joint.index(),
+                    pair.palette.clone(),
+                    pair.joint,
+                )
+            })
+            .collect();
+        twists.sort_by_key(|row| row.0);
+        for (slot, _index, name, joint) in twists {
+            tracks.push(Track {
+                node: usize::MAX,
+                slot,
+                joint,
+                name,
+                translation: None,
+                rotation: Some(Vec::new()),
+                scale: None,
+                fold: Vec::new(),
+                derived: true,
+            });
+        }
+    }
+
+    // The bone that carries the body's travel: the palette joint that is an
+    // ancestor of the most mapped bones (ties broken by depth). An actor built
+    // before `follow_hips` parents the pelvis and the spine as siblings under
+    // `NPC COM`, so that is where the travel goes; an actor built after it has the
+    // torso under the pelvis, and the same rule then answers `NPC Pelvis`. The
+    // choice is computed, never named, and reported as `root_motion_bone`.
+    let root_slot: Option<usize> = match correspondence {
+        // The legacy name-mapped path keeps its own translation handling; the
+        // root-motion policy is the cross-skeleton path's.
+        None => None,
+        Some(_) => {
+            let mapped: Vec<usize> = tracks
+                .iter()
+                .filter(|track| !track.derived)
+                .map(|track| track.slot)
+                .collect();
+            // Ancestor chains, as palette slots.
+            let mut chains: Vec<BTreeSet<usize>> = Vec::new();
+            for track in tracks.iter().filter(|track| !track.derived) {
+                let mut chain: BTreeSet<usize> = BTreeSet::new();
+                let mut cursor = rig
+                    .joint(track.joint)
+                    .and_then(|definition| definition.parent);
+                while let Some(joint) = cursor {
+                    if let Some(slot) = palette
+                        .iter()
+                        .position(|name| rig.joint_by_name(name).ok() == Some(joint))
+                    {
+                        chain.insert(slot);
+                    }
+                    cursor = rig.joint(joint).and_then(|definition| definition.parent);
+                }
+                chains.push(chain);
+            }
+            let mut best: Option<(usize, usize, usize)> = None; // (count, depth, slot)
+            for slot in chains.iter().flat_map(|chain| chain.iter().copied()) {
+                let count = chains.iter().filter(|chain| chain.contains(&slot)).count();
+                let depth = rig
+                    .joint_by_name(&palette[slot])
+                    .ok()
+                    .map(|joint| {
+                        rig.topological_order()
+                            .iter()
+                            .position(|other| *other == joint)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                if best.is_none_or(|(best_count, best_depth, _)| {
+                    count > best_count || (count == best_count && depth > best_depth)
+                }) {
+                    best = Some((count, depth, slot));
+                }
+            }
+            best.filter(|_| !mapped.is_empty()).map(|(_, _, slot)| slot)
+        }
+    };
+    let root_track = root_slot.map(|slot| {
+        match tracks.iter().position(|track| track.slot == slot) {
+            Some(position) => position,
+            None => {
+                let name = palette[slot].clone();
+                let joint = rig
+                    .joint_by_name(&name)
+                    .expect("the root slot is a palette bone");
+                tracks.push(Track {
+                    node: usize::MAX,
+                    slot,
+                    joint,
+                    name,
+                    translation: Some(Vec::new()),
+                    rotation: None,
+                    scale: None,
+                    fold: Vec::new(),
+                    // No source channel drives it: it is the joint the travel is
+                    // written on, so every source read skips it the same way a
+                    // derived twist is skipped.
+                    derived: true,
+                });
+                tracks.len() - 1
+            }
+        }
+    });
+    let source_root = match correspondence {
+        Some(correspondence) => correspondence
+            .pairs
+            .iter()
+            .find(|pair| {
+                matches!(
+                    pair.role.map(|role| role.part),
+                    Some(crate::retarget::Part::Pelvis)
+                )
+            })
+            .and_then(|pair| {
+                tracks
+                    .iter()
+                    .position(|track| track.slot == pair.slot && !track.derived)
+            }),
+        None => None,
+    }
+    .or_else(|| root_track.filter(|position| !tracks[*position].derived));
     // The reference pose this clip's motion is measured from: the clip set's
     // first sample, never the exported node rest.
     let source_local = |node: usize| -> Result<sculpto_mesh::actor::LocalRest, CommandError> {
@@ -1463,132 +1759,142 @@ pub fn plan_clip(
         }
     };
 
-    // One unit ratio for the whole rig: the source's local bone offsets and the
-    // rig's must differ by a single factor, or the translations are not the same
-    // skeleton in another unit. Near-zero offsets carry no scale information and
-    // are excluded, with their ratios reported.
-    let longest_source = tracks
-        .iter()
-        .map(|track| Ok(DVec3::from_array(source_local(track.node)?.translation).length()))
-        .collect::<Result<Vec<_>, CommandError>>()?
-        .into_iter()
-        .fold(0.0_f64, f64::max);
-    let longest_rig = tracks
-        .iter()
-        .map(|track| {
-            DVec3::from_array(
-                rig.joint(track.joint)
-                    .expect("a mapped bone is a rig joint")
-                    .rest
-                    .translation
-                    .map(f64::from),
-            )
-            .length()
-        })
-        .fold(0.0_f64, f64::max);
-    let mut candidates: Vec<(f64, String, f64, f64)> = Vec::new();
-    for track in &tracks {
-        let source_length = DVec3::from_array(source_local(track.node)?.translation).length();
-        let rig_length = DVec3::from_array(
-            rig.joint(track.joint)
-                .expect("a mapped bone is a rig joint")
-                .rest
-                .translation
-                .map(f64::from),
-        )
-        .length();
-        if source_length <= longest_source * 1e-2 || rig_length <= longest_rig * 1e-2 {
-            continue;
-        }
-        candidates.push((
-            rig_length / source_length,
-            track.name.clone(),
-            source_length,
-            rig_length,
-        ));
-    }
-    if candidates.is_empty() {
-        return Err(refused(
-            "export_glb_clip_rest_mismatch",
-            format!(
-                "clip {:?} shares no measurable bone offset with the rig; the unit ratio is undefined",
-                source.name
-            ),
-        ));
-    }
-    let mut ratios: Vec<f64> = candidates.iter().map(|row| row.0).collect();
-    let scale = median(&mut ratios);
-    if !scale.is_finite() || scale <= 0.0 {
-        return Err(refused(
-            "export_glb_clip_rest_mismatch",
-            format!(
-                "clip {:?} bone offsets give no usable unit ratio ({scale})",
-                source.name
-            ),
-        ));
-    }
-    let matching: Vec<f64> = candidates
-        .iter()
-        .map(|row| row.0)
-        .filter(|ratio| (ratio / scale - 1.0).abs() <= tolerances.scale_relative)
-        .collect();
-    let scale_min = matching.iter().copied().fold(f64::INFINITY, f64::min);
-    let scale_max = matching.iter().copied().fold(0.0_f64, f64::max);
-    let share = matching.len() as f64 / candidates.len() as f64;
-    if share < 0.8 {
-        return Err(refused(
-            "export_glb_clip_rest_mismatch",
-            format!(
-                "clip {:?} bone offsets disagree with one unit ratio: {} of {} measurable offsets \
-                 are within {:.4} of {scale:.6} (floor 0.8); the rigs are not one scaled skeleton",
-                source.name,
-                matching.len(),
-                candidates.len(),
-                tolerances.scale_relative,
-            ),
-        ));
-    }
-    let mut scale_outliers = Vec::new();
-    for (ratio, bone, source_length, rig_length) in &candidates {
-        if (ratio / scale - 1.0).abs() > tolerances.scale_relative {
-            scale_outliers.push(ScaleOutlier {
-                bone: bone.clone(),
-                ratio: *ratio,
-                source_length: *source_length,
-                rig_length: *rig_length,
-            });
-        }
-    }
-
-    // Rest compatibility: the two skeletons must be the same pose at one
-    // similarity. Positions are convention free, so they carry the gate;
-    // per-bone orientations are conventions and are reported, not gated.
+    // The unit is measured on the *world* positions the mapped bones occupy, not
+    // on per-bone local offsets. A source authored for another body disagrees with
+    // the rig in every bone length by construction (the Y-bot's clavicle is 11 cm
+    // against the rig's 28.6 cm), so the median of per-bone ratios measures the
+    // body, not the file's unit: on the measured pair it was biased by -4.52 % and
+    // only 9 of 51 offsets agreed within 2 %. The ratio of the two skeletons'
+    // radii about their own centroids is one number for a whole skeleton in one
+    // unit and proportion does not move it.
     let origins: Vec<(usize, DVec3, DVec3)> = tracks
         .iter()
+        .filter(|track| !track.derived)
         .map(|track| {
             let dest = rest_world(rig, track.joint);
             let source = source_world(track.node)?;
             Ok((track.slot, dest.w_axis.truncate(), source.w_axis.truncate()))
         })
         .collect::<Result<_, CommandError>>()?;
-    let frame = rest_frame(&origins)?;
-    let root = origins
-        .iter()
-        .map(|(_, dest, _)| *dest)
-        .fold(None::<DVec3>, |worst, point| match worst {
-            Some(best) if best.length_squared() >= point.length_squared() => Some(best),
-            _ => Some(point),
-        })
-        .unwrap_or(DVec3::ZERO);
+    let mean = |pick: fn(&(usize, DVec3, DVec3)) -> DVec3| -> DVec3 {
+        match origins.is_empty() {
+            true => DVec3::ZERO,
+            false => origins.iter().map(pick).sum::<DVec3>() / origins.len() as f64,
+        }
+    };
+    let target_center = mean(|row| row.1);
+    let source_center = mean(|row| row.2);
+    let (frame, radius_ratio) = match correspondence {
+        Some(correspondence) => (
+            correspondence.similarity.rotation,
+            correspondence.similarity.unit,
+        ),
+        None => (rest_frame(&origins)?, 1.0),
+    };
+    // The lengths are measured between *world* joint origins, not between local
+    // offsets: a source under a 0.01 ancestor carries centimetre locals at metre
+    // world scale, and a ratio of local offsets would compare it against the wrong
+    // frame (the defect the residual above had). A world length divided by a world
+    // length is the same unit as `unit`.
+    let source_parent_world = |node: usize| -> Result<DMat4, CommandError> {
+        match actor.node_parents()[node] {
+            Some(parent) => rest_world_of(actor, parent),
+            None => Ok(DMat4::IDENTITY),
+        }
+    };
+    let mut bone_lengths: Vec<(f64, f64, String)> = Vec::with_capacity(tracks.len());
+    for track in tracks.iter().filter(|track| !track.derived) {
+        let source = source_world(track.node)?.w_axis.truncate();
+        let source_parent = source_parent_world(track.node)?.w_axis.truncate();
+        let rig_origin = rest_world(rig, track.joint).w_axis.truncate();
+        let rig_parent = match rig
+            .joint(track.joint)
+            .expect("a mapped bone is a rig joint")
+            .parent
+        {
+            Some(parent) => rest_world(rig, parent).w_axis.truncate(),
+            None => DVec3::ZERO,
+        };
+        bone_lengths.push((
+            (rig_origin - rig_parent).length(),
+            (source - source_parent).length(),
+            track.name.clone(),
+        ));
+    }
+    let longest_source = bone_lengths.iter().map(|row| row.1).fold(0.0_f64, f64::max);
+    let longest_rig = bone_lengths.iter().map(|row| row.0).fold(0.0_f64, f64::max);
+    let mut candidates: Vec<(f64, String, f64, f64)> = Vec::new();
+    for (rig_length, source_length, name) in &bone_lengths {
+        if *source_length <= longest_source * 1e-2 || *rig_length <= longest_rig * 1e-2 {
+            continue;
+        }
+        candidates.push((
+            rig_length / source_length,
+            name.clone(),
+            *source_length,
+            *rig_length,
+        ));
+    }
+    let unit = match correspondence {
+        Some(_) => radius_ratio,
+        None => {
+            let source_radius: f64 = origins
+                .iter()
+                .map(|row| (row.2 - source_center).length_squared())
+                .sum();
+            let target_radius: f64 = origins
+                .iter()
+                .map(|row| (row.1 - target_center).length_squared())
+                .sum();
+            match source_radius > 1e-18 && target_radius > 1e-18 {
+                true => (target_radius / source_radius).sqrt(),
+                false => {
+                    // Too few bones to place a radius: fall back to the per-bone
+                    // lengths, which is what a two-joint fixture can still define.
+                    let mut ratios: Vec<f64> = candidates.iter().map(|row| row.0).collect();
+                    ratios.sort_by(f64::total_cmp);
+                    match ratios.get(ratios.len() / 2).copied() {
+                        Some(ratio) => ratio,
+                        None => {
+                            return Err(refused(
+                                "export_glb_clip_rest_mismatch",
+                                format!(
+                                    "clip {:?} has no measurable rest extent against the rig; \
+                                     the unit cannot be defined",
+                                    source.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    if !unit.is_finite() || unit <= 0.0 {
+        return Err(refused(
+            "export_glb_clip_rest_mismatch",
+            format!(
+                "clip {:?} rest positions give no usable unit ({unit})",
+                source.name
+            ),
+        ));
+    }
+    // Rest compatibility: the two skeletons must be the same pose at one
+    // similarity. Positions are convention free, so they carry the gate; per-bone
+    // orientations are conventions and are reported, not gated. The expected
+    // position is the *world* source position through the fitted rotation and the
+    // world unit, centred on the rig's own centroid: multiplying a world position
+    // by a per-local-unit ratio (the previous form) mixes two frames and reported
+    // 0.988 on a correct conversion.
     let extent = origins
         .iter()
-        .map(|(_, dest, _)| dest.distance(root))
+        .map(|row| (row.1 - target_center).length())
         .fold(0.0_f64, f64::max);
     let mut max_position_residual = 0.0_f64;
     let mut max_orientation = 0.0_f64;
     let mut worst_bone = String::new();
-    for (track, (_, dest, source)) in tracks.iter().zip(&origins) {
-        let expected = frame * (*source * scale);
+    for (track, (_, dest, source)) in tracks.iter().filter(|track| !track.derived).zip(&origins) {
+        let expected = frame * ((*source - source_center) * unit) + target_center;
         let residual = match extent > 0.0 {
             true => dest.distance(expected) / extent,
             false => dest.distance(expected),
@@ -1600,17 +1906,86 @@ pub fn plan_clip(
         let dest_world = rest_world(rig, track.joint);
         let source_world = source_world(track.node)?;
         let orientation = quaternion_angle(
-            &(DQuat::from_mat4(&dest_world)
-                * (DQuat::from_mat3(&frame) * DQuat::from_mat4(&source_world)).inverse()),
+            &(rotation_of(dest_world)
+                * (DQuat::from_mat3(&frame) * rotation_of(source_world)).inverse()),
         )
         .to_degrees();
         max_orientation = max_orientation.max(orientation);
     }
-    // The anchor's stance is reported, not gated: the conversion above never
-    // uses a bone position, so a source stance that differs from the bind pose
-    // cannot displace the written pose. What it does mean is that only the
-    // motion is imported, not the source's absolute stance.
+    // How far the two skeletons' *bone frames* sit apart after the one fitted
+    // frame. A pose copy writes the source's absolute orientation, so it places
+    // our child offsets along the source's own bone axis; that is only meaningful
+    // when the two frames agree. The measured pair does not (SSE puts the bone
+    // along local +Z, Mixamo along +Y), so the number is a precondition, not a
+    // quality score.
+    let axis_convention_degrees = {
+        let mut angles: Vec<f64> = tracks
+            .iter()
+            .filter(|track| !track.derived)
+            .map(|track| {
+                let target = rotation_of(rest_world(rig, track.joint));
+                let source = rotation_of(source_world(track.node)?);
+                Ok(
+                    quaternion_angle(&(target * (DQuat::from_mat3(&frame) * source).inverse()))
+                        .to_degrees(),
+                )
+            })
+            .collect::<Result<_, CommandError>>()?;
+        angles.sort_by(f64::total_cmp);
+        match angles.is_empty() {
+            true => 0.0,
+            false => angles[angles.len() / 2],
+        }
+    };
+    // The anchor's stance is reported, not gated by itself: the conversion never
+    // reads a bone position, so a source stance that differs from the bind pose
+    // cannot displace the written pose. What it does mean is that only the motion
+    // is imported, not the source's absolute stance; a cross-body source is
+    // expected to be declared, not silently accepted.
     let pose_comparable = max_position_residual <= tolerances.translation_relative;
+
+    // Per-bone ratios stay **reported**: they are the proportion difference of two
+    // bodies, and a gate that refused them would refuse every cross-body source
+    // (measured share 0.176 against the former 0.8 floor). What they still refuse
+    // is the one case they were written for: two rigs that share a rest pose but
+    // not a unit, which is a broken skeleton, not another body.
+    let matching: Vec<f64> = candidates
+        .iter()
+        .map(|row| row.0)
+        .filter(|ratio| (ratio / unit - 1.0).abs() <= tolerances.scale_relative)
+        .collect();
+    let scale_min = matching.iter().copied().fold(f64::INFINITY, f64::min);
+    let scale_max = matching.iter().copied().fold(0.0_f64, f64::max);
+    let share = match candidates.is_empty() {
+        true => 1.0,
+        false => matching.len() as f64 / candidates.len() as f64,
+    };
+    if share < 0.8 && pose_comparable {
+        return Err(refused(
+            "export_glb_clip_rest_mismatch",
+            format!(
+                "clip {:?} reproduces the rig's rest pose (residual {max_position_residual:.4}) but \
+                 its bone offsets disagree with the one unit {unit:.6}: {} of {} measurable offsets \
+                 are within {:.4} (floor 0.8); the skeleton's own lengths are inconsistent",
+                source.name,
+                matching.len(),
+                candidates.len(),
+                tolerances.scale_relative,
+            ),
+        ));
+    }
+    let mut scale_outliers = Vec::new();
+    for (ratio, bone, source_length, rig_length) in &candidates {
+        if (ratio / unit - 1.0).abs() > tolerances.scale_relative {
+            scale_outliers.push(ScaleOutlier {
+                bone: bone.clone(),
+                ratio: *ratio,
+                source_length: *source_length,
+                rig_length: *rig_length,
+            });
+        }
+    }
+    let scale = unit;
 
     // Bone directions carry the motion convention free: the source's two clips
     // disagree about bone roll by tens of degrees on the same bone, so a frame
@@ -1621,13 +1996,17 @@ pub fn plan_clip(
     // children are never mistaken for the anatomical successor.
     let rest_source_worlds: Vec<DMat4> = tracks
         .iter()
-        .map(|track| source_world(track.node))
+        .map(|track| match track.derived {
+            true => Ok(DMat4::IDENTITY),
+            false => source_world(track.node),
+        })
         .collect::<Result<_, CommandError>>()?;
     let directions: Vec<Option<(DVec3, usize)>> = tracks
         .iter()
         .enumerate()
-        .map(|(index, _)| {
-            direction_reference(rig, &tracks, index, &rest_source_worlds, frame, actor)
+        .map(|(index, track)| match track.derived {
+            true => None,
+            false => direction_reference(rig, &tracks, index, &rest_source_worlds, frame, actor),
         })
         .collect();
 
@@ -1640,7 +2019,21 @@ pub fn plan_clip(
         .collect();
     let rest_source_rotations: Vec<DQuat> = tracks
         .iter()
-        .map(|track| Ok(DQuat::from_mat4(&source_world(track.node)?)))
+        .map(|track| match track.derived {
+            true => Ok(DQuat::IDENTITY),
+            false => Ok(rotation_of(source_world(track.node)?)),
+        })
+        .collect::<Result<_, CommandError>>()?;
+    // The source skeleton's own rest pose. A pose transfer is anchored here, not at
+    // the clip's first sample: a walk's first sample is a *stance* (a bent knee,
+    // a planted foot), and a delta measured from it carries only the change since
+    // then, leaving our rest stance to travel with the body — the measured slide.
+    let rest_source_rests: Vec<DQuat> = tracks
+        .iter()
+        .map(|track| match track.derived {
+            true => Ok(DQuat::IDENTITY),
+            false => Ok(rotation_of(rest_world_of(actor, track.node)?)),
+        })
         .collect::<Result<_, CommandError>>()?;
     // Bone-frame deltas carry each rig's roll convention as well as the motion.
     // The convention is one constant twist per bone; it is measured here and
@@ -1650,6 +2043,9 @@ pub fn plan_clip(
     {
         let mut probe: Vec<Option<DMat4>> = vec![None; source_worlds.nodes()];
         for (position, track) in tracks.iter().enumerate() {
+            if track.derived {
+                continue;
+            }
             let axis = directions[position].map(|(_, child)| {
                 let bone = source_worlds
                     .world(track.node, 0, &mut probe)
@@ -1663,14 +2059,14 @@ pub fn plan_clip(
                 continue;
             }
             let sample = source_worlds.world(track.node, 0, &mut probe);
-            let delta = rest_source_rotations[position].inverse() * DQuat::from_mat4(&sample);
+            let delta = rest_source_rotations[position].inverse() * rotation_of(sample);
             let swing = DQuat::from_rotation_arc(axis, delta * axis);
             let twist = swing.inverse() * delta;
             max_roll = max_roll.max(quaternion_angle(&twist).to_degrees());
             twist_baseline[position] = twist;
         }
     }
-    if max_roll > tolerances.roll_degrees {
+    if correspondence.is_none() && max_roll > tolerances.roll_degrees {
         return Err(refused(
             "export_glb_clip_rest_mismatch",
             format!(
@@ -1713,11 +2109,13 @@ pub fn plan_clip(
     {
         let mut probe_worlds: Vec<Option<DMat4>> = vec![None; source_worlds.nodes()];
         for (position, track) in tracks.iter().enumerate() {
+            if track.derived {
+                continue;
+            }
             let bone = source_worlds.world(track.node, 0, &mut probe_worlds);
-            let frame_delta = quaternion_angle(
-                &(DQuat::from_mat4(&bone) * rest_source_rotations[position].inverse()),
-            )
-            .to_degrees();
+            let frame_delta =
+                quaternion_angle(&(rotation_of(bone) * rest_source_rotations[position].inverse()))
+                    .to_degrees();
             let swing = match directions[position] {
                 Some((_, child)) => match tracks.iter().position(|other| other.node == child) {
                     Some(child_position) => {
@@ -1753,99 +2151,374 @@ pub fn plan_clip(
         }
     }
 
+    // A folded segment's own *motion* composes after the bone it folds into:
+    // `S_3 · (S_4 · S0_4⁻¹)`. The measured fourth finger segment carries 0.0000°
+    // in the walk family, so the fold is exact there and only shows in a grip.
+    let fold_reference: Vec<Vec<(usize, DQuat)>> = tracks
+        .iter()
+        .map(|track| {
+            track
+                .fold
+                .iter()
+                .map(|node| {
+                    let rest = source_local(*node)?;
+                    Ok((*node, DQuat::from_array(rest.rotation)))
+                })
+                .collect::<Result<Vec<_>, CommandError>>()
+        })
+        .collect::<Result<_, CommandError>>()?;
+    let frame_rotation = DQuat::from_mat3(&frame);
+    // The bone that carries the body's travel, and the source bone whose travel it
+    // is. A SSE palette hangs the pelvis *beside* the spine off a common ancestor
+    // (`NPC COM`), so translating the pelvis moves the legs and leaves the torso
+    // behind: the travel belongs on the deepest joint every mapped bone descends
+    // from. The source's own travel is read from its root motion bone.
+    // The palette's twist helpers are *side* bones (children of the bone they
+    // serve), not members of the chain: `ForearmTwist1/2` hang off `Forearm`
+    // beside `Hand`, and `UpperarmTwist1/2` hang off `UpperArm` beside `Forearm`.
+    // Their chain is therefore the parent and the parent's anatomical successor,
+    // with the fraction from the helper's own index.
+    let slot_roles: Vec<Option<crate::retarget::BoneRole>> = match correspondence {
+        Some(correspondence) => palette
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| {
+                correspondence
+                    .pairs
+                    .iter()
+                    .find(|pair| pair.slot == slot)
+                    .and_then(|pair| pair.role)
+            })
+            .collect(),
+        None => vec![None; palette.len()],
+    };
+    let track_roles: Vec<Option<crate::retarget::BoneRole>> = tracks
+        .iter()
+        .map(|track| slot_roles.get(track.slot).copied().flatten())
+        .collect();
+    let chains: Vec<Option<TwistChain>> = tracks
+        .iter()
+        .enumerate()
+        .map(|(position, track)| match track.derived {
+            true => twist_chain(rig, &tracks, &track_roles, &slot_roles, position),
+            false => None,
+        })
+        .collect();
+    // D4: a mapped bone whose direct parent is not driven must derive its local
+    // against the nearest *driven* ancestor's posed world, with the constant
+    // offset of the static nodes between them folded out. Mike is the shape this
+    // exists for: 52 of 52 mapped bones hang under an unmapped `CME` mirror, so a
+    // rest-parent substitution drops the parent's posed world entirely.
+    let closure: Vec<Option<(usize, DQuat)>> = tracks
+        .iter()
+        .map(|track| {
+            let parent = rig.joint(track.joint)?.parent?;
+            // Any track the plan writes is a valid derivation parent, derived or
+            // not: its world is known before the locals pass. Skipping a derived
+            // parent and substituting its own ancestor silently treated a rotating
+            // twist helper as if it stood still, and the skin between the two
+            // stretched by the difference.
+            if let Some(found) = tracks.iter().position(|other| other.joint == parent) {
+                return Some((found, DQuat::IDENTITY));
+            }
+            let mut cursor = Some(parent);
+            while let Some(joint) = cursor {
+                if let Some(found) = tracks
+                    .iter()
+                    .position(|other| other.joint == joint && !other.derived)
+                {
+                    let offset = rotation_of(rest_world(rig, joint)).inverse()
+                        * rotation_of(rest_world(rig, parent));
+                    return Some((found, offset));
+                }
+                cursor = rig.joint(joint).and_then(|definition| definition.parent);
+            }
+            None
+        })
+        .collect();
+    let mut errors: Vec<f64> = Vec::with_capacity(samples);
+    let mut error_outlier = String::new();
+    let mut max_error = 0.0_f64;
+    // Our bone's own axis in its local frame, and the source's own: the pair the
+    // direction gate compares in world space, so a differing local axis shows up
+    // as the error it produces rather than as a number about orientations.
+    let rest_axes: Vec<Option<(DVec3, DVec3, usize)>> = tracks
+        .iter()
+        .enumerate()
+        .map(|(position, _track)| {
+            let (_, child) = directions[position]?;
+            let child_position = tracks.iter().position(|other| other.node == child)?;
+            let ours = DVec3::from_array(
+                rig.joint(tracks[child_position].joint)?
+                    .rest
+                    .translation
+                    .map(f64::from),
+            )
+            .normalize_or_zero();
+            let theirs =
+                DVec3::from_array(source_local(child).ok()?.translation).normalize_or_zero();
+            match ours.length_squared() > 0.5 && theirs.length_squared() > 0.5 {
+                true => Some((ours, theirs, child_position)),
+                false => None,
+            }
+        })
+        .collect();
+    let mut direction_errors: Vec<f64> = Vec::with_capacity(samples);
+    let mut written_position: Vec<DVec3> = vec![DVec3::ZERO; tracks.len()];
+    let mut root_positions: Vec<DVec3> = Vec::with_capacity(samples);
+
     let mut worlds: Vec<Option<DMat4>> = vec![None; source_worlds.nodes()];
     for sample in 0..samples {
         worlds.iter_mut().for_each(|slot| *slot = None);
-        let mut deltas: Vec<DQuat> = Vec::with_capacity(tracks.len());
+        // The world orientation every track is written at: the rig rest rotated
+        // by the clip's motion (motion copy), or the clip's own world pose with
+        // the one fitted frame folded in (pose copy).
+        // A bone with no rotation channel keeps its rest orientation, and its
+        // children must see that: the root-motion joint is exactly such a bone.
+        let mut written: Vec<DQuat> = rest_rotations.clone();
         for (position, track) in tracks.iter().enumerate() {
-            let bone = source_worlds.world(track.node, sample, &mut worlds);
-            // The joint rotation in the bone's own frame: the same motion the
-            // source's bone performs relative to the clip set's reference pose.
-            let delta = rest_source_rotations[position].inverse() * DQuat::from_mat4(&bone);
-            let delta = match directions[position] {
-                Some((_, child)) => {
-                    let child_position = tracks
-                        .iter()
-                        .position(|other| other.node == child)
-                        .expect("a direction child is a tracked bone");
-                    let anchor_bone = rest_source_worlds[position].w_axis.truncate();
-                    let anchor_joint = rest_source_worlds[child_position].w_axis.truncate();
-                    let axis = rest_source_rotations[position].inverse()
-                        * (anchor_joint - anchor_bone).normalize_or_zero();
-                    match axis.length_squared() > 0.5 {
-                        true => {
-                            let swing = DQuat::from_rotation_arc(axis, delta * axis);
-                            let twist = swing.inverse() * delta;
-                            swing * (twist * twist_baseline[position].inverse())
-                        }
-                        false => delta,
-                    }
-                }
-                None => delta,
-            };
-            deltas.push(delta);
-        }
-        for (position, track) in tracks.iter().enumerate() {
-            if track.rotation.is_some() {
-                let world = rest_rotations[position] * deltas[position];
-                let parent = rig
-                    .joint(track.joint)
-                    .expect("a mapped bone is a rig joint")
-                    .parent;
-                let parent_world = match parent {
-                    Some(parent) => {
-                        let parent_rest = DQuat::from_mat4(&rest_world(rig, parent));
-                        match tracks.iter().position(|other| other.joint == parent) {
-                            Some(index) => parent_rest * deltas[index],
-                            None => parent_rest,
-                        }
-                    }
-                    None => DQuat::IDENTITY,
-                };
-                let local = parent_world.inverse() * world;
-                rotation_values[position].push(local.normalize().to_array());
+            if track.derived {
+                continue;
             }
-            if let Some(track_values) = &track.translation {
-                let rest = rig
-                    .joint(track.joint)
-                    .expect("a mapped bone is a rig joint")
-                    .rest;
-                let source_rest = source_local(track.node)?;
-                let values = track_values;
-                let delta =
-                    DVec3::from_array(values[sample]) - DVec3::from_array(source_rest.translation);
-                // The node's local translation lives in its parent's frame; map
-                // the source parent frame onto the rig parent frame, then back
-                // into the rig's own local lane.
-                let source_parent = match anchor.parent_world(actor, track.node) {
-                    Some(parent) => DQuat::from_mat4(&parent),
-                    None => rest_source_rotations[position],
+            let bone = source_worlds.world(track.node, sample, &mut worlds);
+            let source_rotation = rotation_of(bone);
+            let mut world = match semantics {
+                // The world rotation the source bone performed since its own
+                // rest, applied to this rig's rest orientation. The delta is
+                // taken in world space, so the source's bone-local axes never
+                // enter: a rig whose bone runs along a different local axis
+                // (SSE +Z against Mixamo +Y, measured 121.91° apart) still gets
+                // the same anatomical motion, and this rig's rest, lengths and
+                // skin frames stay its own.
+                ClipSemantics::Motion => {
+                    // The source's motion is expressed in the source's world; the one
+                    // fitted frame takes it into this rig's world. Without that
+                    // conjugation a source facing +Z and a body facing -Z swing the
+                    // limbs the opposite way and the feet skate at twice the body
+                    // speed (measured 3.49 m/s against the source's 0.084).
+                    let delta = source_rotation * rest_source_rotations[position].inverse();
+                    (frame_rotation * delta * frame_rotation.inverse()) * rest_rotations[position]
+                }
+                // The source's deviation from *its own* rest, applied to this rig's
+                // rest: the stance is carried (a planted foot stays planted while
+                // the body travels) and this rig's bone frames stay its own. An
+                // absolute orientation copy is not offered: it places our child
+                // offsets along the source's bone axis, measured 121.91° apart.
+                ClipSemantics::Pose => {
+                    let delta = source_rotation * rest_source_rests[position].inverse();
+                    (frame_rotation * delta * frame_rotation.inverse()) * rest_rotations[position]
+                }
+            };
+            for (node, reference) in &fold_reference[position] {
+                let Some(values) = rotations.get(node) else {
+                    continue;
                 };
-                let rig_parent = match rig
+                let folded = DQuat::from_array(values[sample.min(values.len() - 1)]);
+                world *= folded * reference.inverse();
+            }
+            written[position] = world;
+            // The gate 0131 recommends: the written world orientation against the
+            // source's own, after the one fitted frame. A motion copy carries the
+            // rest difference into every sample, so on a cross-body pair this is
+            // tens of degrees by construction; a pose copy is the number under 5°.
+            let error = quaternion_angle(&(world * (frame_rotation * source_rotation).inverse()))
+                .to_degrees();
+            if error > max_error {
+                max_error = error;
+                error_outlier.clone_from(&track.name);
+            }
+            if let Some((ours, theirs, _)) = rest_axes[position] {
+                // The bone's own axis through each rig's world frame: the angle
+                // between the two is what the eye sees as "the limb points
+                // somewhere else", unlike an orientation difference.
+                let mine = world * ours;
+                let source_direction = (frame_rotation * source_rotation) * theirs;
+                direction_errors.push(
+                    mine.dot(source_direction)
+                        .clamp(-1.0, 1.0)
+                        .acos()
+                        .to_degrees(),
+                );
+            }
+            errors.push(error);
+            written_position[position] = bone.w_axis.truncate();
+        }
+        // The twist chain runs parent -> twist1 -> twist2 -> child; each twist
+        // takes `depth / length` of the parent-to-child world deviation, so the
+        // band between two bones is monotone instead of snapping at one joint.
+        for (position, chain) in chains.iter().enumerate() {
+            let Some(chain) = chain else { continue };
+            let anchor_world = written[chain.anchor];
+            let tip_world = written[chain.tip];
+            let rest_anchor = DQuat::from_mat4(&rest_world(rig, tracks[chain.anchor].joint));
+            let rest_tip = DQuat::from_mat4(&rest_world(rig, tracks[chain.tip].joint));
+            let from = anchor_world * rest_anchor.inverse();
+            let to = tip_world * rest_tip.inverse();
+            // Only the *twist about the bone's own axis* is distributed. Handing the
+            // band a fraction of the whole parent-to-child deviation moves it off the
+            // bone's axis and shears the skin around the wrist (measured 3.45x on the
+            // wrist band before this form): flexion belongs to the two bones, the
+            // soft-tissue roll to the helpers between them.
+            let axis = (rest_world(rig, tracks[chain.tip].joint).w_axis.truncate()
+                - rest_world(rig, tracks[position].joint).w_axis.truncate())
+            .normalize_or_zero();
+            let deviation = match axis.length_squared() > 0.5 {
+                true => {
+                    let relative = from.inverse() * to;
+                    let swing = DQuat::from_rotation_arc(axis, relative * axis);
+                    let twist = swing.inverse() * relative;
+                    from * slerp_shortest(DQuat::IDENTITY, twist, chain.fraction)
+                }
+                false => slerp_shortest(from, to, chain.fraction),
+            };
+            written[position] = deviation * rest_rotations[position];
+        }
+        // Every local is derived from the *written* parent world, so a chain the
+        // source and the palette share stays consistent sample by sample.
+        for (position, track) in tracks.iter().enumerate() {
+            if track.rotation.is_none() {
+                continue;
+            }
+            let parent_world = match closure[position] {
+                Some((anchor, offset)) => written[anchor] * offset,
+                None => match rig
                     .joint(track.joint)
                     .expect("a mapped bone is a rig joint")
                     .parent
                 {
-                    Some(parent) => DQuat::from_mat4(&rest_world(rig, parent)),
+                    Some(parent) => rotation_of(rest_world(rig, parent)),
                     None => DQuat::IDENTITY,
-                };
-                let world_delta = source_parent * delta;
-                let local_delta = rig_parent.inverse() * ((frame * world_delta) * scale);
-                let value = DVec3::from_array(rest.translation.map(f64::from)) + local_delta;
-                translation_values[position].push(value.to_array());
+                },
+            };
+            let local = parent_world.inverse() * written[position];
+            rotation_values[position].push(local.normalize().to_array());
+        }
+        // Root translation is the one source distance that becomes a rig
+        // distance; every other bone keeps the palette's own rest offset, because
+        // an angle transfers across bodies and a length does not. The world delta
+        // is already metric and already through the source's ancestors, so no
+        // per-local unit ratio enters it.
+        if let (Some(root), Some(source_position)) = (root_track, source_root)
+            && !tracks[source_position].derived
+        {
+            let source_track = &tracks[source_position];
+            let reference = source_world(source_track.node)?;
+            let travel = written_position[source_position] - reference.w_axis.truncate();
+            root_positions.push(travel);
+            let track = &tracks[root];
+            let rest = rig
+                .joint(track.joint)
+                .expect("a mapped bone is a rig joint")
+                .rest;
+            let rig_parent = match rig
+                .joint(track.joint)
+                .expect("a mapped bone is a rig joint")
+                .parent
+            {
+                Some(parent) => rotation_of(rest_world(rig, parent)),
+                None => DQuat::IDENTITY,
+            };
+            let mut local_delta = rig_parent.inverse() * (frame * travel * unit);
+            if root_motion == RootMotion::Zero {
+                local_delta = DVec3::ZERO;
             }
-            if let Some(track_values) = &track.scale {
-                let rest = rig
-                    .joint(track.joint)
-                    .expect("a mapped bone is a rig joint")
-                    .rest;
-                let source_rest = source_local(track.node)?;
-                let values = track_values;
-                let value =
-                    DVec3::from_array(values[sample]) / DVec3::from_array(source_rest.scale);
-                scale_values[position]
-                    .push((DVec3::splat(f64::from(rest.scale)) * value).to_array());
+            let value = DVec3::from_array(rest.translation.map(f64::from)) + local_delta;
+            translation_values[root].push(value.to_array());
+        }
+        for (position, track) in tracks.iter().enumerate() {
+            // The travel of the source's own root bone is consumed by the
+            // root-motion policy above; writing its local translation as well
+            // would move the body twice.
+            if track.derived || Some(position) == source_root || Some(position) == root_track {
+                continue;
             }
+            let Some(track_values) = &track.translation else {
+                continue;
+            };
+            // A non-root translation channel is a source distance between two
+            // bodies; only the motion copy keeps the old conversion, and only for
+            // the coordinates that carry it.
+            if semantics == ClipSemantics::Pose {
+                continue;
+            }
+            let rest = rig
+                .joint(track.joint)
+                .expect("a mapped bone is a rig joint")
+                .rest;
+            let source_rest = source_local(track.node)?;
+            let values = track_values;
+            let delta =
+                DVec3::from_array(values[sample]) - DVec3::from_array(source_rest.translation);
+            let source_parent = match anchor.parent_world(actor, track.node) {
+                Some(parent) => rotation_of(parent),
+                None => rest_source_rotations[position],
+            };
+            let rig_parent = match rig
+                .joint(track.joint)
+                .expect("a mapped bone is a rig joint")
+                .parent
+            {
+                Some(parent) => DQuat::from_mat4(&rest_world(rig, parent)),
+                None => DQuat::IDENTITY,
+            };
+            let world_delta = source_parent * delta;
+            let local_delta = rig_parent.inverse() * ((frame * world_delta) * unit);
+            let value = DVec3::from_array(rest.translation.map(f64::from)) + local_delta;
+            translation_values[position].push(value.to_array());
+        }
+        for (position, track) in tracks.iter().enumerate() {
+            if track.derived {
+                continue;
+            }
+            let Some(track_values) = &track.scale else {
+                continue;
+            };
+            let rest = rig
+                .joint(track.joint)
+                .expect("a mapped bone is a rig joint")
+                .rest;
+            let source_rest = source_local(track.node)?;
+            let values = track_values;
+            let value = DVec3::from_array(values[sample]) / DVec3::from_array(source_rest.scale);
+            scale_values[position].push((DVec3::splat(f64::from(rest.scale)) * value).to_array());
+        }
+    }
+    let median_of = |values: &[f64]| -> f64 {
+        let mut ordered = values.to_vec();
+        ordered.sort_by(f64::total_cmp);
+        match ordered.is_empty() {
+            true => 0.0,
+            false => ordered[ordered.len() / 2],
+        }
+    };
+    let pose_error_median = median_of(&errors);
+    let direction_error_median_degrees = median_of(&direction_errors);
+    let direction_error_max_degrees = direction_errors.iter().copied().fold(0.0_f64, f64::max);
+    // The root-motion split: the linear ramp is the travel a controller consumes,
+    // the residual stays on the pelvis as sway. Reported, never guessed at.
+    let root_travel = match (root_positions.first(), root_positions.last()) {
+        (Some(first), Some(last)) => *last - *first,
+        _ => DVec3::ZERO,
+    };
+    let mut root_motion_travel = 0.0_f64;
+    if root_motion == RootMotion::Split
+        && let Some(root) = root_track
+        && let (Some(first), Some(last)) = (
+            translation_values[root].first().copied(),
+            translation_values[root].last().copied(),
+        )
+    {
+        let ramp = DVec3::from_array(last) - DVec3::from_array(first);
+        root_motion_travel = (frame * root_travel * unit).length();
+        let times = source.times.as_slice();
+        let start = times.first().copied().unwrap_or(0.0) as f64;
+        let end = times.last().copied().unwrap_or(0.0) as f64;
+        let span = (end - start).max(f64::EPSILON);
+        let values = &mut translation_values[root];
+        for (index, value) in values.iter_mut().enumerate() {
+            let time = times.get(index).copied().unwrap_or(0.0) as f64;
+            let fraction = (time - start) / span;
+            *value = (DVec3::from_array(*value) - ramp * fraction).to_array();
         }
     }
 
@@ -1958,6 +2631,20 @@ pub fn plan_clip(
         scale_max,
         scale_shared: share,
         scale_outliers,
+        semantics,
+        axis_convention_degrees,
+        direction_error_median_degrees,
+        direction_error_max_degrees,
+        pose_error_median_degrees: pose_error_median,
+        pose_error_max_degrees: max_error,
+        pose_error_outlier: error_outlier,
+        root_motion,
+        root_motion_bone: root_track.map(|position| tracks[position].name.clone()),
+        source_root_bone: source_root
+            .filter(|position| !tracks[*position].derived)
+            .map(|position| tracks[position].name.clone()),
+        root_motion_travel,
+        root_travel: (frame * root_travel * unit).length(),
     })
 }
 
@@ -2124,6 +2811,142 @@ struct Track {
     translation: Option<Vec<[f64; 3]>>,
     rotation: Option<Vec<[f64; 4]>>,
     scale: Option<Vec<[f64; 3]>>,
+    /// Source nodes whose local motion folds into this bone's rotation.
+    fold: Vec<usize>,
+    /// A palette bone no source drives: a twist the plan derives between its
+    /// nearest mapped ancestor and descendant.
+    derived: bool,
+}
+
+/// Where a derived twist sits in its chain: the mapped bones either side and
+/// the fraction of the parent-to-child deviation it takes.
+struct TwistChain {
+    anchor: usize,
+    tip: usize,
+    fraction: f64,
+}
+
+/// The mapped ancestor and descendant a derived twist sits between, with its
+/// chain fraction (`1/3`, `2/3` on a two-twist arm).
+fn twist_chain(
+    rig: &Rig,
+    tracks: &[Track],
+    roles: &[Option<crate::retarget::BoneRole>],
+    slot_roles: &[Option<crate::retarget::BoneRole>],
+    position: usize,
+) -> Option<TwistChain> {
+    use crate::retarget::{BoneRole, Part};
+    // A side helper: its parent is the bone it serves, and the anatomical
+    // successor of that parent is the other end of the chain.
+    if let Some(BoneRole {
+        side,
+        part: Part::Twist { forearm, index },
+    }) = roles[position]
+    {
+        let successor = match forearm {
+            true => Part::Hand,
+            false => Part::Forearm,
+        };
+        let parent = rig.joint(tracks[position].joint)?.parent?;
+        // The parent may itself be a derived helper (the second twist of a pair):
+        // its written world is already known when the chains are applied.
+        let anchor = tracks.iter().position(|track| track.joint == parent)?;
+        let tip = tracks.iter().position(|track| {
+            slot_roles.get(track.slot).copied().flatten()
+                == Some(BoneRole {
+                    side,
+                    part: successor,
+                })
+                && !track.derived
+        })?;
+        // Two helpers per family: 1/3 and 2/3 from the parent towards the
+        // successor (Unity and Rigify both distribute roll by chain position).
+        let family = slot_roles
+            .iter()
+            .filter(|role| {
+                matches!(
+                    role,
+                    Some(BoneRole {
+                        side: other_side,
+                        part: Part::Twist { forearm: other, .. },
+                    }) if *other_side == side && *other == forearm
+                )
+            })
+            .count()
+            .max(1);
+        let fraction = f64::from(index) / (family as f64 + 1.0);
+        return Some(TwistChain {
+            anchor,
+            tip,
+            fraction: fraction.clamp(0.05, 0.95),
+        });
+    }
+    let joint = tracks[position].joint;
+    let mut children: BTreeMap<JointId, Vec<JointId>> = BTreeMap::new();
+    for (index, definition) in rig.joints().iter().enumerate() {
+        if let Some(parent) = definition.parent {
+            children
+                .entry(parent)
+                .or_default()
+                .push(JointId::new(index as u32));
+        }
+    }
+    let mapped = |joint: JointId| -> Option<usize> {
+        tracks
+            .iter()
+            .position(|track| track.joint == joint && !track.derived)
+    };
+    let mut up = 0_usize;
+    let mut current = joint;
+    let anchor = loop {
+        let parent = rig.joint(current)?.parent?;
+        up += 1;
+        if let Some(found) = mapped(parent) {
+            break found;
+        }
+        current = parent;
+        if up > 8 {
+            return None;
+        }
+    };
+    let mut down = 0_usize;
+    let mut current = joint;
+    let tip = loop {
+        let list = children.get(&current)?;
+        if list.len() != 1 {
+            return None;
+        }
+        let child = list[0];
+        down += 1;
+        if let Some(found) = mapped(child) {
+            break found;
+        }
+        current = child;
+        if down > 8 {
+            return None;
+        }
+    };
+    let total = (up + down) as f64;
+    Some(TwistChain {
+        anchor,
+        tip,
+        fraction: up as f64 / total,
+    })
+}
+
+/// Interpolate two rotations the short way round: a sign flip between samples is
+/// the same rotation, and the longer arc would spin the band backwards.
+fn slerp_shortest(from: DQuat, to: DQuat, alpha: f64) -> DQuat {
+    let mut to = to;
+    if from.dot(to) < 0.0 {
+        to = -to;
+    }
+    let theta = 2.0 * (from - to).length().atan2((from + to).length());
+    match theta > 1e-9 {
+        true => ((from * ((1.0 - alpha) * theta).sin() + to * (alpha * theta).sin()) / theta.sin())
+            .normalize(),
+        false => from,
+    }
 }
 
 /// One rig joint's rest world transform.
@@ -2176,7 +2999,7 @@ impl SourceWorlds {
     fn new(actor: &Actor, tracks: &[Track], samples: usize) -> Result<Self, CommandError> {
         let parents: Vec<Option<usize>> = actor.node_parents().to_vec();
         let mut locals: BTreeMap<usize, Vec<DMat4>> = BTreeMap::new();
-        for track in tracks {
+        for track in tracks.iter().filter(|track| !track.derived) {
             let mut node = Some(track.node);
             while let Some(current) = node {
                 if locals.contains_key(&current) {
@@ -2312,22 +3135,20 @@ fn magnitude<T: Copy>(samples: &[T], distance: impl Fn(T, T) -> f64) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// The rotation of one affine with any scale divided out.
+///
+/// A source under a `0.01` ancestor carries that factor into every world matrix,
+/// and a quaternion read straight off a scaled basis is not unit length — the
+/// failure is silent and total: the written pose comes out half-sized and turns
+/// with the wrong sign.
+fn rotation_of(matrix: DMat4) -> DQuat {
+    let (_, rotation, _) = matrix.to_scale_rotation_translation();
+    rotation
+}
+
 /// Rotation angle of one quaternion, radians in `[0, π]`.
 fn quaternion_angle(value: &DQuat) -> f64 {
     2.0 * value.w.abs().clamp(-1.0, 1.0).acos()
-}
-
-/// Median of already-sorted or unsorted values; zero for an empty slice.
-fn median(values: &mut [f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    match values.len() % 2 {
-        0 => (values[middle - 1] + values[middle]) / 2.0,
-        _ => values[middle],
-    }
 }
 
 /// Scale the whole merged scene into one unit system.
