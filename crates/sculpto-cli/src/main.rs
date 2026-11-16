@@ -42,6 +42,7 @@ commands:
   actor rig-regression --config FILE [--report FILE]
                         the four-way default-vs-adapted gate: spine, clearance, stance,
                         rest, coverage, stretch, clothing; exit 1 names the regressed rows
+  actor havok [options] decode one Skyrim Havok clip; bind its tracks by index
   inspect <path>        parse a document or a `.osd`/`.bsd` morph data file
   bake [options]        resolve a preset, apply it to a body NIF, write an OBJ
   batch [options]       bake every matching set in a project to OBJ files

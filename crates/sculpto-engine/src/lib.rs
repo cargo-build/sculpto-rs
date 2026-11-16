@@ -20,6 +20,7 @@ pub mod errors;
 pub mod export_actor;
 pub mod export_glb;
 mod handlers;
+pub mod havok;
 mod measures;
 pub mod obj;
 pub mod ops;

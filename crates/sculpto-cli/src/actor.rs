@@ -3,6 +3,7 @@
 mod adapt;
 mod fit;
 mod gait;
+mod havok;
 mod pack;
 mod pose;
 mod regression;
@@ -22,6 +23,8 @@ const USAGE: &str = "usage: sculpto actor sample --input actor.glb --part NAME [
     (--rest | --clip NAME --time SECONDS) --out actor.obj [--report actor.json]
 usage: sculpto actor stress --input actor.glb --body NAME --garment NAME [--garment NAME ...] \
     (--rest | --clip NAME --frames N) --tolerance UNITS [--out report.json]
+usage: sculpto actor havok (--archive CLIP.bsa --member PATH | --file CLIP.hkx) \
+    --skeleton skeleton.hkx [--actor actor.glb] [--out source.glb] [--report havok.json]
 usage: sculpto actor fit --input actor.glb --out fitted.glb [--report fitted.json] \
     [--lengths flesh|preserve] [--part NAME ...]
 usage: sculpto actor torso-fit --input actor.glb --body NAME[#i] [--layer NAME[#i] ...] \
@@ -57,6 +60,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "adapt") {
         return adapt::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "havok") {
+        return havok::run(&args[1..]);
     }
     if args.first().is_some_and(|command| command == "torso-fit") {
         return torso::run(&args[1..]);

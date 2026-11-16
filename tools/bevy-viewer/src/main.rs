@@ -201,9 +201,18 @@ struct ModelHome(Vec3);
 #[derive(Component)]
 struct HelpOverlay;
 
-/// Selected actor clip: `0` idle, `1` walk. Cloth keeps its own clip.
+/// Selected actor clip: `0` idle, `1` walk, `2` the actor-extra clip when
+/// `SCULPTO_VIEWER_ACTOR_ANIMATION` names one. Cloth keeps its own clip.
 #[derive(Resource, Clone, Copy)]
 struct ClipSelection(usize);
+
+/// Whether `SCULPTO_VIEWER_ACTOR_ANIMATION` names an extra actor clip (index ≥ 2).
+fn has_actor_extra() -> bool {
+    std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|index| index >= 2)
+}
 
 struct CliOptions {
     report: bool,
@@ -831,6 +840,9 @@ struct GltfRoot(Handle<bevy::gltf::Gltf>);
 struct PlayerGraph {
     handle: Handle<AnimationGraph>,
     nodes: Vec<AnimationNodeIndex>,
+    /// The cloth clip, when `SCULPTO_VIEWER_CLOTH_ANIMATION` names one. It plays
+    /// alongside whatever actor clip is selected, on its own node.
+    cloth: Option<AnimationNodeIndex>,
 }
 
 fn setup(
@@ -954,14 +966,33 @@ fn setup(
         // idle clip a second time at full weight, blending two clips on the same
         // skeleton — the figure trembled and the walk was diluted by half.
         let mut nodes = vec![actor_idle_node, actor_walk_node];
+        // `SCULPTO_VIEWER_ACTOR_ANIMATION=N` with N ≥ 2 adds the named actor clip
+        // (for example an adapted Havok spike) as node 2. `select_clip` reaches it
+        // with the `2` key; cloth keeps its own slot behind it.
+        if has_actor_extra() {
+            let extra_index = std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(2);
+            let extra_clip =
+                asset_server.load(format!("{}#Animation{extra_index}", config.asset_file));
+            nodes.push(graph.add_clip(extra_clip, 1.0, graph.root));
+        }
         if let Ok(index) = std::env::var("SCULPTO_VIEWER_CLOTH_ANIMATION") {
             let cloth_clip = asset_server.load(format!("{}#Animation{index}", config.asset_file));
-            nodes.push(graph.add_clip(cloth_clip, 1.0, graph.root));
+            let cloth_node = graph.add_clip(cloth_clip, 1.0, graph.root);
+            commands.insert_resource(PlayerGraph {
+                handle: graphs.add(graph),
+                nodes,
+                cloth: Some(cloth_node),
+            });
+        } else {
+            commands.insert_resource(PlayerGraph {
+                handle: graphs.add(graph),
+                nodes,
+                cloth: None,
+            });
         }
-        commands.insert_resource(PlayerGraph {
-            handle: graphs.add(graph),
-            nodes,
-        });
     }
 
     let scene = asset_server.load(format!("{}#Scene0", config.asset_file));
@@ -1012,8 +1043,16 @@ fn setup(
                     "Drag LMB orbit · RMB pan · wheel zoom",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB move key light",
-                    "0 idle · 1 walk",
-                    "0 idle · 1 walk · Space pause · Ctrl+, slower · Ctrl+. faster",
+                    if has_actor_extra() {
+                        "0 idle · 1 walk · 2 attack"
+                    } else {
+                        "0 idle · 1 walk"
+                    },
+                    if has_actor_extra() {
+                        "0 idle · 1 walk · 2 attack · Space pause · Ctrl+, slower · Ctrl+. faster"
+                    } else {
+                        "0 idle · 1 walk · Space pause · Ctrl+, slower · Ctrl+. faster"
+                    },
                     "R reset · L lit/flat · 3 rig · B bones (chain/all) · H help",
                 ] {
                     card.spawn((
@@ -1374,11 +1413,12 @@ fn advance_animation(
     // The glTF scene spawns its players asynchronously; attach our graph and
     // start both clips the moment each player appears.
     let Some(graph) = graph else { return };
-    let selection = selection.0.min(1);
+    let selection = selection.0.min(graph.nodes.len().saturating_sub(1));
+    let cloth = graph.cloth;
     for (entity, mut player) in &mut players {
         player.play(graph.nodes[selection]).repeat();
-        if let Some(cloth) = graph.nodes.get(2) {
-            player.play(*cloth).repeat();
+        if let Some(cloth) = cloth {
+            player.play(cloth).repeat();
         }
         commands
             .entity(entity)
@@ -1403,6 +1443,9 @@ fn select_clip(
         Some(0)
     } else if keys.just_pressed(KeyCode::Digit1) {
         Some(1)
+    } else if keys.just_pressed(KeyCode::Digit2) && graph.as_ref().is_some_and(|g| g.nodes.len() > 2)
+    {
+        Some(2)
     } else {
         None
     };
@@ -1417,8 +1460,8 @@ fn select_clip(
     for mut player in &mut players {
         player.stop_all();
         player.play(graph.nodes[wanted]).repeat();
-        if let Some(cloth) = graph.nodes.get(2) {
-            player.play(*cloth).repeat();
+        if let Some(cloth) = graph.cloth {
+            player.play(cloth).repeat();
         }
     }
 }
