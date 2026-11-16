@@ -290,8 +290,12 @@ fn an_unmapped_tip_seats_at_the_authored_world_offset_under_a_scaled_skeleton() 
     let authored_offset = {
         let spine = target.joint_by_name("mixamorig:Spine").unwrap();
         let tip = target.joint_by_name("mixamorig:HeadTop_End").unwrap();
-        let a = DMat4::from_cols_array_2d(&target.rest_world(spine).unwrap()).w_axis.truncate();
-        let b = DMat4::from_cols_array_2d(&target.rest_world(tip).unwrap()).w_axis.truncate();
+        let a = DMat4::from_cols_array_2d(&target.rest_world(spine).unwrap())
+            .w_axis
+            .truncate();
+        let b = DMat4::from_cols_array_2d(&target.rest_world(tip).unwrap())
+            .w_axis
+            .truncate();
         a.distance(b)
     };
     let out_bytes = std::fs::read(&out_path).expect("read output");
@@ -300,8 +304,12 @@ fn an_unmapped_tip_seats_at_the_authored_world_offset_under_a_scaled_skeleton() 
     let seated_offset = {
         let spine = out_rig.joint_by_name("mixamorig:Spine").unwrap();
         let tip = out_rig.joint_by_name("mixamorig:HeadTop_End").unwrap();
-        let a = DMat4::from_cols_array_2d(&out_rig.rest_world(spine).unwrap()).w_axis.truncate();
-        let b = DMat4::from_cols_array_2d(&out_rig.rest_world(tip).unwrap()).w_axis.truncate();
+        let a = DMat4::from_cols_array_2d(&out_rig.rest_world(spine).unwrap())
+            .w_axis
+            .truncate();
+        let b = DMat4::from_cols_array_2d(&out_rig.rest_world(tip).unwrap())
+            .w_axis
+            .truncate();
         a.distance(b)
     };
     assert!(
