@@ -88,6 +88,15 @@ impl Default for HavokParams {
 pub struct SplineTrack {
     pub translations: Vec<[f64; 3]>,
     pub rotations: Vec<[f64; 4]>,
+    /// The track's position mask declares data (a static or spline axis). When
+    /// false the bone's local translation never leaves its rest, and a written
+    /// clip must carry no translation channel for it at all — a zero channel
+    /// would override the rest and collapse the skeleton into its parents.
+    pub has_translation: bool,
+    /// The track's rotation mask declares data (static or spline).
+    pub has_rotation: bool,
+    /// The raw position mask byte, reported as evidence.
+    pub pos_flags: u8,
 }
 
 /// A decoded `hkaSplineCompressedAnimation`.
@@ -265,6 +274,7 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
             "palette_bone": slot.map(|slot| palette[slot].as_str()),
             "max_rotation_degrees": motion[0],
             "translation_range_m": motion[1],
+            "pos_flags": track.pos_flags,
         }));
     }
     let mut driven = vec![false; palette.len()];
@@ -1022,6 +1032,9 @@ fn decode_blocks(
                 decode_rotation(blob, &mut cursor, mask, frames_in_block).map_err(mapped)?;
             decode_scale(blob, &mut cursor, mask, frames_in_block).map_err(mapped)?;
             cursor = align_up(cursor, 4);
+            track.pos_flags = mask.pos_flags;
+            track.has_translation = mask.pos_flags != 0;
+            track.has_rotation = mask.rot_flags != 0;
             track
                 .translations
                 .extend(translations.into_iter().skip(skip));
@@ -1041,7 +1054,53 @@ fn decode_blocks(
             clip.num_frames
         )));
     }
+    // A declared translation channel that decodes to exact zeros after the first
+    // frame is the silent-corruption signature (0152: the vanilla walk's pelvis
+    // sat at its rest pose on frame 0 and collapsed into the origin afterwards).
+    // Real data may key a static zero, but then every frame is zero *including*
+    // the first; first-frame-correct and zero-afterwards is a decoder fault or a
+    // corrupt block, and either way refusing beats printing a collapse.
+    let dead: Vec<usize> = clip
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(index, track)| {
+            track.rotations.len() >= 2
+                && track.translations.len() == track.rotations.len()
+                && track.translations[1..]
+                    .iter()
+                    .all(|t| t == &[0.0, 0.0, 0.0])
+                && track.translations[0] != [0.0, 0.0, 0.0]
+                && masks_at(blob, clip, block_offsets, *index)
+                    .is_some_and(|mask| mask.pos_flags != 0)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !dead.is_empty() {
+        return Err(refuse(format!(
+            "translation tracks {dead:?} decode to exact zeros after frame 0 while their \
+             masks declare data: the block expansion is misread or the clip is corrupt"
+        )));
+    }
     Ok(())
+}
+
+/// The position mask of one track in the first block, for the zero-track gate.
+fn masks_at(
+    blob: &[u8],
+    clip: &SplineClip,
+    block_offsets: &[u32],
+    track_index: usize,
+) -> Option<TrackMask> {
+    let block_start = *block_offsets.first()? as usize;
+    let mask_size = if clip.mask_and_quant_size > 0 {
+        clip.mask_and_quant_size
+    } else {
+        align_up(4 * clip.num_tracks, 4)
+    };
+    let at = block_start + track_index * 4;
+    let bytes = blob.get(at..at + 4)?;
+    (at < block_start + mask_size).then(|| TrackMask::new(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
 
 /// One axis' storage class with its static value or quantization range.
@@ -1067,6 +1126,16 @@ fn read_axis_channels(
             ChannelType::Spline => {
                 let min = read_scalar(blob, cursor)?;
                 let max = read_scalar(blob, cursor)?;
+                // A declared spline with a degenerate range cannot carry motion:
+                // every quantized control point decodes to the same value. That is
+                // the signature of misaligned reads (it silently produced exact
+                // zeros across the vanilla walk), so it is a refusal, not data.
+                if min == max {
+                    return Err(format!(
+                        "spline axis {axis} declares a degenerate quantization range \
+                         (min = max = {min}); the block is misread or corrupt"
+                    ));
+                }
                 channel.min = min;
                 channel.max = max;
             }
@@ -1091,6 +1160,12 @@ fn decode_position(
     let kinds = [mask.pos_type(0), mask.pos_type(1), mask.pos_type(2)];
     if kinds.contains(&ChannelType::Spline) {
         let knots = read_spline_header(blob, cursor)?;
+        // The knot vector is byte-sized and ends anywhere: the reference reader
+        // aligns to 4 before the min/max floats. Skipping this read every min/max
+        // (and therefore every control point) up to 3 bytes off — the vanilla
+        // walk decoded as exact zeros because the misaligned pair landed on
+        // padding.
+        *cursor = align_up(*cursor, 4);
         let channels = read_axis_channels(blob, cursor, kinds, 0.0)?;
         let mut points = Vec::with_capacity(knots.num_points);
         for _ in 0..knots.num_points {
@@ -1169,6 +1244,9 @@ fn decode_scale(
     let kinds = [mask.scale_type(0), mask.scale_type(1), mask.scale_type(2)];
     if kinds.contains(&ChannelType::Spline) {
         let knots = read_spline_header(blob, cursor)?;
+        // Same alignment as the position spline: floats start on a 4-byte boundary
+        // after the byte-sized knot vector.
+        *cursor = align_up(*cursor, 4);
         let channels = read_axis_channels(blob, cursor, kinds, 1.0)?;
         let mut points = Vec::with_capacity(knots.num_points);
         for _ in 0..knots.num_points {
@@ -1830,32 +1908,44 @@ fn write_source_glb(
         let Some(bone) = track_bones.get(track_index).copied().flatten() else {
             continue;
         };
-        let rotations = hemisphere_fixed(&track.rotations);
-        let rotations: Vec<f32> = rotations
-            .iter()
-            .flat_map(|q| q.map(|value| value as f32))
-            .collect();
-        let translations: Vec<f32> = track
-            .translations
-            .iter()
-            .flat_map(|t| t.iter().map(|value| (*value * scale) as f32))
-            .collect();
-        let rotation_accessor =
-            push_view(&pack_f32(&rotations), "VEC4", track.rotations.len(), None);
-        let translation_accessor = push_view(
-            &pack_f32(&translations),
-            "VEC3",
-            track.translations.len(),
-            None,
-        );
-        samplers.push(json!({"input": times_accessor, "output": rotation_accessor, "interpolation": "LINEAR"}));
-        samplers.push(json!({"input": times_accessor, "output": translation_accessor, "interpolation": "LINEAR"}));
-        channels.push(
-            json!({"sampler": samplers.len() - 2, "target": {"node": bone, "path": "rotation"}}),
-        );
-        channels.push(
-            json!({"sampler": samplers.len() - 1, "target": {"node": bone, "path": "translation"}}),
-        );
+        // A channel the clip does not declare must not be written: a zero
+        // translation channel would override the node's rest every frame and
+        // collapse the skeleton (the 0152 walk collapse), and an identity
+        // rotation channel would pin the bone against its rest orientation.
+        if track.has_rotation {
+            let rotations = hemisphere_fixed(&track.rotations);
+            let rotations: Vec<f32> = rotations
+                .iter()
+                .flat_map(|q| q.map(|value| value as f32))
+                .collect();
+            let rotation_accessor =
+                push_view(&pack_f32(&rotations), "VEC4", track.rotations.len(), None);
+            samplers.push(
+                json!({"input": times_accessor, "output": rotation_accessor, "interpolation": "LINEAR"}),
+            );
+            channels.push(
+                json!({"sampler": samplers.len() - 1, "target": {"node": bone, "path": "rotation"}}),
+            );
+        }
+        if track.has_translation {
+            let translations: Vec<f32> = track
+                .translations
+                .iter()
+                .flat_map(|t| t.iter().map(|value| (*value * scale) as f32))
+                .collect();
+            let translation_accessor = push_view(
+                &pack_f32(&translations),
+                "VEC3",
+                track.translations.len(),
+                None,
+            );
+            samplers.push(
+                json!({"input": times_accessor, "output": translation_accessor, "interpolation": "LINEAR"}),
+            );
+            channels.push(
+                json!({"sampler": samplers.len() - 1, "target": {"node": bone, "path": "translation"}}),
+            );
+        }
     }
     if channels.is_empty() {
         return Err(invalid(

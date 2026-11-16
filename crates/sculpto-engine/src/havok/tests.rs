@@ -112,9 +112,15 @@ fn the_source_glb_round_trips_through_the_actor_loader() {
             SplineTrack {
                 translations: vec![[0.0; 3], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
                 rotations: vec![[0.0, 0.0, 0.0, 1.0]; 3],
+                has_translation: true,
+                has_rotation: false,
+                pos_flags: 1,
             },
             SplineTrack {
                 translations: vec![[7.0, 0.0, 0.0]; 3],
+                has_translation: false,
+                has_rotation: true,
+                pos_flags: 0,
                 rotations: vec![
                     [0.0, 0.0, 0.0, 1.0],
                     [
@@ -137,10 +143,30 @@ fn the_source_glb_round_trips_through_the_actor_loader() {
     assert_eq!(actor.clip_names(), vec![Some("walk")]);
     let clip_read = actor.clip("walk").expect("clip read");
     assert_eq!(clip_read.times.len(), 3);
+    // Channel presence follows the masks: the root track declares translation
+    // only, the spine track rotation only. A channel the clip does not declare
+    // must be absent — writing it would pin the bone away from its rest.
     assert_eq!(
         clip_read.channels.len(),
-        4,
-        "rotation + translation per track"
+        2,
+        "one declared channel per track"
+    );
+    let written: Vec<_> = clip_read
+        .channels
+        .iter()
+        .map(|channel| {
+            (
+                channel.node_name.as_deref().unwrap_or(""),
+                matches!(
+                    channel.property,
+                    sculpto_mesh::actor::SourceProperty::Translation
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(
+        written,
+        vec![("NPC Root [Root]", true), ("NPC Spine1 [Spn1]", false)]
     );
     let spine = actor.rest_local(1).expect("rest");
     assert!(
@@ -191,4 +217,92 @@ fn a_one_frame_clip_is_refused() {
     };
     let error = write_source_glb(&skeleton, &clip, &[Some(0)], 0.014, "walk").expect_err("refused");
     assert!(error.to_string().contains("at least two"));
+}
+
+/// A one-track block whose Y translation is a 16-bit spline: 2 control points,
+/// a knot vector that ends 2 bytes short of the 4-byte boundary, then min/max
+/// and the quantized control points. Byte layout per the reference reader:
+/// masks (4) | spline header (3) | knots (3) | pad (2) | min | max | CP0 | CP1.
+fn position_spline_blob(min: f32, max: f32, cp0: u16, cp1: u16) -> Vec<u8> {
+    let mut blob = vec![
+        0x01, 0x20, 0x00, 0x00, // mask: pos_quant 1, Y spline, rot/scale identity
+        0x01, 0x00, 0x01, // spline header: 1 item (2 CPs), degree 1
+        0x00, 0x00, 0x01, // knots [0, 0, 1] — ends 2 bytes off the boundary
+        0x00, 0x00, // the alignment pad the reference reader skips
+    ];
+    blob.extend_from_slice(&min.to_le_bytes());
+    blob.extend_from_slice(&max.to_le_bytes());
+    blob.extend_from_slice(&cp0.to_le_bytes());
+    blob.extend_from_slice(&cp1.to_le_bytes());
+    blob
+}
+
+fn one_track_clip(num_frames: usize) -> SplineClip {
+    SplineClip {
+        num_frames,
+        num_tracks: 1,
+        num_blocks: 1,
+        max_frames_per_block: 256,
+        mask_and_quant_size: 4,
+        tracks: vec![SplineTrack::default()],
+        ..SplineClip::default()
+    }
+}
+
+/// The unaligned knot vector must not shift the min/max reads: the decoded
+/// trajectory follows the real quantization range, not the padding. This is the
+/// regression test for the vanilla walk's zero pelvis (0152): without the
+/// post-knot alignment the min/max landed on the pad and every frame decoded
+/// to the same wrong value.
+#[test]
+fn an_unaligned_knot_vector_does_not_shift_the_quantization_range() {
+    let blob = position_spline_blob(1.0, 3.0, 0, 65535);
+    let mut clip = one_track_clip(2);
+    super::decode_blocks(&blob, &mut clip, &[0]).expect("decode");
+    assert_eq!(
+        clip.tracks[0].translations,
+        vec![[0.0, 1.0, 0.0], [0.0, 3.0, 0.0]]
+    );
+}
+
+/// A declared spline whose quantization range is degenerate (min == max) cannot
+/// carry motion: the reader refuses instead of emitting a flat track.
+#[test]
+fn a_degenerate_spline_range_is_a_refusal() {
+    let blob = position_spline_blob(2.0, 2.0, 0, 65535);
+    let mut clip = one_track_clip(2);
+    let error = super::decode_blocks(&blob, &mut clip, &[0]).expect_err("refused");
+    assert!(error.to_string().contains("degenerate quantization range"));
+}
+
+/// The 0152 defect shape: a declared translation channel whose first frame is
+/// real and every later frame is exactly zero refuses instead of playing a
+/// collapse.
+#[test]
+fn a_translation_track_zero_after_frame_0_is_a_refusal() {
+    // Y spline from 2.0 down to exactly 0.0: frame 0 carries 2.0, frame 1 is 0.
+    let blob = position_spline_blob(0.0, 2.0, 65535, 0);
+    let mut clip = one_track_clip(2);
+    let error = super::decode_blocks(&blob, &mut clip, &[0]).expect_err("refused");
+    assert!(error.to_string().contains("exact zeros after frame 0"));
+}
+
+/// A static translation that legitimately keys zero on every axis stays legal:
+/// all frames equal, so nothing collapses and nothing refuses.
+#[test]
+fn a_flat_static_zero_translation_is_still_legal() {
+    // pos_flags = 0x01: X static, value 0.0; no spline anywhere.
+    let blob = vec![
+        0x01,
+        0x01,
+        0x00,
+        0x00, // mask: pos_quant irrelevant, X static
+        0.0f32.to_le_bytes()[0],
+        0.0f32.to_le_bytes()[1],
+        0.0f32.to_le_bytes()[2],
+        0.0f32.to_le_bytes()[3],
+    ];
+    let mut clip = one_track_clip(2);
+    super::decode_blocks(&blob, &mut clip, &[0]).expect("decode");
+    assert_eq!(clip.tracks[0].translations, vec![[0.0, 0.0, 0.0]; 2]);
 }
