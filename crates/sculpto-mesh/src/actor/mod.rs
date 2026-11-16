@@ -10,17 +10,22 @@ mod packing;
 mod pose;
 mod rig;
 mod stress;
+mod torso;
 
 pub use clips::{LocalRest, SourceChannel, SourceClip, SourceProperty, SourceValues};
 pub use fit::{
     ChainFit, FitOutcome, FittedFrame, Flexion, JointFit, LengthMode, UnfittedChain, extent, fit,
-    write_fit,
+    write_fit, write_frames,
 };
 pub use gait::{GaitOutcome, GaitParameters, JointRange, gait, write_gait_clip};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
 pub use pose::{Axis, JointPose, JointProbe, PoseOutcome, PosedJoint, probe, write_probe_clip};
 pub use stress::{
     FrameRow, GarmentRow, PartAddress, StressError, StressPlan, StressPose, StressReport, stress,
+};
+pub use torso::{
+    AnatomyLevel, BodyFrame, Decision, LATERAL_TOLERANCE, LimbProbe, PartSelector, Section,
+    SectionLoop, TORSO_CHAIN, TorsoBone, TorsoJoint, TorsoOutcome, torso_fit,
 };
 
 use std::fmt;

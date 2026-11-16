@@ -437,13 +437,16 @@ fn flexion_off_plane(rotation: DQuat, plane_normal: DVec3) -> f64 {
 
 /// The skin's one base matrix: `world * inverse_bind`, which must agree over the
 /// whole skin or a rewritten frame would move the rest geometry.
-struct SkinBase {
-    matrix: DMat4,
-    spread: f64,
+pub(super) struct SkinBase {
+    pub(super) matrix: DMat4,
+    pub(super) spread: f64,
 }
 
 /// `world * inverse_bind` for every joint of the actor's skin.
-fn skin_matrices(actor: &Actor, worlds: &[DMat4]) -> Result<Vec<(usize, DMat4)>, ActorError> {
+pub(super) fn skin_matrices(
+    actor: &Actor,
+    worlds: &[DMat4],
+) -> Result<Vec<(usize, DMat4)>, ActorError> {
     let node = actor
         .document
         .nodes()
@@ -457,7 +460,7 @@ fn skin_matrices(actor: &Actor, worlds: &[DMat4]) -> Result<Vec<(usize, DMat4)>,
     Ok(joints.into_iter().zip(products).collect())
 }
 
-fn skin_base(binds: &[(usize, DMat4)]) -> Result<SkinBase, ActorError> {
+pub(super) fn skin_base(binds: &[(usize, DMat4)]) -> Result<SkinBase, ActorError> {
     let first = binds
         .first()
         .map(|(_, product)| *product)
@@ -487,7 +490,7 @@ fn skin_base(binds: &[(usize, DMat4)]) -> Result<SkinBase, ActorError> {
     })
 }
 
-fn node_names(actor: &Actor) -> Vec<Option<String>> {
+pub(super) fn node_names(actor: &Actor) -> Vec<Option<String>> {
     actor
         .document
         .nodes()
@@ -587,7 +590,7 @@ fn sampled_vertices(
 
 /// Split a palette bone name into its side and base name: `L` and `Finger10`.
 /// Torso and neck bones carry no side and are reported as `C`.
-fn parse_name(name: &str) -> Option<(char, &str)> {
+pub(super) fn parse_name(name: &str) -> Option<(char, &str)> {
     let rest = name.strip_prefix("NPC ")?;
     let base = rest.split(" [").next()?.trim();
     if base.is_empty() {
@@ -1199,7 +1202,7 @@ fn fit_chain(
 }
 
 /// Rebuild every skin joint's world, local transform and inverse bind.
-fn build_frames(
+pub(super) fn build_frames(
     actor: &Actor,
     names: &[Option<String>],
     worlds: &[DMat4],
@@ -1258,8 +1261,17 @@ fn build_frames(
 /// index that the document does not carry, or a skin whose inverse bind accessor
 /// it cannot overwrite in place.
 pub fn write_fit(glb: &[u8], outcome: &FitOutcome) -> Result<Vec<u8>, ActorError> {
-    let frames: Vec<sculpto_gltf::frame::JointFrame> = outcome
-        .frames
+    write_frames(glb, &outcome.frames)
+}
+
+/// Write rest frames and their inverse binds back into the actor GLB.
+///
+/// # Errors
+/// Any refusal of the frame writer: an unparsable GLB, a joint node addressed by
+/// index that the document does not carry, or a skin whose inverse bind accessor
+/// it cannot overwrite in place.
+pub fn write_frames(glb: &[u8], frames: &[FittedFrame]) -> Result<Vec<u8>, ActorError> {
+    let rewrites: Vec<sculpto_gltf::frame::JointFrame> = frames
         .iter()
         .filter(|frame| frame.rewritten)
         .map(|frame| sculpto_gltf::frame::JointFrame {
@@ -1269,14 +1281,13 @@ pub fn write_fit(glb: &[u8], outcome: &FitOutcome) -> Result<Vec<u8>, ActorError
             scale: frame.scale,
         })
         .collect();
-    let binds: Vec<sculpto_gltf::frame::JointBind> = outcome
-        .frames
+    let binds: Vec<sculpto_gltf::frame::JointBind> = frames
         .iter()
         .map(|frame| sculpto_gltf::frame::JointBind {
             node: frame.node,
             matrix: frame.inverse_bind,
         })
         .collect();
-    sculpto_gltf::frame::rewrite_frames(glb, &frames, &binds)
+    sculpto_gltf::frame::rewrite_frames(glb, &rewrites, &binds)
         .map_err(|error| invalid("actor fit write", error.to_string()))
 }

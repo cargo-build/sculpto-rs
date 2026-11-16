@@ -7,6 +7,7 @@ mod pack;
 mod pose;
 mod rig;
 mod stress;
+mod torso;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -21,7 +22,9 @@ const USAGE: &str = "usage: sculpto actor sample --input actor.glb --part NAME [
 usage: sculpto actor stress --input actor.glb --body NAME --garment NAME [--garment NAME ...] \
     (--rest | --clip NAME --frames N) --tolerance UNITS [--out report.json]
 usage: sculpto actor fit --input actor.glb --out fitted.glb [--report fitted.json] \
-    [--lengths flesh|preserve] [--part NAME ...]";
+    [--lengths flesh|preserve] [--part NAME ...]
+usage: sculpto actor torso-fit --input actor.glb --body NAME[#i] [--layer NAME[#i] ...] \
+    [--out fitted.glb] [--report report.json]";
 
 #[derive(Debug)]
 struct Arguments<'arg> {
@@ -53,6 +56,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "adapt") {
         return adapt::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "torso-fit") {
+        return torso::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,
