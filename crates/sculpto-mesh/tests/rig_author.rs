@@ -3,7 +3,9 @@
 //! @req DECL0008
 
 use glam::DVec3;
-use sculpto_mesh::rig::author::{AuthorSettings, BodySide, DeformBone, author_weights};
+use sculpto_mesh::rig::author::{
+    AuthorSettings, BodySide, DeformBone, VertexCells, author_weights, author_weights_within,
+};
 
 /// A closed tube along `axis` from `start` for `length`, `radius` thick: a
 /// surface with real adjacency, `rings` stations of `sides` vertices each.
@@ -303,5 +305,62 @@ fn a_shell_inherits_the_flesh_it_lies_on() {
         if points[vertex][0] < 0.12 {
             assert!(weight(row, "Upper") > 0.5, "sleeve weighted {row:?}");
         }
+    }
+}
+
+/// The solid's cells are the authority: a vertex the cells hand to one bone
+/// carries that bone, whatever the surface path would have said. This is the
+/// armpit rule — an A-pose arm comes within a centimetre of the chest wall, and a
+/// surface-geodesic field alone gives the arm most of that wall.
+#[test]
+fn a_cell_budget_overrides_the_surface_path() {
+    let (points, triangles, bones) = limb();
+    let flesh = vec![true; points.len()];
+    // Every vertex belongs to the upper bone's cell alone: the joint band is shut.
+    let cells = VertexCells {
+        allowed: vec![vec![(0, 1.0)]; points.len()],
+    };
+    let authored = author_weights_within(
+        &points,
+        &triangles,
+        &bones,
+        &flesh,
+        &AuthorSettings::default(),
+        Some(&cells),
+    )
+    .expect("a budgeted skin is still a valid surface");
+
+    for (vertex, row) in authored.rows.iter().enumerate() {
+        assert_eq!(row.len(), 1, "vertex {vertex} carries {:?}", row);
+        assert_eq!(weight(row, "Upper"), 1.0, "vertex {vertex}");
+        assert_eq!(weight(row, "Lower"), 0.0, "vertex {vertex}");
+    }
+    let report = authored.report.cells.expect("the mask is reported");
+    assert_eq!(report.unconstrained, 0);
+    assert_eq!(report.allowed_widest, 1);
+    assert!(report.cut_vertices > 0, "the lower half lost its owner");
+}
+
+/// A joint's band is shared, not stepped: two cells whose budgets meet at half
+/// produce a blend, and the row is still normalized.
+#[test]
+fn a_shared_budget_blends_across_the_band() {
+    let (points, triangles, bones) = limb();
+    let flesh = vec![true; points.len()];
+    let cells = VertexCells {
+        allowed: vec![vec![(0, 0.5), (1, 0.5)]; points.len()],
+    };
+    let authored = author_weights_within(
+        &points,
+        &triangles,
+        &bones,
+        &flesh,
+        &AuthorSettings::default(),
+        Some(&cells),
+    )
+    .expect("a shared budget is a valid surface");
+    for row in &authored.rows {
+        assert!((weight(row, "Upper") - 0.5).abs() < 1e-5, "row {:?}", row);
+        assert!((weight(row, "Lower") - 0.5).abs() < 1e-5, "row {:?}", row);
     }
 }

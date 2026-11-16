@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use sculpto_engine::skin::{SkinParams, run as skin_run, verdict};
 
 const USAGE: &str = "usage: sculpto actor skin --actor actor.glb [--out skinned.glb] \
-    [--report skin.json]";
+    [--report skin.json] [--expect-input-sha HEX]";
 
 pub(super) fn run(args: &[String]) -> ExitCode {
     let params = match arguments(args) {
@@ -33,7 +33,7 @@ fn arguments(args: &[String]) -> Result<SkinParams, String> {
     let mut iter = args.iter();
     while let Some(key) = iter.next().map(String::as_str) {
         match key {
-            "--actor" | "--out" | "--report" => {
+            "--actor" | "--out" | "--report" | "--expect-input-sha" => {
                 let value = iter.next().ok_or_else(|| format!("{key} needs a value"))?;
                 if flags.insert(key, value.as_str()).is_some() {
                     return Err(format!("duplicate {key}"));
@@ -55,6 +55,9 @@ fn arguments(args: &[String]) -> Result<SkinParams, String> {
         actor: actor.into(),
         out: out.map(Into::into),
         report: report.map(Into::into),
+        expect_input_sha: flags
+            .get("--expect-input-sha")
+            .map(|value| (*value).to_owned()),
     })
 }
 
@@ -73,6 +76,24 @@ fn job(params: &SkinParams) -> Result<(), String> {
         gates["leaf_weight_mass"].as_f64().unwrap_or_default(),
         gates["discarded_over_0_05"].as_u64().unwrap_or_default(),
     );
+    let cells = &report["cells"];
+    if let Some(mask) = cells["mask"].as_object() {
+        println!(
+            "  cells: {} bones over {} flesh voxels at {:.1} mm, widest band {:.1} mm",
+            cells["bones_with_cells"].as_u64().unwrap_or_default(),
+            cells["flesh_voxels"].as_u64().unwrap_or_default(),
+            cells["voxel_m"].as_f64().unwrap_or_default() * 1000.0,
+            cells["band_max_m"].as_f64().unwrap_or_default() * 1000.0,
+        );
+        println!(
+            "  mask: cut {} vertices ({:.3e} mass), restored {}, allowed {:.2} bones mean / {} widest",
+            mask["cut_vertices"].as_u64().unwrap_or_default(),
+            mask["cut_mass"].as_f64().unwrap_or_default(),
+            mask["restored"].as_u64().unwrap_or_default(),
+            mask["allowed_mean"].as_f64().unwrap_or_default(),
+            mask["allowed_widest"].as_u64().unwrap_or_default(),
+        );
+    }
     println!(
         "  method {}: {} deform bones, {} leaves excluded",
         report["method"]["name"].as_str().unwrap_or("?"),

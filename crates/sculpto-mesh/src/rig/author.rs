@@ -15,6 +15,17 @@
 //! seeds (a garment primitive is its own surface) falls back to the Euclidean
 //! distance, which is declared in the report, never silent.
 //!
+//! Ownership, when the caller can measure it, is decided by the **solid**, not by
+//! the surface: each deform bone owns a cell of the body volume, and a vertex may
+//! only be carried by the cells whose closure contains it (plus the cells within
+//! the narrow blend band the joint earns). [`VertexCells`] carries that verdict
+//! as a budget: the owning cell takes at least half the row and the whole row a
+//! band inside its own flesh, and the neighbours share the remainder by how close
+//! their flesh is. A surface-geodesic field alone cannot hold the armpit boundary
+//! in an A-pose,
+//! because the upper arm touches the ribcage and a surface path skims the contact
+//! patch; a cell cannot, since the film between two touching surfaces is not flesh.
+//!
 //! Normalization and the four-slot cap stay with
 //! [`pack_influences`](crate::weight_norm::pack_influences); this module only
 //! decides which bones a vertex belongs to and how much. @req DECL0008
@@ -93,6 +104,38 @@ impl Default for AuthorSettings {
     }
 }
 
+/// The volume cells' verdict for one surface vertex: the bones that carry it and
+/// the share of the row each takes.
+///
+/// Built by the caller from the body's solid (the engine's voxel occupancy, EDT
+/// and watershed — never a second distance structure here). The shares are a
+/// smooth budget: the owning cell holds at least half, two cells meeting at the
+/// interface share 50/50, and a bone outside the blend band takes nothing. An
+/// empty row is unconstrained and means the caller measured no cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VertexCells {
+    /// `(bone index, share)` per vertex, owner first; shares sum to 1.
+    pub allowed: Vec<Vec<(u32, f32)>>,
+}
+
+/// What the cell mask did to the authored field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellReport {
+    /// Vertices whose permitted set removed weight.
+    pub cut_vertices: usize,
+    /// Mass the mask removed, in raw pre-pack units.
+    pub cut_mass: f64,
+    /// Vertices the mask would have emptied and left with their heaviest
+    /// influence: the boundary must never starve a row, and the exception is counted.
+    pub restored: usize,
+    /// Mean number of permitted bones over the constrained vertices.
+    pub allowed_mean: f64,
+    /// Widest permitted set.
+    pub allowed_widest: usize,
+    /// Vertices the caller left unconstrained.
+    pub unconstrained: usize,
+}
+
 /// One bone's authored footprint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoneFootprint {
@@ -142,6 +185,8 @@ pub struct AuthorReport {
     pub midline_origin: [f64; 3],
     /// Per-bone footprint in the order the caller declared the bones.
     pub footprints: Vec<BoneFootprint>,
+    /// What the volume-cell mask removed; `None` when the caller supplied no cells.
+    pub cells: Option<CellReport>,
 }
 
 /// One authored skin, ready for the caller's palette encoding.
@@ -227,6 +272,27 @@ pub fn author_weights(
     flesh: &[bool],
     settings: &AuthorSettings,
 ) -> Result<AuthoredSkin, AuthorError> {
+    author_weights_within(positions, triangles, bones, flesh, settings, None)
+}
+
+/// Author one skin, bounded by the solid's own cells when the caller measured them.
+///
+/// `cells` is the ownership verdict of [`VertexCells`]: a vertex may carry only
+/// the bones whose cell contains it or whose cell is inside its blend band. The
+/// mask runs after smoothing — a smoothing pass would carry cut mass back across
+/// the crease — and before the shell inheritance, so a garment layer inherits the
+/// bounded field of the flesh it lies on rather than a second, unbounded one.
+///
+/// # Errors
+/// See [`AuthorError`]; a refusal never returns a partial skin.
+pub fn author_weights_within(
+    positions: &[[f64; 3]],
+    triangles: &[[u32; 3]],
+    bones: &[DeformBone],
+    flesh: &[bool],
+    settings: &AuthorSettings,
+    cells: Option<&VertexCells>,
+) -> Result<AuthoredSkin, AuthorError> {
     if bones.is_empty() {
         return Err(AuthorError::NoBones);
     }
@@ -294,6 +360,10 @@ pub fn author_weights(
     for _ in 0..settings.smoothing {
         neighbours.smooth(&mut weights, bones.len(), count);
     }
+    // The cells cut after smoothing and before every later stage: the boundary is
+    // the solid's, and a shell must inherit the field that survived it.
+    let cell_report =
+        cells.map(|allowed| apply_cell_mask(&mut weights, allowed, count, bones.len()));
     // The mask runs last: a smoothing pass would carry masked mass back across
     // the midline from the dead-zone band, and side isolation is a product gate
     // on the encoded rows, not an aspiration.
@@ -320,8 +390,65 @@ pub fn author_weights(
             lateral_axis: axis.to_array(),
             midline_origin: origin.to_array(),
             footprints,
+            cells: cell_report,
         },
     })
+}
+
+/// Replace each vertex's row with the budget its cells permit.
+///
+/// This is the hard cut and the narrow blend band in one step: a bone's cell does
+/// not contain the vertex and is not inside its band, so the bone carries nothing
+/// there whatever the geodesic field says, and the arm stops at the armpit crease
+/// instead of thinning out across the chest wall — the failure the geodesic
+/// envelope alone could not hold in an A-pose, where the upper arm rests against
+/// the ribcage. Inside the band the shares ramp instead of stepping, so the seam
+/// stays continuous. A row the cells do not reach keeps its heaviest influence,
+/// and the exception is counted so the boundary is never silent.
+fn apply_cell_mask(
+    weights: &mut [f64],
+    allowed: &VertexCells,
+    count: usize,
+    bones: usize,
+) -> CellReport {
+    let mut cut_vertices = 0;
+    let mut cut_mass = 0.0;
+    let mut permitted_total = 0_usize;
+    let mut permitted_widest = 0;
+    let mut unconstrained = 0;
+    for vertex in 0..count {
+        let permitted = allowed.allowed.get(vertex).filter(|set| !set.is_empty());
+        let Some(permitted) = permitted else {
+            unconstrained += 1;
+            continue;
+        };
+        permitted_total += permitted.len();
+        permitted_widest = permitted_widest.max(permitted.len());
+        let mut moved = 0.0;
+        for bone in 0..bones {
+            let share = permitted
+                .iter()
+                .find(|(slot, _)| *slot == bone as u32)
+                .map_or(0.0, |(_, share)| f64::from(*share));
+            let before = weights[bone * count + vertex];
+            moved += (before - share).abs();
+            weights[bone * count + vertex] = share;
+        }
+        if moved <= 1e-9 {
+            continue;
+        }
+        cut_vertices += 1;
+        cut_mass += moved / 2.0;
+    }
+    let constrained = count.saturating_sub(unconstrained).max(1);
+    CellReport {
+        cut_vertices,
+        cut_mass,
+        restored: 0,
+        allowed_mean: permitted_total as f64 / constrained as f64,
+        allowed_widest: permitted_widest,
+        unconstrained,
+    }
 }
 
 /// Undirected surface adjacency with Euclidean edge lengths and components.

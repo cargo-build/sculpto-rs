@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use glam::DMat4;
+use glam::{DMat4, DVec3};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,15 +29,18 @@ use sculpto_core::skin::SkinWeights;
 use sculpto_gltf::review::smooth_normals;
 use sculpto_gltf::write_partitioned_rigged_glb;
 use sculpto_mesh::actor::Actor;
-use sculpto_mesh::rig::author::{AuthorSettings, BodySide, DeformBone, author_weights};
+use sculpto_mesh::rig::author::{
+    AuthorSettings, BodySide, DeformBone, VertexCells, author_weights_within,
+};
 
 use crate::CommandError;
-use crate::actor_io::{f32_of, identity_f32, part_materials, read_pool, validate_skin};
+use crate::actor_io::{Pool, f32_of, identity_f32, part_materials, read_pool, validate_skin};
 use crate::adapt::actor_rig;
 use crate::errors;
 use crate::export_glb::{
     actor_error, bounds, glb_error, hex as sha_hex, refused, rest_error, write_report,
 };
+use crate::medial::MedialField;
 
 /// The command input.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
@@ -51,6 +54,9 @@ pub struct SkinParams {
     /// Write the JSON report here.
     #[serde(default)]
     pub report: Option<PathBuf>,
+    /// Refuse unless the actor's sha256 starts with this (the stale-chain guard).
+    #[serde(default)]
+    pub expect_input_sha: Option<String>,
 }
 
 /// Author a skin for one actor's own skeleton.
@@ -62,6 +68,15 @@ pub struct SkinParams {
 pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
     let actor_bytes =
         std::fs::read(&params.actor).map_err(|error| errors::io(&params.actor, error))?;
+    let input_sha = sha_hex(&Sha256::digest(&actor_bytes));
+    if let Some(expected) = &params.expect_input_sha
+        && !input_sha.starts_with(expected)
+    {
+        return Err(refused(
+            "skin_input_sha",
+            format!("the actor is {input_sha}, not the pinned {expected}"),
+        ));
+    }
     let actor = Actor::from_glb(&actor_bytes).map_err(actor_error)?;
     let (rig, palette) = actor_rig(&actor)?;
     if rig.roots().len() != 1 {
@@ -112,8 +127,24 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
         ));
     }
     let settings = AuthorSettings::default();
-    let authored = author_weights(&pool.vertices, &pool.triangles, &bones, &flesh, &settings)
-        .map_err(|error| refused("skin_author", error.to_string()))?;
+    // The ownership the geodesic field may not cross comes from the solid, not
+    // from the surface: each deform bone owns a cell of the body volume, and a
+    // vertex may only carry the cells that contain it or reach into its band.
+    let cells = crate::cells::flesh_cells(
+        &MedialField::from_mesh_sealed(&pool.vertices, &flesh_triangles(&pool), CELL_VOXEL_M, 2),
+        &cell_bones(&bones),
+        CELL_BAND_MAX_M,
+    );
+    let ownership = ownership(&cells, &pool.vertices, &flesh);
+    let authored = author_weights_within(
+        &pool.vertices,
+        &pool.triangles,
+        &bones,
+        &flesh,
+        &settings,
+        Some(&ownership),
+    )
+    .map_err(|error| refused("skin_author", error.to_string()))?;
 
     let slot_of: BTreeMap<&str, usize> = palette
         .iter()
@@ -210,6 +241,7 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
         leaves: &leaves,
         duplicates: &duplicates,
         authored: &authored,
+        cells: &cells,
         validation: &validation,
         gates: &gates,
         measurement,
@@ -220,6 +252,66 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
         write_report(path, &report)?;
     }
     Ok(report)
+}
+
+/// Voxel edge of the ownership field, metres. The blend band is twenty
+/// millimetres, so a cell boundary is resolved to a fraction of its own width.
+const CELL_VOXEL_M: f64 = 0.003;
+/// Widest blend band between two cells, metres: the narrow band a crease blends
+/// over, while the cell still decides who dominates.
+const CELL_BAND_MAX_M: f64 = 0.020;
+
+/// The bones as cell owners, in the author's own order.
+fn cell_bones(bones: &[DeformBone]) -> Vec<crate::cells::CellBone> {
+    bones
+        .iter()
+        .map(|bone| crate::cells::CellBone {
+            name: bone.name.clone(),
+            segments: bone.segments.clone(),
+        })
+        .collect()
+}
+
+/// The body's own surface: the solid whose cells the weights are partitioned by.
+///
+/// Only partition 0 is flesh; every later primitive is a layer that inherits it.
+/// Vertices outside those triangles are simply never referenced by the raster.
+fn flesh_triangles(pool: &Pool) -> Vec<[u32; 3]> {
+    pool.triangles
+        .iter()
+        .zip(&pool.partitions)
+        .filter(|(_, partition)| partition.0 == 0)
+        .map(|(triangle, _)| *triangle)
+        .collect()
+}
+
+/// Each flesh vertex's cell budget, from the cells of the solid.
+///
+/// The owner first with at least half the row, then the neighbours inside the
+/// blend band. A shell vertex is left unconstrained here because it inherits the
+/// flesh row it lies on after the budget runs; a vertex the field cannot resolve
+/// keeps the geodesic field's own verdict rather than losing every influence.
+fn ownership(cells: &crate::cells::FleshCells, points: &[[f64; 3]], flesh: &[bool]) -> VertexCells {
+    let mut allowed = vec![Vec::new(); points.len()];
+    for (vertex, point) in points.iter().enumerate() {
+        if !flesh[vertex] {
+            continue;
+        }
+        let point = DVec3::from_array(*point);
+        let Some(cell) = cells.nearest_cell(point, 1) else {
+            continue;
+        };
+        let band = cells.band_at(cell);
+        let Some(blend) = cells.blend_at(point, band) else {
+            continue;
+        };
+        allowed[vertex] = blend
+            .shares
+            .iter()
+            .map(|(slot, share)| (*slot, *share as f32))
+            .collect();
+    }
+    VertexCells { allowed }
 }
 
 /// The one-line verdict the CLI prints.
@@ -476,6 +568,7 @@ struct ReportInputs<'a> {
     leaves: &'a [String],
     duplicates: &'a [String],
     authored: &'a sculpto_mesh::rig::author::AuthoredSkin,
+    cells: &'a crate::cells::FleshCells,
     validation: &'a crate::actor_io::Validation,
     gates: &'a Gates,
     measurement: sculpto_core::rig::rest::RestMeasurement,
@@ -554,6 +647,7 @@ fn build_report(input: ReportInputs<'_>) -> Value {
             "leaves_excluded": input.leaves,
             "coincident_bones_dropped": input.duplicates,
         },
+        "cells": cells_json(input.cells, input.bones, input.authored),
         "authoring": {
             "vertices": input.authored.report.vertices,
             "components": input.authored.report.components,
@@ -593,5 +687,76 @@ fn build_report(input: ReportInputs<'_>) -> Value {
             "max_joint": input.measurement.max_joint,
         },
         "bounds": input.bounds,
+    })
+}
+
+/// The solid partition, as evidence: how the body was cut and what it cut.
+fn cells_json(
+    cells: &crate::cells::FleshCells,
+    bones: &[DeformBone],
+    authored: &sculpto_mesh::rig::author::AuthoredSkin,
+) -> Value {
+    let inside = cells.volumes.iter().sum::<usize>();
+    let mut volumes: Vec<Value> = bones
+        .iter()
+        .enumerate()
+        .map(|(slot, bone)| {
+            json!({
+                "bone": bone.name,
+                "voxels": cells.volumes[slot],
+                "millilitres": (cells.volumes[slot] as f64
+                    * cells.grid.h * cells.grid.h * cells.grid.h * 1e6 * 10.0).round() / 10.0,
+                "band_mm": (cells.bands[slot] * 1000.0 * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+    volumes.sort_by(|left, right| {
+        right["voxels"]
+            .as_u64()
+            .unwrap_or_default()
+            .cmp(&left["voxels"].as_u64().unwrap_or_default())
+    });
+    let empty: Vec<&str> = bones
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| cells.volumes[*slot] == 0)
+        .map(|(_, bone)| bone.name.as_str())
+        .collect();
+    // The crease each limb boundary crosses, as the narrowest inscribed radius on
+    // the interface between the two cells: the armpit is the number that matters.
+    let mut interfaces: Vec<Value> = cells
+        .interfaces
+        .iter()
+        .map(|(&(left, right), &radius)| {
+            json!({
+                "cells": [bones[left as usize].name, bones[right as usize].name],
+                "narrowest_mm": (radius * 1000.0 * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+    interfaces.sort_by(|left, right| {
+        left["narrowest_mm"]
+            .as_f64()
+            .unwrap_or_default()
+            .total_cmp(&right["narrowest_mm"].as_f64().unwrap_or_default())
+    });
+    json!({
+        "method": "solid partition: voxel occupancy + EDT (medial field) + radius-ordered watershed",
+        "voxel_m": cells.grid.h,
+        "grid": cells.grid.dims,
+        "flesh_voxels": inside,
+        "bones_with_cells": bones.len() - empty.len(),
+        "bones_without_cells": empty,
+        "band_max_m": cells.band_max,
+        "volumes": volumes,
+        "narrowest_interfaces": interfaces.iter().take(12).cloned().collect::<Vec<_>>(),
+        "mask": authored.report.cells.as_ref().map(|report| json!({
+            "cut_vertices": report.cut_vertices,
+            "cut_mass": report.cut_mass,
+            "restored": report.restored,
+            "allowed_mean": (report.allowed_mean * 100.0).round() / 100.0,
+            "allowed_widest": report.allowed_widest,
+            "unconstrained": report.unconstrained,
+        })),
     })
 }

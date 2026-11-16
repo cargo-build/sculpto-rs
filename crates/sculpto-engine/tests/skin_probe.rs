@@ -25,6 +25,7 @@ fn authored(name: &str) -> Option<serde_json::Value> {
             actor,
             out: None,
             report: None,
+            expect_input_sha: None,
         })
         .expect("the seated actor authors a skin"),
     )
@@ -126,6 +127,7 @@ fn a_ghost_twin_carries_no_weight_on_the_t_rest_bodies() {
             actor,
             out: None,
             report: None,
+            expect_input_sha: None,
         })
         .expect("the t-rest body authors a skin");
         let footprints = report["footprints"].as_array().unwrap();
@@ -149,4 +151,30 @@ fn a_ghost_twin_carries_no_weight_on_the_t_rest_bodies() {
         assert_eq!(report["gates"]["side_isolation"]["left_violations"], 0);
         assert_eq!(report["gates"]["leaf_weight_mass"].as_f64().unwrap(), 0.0);
     }
+}
+
+/// The stage refuses an actor that is not the pinned bytes.
+///
+/// Three audits graded a superseded seat because nothing recorded the input; the
+/// guard is the fix, and this test proves it fires before any authoring runs.
+#[test]
+fn a_pinned_input_sha_is_enforced() {
+    let actor = home().join("Models/sculpto-skeleton-20261116/emily-M2.glb");
+    if !actor.exists() {
+        eprintln!("skip: the M2 seat is absent");
+        return;
+    }
+    let error = run(&SkinParams {
+        actor: actor.clone(),
+        out: None,
+        report: None,
+        expect_input_sha: Some("000000000000".into()),
+    })
+    .expect_err("a wrong pinned sha must be refused");
+    let text = error.to_string();
+    assert!(text.contains("000000000000"), "{text}");
+    assert!(
+        text.contains("eb3180202cdf"),
+        "the refusal names the real bytes: {text}"
+    );
 }
