@@ -1,3 +1,5 @@
+cargo-features = ["codegen-backend"]
+
 [workspace]
 members = ["crates/sculpto-core", "crates/sculpto-cli", "crates/sculpto-bake", "crates/sculpto-mesh", "crates/sculpto-nif", "crates/boethos", "crates/boethos-catalogue", "crates/boethos-cli", "crates/sculpto-engine", "crates/sculpto-gltf", "crates/sculpto-blender", "tools/span-manifest", "tools/tripo-split"]
 exclude = ["vendor/byroredux", "tools/bevy-viewer"]
@@ -27,9 +29,17 @@ toml = "0.9"
 # (33 jj workspaces held 421 GB of `target/`). Operator decision 2026-11-17.
 [profile.dev]
 debug = 0
+codegen-backend = "cranelift"
 
 [profile.test]
 debug = 0
+codegen-backend = "cranelift"
 
 [profile.dev.build-override]
 debug = 0
+codegen-backend = "cranelift"
+
+# Alpha builds prefer compile speed over run speed: Cranelift, minimal optimisation.
+[profile.release]
+opt-level = 0
+codegen-backend = "cranelift"
