@@ -124,6 +124,72 @@ impl<'a> BoneMap<'a> {
         })
     }
 
+    /// A mapping from an explicitly checked resolution table: one destination
+    /// per source joint, in identity order.
+    ///
+    /// Where [`build`](Self::build) resolves the supported body families by
+    /// exact name, this entry accepts a resolution the caller has already
+    /// proved — a convention correspondence plus a fold rule — and checks only
+    /// what the remap kernel relies on: matching frames, unique joint names on
+    /// both graphs, and destination identities inside the target graph. The
+    /// family gate stays with `build`; [`remap_skin`](crate::rig::remap::remap_skin)
+    /// stays the single transfer owner. @req DECL0008
+    ///
+    /// # Errors
+    /// Refuses a table whose length differs from the source joint count, mixed
+    /// frames, ambiguous joint names on either graph, and a destination outside
+    /// the target graph.
+    pub fn resolved(
+        source: &RestBinding<'a>,
+        target: &'a Rig,
+        destinations: &[Destination],
+    ) -> Result<Self, BoneMapError> {
+        let rig = source.rig();
+        if destinations.len() != rig.joints().len() {
+            return Err(BoneMapError::DestinationCount {
+                expected: rig.joints().len(),
+                got: destinations.len(),
+            });
+        }
+        if rig.frame() != target.frame() {
+            return Err(BoneMapError::Frame {
+                source: rig.frame(),
+                target: target.frame(),
+            });
+        }
+        names(rig, "source")?;
+        names(target, "target")?;
+        for (index, destination) in destinations.iter().enumerate() {
+            let destination_id = match destination {
+                Destination::Direct(id) | Destination::Collapsed(id) => *id,
+                Destination::Unsupported => continue,
+            };
+            if destination_id.index() >= target.joints().len() {
+                return Err(BoneMapError::DestinationOutOfRange {
+                    joint: JointId::new(index as u32),
+                    destination: destination_id,
+                    joints: target.joints().len(),
+                });
+            }
+        }
+        let weighted = weighted_joints(source);
+        let entries = rig
+            .joints()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| JointMapping {
+                source: JointId::new(index as u32),
+                weighted: weighted[index],
+                destination: destinations[index],
+            })
+            .collect();
+        Ok(Self {
+            source: rig,
+            target,
+            entries,
+        })
+    }
+
     /// Graph that owns the source joint IDs.
     pub fn source(&self) -> &'a Rig {
         self.source
@@ -229,6 +295,22 @@ pub enum BoneMapError {
         joint: JointId,
         name: Option<String>,
     },
+    /// An explicit resolution table does not carry one entry per source joint.
+    DestinationCount {
+        /// Source joints the table must cover.
+        expected: usize,
+        /// Entries the table carries.
+        got: usize,
+    },
+    /// An explicit destination names a joint outside the target graph.
+    DestinationOutOfRange {
+        /// Source joint whose destination is invalid.
+        joint: JointId,
+        /// The out-of-range destination.
+        destination: JointId,
+        /// Target joint count.
+        joints: usize,
+    },
 }
 
 impl fmt::Display for BoneMapError {
@@ -260,6 +342,19 @@ impl fmt::Display for BoneMapError {
             Self::Unsupported { joint, name: None } => write!(
                 f,
                 "unnamed source joint {joint} has no supported destination"
+            ),
+            Self::DestinationCount { expected, got } => write!(
+                f,
+                "resolution table carries {got} entries for {expected} source joints"
+            ),
+            Self::DestinationOutOfRange {
+                joint,
+                destination,
+                joints,
+            } => write!(
+                f,
+                "source joint {joint} resolves to destination {destination} outside the \
+                 target's {joints} joints"
             ),
         }
     }

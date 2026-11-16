@@ -142,7 +142,7 @@ fn root_motion_of(params: &AdaptParams) -> Result<RootMotion, CommandError> {
 }
 
 /// Rest world transform of every node, from the actor's rest locals.
-fn actor_rest_worlds(actor: &Actor) -> Result<Vec<DMat4>, CommandError> {
+pub(crate) fn actor_rest_worlds(actor: &Actor) -> Result<Vec<DMat4>, CommandError> {
     fn resolve(
         actor: &Actor,
         node: usize,

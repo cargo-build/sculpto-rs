@@ -25,6 +25,7 @@ pub mod measures;
 pub mod obj;
 pub mod ops;
 mod parts;
+pub mod rebind;
 pub mod regression;
 pub mod retarget;
 pub mod rules;

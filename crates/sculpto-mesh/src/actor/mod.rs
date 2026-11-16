@@ -139,6 +139,15 @@ pub struct RigSample {
     pub disambiguated: Vec<JointDisambiguation>,
 }
 
+/// One primitive's part material: its name and base colour. @req DECL0013
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartColor {
+    /// glTF material name, usually the part name.
+    pub name: String,
+    /// The material's `baseColorFactor`.
+    pub color: [f32; 4],
+}
+
 /// Classified input failures retain their source location. @req DECL0013
 #[derive(Debug)]
 #[non_exhaustive]
@@ -331,6 +340,128 @@ impl Actor {
     /// The node's parent, for verbs that report a joint's parent link. @req DECL0013
     pub(super) fn parent_of(&self, node: usize) -> Option<usize> {
         self.parents.get(node).copied().flatten()
+    }
+
+    /// The validated glTF document, for read-only inspection by other verbs
+    /// (primitive layout, materials). No I/O occurs here; [`Actor::from_glb`]
+    /// already validated framing, references and hierarchy. @req DECL0013
+    pub fn document(&self) -> &gltf::Document {
+        &self.document
+    }
+
+    /// The unique skinned mesh node and its name, for a weight transfer.
+    ///
+    /// # Errors
+    /// Refuses zero or several skinned mesh nodes, or an unnamed one.
+    /// @req DECL0013
+    pub fn skinned_mesh_node(&self) -> Result<(usize, String), ActorError> {
+        let mut found = self
+            .document
+            .nodes()
+            .filter(|node| node.mesh().is_some() && node.skin().is_some())
+            .map(|node| (node.index(), node.name().map(str::to_owned)));
+        let Some((node, name)) = found.next() else {
+            return Err(invalid(
+                "actor skin",
+                "the actor carries no skinned mesh node",
+            ));
+        };
+        if found.next().is_some() {
+            return Err(invalid(
+                "actor skin",
+                "the actor carries several skinned mesh nodes; a transfer seats one",
+            ));
+        }
+        let name = name
+            .ok_or_else(|| invalid(format!("node {node}"), "the skinned mesh node is unnamed"))?;
+        Ok((node, name))
+    }
+
+    /// Validate the shared-pool actor layout: every primitive shares one
+    /// POSITION/JOINTS_0/WEIGHTS_0 arena, is triangles, and carries no morphs.
+    /// Returns the primitive count. @req DECL0013
+    ///
+    /// # Errors
+    /// Refuses an empty mesh, a primitive that does not share the pool, a
+    /// non-triangle mode and morph geometry.
+    pub fn shared_pool_parts(&self, node: usize) -> Result<usize, ActorError> {
+        use gltf::mesh::{Mode, Semantic};
+        let mesh = self
+            .document
+            .nodes()
+            .nth(node)
+            .and_then(|node| node.mesh())
+            .ok_or_else(|| invalid(format!("node {node}"), "missing selected mesh"))?;
+        let primitives: Vec<_> = mesh.primitives().collect();
+        if primitives.is_empty() {
+            return Err(invalid(
+                format!("node {node}"),
+                "the mesh has no primitives",
+            ));
+        }
+        let first = &primitives[0];
+        let index_of = |primitive: &gltf::Primitive<'_>, semantic: &Semantic| {
+            primitive.get(semantic).map(|accessor| accessor.index())
+        };
+        for primitive in &primitives {
+            let context = format!("node {node} primitive {}", primitive.index());
+            for semantic in [
+                Semantic::Positions,
+                Semantic::Joints(0),
+                Semantic::Weights(0),
+            ] {
+                if index_of(primitive, &semantic) != index_of(first, &semantic) {
+                    return Err(invalid(
+                        &context,
+                        "the primitives do not share one POSITION/JOINTS_0/WEIGHTS_0 vertex pool",
+                    ));
+                }
+            }
+            if primitive.mode() != Mode::Triangles {
+                return Err(unsupported(
+                    &context,
+                    format!("mode {:?}", primitive.mode()),
+                ));
+            }
+            if primitive.morph_targets().len() > 0 {
+                return Err(unsupported(&context, "morph geometry"));
+            }
+        }
+        Ok(primitives.len())
+    }
+
+    /// One part colour per primitive of a mesh node. @req DECL0013
+    ///
+    /// # Errors
+    /// Refuses a textured material: the colour-only part route would drop it.
+    pub fn part_colors(&self, node: usize) -> Result<Vec<PartColor>, ActorError> {
+        let mesh = self
+            .document
+            .nodes()
+            .nth(node)
+            .and_then(|node| node.mesh())
+            .ok_or_else(|| invalid(format!("node {node}"), "missing selected mesh"))?;
+        let mut colors = Vec::new();
+        for primitive in mesh.primitives() {
+            let material = primitive.material();
+            let pbr = material.pbr_metallic_roughness();
+            if pbr.base_color_texture().is_some()
+                || pbr.metallic_roughness_texture().is_some()
+                || material.normal_texture().is_some()
+                || material.occlusion_texture().is_some()
+                || material.emissive_texture().is_some()
+            {
+                return Err(unsupported(
+                    format!("node {node} primitive {}", primitive.index()),
+                    "a textured material; the part route writes colour only",
+                ));
+            }
+            colors.push(PartColor {
+                name: material.name().unwrap_or("part").to_owned(),
+                color: pbr.base_color_factor(),
+            });
+        }
+        Ok(colors)
     }
 
     fn buffer(&self, buffer: gltf::Buffer<'_>) -> Option<&[u8]> {
