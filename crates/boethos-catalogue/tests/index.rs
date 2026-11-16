@@ -557,3 +557,38 @@ fn indexes_embedded_actor_clips_and_prunes_them() {
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn index_file_selects_one_path_without_walking_its_directory() {
+    let root = temp_dir("single-file");
+    fs::write(root.join("keep.nif"), b"KEEP").expect("keep");
+    fs::write(root.join("skip.nif"), b"SKIP").expect("skip");
+    let db = root.with_extension("redb");
+    let store = Store::open(&db).expect("store");
+    let report = boethos_catalogue::index_file(
+        &store,
+        &root.join("keep.nif"),
+        "downloads",
+        &IndexOptions {
+            archive_entries: false,
+            prune: false,
+        },
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.files, 1);
+    assert_eq!(report.inserted, 1);
+    let rows = store.iter_kind::<Assets>().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.name, "keep.nif");
+    assert_eq!(rows[0].1.source, "downloads");
+    let missing = boethos_catalogue::index_file(
+        &store,
+        &root.join("absent.nif"),
+        "downloads",
+        &IndexOptions::default(),
+    );
+    assert_eq!(missing.inserted, 0);
+    assert!(missing.errors[0].contains("not a file"));
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}

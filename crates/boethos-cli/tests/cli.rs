@@ -761,3 +761,56 @@ fn clips_reads_animations_without_a_database_and_a_category_lists_them() {
     let _ = fs::remove_file(&db);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn index_file_needs_a_source_and_indexes_only_the_named_path() {
+    let root = temp_dir("single-file");
+    let keep = root.join("keep.nif");
+    let skip = root.join("skip.nif");
+    fs::write(&keep, b"KEEP").expect("keep");
+    fs::write(&skip, b"SKIP").expect("skip");
+    let db = root.with_extension("redb");
+
+    let (code, _, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--file",
+            keep.to_str().expect("keep"),
+            "--no-archives",
+        ],
+    );
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("--file requires --source"),
+        "stderr: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run(
+        &db,
+        &[
+            "index",
+            "--file",
+            keep.to_str().expect("keep"),
+            "--source",
+            "downloads",
+            "--no-archives",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(report["files"], 1);
+    assert_eq!(report["inserted"], 1);
+    assert_eq!(report["paths"][0], keep.to_str().expect("keep"));
+
+    let (code, stdout, stderr) = run(&db, &["list", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let rows: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "keep.nif");
+    assert_eq!(rows[0]["source"], "downloads");
+    let _ = fs::remove_file(&db);
+    let _ = fs::remove_dir_all(root);
+}

@@ -14,7 +14,7 @@ The default database is `$BOETHOS_DB`, else
 `$HOME/.local/state/boethos/assets.redb`.
 
 ```sh
-boethos index --root DIR [--root DIR ...] [--source LABEL] [--prune]
+boethos index --root DIR [--root DIR ...] [--file PATH ...] [--source LABEL] [--prune]
 boethos list [--category C] [--sex S] [--family F] [--source S] [--tag T]
              [--name TEXT] [--offset N] [--limit N] [--json]
 boethos get ID [--json]
@@ -24,7 +24,9 @@ boethos stats [--json]
 boethos export PATH
 ```
 
-Commands are non-interactive and strict about arguments. Read commands open an
+`--file` indexes one hand-picked file with the same canonical-path identity the
+recursive walk produces and requires `--source`. Commands are non-interactive
+and strict about arguments. Read commands open an
 existing database read-only; a missing database is a refusal, not an empty
 catalogue. `clips --glb PATH` reads an actor document directly and needs no
 database. `--json` prints one document; text `list` prints `id`, `category`,

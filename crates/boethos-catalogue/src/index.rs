@@ -155,67 +155,111 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
                 .push(format!("{}: non-UTF-8 path skipped", path.display()));
             continue;
         }
-        let extension = extension(&path);
-        if ARCHIVE_EXTENSIONS.contains(&extension.as_str()) {
-            report.archives += 1;
-            index_archive(
-                store,
-                &path,
-                source,
-                &readme_hashes,
-                options,
-                &mut seen,
-                &mut report,
-            );
-            continue;
-        }
-        report.files += 1;
-        if UNSUPPORTED_ARCHIVES.contains(&extension.as_str()) {
-            report.unsupported_archives += 1;
-        }
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        let relative_text = relative.to_string_lossy();
-        let category = classify(relative, &extension);
-        let sha = match sha256_file(&path) {
-            Ok(sha) => sha,
-            Err(error) => {
-                report.errors.push(error);
-                continue;
-            }
-        };
-        let path_text = path.to_string_lossy().into_owned();
-        let bytes = fs::metadata(&path).ok().map(|meta| meta.len());
-        let status = status_from_path(&relative_text);
-        let asset = Asset {
-            id: crate::identity(&["file", source, &path_text]),
-            category,
-            name: file_name(&path),
-            path: path_text.clone(),
-            source: source.to_string(),
-            archive: None,
-            entry: None,
-            format: extension,
-            shape: None,
-            vertices: None,
-            triangles: None,
-            clip: None,
-            sha256: Some(sha),
-            source_sha256: None,
-            bytes,
-            sex: sex_from_path(&relative_text),
-            family: family_from_path(&relative_text),
-            tags: garment_tags(&relative_text, category, source),
-            status,
-        };
-        write(store, &asset, &mut seen, &mut report);
-        if matches!(asset.format.as_str(), "glb" | "gltf") {
-            index_clips(store, &path, &asset, &mut seen, &mut report);
-        }
+        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        index_one(
+            store,
+            &path,
+            &relative,
+            source,
+            &readme_hashes,
+            options,
+            &mut seen,
+            &mut report,
+        );
     }
     if options.prune {
         prune(store, root, source, &seen, &mut report);
     }
     report
+}
+
+/// Index one explicit file without walking a directory.
+///
+/// Use it when a hand-picked set matters more than a whole root: the row
+/// identity is the same canonical path the recursive walk would produce, and
+/// archive files still gain their members.
+pub fn index_file(store: &Store, path: &Path, source: &str, options: &IndexOptions) -> IndexReport {
+    let mut report = IndexReport::default();
+    if !path.is_file() {
+        report
+            .errors
+            .push(format!("{}: not a file", path.display()));
+        return report;
+    }
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let relative = Path::new(path.file_name().unwrap_or(path.as_os_str())).to_path_buf();
+    let mut seen = HashSet::new();
+    index_one(
+        store,
+        &path,
+        &relative,
+        source,
+        &HashMap::new(),
+        options,
+        &mut seen,
+        &mut report,
+    );
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_one(
+    store: &Store,
+    path: &Path,
+    relative: &Path,
+    source: &str,
+    readme_hashes: &HashMap<String, String>,
+    options: &IndexOptions,
+    seen: &mut HashSet<String>,
+    report: &mut IndexReport,
+) {
+    let extension = extension(path);
+    if ARCHIVE_EXTENSIONS.contains(&extension.as_str()) {
+        report.archives += 1;
+        index_archive(store, path, source, readme_hashes, options, seen, report);
+        return;
+    }
+    report.files += 1;
+    if UNSUPPORTED_ARCHIVES.contains(&extension.as_str()) {
+        report.unsupported_archives += 1;
+    }
+    let relative_text = relative.to_string_lossy();
+    let category = classify(relative, &extension);
+    let sha = match sha256_file(path) {
+        Ok(sha) => sha,
+        Err(error) => {
+            report.errors.push(error);
+            return;
+        }
+    };
+    let path_text = path.to_string_lossy().into_owned();
+    let bytes = fs::metadata(path).ok().map(|meta| meta.len());
+    let status = status_from_path(&relative_text);
+    let asset = Asset {
+        id: crate::identity(&["file", source, &path_text]),
+        category,
+        name: file_name(path),
+        path: path_text.clone(),
+        source: source.to_string(),
+        archive: None,
+        entry: None,
+        format: extension,
+        shape: None,
+        vertices: None,
+        triangles: None,
+        clip: None,
+        sha256: Some(sha),
+        source_sha256: None,
+        bytes,
+        sex: sex_from_path(&relative_text),
+        family: family_from_path(&relative_text),
+        tags: garment_tags(&relative_text, category, source),
+        status,
+    };
+    write(store, &asset, seen, report);
+    if matches!(asset.format.as_str(), "glb" | "gltf") {
+        index_clips(store, path, &asset, seen, report);
+    }
 }
 
 fn index_clips(

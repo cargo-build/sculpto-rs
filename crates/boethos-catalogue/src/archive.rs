@@ -59,21 +59,74 @@ pub fn list_bsa(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
 }
 
 /// List an archive through the host `7z` binary.
+///
+/// RAR5 containers are not readable by the installed p7zip; when `7z` refuses
+/// a `.rar`, fall back to the host `unrar lb` route. Both readers stay host
+/// tools: the catalogue never extracts the payload.
 pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
-    let output = Command::new("7z")
-        .arg("l")
-        .arg("-slt")
+    let attempt = Command::new("7z").arg("l").arg("-slt").arg(path).output();
+    let seven_error = match attempt {
+        Ok(output) if output.status.success() => {
+            return Ok(parse_listing(&String::from_utf8_lossy(&output.stdout)));
+        }
+        Ok(output) => format!(
+            "7z listing failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("7z is unavailable: {error}"),
+    };
+    let is_rar = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rar"));
+    if !is_rar {
+        return Err(format!("{}: {seven_error}", path.display()));
+    }
+    list_rar(path).map_err(|unrar_error| {
+        format!(
+            "{}: {seven_error}; unrar fallback failed: {unrar_error}",
+            path.display()
+        )
+    })
+}
+
+/// List a RAR through the host `unrar` binary.
+///
+/// `lb` prints bare member paths; sizes and CRCs are not part of that output.
+fn list_rar(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
+    let output = Command::new("unrar")
+        .arg("lb")
+        .arg("-p-")
         .arg(path)
         .output()
-        .map_err(|error| format!("{}: 7z is unavailable: {error}", path.display()))?;
+        .map_err(|error| format!("unrar is unavailable: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "{}: 7z listing failed: {}",
-            path.display(),
+            "unrar listing failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(parse_listing(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_unrar_listing(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Parse `unrar lb` output into member rows.
+fn parse_unrar_listing(text: &str) -> Vec<ArchiveEntry> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let is_directory = line.ends_with('/') || line.ends_with('\\');
+            ArchiveEntry {
+                path: line.trim_end_matches(['/', '\\']).replace('\\', "/"),
+                size: None,
+                crc: None,
+                is_directory,
+            }
+        })
+        .filter(|entry| !entry.path.is_empty())
+        .collect()
 }
 
 /// Parse `7z l -slt` output into member rows.
@@ -220,5 +273,25 @@ Size = 0
         assert_eq!(entries[0].crc.as_deref(), Some("A1B2C3D4"));
         assert!(!entries[0].is_directory);
         assert!(entries[1].is_directory);
+    }
+
+    #[test]
+    fn parses_the_unrar_lb_member_list() {
+        let listing = "Meshes\\actors\\character\\animations\\male\\mt_walkForward.HkX\r\n\
+Meshes/actors/character/animations/female/mt_walkForward.hkx\n\
+textures/\n";
+        let entries = parse_unrar_listing(listing);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0].path,
+            "Meshes/actors/character/animations/male/mt_walkForward.HkX"
+        );
+        assert_eq!(
+            entries[1].path,
+            "Meshes/actors/character/animations/female/mt_walkForward.hkx"
+        );
+        assert!(entries[2].is_directory);
+        assert_eq!(entries[2].path, "textures");
+        assert!(entries.iter().all(|entry| entry.size.is_none()));
     }
 }
