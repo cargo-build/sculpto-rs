@@ -335,27 +335,16 @@ fn body_positions() -> Vec<[f32; 3]> {
     ]
 }
 
-fn temp_path(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sculpto-tpose-{}-{label}.glb", std::process::id()))
-}
-
-#[test]
-fn the_arm_chain_is_re_aimed_onto_the_reference_t_pose() {
-    let body = a_pose_body();
-    let reference = y_along_bones(&t_pose_reference());
-    let body_palette = palette(&body);
-    let reference_palette = palette(&reference);
-    let positions = body_positions();
-    let triangles = [[0_u32, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
-    // One vertex per arm bone per side, plus two torso vertices: the pool must
-    // weight every aimed bone or the verb refuses the aim as inert.
+/// One vertex per arm bone per side, plus two torso vertices: the pool must
+/// weight every aimed bone or the verb refuses the aim as inert.
+fn weight_rows(palette: &[&str]) -> Vec<(Vec<u16>, Vec<f32>)> {
     let slot = |name: &str| -> u16 {
-        body_palette
+        palette
             .iter()
             .position(|bone| *bone == name)
             .expect("palette bone") as u16
     };
-    let rows: Vec<(Vec<u16>, Vec<f32>)> = vec![
+    vec![
         (vec![slot("NPC L UpperArm [LUar]")], vec![1.0]),
         (vec![slot("NPC L Forearm [LLar]")], vec![1.0]),
         (vec![slot("NPC L Hand [LHnd]")], vec![1.0]),
@@ -368,34 +357,64 @@ fn the_arm_chain_is_re_aimed_onto_the_reference_t_pose() {
         (vec![slot("NPC R Finger20 [RF20]")], vec![1.0]),
         (vec![slot("NPC Spine2 [Spn2]")], vec![1.0]),
         (vec![slot("NPC Spine2 [Spn2]")], vec![1.0]),
-    ];
+    ]
+}
+
+/// Write the body and the reference as the GLB pair the verb reads.
+///
+/// The reference carries the body's weight rows: the verb reads the reference's
+/// rest geometry only, and one pool keeps the fixture a single object.
+fn write_pair(label: &str, body: &Rig, reference: &Rig) -> (PathBuf, PathBuf) {
+    let positions = body_positions();
+    let triangles = [[0_u32, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
+    let body_palette = palette(body);
+    let reference_palette = palette(reference);
+    let rows = weight_rows(&body_palette);
     let rows: Vec<(&[u16], &[f32])> = rows
         .iter()
         .map(|(joints, weights)| (joints.as_slice(), weights.as_slice()))
         .collect();
-    let body_bytes = actor_glb(
-        "TestBody",
-        &body,
-        &body_palette,
-        &positions,
-        &triangles,
-        &rows,
-        [0.9, 0.8, 0.7, 1.0],
-    );
-    let reference_bytes = actor_glb(
-        "ReferenceBody",
-        &reference,
-        &reference_palette,
-        &positions,
-        &triangles,
-        &rows,
-        [0.5, 0.5, 0.5, 1.0],
-    );
-    let actor_path = temp_path("actor");
-    let reference_path = temp_path("reference");
+    let actor_path = temp_path(&format!("{label}-actor"));
+    let reference_path = temp_path(&format!("{label}-reference"));
+    std::fs::write(
+        &actor_path,
+        actor_glb(
+            "TestBody",
+            body,
+            &body_palette,
+            &positions,
+            &triangles,
+            &rows,
+            [0.9, 0.8, 0.7, 1.0],
+        ),
+    )
+    .expect("write actor");
+    std::fs::write(
+        &reference_path,
+        actor_glb(
+            "ReferenceBody",
+            reference,
+            &reference_palette,
+            &positions,
+            &triangles,
+            &rows,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+    )
+    .expect("write reference");
+    (actor_path, reference_path)
+}
+
+fn temp_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sculpto-tpose-{}-{label}.glb", std::process::id()))
+}
+
+#[test]
+fn the_arm_chain_is_re_aimed_onto_the_reference_t_pose() {
+    let body = a_pose_body();
+    let reference = y_along_bones(&t_pose_reference());
+    let (actor_path, reference_path) = write_pair("aim", &body, &reference);
     let out_path = temp_path("out");
-    std::fs::write(&actor_path, &body_bytes).expect("write actor");
-    std::fs::write(&reference_path, &reference_bytes).expect("write reference");
 
     let report = run(&TPoseParams {
         actor: actor_path,
@@ -407,6 +426,7 @@ fn the_arm_chain_is_re_aimed_onto_the_reference_t_pose() {
         pose_time: None,
         pose_scan: false,
         pose_rest: None,
+        straighten_arms: false,
     })
     .expect("the bake succeeds");
 
@@ -494,64 +514,7 @@ fn a_reference_that_is_not_a_t_pose_is_refused() {
         .collect();
     reference = Rig::new(joints, RigFrame::YUp).expect("a drooping reference");
     let body = a_pose_body();
-    let body_palette = palette(&body);
-    let reference_palette = palette(&reference);
-    let positions = body_positions();
-    let triangles = [[0_u32, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
-    // One vertex per arm bone per side, plus two torso vertices: the pool must
-    // weight every aimed bone or the verb refuses the aim as inert.
-    let slot = |name: &str| -> u16 {
-        body_palette
-            .iter()
-            .position(|bone| *bone == name)
-            .expect("palette bone") as u16
-    };
-    let rows: Vec<(Vec<u16>, Vec<f32>)> = vec![
-        (vec![slot("NPC L UpperArm [LUar]")], vec![1.0]),
-        (vec![slot("NPC L Forearm [LLar]")], vec![1.0]),
-        (vec![slot("NPC L Hand [LHnd]")], vec![1.0]),
-        (vec![slot("NPC L Finger20 [LF20]")], vec![1.0]),
-        (vec![slot("NPC Spine2 [Spn2]")], vec![1.0]),
-        (vec![slot("NPC Spine2 [Spn2]")], vec![1.0]),
-        (vec![slot("NPC R UpperArm [RUar]")], vec![1.0]),
-        (vec![slot("NPC R Forearm [RLar]")], vec![1.0]),
-        (vec![slot("NPC R Hand [RHnd]")], vec![1.0]),
-        (vec![slot("NPC R Finger20 [RF20]")], vec![1.0]),
-        (vec![slot("NPC Spine2 [Spn2]")], vec![1.0]),
-        (vec![slot("NPC Spine2 [Spn2]")], vec![1.0]),
-    ];
-    let rows: Vec<(&[u16], &[f32])> = rows
-        .iter()
-        .map(|(joints, weights)| (joints.as_slice(), weights.as_slice()))
-        .collect();
-    let actor_path = temp_path("refused-actor");
-    let reference_path = temp_path("refused-reference");
-    std::fs::write(
-        &actor_path,
-        actor_glb(
-            "TestBody",
-            &body,
-            &body_palette,
-            &positions,
-            &triangles,
-            &rows,
-            [0.9, 0.8, 0.7, 1.0],
-        ),
-    )
-    .expect("write actor");
-    std::fs::write(
-        &reference_path,
-        actor_glb(
-            "ReferenceBody",
-            &reference,
-            &reference_palette,
-            &positions,
-            &triangles,
-            &rows,
-            [0.5, 0.5, 0.5, 1.0],
-        ),
-    )
-    .expect("write reference");
+    let (actor_path, reference_path) = write_pair("refused", &body, &reference);
     let error = run(&TPoseParams {
         actor: actor_path,
         reference: reference_path,
@@ -562,10 +525,125 @@ fn a_reference_that_is_not_a_t_pose_is_refused() {
         pose_time: None,
         pose_scan: false,
         pose_rest: None,
+        straighten_arms: false,
     })
     .expect_err("a drooping reference is not a T-pose");
     assert!(
         error.to_string().contains("not a T-pose"),
         "unexpected refusal: {error}"
     );
+}
+
+/// A T-pose reference whose elbow and wrist are bent in the horizontal plane.
+///
+/// A bone's direction is the offset to its child, so the elbow is the `Hand`
+/// node's placement and the wrist the `HandMiddle1` node's. Every segment still
+/// lies horizontal, so the verb accepts the reference as a T — and the aimed
+/// chain keeps both bends, which is what the fall pose gives us and what the
+/// straightening step exists to remove.
+fn bent_arm_reference(degrees: f32) -> Rig {
+    let direction = |angle: f32, length: f32, sign: f32| {
+        let (sin, cos) = angle.to_radians().sin_cos();
+        [sign * length * cos, 0.0, length * sin]
+    };
+    let joints: Vec<Joint> = t_pose_reference()
+        .joints()
+        .iter()
+        .map(|joint| {
+            let mut joint = joint.clone();
+            let Some(name) = joint.name.as_deref() else {
+                return joint;
+            };
+            let sign = match name.starts_with("mixamorig:Left") {
+                true => 1.0,
+                false => -1.0,
+            };
+            match name.ends_with("Hand") {
+                true => joint.rest.translation = direction(degrees, 0.10, sign),
+                false => {
+                    if name.ends_with("HandMiddle1") {
+                        joint.rest.translation = direction(2.0 * degrees, 0.05, sign);
+                    }
+                }
+            }
+            joint
+        })
+        .collect();
+    y_along_bones(&Rig::new(joints, RigFrame::YUp).expect("a bent reference"))
+}
+
+#[test]
+fn a_bent_elbow_is_straightened_about_its_own_hinge() {
+    let body = a_pose_body();
+    let reference = bent_arm_reference(20.0);
+    let (actor_path, reference_path) = write_pair("straighten", &body, &reference);
+    let out_path = temp_path("straighten-out");
+    let run_once = |out: &PathBuf| {
+        run(&TPoseParams {
+            actor: actor_path.clone(),
+            reference: reference_path.clone(),
+            out: Some(out.clone()),
+            report: None,
+            pose: None,
+            pose_clip: None,
+            pose_time: None,
+            pose_scan: false,
+            pose_rest: None,
+            straighten_arms: true,
+        })
+        .expect("the bake succeeds")
+    };
+
+    let report = run_once(&out_path);
+    // The aggregate gate is graded on a real body (its stretch row needs flesh
+    // that spans the chain); here every row the fixture can carry is checked.
+    assert!(
+        report["gates"]["straighten"]["edge_stretch_not_worse"].is_boolean(),
+        "the stretch comparison is reported on every bake"
+    );
+    let rotations = report["straighten"]["rotations"]
+        .as_array()
+        .expect("a rotation ledger");
+    assert_eq!(rotations.len(), 4, "two joints per side");
+    for row in rotations {
+        // The bend the aim left is 20° at both joints; the step removes all of
+        // it, and reports the axis it turned about in world and in the bone.
+        // The reference's own translations are f32, so the bend it carries is
+        // 20° to a part per million rather than exactly.
+        let before = row["angle_before_deg"].as_f64().unwrap();
+        assert!((before - 20.0).abs() < 1e-5, "before {before}");
+        assert!(row["angle_after_deg"].as_f64().unwrap() < 1e-5);
+        assert!(row["residual_to_target_deg"].as_f64().unwrap() < 1e-5);
+        assert!((row["rotation_deg"].as_f64().unwrap() + before).abs() < 1e-5);
+        assert!(row["hinge_world"].is_array(), "the hinge is reported");
+        assert!(row["hinge_local"].is_array());
+        // The authored A-rest has a bent elbow and a straight wrist, so the rest
+        // hinge is reported for the elbow and may be null for the hand.
+        if row["joint"] == "Forearm" {
+            assert!(
+                row["rest_hinge_world"].is_array(),
+                "the A-rest's elbow is bent, so it has a hinge"
+            );
+        }
+    }
+    // Nothing outside the arm subtrees may move, and the upper arm — the
+    // shoulder line the pose gave us — must survive the step untouched.
+    assert_eq!(
+        report["straighten"]["outside_arm_subtree"]["max_rotation_deg"],
+        0.0
+    );
+    assert_eq!(
+        report["straighten"]["outside_arm_subtree"]["max_pivot_shift_m"],
+        0.0
+    );
+    assert_eq!(report["straighten"]["upper_arm_max_delta_deg"], 0.0);
+    assert_eq!(report["straighten"]["elbow_max_deg"], 0.0);
+    assert_eq!(report["straighten"]["wrist_max_deg"], 0.0);
+
+    // The same input writes the same bytes, twice.
+    let first = std::fs::read(&out_path).expect("read the written actor");
+    run_once(&out_path);
+    let second = std::fs::read(&out_path).expect("read the written actor again");
+    assert_eq!(first, second, "the same input must write the same bytes");
+    let _ = std::fs::remove_file(&out_path);
 }

@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use sculpto_engine::rest::{TPoseParams, run as tpose_run, verdict};
 
 const USAGE: &str = "usage: sculpto actor tpose --actor actor.glb --reference skeleton.glb \
-    [--out tposed.glb] [--report tpose.json] \
+    [--out tposed.glb] [--report tpose.json] [--straighten-arms] \
     [--pose pose-actor.glb --pose-clip NAME (--pose-time SECONDS | --pose-scan) \
     [--pose-rest havok-report.json]]";
 
@@ -33,11 +33,15 @@ pub(super) fn run(args: &[String]) -> ExitCode {
 fn arguments(args: &[String]) -> Result<TPoseParams, String> {
     let mut flags: HashMap<&str, &str> = HashMap::new();
     let mut scan = false;
+    let mut straighten = false;
     let mut iter = args.iter();
     while let Some(key) = iter.next().map(String::as_str) {
         match key {
             "--pose-scan" => {
                 scan = true;
+            }
+            "--straighten-arms" => {
+                straighten = true;
             }
             "--actor" | "--reference" | "--out" | "--report" | "--pose" | "--pose-clip"
             | "--pose-time" | "--pose-rest" => {
@@ -80,6 +84,7 @@ fn arguments(args: &[String]) -> Result<TPoseParams, String> {
         pose_time,
         pose_scan: scan,
         pose_rest: value("--pose-rest").map(Into::into),
+        straighten_arms: straighten,
     })
 }
 
@@ -95,6 +100,20 @@ fn job(params: &TPoseParams) -> Result<(), String> {
                 aim["turn_degrees"].as_f64().unwrap_or(0.0),
                 aim["residual_degrees"].as_f64().unwrap_or(0.0),
                 aim["below_horizontal_after_deg"].as_f64().unwrap_or(0.0),
+            );
+        }
+    }
+    if let Some(rows) = report["straighten"]["rotations"].as_array() {
+        for row in rows {
+            println!(
+                "  straightened {:9} {:14} {:<28} {:7.3}°  {:5.3}° -> {:0.6}°  residual {:0.6}°",
+                row["side"].as_str().unwrap_or("?"),
+                row["joint"].as_str().unwrap_or("?"),
+                row["bone"].as_str().unwrap_or("?"),
+                row["rotation_deg"].as_f64().unwrap_or(0.0),
+                row["angle_before_deg"].as_f64().unwrap_or(0.0),
+                row["angle_after_deg"].as_f64().unwrap_or(0.0),
+                row["residual_to_target_deg"].as_f64().unwrap_or(0.0),
             );
         }
     }

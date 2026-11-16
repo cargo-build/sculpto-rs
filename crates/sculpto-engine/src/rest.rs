@@ -85,6 +85,20 @@ pub const POSE_TORSO_TOLERANCE_DEG: f64 = 5.0;
 /// How far the legs may leave their rest orientation in a chosen pose, degrees.
 pub const POSE_LEG_TOLERANCE_DEG: f64 = 10.0;
 
+/// How straight an elbow or wrist must be after the straightening step, degrees.
+///
+/// The bar is the task's, not the geometry's: a hinge rotation about
+/// `normalize(parent × child)` lands the child collinear by construction, so
+/// anything above float noise means the written turn did not reach the bone.
+pub const STRAIGHTEN_TOLERANCE_DEG: f64 = 0.5;
+
+/// How straight a pair must already be before the step is a no-op, degrees.
+///
+/// The hinge is the pair's cross product, which vanishes as the flexion does; a
+/// pair below this is recorded as already straight instead of being turned about
+/// float noise.
+pub const STRAIGHTEN_EPS_DEG: f64 = 1e-6;
+
 /// The command input.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +137,17 @@ pub struct TPoseParams {
     /// game applies (`rest⁻¹ · pose`) in its own local frame.
     #[serde(default)]
     pub pose_rest: Option<PathBuf>,
+    /// Straighten each elbow and wrist about its own geometric hinge.
+    ///
+    /// The shipped pose is a fall (`mt_jumpfall` f148): its shoulders are a T to
+    /// `1.5°`, but its elbows are bent `43°`/`52°`, and a rest pose that carries
+    /// that bend adds it to every clip played against the rest. The step runs
+    /// after the aim and rotates each forearm onto its upper arm, then each hand
+    /// onto the straightened forearm, about `normalize(parent × child)` — the
+    /// pair's own hinge, not the axis `joints.toml` declares, which sits `59–65°`
+    /// off it on this rig.
+    #[serde(default)]
+    pub straighten_arms: bool,
 }
 
 /// One arm-chain segment the bake aims: the bone, and the joint that ends it.
@@ -273,17 +298,35 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
         }
     }
 
-    let aims: Vec<RestAim> = resolved
-        .iter()
-        .map(|row| RestAim {
-            joint: row.joint,
-            child: row.tip,
-            direction: row.reference_direction.to_array(),
-            local_turn: None,
-            turn: Some(row.turn.to_array()),
-        })
-        .collect();
-    let bake = bake_rest(&actor, &[mesh_name.as_str()], &aims).map_err(actor_error)?;
+    let aims_of = |resolved: &[Resolved]| -> Vec<RestAim> {
+        resolved
+            .iter()
+            .map(|row| RestAim {
+                joint: row.joint,
+                child: row.tip,
+                direction: row.reference_direction.to_array(),
+                local_turn: None,
+                turn: Some(row.turn.to_array()),
+            })
+            .collect()
+    };
+    // The aim is baked and then measured, because the hinge a chain turns about
+    // is its own geometry: the straightening step re-aims what the aim produced,
+    // and predicting that pose instead would be a second implementation of the
+    // same solver, free to disagree with it.
+    let (bake, straighten) = {
+        let aimed =
+            bake_rest(&actor, &[mesh_name.as_str()], &aims_of(&resolved)).map_err(actor_error)?;
+        match params.straighten_arms {
+            true => {
+                let plan = plan_straightening(&mut resolved, &mut hands, &aimed)?;
+                let straightened = bake_rest(&actor, &[mesh_name.as_str()], &aims_of(&resolved))
+                    .map_err(actor_error)?;
+                (straightened, Some((plan, aimed)))
+            }
+            false => (aimed, None),
+        }
+    };
 
     // The posed worlds become the rest: one rig, one skin, one proof.
     let (baked_rig, baked_palette) = actor_rig_with_worlds(&actor, &bake.worlds)?;
@@ -370,6 +413,42 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
         .map(|material| material.name.clone())
         .collect();
     let deformation = Deformation::measure(&bake, &pool, &our_palette, &names);
+    let (straighten_value, straighten_verdict) = match &straighten {
+        Some((plan, baseline)) => {
+            let baseline_deformation = Deformation::measure(baseline, &pool, &our_palette, &names);
+            let (value, verdict) = straighten_report(&StraightenInputs {
+                plan,
+                baseline,
+                straightened: &bake,
+                hands: &hands,
+                resolved: &resolved,
+                authored: &our_worlds,
+                actor: &actor,
+                baseline_deformation: &baseline_deformation,
+                deformation: &deformation,
+            })?;
+            (value, Some(verdict))
+        }
+        None => (Value::Null, None),
+    };
+    // The straightening block is its own evidence: the aim gates above cannot
+    // carry it, so it appends its own row to the same table.
+    let mut gate_rows = gates(
+        &resolved,
+        &hands,
+        &bake,
+        &deformation,
+        &validation,
+        &measurement,
+        &bodies,
+    );
+    gate_rows
+        .as_object_mut()
+        .expect("the gate table is an object")
+        .insert(
+            "straighten".to_owned(),
+            straighten_gate(straighten_verdict.as_ref()),
+        );
     let report = json!({
         "ok": true,
         "verdict": verdict_text(&resolved, &measurement.max_vertex, &deformation),
@@ -436,7 +515,8 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
             "per_bone_mass": our_palette.iter().zip(&validation.per_bone).map(|(name, mass)| (name.clone(), mass)).collect::<BTreeMap<_, _>>(),
         },
         "pose": pose_block,
-        "gates": gates(&resolved, &hands, &bake, &deformation, &validation, &measurement, &bodies),
+        "straighten": straighten_value,
+        "gates": gate_rows,
         "deformation": deformation.report(),
         "bone_length_max_change_m": bake.aims.iter().map(|aim| (aim.length_after - aim.length_before).abs()).fold(0.0_f64, f64::max),
         "output": {
@@ -703,6 +783,558 @@ fn side_sign(side: Side) -> f64 {
         Side::Left => 1.0,
         Side::Right | Side::Centre => -1.0,
     }
+}
+
+/// A two-segment joint's own hinge: the axis the flexion turns about.
+struct Hinge {
+    /// `normalize(parent × child)`, world.
+    axis: DVec3,
+    /// The angle between the segments, degrees, positive.
+    flexion_deg: f64,
+}
+
+impl Hinge {
+    /// The world rotation that removes the flexion: `−flexion` about the hinge.
+    ///
+    /// By construction this lands the child on the parent, whatever the rig's
+    /// declared joint axis says the hinge is.
+    fn rotation(&self) -> DQuat {
+        DQuat::from_axis_angle(self.axis, -self.flexion_deg.to_radians())
+    }
+}
+
+/// One arm joint the straightening step re-aims.
+struct Straightening {
+    side: Side,
+    /// The joint that turns.
+    part: Part,
+    /// The segment it is made collinear with.
+    parent: Part,
+    /// The hinge of the pose the step turns, or `None` when already collinear.
+    hinge: Option<Hinge>,
+    /// The same joint's hinge on the authored rest, for the record: the hinge is
+    /// a property of a pose, and the pose that was straightened is the fall's.
+    rest_hinge: Option<Hinge>,
+    /// The world turn that replaces the aimed one.
+    turn: DQuat,
+}
+
+/// The hinge of one two-segment joint, measured from the segments themselves.
+///
+/// `joints.toml` declares the elbow as its own local `Z`; on our rig that axis
+/// sits `59–65°` off the true hinge (the report's `declared_local_z_off_deg`), and
+/// a rotation about it swings the forearm sideways instead of straightening it.
+/// The convention-free hinge is the pair's cross product: turning the child by
+/// the flexion about `normalize(parent × child)` leaves it collinear with the
+/// parent by construction, and the axis is only undefined when the pair is
+/// already straight or exactly folded back.
+fn hinge_between(
+    parent: DVec3,
+    child: DVec3,
+    side: Side,
+    part: Part,
+) -> Result<Option<Hinge>, CommandError> {
+    let (Some(parent), Some(child)) = (parent.try_normalize(), child.try_normalize()) else {
+        return Err(refused(
+            "tpose_straighten",
+            format!("the {side:?} {part:?} segment has no length, so its hinge is undefined"),
+        ));
+    };
+    let flexion_deg = parent.angle_between(child).to_degrees();
+    if !flexion_deg.is_finite() {
+        return Err(refused(
+            "tpose_straighten",
+            format!("the {side:?} {part:?} segment does not point anywhere finite"),
+        ));
+    }
+    if flexion_deg <= STRAIGHTEN_EPS_DEG {
+        return Ok(None);
+    }
+    if flexion_deg >= 180.0 - STRAIGHTEN_EPS_DEG {
+        return Err(refused(
+            "tpose_straighten",
+            format!(
+                "the {side:?} {part:?} joint is folded back by {flexion_deg:.3}°, so the turn axis \
+                 is undefined and it cannot be straightened"
+            ),
+        ));
+    }
+    Ok(Some(Hinge {
+        axis: parent.cross(child).normalize(),
+        flexion_deg,
+    }))
+}
+
+/// Replace the aimed arm turns with ones that leave each chain collinear.
+///
+/// The elbow turns the forearm onto its upper arm; that turn carries the hand, so
+/// the wrist then turns what is left onto the straightened forearm. Both turns
+/// are stated against the authored basis, exactly as the aim's were, so the
+/// second bake writes each bone's world orientation once instead of compounding.
+fn plan_straightening(
+    resolved: &mut [Resolved],
+    hands: &mut [HandFrame],
+    aimed: &RestBake,
+) -> Result<Vec<Straightening>, CommandError> {
+    let mut plan = Vec::new();
+    for side in [Side::Left, Side::Right] {
+        let role = |part: Part| BoneRole { side, part };
+        let find = |resolved: &[Resolved], part: Part| {
+            resolved
+                .iter()
+                .position(|row| row.segment.role == role(part))
+        };
+        let mut chain = [DVec3::ZERO; 3];
+        for (slot, part) in [Part::UpperArm, Part::Forearm, Part::Hand]
+            .into_iter()
+            .enumerate()
+        {
+            chain[slot] = measured_direction(aimed, resolved, role(part)).ok_or_else(|| {
+                refused(
+                    "tpose_straighten",
+                    format!(
+                        "the aim carries no {:?} {:?} direction to straighten",
+                        side, part
+                    ),
+                )
+            })?;
+        }
+        let elbow = hinge_between(chain[0], chain[1], side, Part::Forearm)?;
+        let elbow_lift = elbow
+            .as_ref()
+            .map(Hinge::rotation)
+            .unwrap_or(DQuat::IDENTITY);
+        let forearm = elbow_lift * chain[1];
+        // The hand is a child of the forearm, so the elbow's turn carries it
+        // before the wrist decides how much of the remaining bend to remove.
+        let wrist = hinge_between(forearm, elbow_lift * chain[2], side, Part::Hand)?;
+        let wrist_lift = wrist
+            .as_ref()
+            .map(Hinge::rotation)
+            .unwrap_or(DQuat::IDENTITY);
+        let steps = [
+            (Part::Forearm, Part::UpperArm, elbow, elbow_lift),
+            (
+                Part::Hand,
+                Part::Forearm,
+                wrist,
+                (wrist_lift * elbow_lift).normalize(),
+            ),
+        ];
+        for (part, parent, hinge, composition) in steps {
+            let index = find(resolved, part).ok_or_else(|| {
+                refused(
+                    "tpose_straighten",
+                    format!("the aim carries no {:?} {part:?} bone to straighten", side),
+                )
+            })?;
+            let parent_index = find(resolved, parent).ok_or_else(|| {
+                refused(
+                    "tpose_straighten",
+                    format!(
+                        "the aim carries no {:?} {parent:?} bone to straighten against",
+                        side
+                    ),
+                )
+            })?;
+            let turn = combine(&composition, resolved[index].turn);
+            resolved[index].turn = turn;
+            // Collinear with the upper arm's own measured direction: the
+            // residual the bake then reports is the real collinearity error.
+            resolved[index].reference_direction = chain[0];
+            plan.push(Straightening {
+                side,
+                part,
+                parent,
+                hinge,
+                rest_hinge: hinge_between(
+                    resolved[parent_index].authored,
+                    resolved[index].authored,
+                    side,
+                    part,
+                )?,
+                turn,
+            });
+        }
+        // The hand's target frame is the pose's own authority carried through the
+        // same rotation: the step turns the whole hand, so grading the palm
+        // against a target left behind would report the step as a roll defect.
+        if let Some(hand) = hands.iter_mut().find(|hand| hand.side == side) {
+            let carry = (wrist_lift * elbow_lift).normalize();
+            hand.target_axis = carry * hand.target_axis;
+            hand.target_normal = carry * hand.target_normal;
+            hand.target_thumb = carry * hand.target_thumb;
+        }
+    }
+    Ok(plan)
+}
+
+/// Apply one straightening turn on top of an aimed one.
+///
+/// The aim's turn is `R_aim · authored`, and the step wants `R_step · R_aim ·
+/// authored`: a world pre-rotation of the pose the aim produced, so the authored
+/// basis is named once and the chain's parents are not re-applied.
+fn combine(step: &DQuat, aimed: DQuat) -> DQuat {
+    (*step * aimed).normalize()
+}
+
+/// One joint's direction as one bake measured it, by role.
+fn measured_direction(bake: &RestBake, resolved: &[Resolved], role: BoneRole) -> Option<DVec3> {
+    let row = resolved.iter().find(|row| row.segment.role == role)?;
+    let aimed = bake
+        .aims
+        .iter()
+        .find(|aimed| aimed.joint == row.joint && aimed.child == row.tip)?;
+    Some(DVec3::from_array(aimed.direction_after))
+}
+
+/// The rotation of one world transform with its scale divided out.
+///
+/// A trace-based extraction from a scaled matrix is not scale-invariant, and the
+/// hands carry `0.8517`: the local axis of a hinge expressed in that frame would
+/// otherwise be off by degrees.
+fn world_rotation(world: DMat4) -> DQuat {
+    world.to_scale_rotation_translation().1.normalize()
+}
+
+/// Everything the straightening ledger reads.
+struct StraightenInputs<'a> {
+    plan: &'a [Straightening],
+    /// The bake before the step: the aim's own pose.
+    baseline: &'a RestBake,
+    /// The bake after the step, which is also the written rest.
+    straightened: &'a RestBake,
+    hands: &'a [HandFrame],
+    resolved: &'a [Resolved],
+    /// The authored worlds, for the hinge expressed in a bone's own frame.
+    authored: &'a [DMat4],
+    actor: &'a Actor,
+    baseline_deformation: &'a Deformation,
+    deformation: &'a Deformation,
+}
+
+/// The few numbers the gate reads back out of the ledger.
+struct StraightenVerdict {
+    applied: bool,
+    elbow_max_deg: f64,
+    wrist_max_deg: f64,
+    upper_arm_max_deg: f64,
+    non_arm_max_deg: f64,
+    not_worse: bool,
+    applied_max_deg: f64,
+}
+
+/// The straightening ledger: every rotation, both angles, and what it cost.
+///
+/// The angles are measured, not predicted: `angle_before_deg` comes from the
+/// bake the aim produced and `angle_after_deg` from the bake that is written, so
+/// the residual column is the artifact's own collinearity error.
+fn straighten_report(
+    input: &StraightenInputs<'_>,
+) -> Result<(Value, StraightenVerdict), CommandError> {
+    let measured = |bake: &RestBake, role: BoneRole| measured_direction(bake, input.resolved, role);
+    let mut rows = Vec::new();
+    for stepped in input.plan {
+        let role = BoneRole {
+            side: stepped.side,
+            part: stepped.part,
+        };
+        let parent_role = BoneRole {
+            side: stepped.side,
+            part: stepped.parent,
+        };
+        let row = input
+            .resolved
+            .iter()
+            .find(|row| row.segment.role == role)
+            .ok_or_else(|| {
+                refused(
+                    "tpose_straighten",
+                    "the plan names a joint the aim does not resolve".to_owned(),
+                )
+            })?;
+        let angle = |a: DVec3, b: DVec3| a.angle_between(b).to_degrees();
+        let (parent_before, before) = (
+            measured(input.baseline, parent_role)
+                .ok_or_else(|| refused("tpose_straighten", "no parent direction".to_owned()))?,
+            measured(input.baseline, role)
+                .ok_or_else(|| refused("tpose_straighten", "no child direction".to_owned()))?,
+        );
+        let (parent_after, after) = (
+            measured(input.straightened, parent_role)
+                .ok_or_else(|| refused("tpose_straighten", "no parent direction".to_owned()))?,
+            measured(input.straightened, role)
+                .ok_or_else(|| refused("tpose_straighten", "no child direction".to_owned()))?,
+        );
+        let local = stepped
+            .hinge
+            .as_ref()
+            .map(|hinge| world_rotation(input.authored[row.joint]).inverse() * hinge.axis);
+        rows.push(json!({
+            "side": format!("{:?}", stepped.side),
+            "joint": format!("{:?}", stepped.part),
+            "bone": row.joint_name,
+            "node": row.joint,
+            "straightened_against": format!("{:?}", stepped.parent),
+            // The hinge the step turned about, and the same axis in the joint's
+            // own authored frame — the frame a declared joint axis is written in.
+            "hinge_world": stepped.hinge.as_ref().map(|hinge| hinge.axis.to_array()),
+            "hinge_local": local.map(|axis| axis.to_array()),
+            "hinge_local_off_z_deg": local.map(|axis| axis.angle_between(DVec3::Z).to_degrees()),
+            // The same joint on the authored A-rest: a hinge belongs to a pose,
+            // and the step's hinge is the fall's, not the rest's.
+            "rest_hinge_world": stepped.rest_hinge.as_ref().map(|hinge| hinge.axis.to_array()),
+            "rest_flexion_deg": stepped.rest_hinge.as_ref().map(|hinge| hinge.flexion_deg).unwrap_or(0.0),
+            "hinge_moved_from_rest_deg": match (&stepped.rest_hinge, &stepped.hinge) {
+                (Some(rest), Some(hinge)) => Some(rest.axis.angle_between(hinge.axis).to_degrees()),
+                _ => None,
+            },
+            "flexion_deg": stepped.hinge.as_ref().map(|hinge| hinge.flexion_deg).unwrap_or(0.0),
+            "rotation_deg": stepped.hinge.as_ref().map(|hinge| -hinge.flexion_deg).unwrap_or(0.0),
+            "turn_world": stepped.turn.to_array(),
+            "direction_before": before.to_array(),
+            "direction_after": after.to_array(),
+            "angle_before_deg": angle(parent_before, before),
+            "angle_after_deg": angle(parent_after, after),
+            "turn_degrees": angle(before, after),
+            "target": row.reference_direction.to_array(),
+            "residual_to_target_deg": angle(after, row.reference_direction),
+        }));
+    }
+
+    // The upper arm is not the step's to move: its direction and its angle to the
+    // horizontal must survive, or the T was not preserved, it was replaced.
+    let mut upper = Vec::new();
+    let mut elbow_max_deg = 0.0_f64;
+    let mut wrist_max_deg = 0.0_f64;
+    for side in [Side::Left, Side::Right] {
+        let role = |part: Part| BoneRole { side, part };
+        let upper_before = measured(input.baseline, role(Part::UpperArm));
+        let upper_after = measured(input.straightened, role(Part::UpperArm));
+        let elbow = (
+            measured(input.straightened, role(Part::UpperArm)),
+            measured(input.straightened, role(Part::Forearm)),
+        );
+        let wrist = (
+            measured(input.straightened, role(Part::Forearm)),
+            measured(input.straightened, role(Part::Hand)),
+        );
+        let elbow_deg = match elbow {
+            (Some(a), Some(b)) => a.angle_between(b).to_degrees(),
+            _ => f64::INFINITY,
+        };
+        let wrist_deg = match wrist {
+            (Some(a), Some(b)) => a.angle_between(b).to_degrees(),
+            _ => f64::INFINITY,
+        };
+        elbow_max_deg = elbow_max_deg.max(elbow_deg);
+        wrist_max_deg = wrist_max_deg.max(wrist_deg);
+        upper.push(json!({
+            "side": format!("{side:?}"),
+            "direction_before": upper_before.map(|d| d.to_array()),
+            "direction_after": upper_after.map(|d| d.to_array()),
+            "delta_deg": match (upper_before, upper_after) {
+                (Some(a), Some(b)) => a.angle_between(b).to_degrees(),
+                _ => f64::INFINITY,
+            },
+            "below_horizontal_before_deg": upper_before.map(below_horizontal),
+            "below_horizontal_after_deg": upper_after.map(below_horizontal),
+            "elbow_after_deg": elbow_deg,
+            "wrist_after_deg": wrist_deg,
+        }));
+    }
+    let upper_arm_max_deg = upper
+        .iter()
+        .map(|row| row["delta_deg"].as_f64().unwrap_or(180.0))
+        .fold(0.0_f64, f64::max);
+
+    // The palm rides the chain: how far it moved is the visible cost of the step,
+    // and stating it keeps a rotated hand from passing as an untouched one.
+    let mut palms = Vec::new();
+    for hand in input.hands {
+        let normal = |bake: &RestBake| -> Result<DVec3, CommandError> {
+            Ok(plane_normal(&bake.worlds, hand.hand, hand.index, hand.pinky)?.normalize_or_zero())
+        };
+        let before = normal(input.baseline)?;
+        let after = normal(input.straightened)?;
+        palms.push(json!({
+            "side": format!("{:?}", hand.side),
+            "palm_before": before.to_array(),
+            "palm_after": after.to_array(),
+            "change_deg": before.angle_between(after).to_degrees(),
+        }));
+    }
+
+    // Everything outside the arm subtrees must be bit-identical between the two
+    // bakes: the step aims six bones and inherits their ancestry, nothing else.
+    let deltas = world_deltas(
+        input.actor,
+        input.resolved,
+        input.baseline,
+        input.straightened,
+    );
+
+    let band = |deformation: &Deformation, name: &str| {
+        deformation
+            .bands
+            .iter()
+            .find(|band| band.name == name)
+            .map(|band| (band.max_ratio, band.above_2x))
+            .unwrap_or((1.0, 0))
+    };
+    let (arm_before, arm_above_before) = band(input.baseline_deformation, "arm_chain");
+    let (arm_after, arm_above_after) = band(input.deformation, "arm_chain");
+    let not_worse = input.deformation.max_ratio <= input.baseline_deformation.max_ratio
+        && input.deformation.above_2x <= input.baseline_deformation.above_2x;
+    let applied_max_deg = input
+        .plan
+        .iter()
+        .filter_map(|stepped| stepped.hinge.as_ref().map(|hinge| hinge.flexion_deg))
+        .fold(0.0_f64, f64::max);
+
+    let value = json!({
+        "flag": "--straighten-arms",
+        "step": "after the aim, each forearm onto its upper arm and each hand onto the straightened forearm, about normalize(parent × child)",
+        "axes": "hinge_world is the pose's own hinge in the actor's Y-up world frame; hinge_local is that axis in the joint's own authored world basis, so hinge_local_off_z_deg is its angle to that basis's +Z. The fall's hinge and the authored A-rest's hinge are different axes: rest_hinge_world is the same joint measured on the rest, and hinge_moved_from_rest_deg is how far the pose moved it",
+        "applied": applied_max_deg > STRAIGHTEN_EPS_DEG,
+        "max_flexion_removed_deg": applied_max_deg,
+        "rotations": rows,
+        "upper_arm": upper,
+        "palm": palms,
+        "elbow_max_deg": elbow_max_deg,
+        "wrist_max_deg": wrist_max_deg,
+        "upper_arm_max_delta_deg": upper_arm_max_deg,
+        "outside_arm_subtree": {
+            "nodes": deltas.outside_nodes,
+            "max_rotation_deg": deltas.outside_deg,
+            "max_pivot_shift_m": deltas.outside_pivot_m,
+        },
+        "arm_subtree": {
+            "nodes": deltas.arm_nodes,
+            "max_rotation_deg": deltas.arm_deg,
+            "max_pivot_shift_m": deltas.arm_pivot_m,
+        },
+        "edge_stretch": {
+            "baseline_max_ratio": input.baseline_deformation.max_ratio,
+            "baseline_edges_above_2x": input.baseline_deformation.above_2x,
+            "after_max_ratio": input.deformation.max_ratio,
+            "after_edges_above_2x": input.deformation.above_2x,
+            "arm_chain_baseline_max_ratio": arm_before,
+            "arm_chain_baseline_edges_above_2x": arm_above_before,
+            "arm_chain_after_max_ratio": arm_after,
+            "arm_chain_after_edges_above_2x": arm_above_after,
+            "not_worse": not_worse,
+        },
+    });
+    let verdict = StraightenVerdict {
+        applied: applied_max_deg > STRAIGHTEN_EPS_DEG,
+        elbow_max_deg,
+        wrist_max_deg,
+        upper_arm_max_deg,
+        non_arm_max_deg: deltas.outside_deg,
+        not_worse,
+        applied_max_deg,
+    };
+    Ok((value, verdict))
+}
+
+/// Rotation and pivot deltas between two bakes, split at the arm subtrees.
+struct WorldDeltas {
+    /// Largest rotation change outside the arm subtrees, degrees.
+    outside_deg: f64,
+    /// Largest pivot shift outside the arm subtrees, metres.
+    outside_pivot_m: f64,
+    /// Largest rotation change inside them, degrees.
+    arm_deg: f64,
+    /// Largest pivot shift inside them, metres.
+    arm_pivot_m: f64,
+    /// Nodes measured in each class.
+    outside_nodes: usize,
+    arm_nodes: usize,
+}
+
+fn world_deltas(
+    actor: &Actor,
+    resolved: &[Resolved],
+    baseline: &RestBake,
+    straightened: &RestBake,
+) -> WorldDeltas {
+    let parents = actor.node_parents();
+    let mut inside = vec![false; baseline.worlds.len()];
+    for row in resolved {
+        if !matches!(row.segment.role.part, Part::UpperArm) {
+            continue;
+        }
+        let mut stack = vec![row.joint];
+        while let Some(node) = stack.pop() {
+            if std::mem::replace(&mut inside[node], true) {
+                continue;
+            }
+            for (child, parent) in parents.iter().enumerate() {
+                if *parent == Some(node) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    let mut deltas = WorldDeltas {
+        outside_deg: 0.0,
+        outside_pivot_m: 0.0,
+        arm_deg: 0.0,
+        arm_pivot_m: 0.0,
+        outside_nodes: 0,
+        arm_nodes: 0,
+    };
+    for node in 0..baseline.worlds.len() {
+        let rotation = world_rotation(baseline.worlds[node])
+            .angle_between(world_rotation(straightened.worlds[node]))
+            .to_degrees();
+        let pivot = baseline.worlds[node]
+            .transform_point3(DVec3::ZERO)
+            .distance(straightened.worlds[node].transform_point3(DVec3::ZERO));
+        match inside[node] {
+            true => {
+                deltas.arm_deg = deltas.arm_deg.max(rotation);
+                deltas.arm_pivot_m = deltas.arm_pivot_m.max(pivot);
+                deltas.arm_nodes += 1;
+            }
+            false => {
+                deltas.outside_deg = deltas.outside_deg.max(rotation);
+                deltas.outside_pivot_m = deltas.outside_pivot_m.max(pivot);
+                deltas.outside_nodes += 1;
+            }
+        }
+    }
+    deltas
+}
+
+/// The straightening gate: the T it claims, and what it cost.
+fn straighten_gate(verdict: Option<&StraightenVerdict>) -> Value {
+    let Some(verdict) = verdict else {
+        return json!({
+            "applied": false,
+            "note": "the step did not run; --straighten-arms was not set",
+        });
+    };
+    json!({
+        "applied": verdict.applied,
+        "bar_deg": STRAIGHTEN_TOLERANCE_DEG,
+        "max_flexion_removed_deg": verdict.applied_max_deg,
+        "elbow_max_deg": verdict.elbow_max_deg,
+        "wrist_max_deg": verdict.wrist_max_deg,
+        "bar_upper_arm_deg": T_POSE_TOLERANCE_DEG,
+        "upper_arm_max_delta_deg": verdict.upper_arm_max_deg,
+        "outside_arm_max_rotation_deg": verdict.non_arm_max_deg,
+        "edge_stretch_not_worse": verdict.not_worse,
+        // "Exactly 0.00°" is compared exactly: the two bakes compose the same
+        // locals for every node outside the arm subtrees, so a non-zero value is
+        // a real move, not a rounding one.
+        "pass": verdict.elbow_max_deg <= STRAIGHTEN_TOLERANCE_DEG
+            && verdict.wrist_max_deg <= STRAIGHTEN_TOLERANCE_DEG
+            && verdict.upper_arm_max_deg <= T_POSE_TOLERANCE_DEG
+            && verdict.non_arm_max_deg == 0.0
+            && verdict.not_worse,
+    })
 }
 
 /// One candidate frame of a shipped clip, measured.
@@ -2199,5 +2831,72 @@ fn quantile(sorted: &[f64], fraction: f64) -> f64 {
             let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
             sorted[index]
         }
+    }
+}
+
+/// The hinge is the pair's own geometry, and the turn it produces is exact.
+#[cfg(test)]
+mod straighten_tests {
+    use super::*;
+
+    /// A parent along `+x` and a child 40° from it, tilted out of every axis
+    /// plane: an arbitrary pair, which is what a measured pose is.
+    fn pair() -> (DVec3, DVec3) {
+        let parent = DVec3::X;
+        let child = (DVec3::X * 40.0_f64.to_radians().cos()
+            + DVec3::Y * 40.0_f64.to_radians().sin() * 0.6
+            + DVec3::Z * 40.0_f64.to_radians().sin() * 0.8)
+            .normalize();
+        (parent, child)
+    }
+
+    #[test]
+    fn the_hinge_turn_lands_the_child_on_the_parent() {
+        let (parent, child) = pair();
+        let hinge = hinge_between(parent, child, Side::Left, Part::Forearm)
+            .expect("a bent pair has a hinge")
+            .expect("a bent pair is not already straight");
+        assert!(
+            (hinge.flexion_deg - 40.0).abs() < 1e-9,
+            "{}",
+            hinge.flexion_deg
+        );
+        // `normalize(parent × child)` is perpendicular to both segments by
+        // construction, which is the whole reason it is the hinge.
+        assert!(hinge.axis.dot(parent).abs() < 1e-12);
+        assert!(hinge.axis.dot(child).abs() < 1e-12);
+        let landed = hinge.rotation() * child;
+        assert!(
+            landed.angle_between(parent).to_degrees() < 1e-9,
+            "residual {}",
+            landed.angle_between(parent).to_degrees()
+        );
+        // The turn only rotates about the hinge: it cannot swing the child
+        // sideways, which is what a wrong axis such as the declared local Z does.
+        assert!((landed.length() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_straight_pair_needs_no_hinge_and_a_folded_one_has_none() {
+        let straight = hinge_between(DVec3::X, DVec3::X, Side::Right, Part::Hand)
+            .expect("a straight pair is not an error");
+        assert!(straight.is_none(), "a straight pair must be a no-op");
+        let folded = hinge_between(DVec3::X, -DVec3::X, Side::Right, Part::Hand);
+        assert!(folded.is_err(), "an antipodal pair has no turn axis");
+        let empty = hinge_between(DVec3::ZERO, DVec3::X, Side::Left, Part::Forearm);
+        assert!(empty.is_err(), "a zero-length segment has no hinge");
+    }
+
+    #[test]
+    fn the_turn_is_composed_on_the_world_side_of_the_aim() {
+        // The aim produced `R_aim`; the step wants `R_step · R_aim`, so the
+        // composed turn applied to the authored basis equals the step applied to
+        // the aimed world rotation.
+        let aim = DQuat::from_axis_angle(DVec3::Y, 0.7);
+        let step = DQuat::from_axis_angle(DVec3::X, -0.3);
+        let composed = combine(&step, aim);
+        let direct = step * aim;
+        assert!(composed.angle_between(direct).to_degrees() < 1e-12);
+        assert!((composed.length() - 1.0).abs() < 1e-12);
     }
 }
