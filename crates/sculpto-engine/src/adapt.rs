@@ -177,7 +177,35 @@ pub(crate) fn actor_rest_worlds(actor: &Actor) -> Result<Vec<DMat4>, CommandErro
 /// parent is its nearest palette ancestor, so a scaffolding node between two
 /// joints is folded into the local without changing any world transform.
 pub fn actor_rig(actor: &Actor) -> Result<(Rig, Vec<String>), CommandError> {
+    let worlds = actor_rest_worlds(actor)?;
+    actor_rig_with_worlds(actor, &worlds)
+}
+
+/// The same palette as a rig, from a supplied rest world per document node.
+///
+/// A verb that moves the rest itself needs the rig the *posed* worlds describe,
+/// not the file's own: `actor tpose` bakes a pose into the flesh and then writes
+/// that pose as the skeleton's rest, and this is the one composition route, so
+/// the two rigs cannot disagree about folding a scaffolding node.
+///
+/// # Errors
+/// The same refusals as [`actor_rig`], plus a world list that does not cover
+/// every document node.
+pub(crate) fn actor_rig_with_worlds(
+    actor: &Actor,
+    worlds: &[DMat4],
+) -> Result<(Rig, Vec<String>), CommandError> {
     let joints = actor.skin_joints().map_err(actor_error)?;
+    if worlds.len() != actor.node_parents().len() {
+        return Err(refused(
+            "adapt_palette",
+            format!(
+                "{} rest worlds for {} document nodes",
+                worlds.len(),
+                actor.node_parents().len()
+            ),
+        ));
+    }
     if joints.is_empty() {
         return Err(refused(
             "adapt_palette",
@@ -196,7 +224,6 @@ pub fn actor_rig(actor: &Actor) -> Result<(Rig, Vec<String>), CommandError> {
         .iter()
         .map(|node| name_of(*node))
         .collect::<Result<_, _>>()?;
-    let worlds = actor_rest_worlds(actor)?;
     let slot_of: BTreeMap<usize, usize> = joints
         .iter()
         .enumerate()

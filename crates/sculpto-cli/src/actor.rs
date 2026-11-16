@@ -13,6 +13,7 @@ mod shoulder;
 mod skin;
 mod stress;
 mod torso;
+mod tpose;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -33,7 +34,9 @@ usage: sculpto actor fit --input actor.glb --out fitted.glb [--report fitted.jso
 usage: sculpto actor torso-fit --input actor.glb --body NAME[#i] [--layer NAME[#i] ...] \
     [--out fitted.glb] [--report report.json]
 usage: sculpto actor shoulder-seat --input actor.glb --body NAME[#i] \
-    [--layer NAME[#i] ...] [--report report.json]";
+    [--layer NAME[#i] ...] [--report report.json]
+usage: sculpto actor tpose --actor actor.glb --reference skeleton.glb [--out tposed.glb] \
+    [--report tpose.json]";
 
 #[derive(Debug)]
 struct Arguments<'arg> {
@@ -71,6 +74,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "skin") {
         return skin::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "tpose") {
+        return tpose::run(&args[1..]);
     }
     if args.first().is_some_and(|command| command == "havok") {
         return havok::run(&args[1..]);

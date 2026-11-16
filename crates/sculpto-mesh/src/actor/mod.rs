@@ -8,6 +8,7 @@ mod gait;
 mod geometry;
 mod packing;
 mod pose;
+mod rest;
 mod rig;
 mod shoulder;
 mod stress;
@@ -21,6 +22,7 @@ pub use fit::{
 pub use gait::{GaitOutcome, GaitParameters, JointRange, gait, write_gait_clip};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
 pub use pose::{Axis, JointPose, JointProbe, PoseOutcome, PosedJoint, probe, write_probe_clip};
+pub use rest::{AimedJoint, RestAim, RestBake, bake_rest};
 pub use shoulder::{SEAT_CHAIN, SeatBone, SeatJoint, SeatOutcome, SeatWall, shoulder_seat};
 pub use stress::{
     FrameRow, GarmentRow, PartAddress, StressError, StressPlan, StressPose, StressReport, stress,
@@ -324,6 +326,20 @@ impl Actor {
     /// zero or several clips.
     pub fn clip_span(&self, name: &str) -> Result<(f64, f64), ActorError> {
         animation::span(self, name)
+    }
+
+    /// Every node's world transform at one pose, without sampling geometry.
+    ///
+    /// A caller that needs the *skeleton* at a clip time — choosing a rest frame,
+    /// comparing joint directions — would otherwise pay for a full skinned sample
+    /// of the mesh on every candidate. The composition is the same owner the
+    /// vertex path uses, so the two cannot disagree.
+    ///
+    /// # Errors
+    /// A clip name that matches zero or several clips, an unreadable channel, or a
+    /// sampled time outside the clip's authored span.
+    pub fn skeleton_worlds(&self, pose: Pose<'_>) -> Result<Vec<DMat4>, ActorError> {
+        animation::worlds(self, &[], pose)
     }
 
     /// Reduced skin correspondence for the same explicit parts and pose.

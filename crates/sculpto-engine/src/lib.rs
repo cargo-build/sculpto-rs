@@ -28,6 +28,7 @@ pub mod ops;
 mod parts;
 pub mod rebind;
 pub mod regression;
+pub mod rest;
 pub mod retarget;
 pub mod rules;
 mod seal;
