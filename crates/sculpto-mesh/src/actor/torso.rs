@@ -652,10 +652,7 @@ fn instrument(
             });
         }
     }
-    Instrument {
-        probes,
-        skipped,
-    }
+    Instrument { probes, skipped }
 }
 
 /// A sampled part: its world-space vertices and its triangles, rebased so the
