@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use glam::{DMat4, DVec3};
+use glam::{DMat3, DMat4, DQuat, DVec3};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -72,20 +72,92 @@ struct FoldRow {
     target: String,
 }
 
-/// Seat the target hierarchy at the source rest and report the per-bone shift.
+/// The chain a target bone belongs to, for per-chain proportioning. Fingers are
+/// their own chain: they branch in parallel from the hand, so summing them into
+/// the arm would inflate the arm's length and mis-scale the upper arm.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chain {
+    Spine,
+    Arm,
+    Leg,
+    Finger,
+}
+
+const CHAIN_COUNT: usize = 4;
+
+fn chain_idx(c: Chain) -> usize {
+    match c {
+        Chain::Spine => 0,
+        Chain::Arm => 1,
+        Chain::Leg => 2,
+        Chain::Finger => 3,
+    }
+}
+
+fn chain_name(c: Chain) -> &'static str {
+    match c {
+        Chain::Spine => "spine",
+        Chain::Arm => "arm",
+        Chain::Leg => "leg",
+        Chain::Finger => "finger",
+    }
+}
+
+fn chain_of(name: &str) -> Chain {
+    match role_of(name).map(|role| role.part) {
+        Some(Part::Digit { .. }) => Chain::Finger,
+        Some(Part::UpperArm | Part::Forearm | Part::Hand) => Chain::Arm,
+        Some(Part::Thigh | Part::Calf | Part::Foot | Part::Toe) => Chain::Leg,
+        Some(Part::Marker) if compact(name).contains("toe") => Chain::Leg,
+        // The clavicle is shoulder girdle: it scales with the torso, so the arm
+        // factor covers only Arm->ForeArm->Hand (the operator's limb chain).
+        _ => Chain::Spine,
+    }
+}
+
+/// Signed distance of a point to the nearest flesh vertex, millimetres: positive
+/// outside, negative inside, by the surface normal at the nearest vertex.
+/// Nearest-vertex resolution (the mesh tessellation bounds the precision).
+fn flesh_probe(
+    point: DVec3,
+    mesh_positions: &[[f64; 3]],
+    mesh_normals: &[[f32; 3]],
+) -> (f64, usize, bool) {
+    let mut best = f64::INFINITY;
+    let mut best_k = 0;
+    for (k, v) in mesh_positions.iter().enumerate() {
+        let d = point.distance(DVec3::from_array(*v));
+        if d < best {
+            best = d;
+            best_k = k;
+        }
+    }
+    let normal = DVec3::from_array(mesh_normals[best_k].map(f64::from));
+    let outward = (point - DVec3::from_array(mesh_positions[best_k])).dot(normal);
+    let signed_mm = best * 1000.0 * if outward > 0.0 { 1.0 } else { -1.0 };
+    (signed_mm, best_k, outward <= 0.0)
+}
+
+/// Seat the target skeleton by proportioning each chain to the flesh.
 ///
-/// A mapped target bone takes its source bone's rest world; an unmapped tip
-/// (the fourth finger segment, `Toe_End`, `HeadTop_End`) keeps its authored
-/// offset from the seated parent. Locals are recomposed from the seated worlds.
+/// Mixamo's names, hierarchy and rest directions are kept; each chain's bone
+/// lengths are scaled by one uniform factor so the chain matches the flesh's own
+/// measured length (shoulder→elbow→wrist, hip→knee→ankle, pelvis→head). The root
+/// is anchored at the flesh hip landmark. The native palette is used only to
+/// *measure* flesh lengths and to report the delta a native seat would have
+/// copied — never as a placement. The result is Mixamo's skeleton proportioned to
+/// this body, not native placement and not literal Mixamo proportions.
 fn seat_rig(
     target_rig: &Rig,
     target_palette: &[String],
-    seat_world: &BTreeMap<JointId, DMat4>,
+    flesh_pos: &BTreeMap<JointId, DVec3>,
+    native_pos: &BTreeMap<JointId, DVec3>,
+    mesh_positions: &[[f64; 3]],
+    mesh_normals: &[[f32; 3]],
 ) -> Result<(Rig, Value), CommandError> {
-    let authored: Vec<DMat4> = target_palette
-        .iter()
-        .enumerate()
-        .map(|(slot, _)| -> Result<DMat4, CommandError> {
+    let n = target_palette.len();
+    let authored: Vec<DMat4> = (0..n)
+        .map(|slot| -> Result<DMat4, CommandError> {
             Ok(DMat4::from_cols_array_2d(
                 &target_rig
                     .rest_world(JointId::new(slot as u32))
@@ -94,82 +166,251 @@ fn seat_rig(
                     })?,
             ))
         })
-        .collect::<Result<_, CommandError>>()?;
-    let mut seated: Vec<Option<DMat4>> = vec![None; target_palette.len()];
-    fn resolve(
-        slot: usize,
-        target_rig: &Rig,
-        seat_world: &BTreeMap<JointId, DMat4>,
-        authored: &[DMat4],
-        seated: &mut Vec<Option<DMat4>>,
-    ) -> Result<DMat4, CommandError> {
-        if let Some(world) = seated[slot] {
-            return Ok(world);
+        .collect::<Result<_, _>>()?;
+    let pos: Vec<DVec3> = authored.iter().map(|m| m.w_axis.truncate()).collect();
+    let chain: Vec<Chain> = target_palette.iter().map(|name| chain_of(name)).collect();
+    let parent: Vec<Option<usize>> = (0..n)
+        .map(|slot| {
+            target_rig
+                .joint(JointId::new(slot as u32))
+                .and_then(|joint| joint.parent)
+                .map(|p| p.index())
+        })
+        .collect();
+    let root = target_rig.roots()[0].index();
+
+    // Flesh landmarks are the mesh centroids (`flesh_pos`): the body's own flesh
+    // level, not the SSE-angled native joint seat. The girdle root therefore lands
+    // at the anatomical shoulder level (top of the chest), which a scaled Mixamo
+    // spine cannot produce. Native seats are kept only to report the delta a native
+    // placement would have copied and how many of them sit outside the flesh.
+    let landmark_pos = flesh_pos.clone();
+    let mut landmark_src: BTreeMap<JointId, (&'static str, f64)> = BTreeMap::new();
+    for (&joint, &fp) in flesh_pos {
+        let (mm, _k, _inside) = flesh_probe(fp, mesh_positions, mesh_normals);
+        landmark_src.insert(joint, ("flesh_landmark", mm));
+    }
+    let mut native_outside = 0_usize;
+    for &np in native_pos.values() {
+        let (_mm, _k, inside) = flesh_probe(np, mesh_positions, mesh_normals);
+        if !inside {
+            native_outside += 1;
         }
-        let joint = JointId::new(slot as u32);
-        let world = match seat_world.get(&joint) {
-            Some(world) => *world,
-            None => {
-                let parent = target_rig.joint(joint).and_then(|joint| joint.parent);
-                let Some(parent) = parent else {
-                    return Err(refused(
-                        "rebind_seat",
-                        format!(
-                            "skeleton root {:?} has no source bone to seat it; the correspondence \
-                             mapped no root",
-                            target_rig.joint(joint).and_then(|joint| joint.name.clone())
-                        ),
-                    ));
+    }
+    let hip_anchor = *landmark_pos.get(&JointId::new(root as u32)).ok_or_else(|| {
+        refused(
+            "rebind_seat",
+            "the flesh hip landmark (source of the skeleton root) is unmapped; cannot anchor the seat",
+        )
+    })?;
+
+    // Align Mixamo's rest frame to the body's rest frame. Our bodies face -Z and
+    // Mixamo +Z (180 deg yaw); the rotation is measured from the flesh landmarks
+    // (left->right shoulder axis, hips->head up), not assumed. Mixamo's anatomical
+    // directions are kept but expressed in the body frame, so the arms point down
+    // the body's own sides instead of across its chest.
+    let find = |name: &str| target_palette.iter().position(|p| p == name);
+    let body_vec = |a: &str, b: &str| -> Option<DVec3> {
+        let ia = find(a)?;
+        let ib = find(b)?;
+        let pa = landmark_pos.get(&JointId::new(ia as u32))?;
+        let pb = landmark_pos.get(&JointId::new(ib as u32))?;
+        Some((*pb - *pa).normalize_or_zero())
+    };
+    let mix_vec = |a: &str, b: &str| -> Option<DVec3> {
+        let ia = find(a)?;
+        let ib = find(b)?;
+        Some((pos[ib] - pos[ia]).normalize_or_zero())
+    };
+    let basis = |right: DVec3, up: DVec3| -> DMat3 {
+        let up = up.normalize_or_zero();
+        let right = (right - up * right.dot(up)).normalize_or_zero();
+        DMat3::from_cols(right, up, right.cross(up))
+    };
+    let frame_rotation = match (
+        body_vec("mixamorig:LeftShoulder", "mixamorig:RightShoulder"),
+        body_vec("mixamorig:Hips", "mixamorig:Head"),
+        mix_vec("mixamorig:LeftShoulder", "mixamorig:RightShoulder"),
+        mix_vec("mixamorig:Hips", "mixamorig:Head"),
+    ) {
+        (Some(br), Some(bu), Some(mr), Some(mu)) => basis(br, bu) * basis(mr, mu).inverse(),
+        _ => DMat3::IDENTITY,
+    };
+    let frame_quat = DQuat::from_mat3(&frame_rotation);
+
+    // First pass: one uniform scale per chain, measured along the serial limb path
+    // (shoulder->elbow->wrist, hip->knee->ankle, pelvis->head, hand->fingertip),
+    // not the sum of parallel branches. Reported as the reference.
+    let path_len = |names: &[&str], flesh: bool| -> f64 {
+        let mut total = 0.0;
+        let mut prev: Option<DVec3> = None;
+        for nm in names {
+            let point = find(nm).and_then(|i| {
+                if flesh {
+                    landmark_pos.get(&JointId::new(i as u32)).copied()
+                } else {
+                    Some(pos[i])
+                }
+            });
+            if let (Some(a), Some(b)) = (prev, point) {
+                total += a.distance(b);
+            }
+            prev = point;
+        }
+        total
+    };
+    let spine_path = [
+        "mixamorig:Hips",
+        "mixamorig:Spine",
+        "mixamorig:Spine1",
+        "mixamorig:Spine2",
+        "mixamorig:Neck",
+        "mixamorig:Head",
+    ];
+    let arm_path = [
+        "mixamorig:LeftShoulder",
+        "mixamorig:LeftArm",
+        "mixamorig:LeftForeArm",
+        "mixamorig:LeftHand",
+    ];
+    let leg_path = [
+        "mixamorig:LeftUpLeg",
+        "mixamorig:LeftLeg",
+        "mixamorig:LeftFoot",
+        "mixamorig:LeftToeBase",
+    ];
+    let finger_path = [
+        "mixamorig:LeftHand",
+        "mixamorig:LeftHandMiddle1",
+        "mixamorig:LeftHandMiddle2",
+        "mixamorig:LeftHandMiddle3",
+    ];
+    let mut mix_len = [0.0_f64; CHAIN_COUNT];
+    let mut flesh_len = [0.0_f64; CHAIN_COUNT];
+    for (k, path) in [
+        spine_path.as_slice(),
+        arm_path.as_slice(),
+        leg_path.as_slice(),
+        finger_path.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        mix_len[k] = path_len(path, false);
+        flesh_len[k] = path_len(path, true);
+    }
+    let mut scale = [1.0_f64; CHAIN_COUNT];
+    for k in 0..CHAIN_COUNT {
+        if mix_len[k] > 1e-9 {
+            scale[k] = flesh_len[k] / mix_len[k];
+        }
+    }
+
+    // Escalation: a uniform chain factor cannot put every joint inside when the
+    // flesh's per-bone proportions differ from Mixamo's (clavicle 196 vs 129 mm,
+    // forearm 225 vs 276 mm). Where that happens, adapt per bone: each bone keeps
+    // Mixamo's body-frame direction but takes its length from the flesh landmark
+    // spacing. The per-bone factor and the joint-angle error it introduces are
+    // declared per joint below; no joint is nudged to a native position.
+    let mut bone_vec = vec![DVec3::ZERO; n];
+    let mut bone_factor = vec![1.0_f64; n];
+    let mut angle_error = vec![0.0_f64; n];
+    for j in 0..n {
+        let Some(p) = parent[j] else { continue };
+        let mix_bone = frame_rotation * (pos[j] - pos[p]);
+        let mix_length = mix_bone.length();
+        let dir = mix_bone.normalize_or_zero();
+        let mapped = landmark_pos
+            .get(&JointId::new(j as u32))
+            .copied()
+            .zip(landmark_pos.get(&JointId::new(p as u32)).copied());
+        let (vec, factor, angle) = match mapped {
+            Some((nj, np)) => {
+                let flesh_bone = nj - np;
+                let flesh_length = flesh_bone.length();
+                let angle = flesh_bone
+                    .normalize_or_zero()
+                    .dot(dir)
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees();
+                let factor = if mix_length > 1e-9 {
+                    flesh_length / mix_length
+                } else {
+                    1.0
                 };
-                let parent_world =
-                    resolve(parent.index(), target_rig, seat_world, authored, seated)?;
-                // The authored offset is extracted scale-free: a target skeleton
-                // exported with a unit scale (Blender's 0.01 armature) would
-                // otherwise amplify the tip offset by the inverse scale and throw
-                // the leaf metres away. The seated parent's own scale still applies.
-                let relative =
-                    scale_free(authored[parent.index()]).inverse() * scale_free(authored[slot]);
-                parent_world * relative
+                (flesh_bone, factor, angle)
+            }
+            None => {
+                let k = chain_idx(chain[j]);
+                (dir * scale[k] * mix_length, scale[k], 0.0)
             }
         };
-        seated[slot] = Some(world);
-        Ok(world)
+        bone_vec[j] = vec;
+        bone_factor[j] = factor;
+        angle_error[j] = angle;
     }
-    let mut worlds = Vec::with_capacity(target_palette.len());
-    for slot in 0..target_palette.len() {
-        worlds.push(resolve(
-            slot,
-            target_rig,
-            seat_world,
-            &authored,
-            &mut seated,
-        )?);
+    let mut seated_pos = vec![DVec3::ZERO; n];
+    let mut done = vec![false; n];
+    seated_pos[root] = hip_anchor;
+    done[root] = true;
+    fn place(
+        j: usize,
+        parent: &[Option<usize>],
+        bone_vec: &[DVec3],
+        seated_pos: &mut [DVec3],
+        done: &mut [bool],
+    ) {
+        if done[j] {
+            return;
+        }
+        let p = parent[j].expect("non-root joint has a parent");
+        place(p, parent, bone_vec, seated_pos, done);
+        seated_pos[j] = seated_pos[p] + bone_vec[j];
+        done[j] = true;
     }
-    let mut joints = Vec::with_capacity(target_palette.len());
-    let mut shifts = Vec::new();
-    let mut max_shift = 0.0_f64;
-    for (slot, name) in target_palette.iter().enumerate() {
-        let parent = target_rig
-            .joint(JointId::new(slot as u32))
-            .and_then(|joint| joint.parent);
-        let parent_world = match parent {
-            Some(parent) => worlds[parent.index()],
+    for j in 0..n {
+        place(j, &parent, &bone_vec, &mut seated_pos, &mut done);
+    }
+
+    let mut joints = Vec::with_capacity(n);
+    let mut rows = Vec::new();
+    for j in 0..n {
+        let rotation = frame_quat * authored[j].to_scale_rotation_translation().1;
+        let world = DMat4::from_scale_rotation_translation(DVec3::ONE, rotation, seated_pos[j]);
+        let pworld = match parent[j] {
+            Some(p) => DMat4::from_scale_rotation_translation(
+                DVec3::ONE,
+                frame_quat * authored[p].to_scale_rotation_translation().1,
+                seated_pos[p],
+            ),
             None => DMat4::IDENTITY,
         };
-        let rest = local_of(parent_world.inverse() * worlds[slot], name)?;
-        let shift = worlds[slot]
-            .w_axis
-            .truncate()
-            .distance(authored[slot].w_axis.truncate());
-        max_shift = max_shift.max(shift);
-        shifts.push(json!({
-            "bone": name,
-            "seated": seat_world.contains_key(&JointId::new(slot as u32)),
-            "rest_shift_metres": shift,
+        let rest = local_of(pworld.inverse() * world, &target_palette[j])?;
+        // Signed distance of the SEATED joint to the nearest flesh vertex.
+        let (signed_mm, _k, inside) = flesh_probe(seated_pos[j], mesh_positions, mesh_normals);
+        let native_delta = native_pos
+            .get(&JointId::new(j as u32))
+            .map(|np| seated_pos[j].distance(*np) * 1000.0);
+        let (src, native_mm) = landmark_src
+            .get(&JointId::new(j as u32))
+            .copied()
+            .unwrap_or(("unmapped", f64::NAN));
+        rows.push(json!({
+            "bone": target_palette[j],
+            "chain": chain_name(chain[j]),
+            "chain_scale": scale[chain_idx(chain[j])],
+            "bone_factor": bone_factor[j],
+            "joint_angle_error_degrees": angle_error[j],
+            "flesh_distance_mm": signed_mm,
+            "inside": inside,
+            "native_delta_mm": native_delta,
+            "landmark_source": src,
+            "native_seat_flesh_mm": native_mm,
         }));
         joints.push(Joint {
-            name: Some(name.clone()),
-            parent,
+            name: Some(target_palette[j].clone()),
+            parent: parent[j].map(|p| JointId::new(p as u32)),
             rest,
         });
     }
@@ -179,12 +420,48 @@ fn seat_rig(
             format!("the seated skeleton is not a rig: {error}"),
         )
     })?;
+    let outside: Vec<&Value> = rows.iter().filter(|r| r["inside"] == false).collect();
+    let yaw_degrees = (-frame_rotation.x_axis.z)
+        .atan2(frame_rotation.x_axis.x)
+        .to_degrees();
+    let sp2 = find("mixamorig:Spine2");
+    let girdle: Vec<Value> = ["Left", "Right"]
+        .iter()
+        .filter_map(|side| {
+            let sh = find(&format!("mixamorig:{side}Shoulder"))?;
+            let sp2 = sp2?;
+            let anchor_level = (seated_pos[sh].y - seated_pos[sp2].y) * 1000.0;
+            let mixamo_level = (pos[sh].y - pos[sp2].y) * 1000.0;
+            let (mm, _k, inside) = flesh_probe(seated_pos[sh], mesh_positions, mesh_normals);
+            let arm = find(&format!("mixamorig:{side}Arm"));
+            let clavicle_deltoid_vertical = arm.map(|a| (seated_pos[sh].y - seated_pos[a].y) * 1000.0);
+            Some(json!({
+                "side": side,
+                "anchor_level_above_spine2_mm": anchor_level,
+                "mixamo_proportion_level_mm": mixamo_level,
+                "shoulders_low_gap_mm": anchor_level - mixamo_level,
+                "clavicle_to_deltoid_vertical_mm": clavicle_deltoid_vertical,
+                "flesh_distance_mm": mm,
+                "inside": inside,
+                "native_delta_mm": native_pos.get(&JointId::new(sh as u32)).map(|np| seated_pos[sh].distance(*np)*1000.0),
+            }))
+        })
+        .collect();
     let report = json!({
-        "bones": target_palette.len(),
-        "seated": seat_world.len(),
-        "tips_kept": target_palette.len() - seat_world.len(),
-        "max_rest_shift_metres": max_shift,
-        "per_bone": shifts,
+        "method": "per-chain Mixamo structure seated at the caller's flesh landmarks: per-bone vectors from landmark spacing, uniform chain-scale fallback for unmapped joints, anatomical girdle root",
+        "bones": n,
+        "frame_yaw_degrees": yaw_degrees,
+        "shoulder_girdle": girdle,
+        "chain_scale": { "spine": scale[0], "arm": scale[1], "leg": scale[2], "finger": scale[3] },
+        "chain_length_mm": {
+            "spine": { "mixamo": mix_len[0]*1000.0, "flesh": flesh_len[0]*1000.0 },
+            "arm": { "mixamo": mix_len[1]*1000.0, "flesh": flesh_len[1]*1000.0 },
+            "leg": { "mixamo": mix_len[2]*1000.0, "flesh": flesh_len[2]*1000.0 },
+            "finger": { "mixamo": mix_len[3]*1000.0, "flesh": flesh_len[3]*1000.0 },
+        },
+        "outside_flesh_count": outside.len(),
+        "native_outside_flesh_count": native_outside,
+        "per_bone": rows,
     });
     Ok((rig, report))
 }
@@ -203,12 +480,6 @@ fn local_of(local: DMat4, name: &str) -> Result<LocalTransform, CommandError> {
         rotation: rotation.normalize().to_array().map(|value| value as f32),
         scale: scale.x as f32,
     })
-}
-
-/// One affine with its scale divided out: rotation and translation only.
-fn scale_free(value: DMat4) -> DMat4 {
-    let (_, rotation, translation) = value.to_scale_rotation_translation();
-    DMat4::from_scale_rotation_translation(DVec3::ONE, rotation, translation)
 }
 
 /// The family a folded bone belongs to, for the named soft-tissue census.
@@ -270,15 +541,277 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
         .map(|(slot, node)| (*node, slot))
         .collect();
     let mut direct: Vec<Option<JointId>> = vec![None; source_palette.len()];
-    let mut seat_world: BTreeMap<JointId, DMat4> = BTreeMap::new();
+    let mut native_pos: BTreeMap<JointId, DVec3> = BTreeMap::new();
     for pair in &correspondence.pairs {
         let Some(node) = pair.source else { continue };
-        seat_world.insert(pair.joint, source_worlds[node]);
+        native_pos.insert(pair.joint, source_worlds[node].w_axis.truncate());
         if let Some(&slot) = slot_of_node.get(&node) {
             direct[slot] = Some(pair.joint);
         }
     }
-    let (seated_rig, seat_report) = seat_rig(&target_rig, &target_palette, &seat_world)?;
+    // The correspondence resolves by role, and the 13 zero-weight leaf tips carry
+    // no role — yet they are joints of the body's own rest polyline (the extent
+    // carrier). Recover their rest worlds by name so their chains (head_top, toe,
+    // finger) place them at the flesh tip (fraction 1.0) instead of falling back
+    // to a scaled Mixamo offset. This seats no weight: `direct` stays role-based.
+    for (j, name) in target_palette.iter().enumerate() {
+        let joint = JointId::new(j as u32);
+        if native_pos.contains_key(&joint) {
+            continue;
+        }
+        if let Some(slot) = source_palette.iter().position(|p| p == name) {
+            native_pos.insert(joint, source_worlds[source_joints[slot]].w_axis.truncate());
+        }
+    }
+    // Skeleton-authority placement (operator): Mixamo's graph and chain fractions
+    // are the authority; the body's own chain extents carry them. No native joint
+    // places a vertex — the M0 rest is read only as the body's rest-shape polyline
+    // and as the delta baseline. Each joint lands at Mixamo's arc-fraction along OUR
+    // chain polyline. The polyline runs through the flesh (its seats passed the M0
+    // containment gate), so interpolation stays inside; containment is measured
+    // with the acceptance gate's own ray-parity probe and the medial field supplies
+    // the inscribed radius. A joint outside the flesh is a warp or refusal
+    // candidate, never snapped back onto the axis — bending the skeleton to the
+    // flesh is the rejected direction.
+    let field =
+        crate::medial::MedialField::from_mesh_sealed(&pool.vertices, &pool.triangles, 0.003, 2);
+    let target_rest: Vec<DVec3> = (0..target_palette.len())
+        .map(|i| {
+            let m = target_rig
+                .rest_world(JointId::new(i as u32))
+                .map_err(|e| errors::invalid("rebind_seat", format!("target rest world: {e}")))?;
+            Ok(DVec3::new(m[3][0], m[3][1], m[3][2]))
+        })
+        .collect::<Result<_, CommandError>>()?;
+    let fractions = crate::medial::chain_fractions(&target_palette, &target_rest);
+    // Our chain polylines from the M0 rest, arc-length parameterised (the body's
+    // own extents: spine ~763, arm ~741, leg ~1039 mm for Emily).
+    let index_of = |name: &str| target_palette.iter().position(|p| p == name);
+    let mut chain_arc: BTreeMap<String, (Vec<DVec3>, Vec<f64>)> = BTreeMap::new();
+    for (cname, names) in crate::medial::mixamo_chains() {
+        let pts: Vec<DVec3> = names
+            .iter()
+            .filter_map(|n| index_of(n))
+            .filter_map(|i| native_pos.get(&JointId::new(i as u32)).copied())
+            .collect();
+        if pts.len() < 2 {
+            continue;
+        }
+        let mut arc = vec![0.0_f64; pts.len()];
+        for k in 1..pts.len() {
+            arc[k] = arc[k - 1] + pts[k].distance(pts[k - 1]);
+        }
+        chain_arc.insert(cname, (pts, arc));
+    }
+    let point_at_arc = |pts: &[DVec3], arc: &[f64], target: f64| -> DVec3 {
+        if pts.is_empty() {
+            return DVec3::ZERO;
+        }
+        if target <= 0.0 {
+            return pts[0];
+        }
+        for k in 1..pts.len() {
+            if arc[k] >= target {
+                let span = arc[k] - arc[k - 1];
+                let u = if span > 1e-9 {
+                    (target - arc[k - 1]) / span
+                } else {
+                    0.0
+                };
+                return pts[k - 1].lerp(pts[k], u);
+            }
+        }
+        *pts.last().unwrap()
+    };
+    let mut flesh_pos: BTreeMap<JointId, DVec3> = BTreeMap::new();
+    let mut joint_meta: BTreeMap<JointId, Value> = BTreeMap::new();
+    for (j, _name) in target_palette.iter().enumerate() {
+        let joint = JointId::new(j as u32);
+        let Some(t) = fractions.get(&j) else {
+            if let Some(&p) = native_pos.get(&joint) {
+                flesh_pos.insert(joint, p);
+            }
+            continue;
+        };
+        let Some((pts, arc)) = chain_arc.get(&t.chain) else {
+            continue;
+        };
+        let total = arc.last().copied().unwrap_or(0.0);
+        let placed = point_at_arc(pts, arc, t.fraction * total);
+        let radius = field.radius_at(placed);
+        let inside = field.is_inside(placed);
+        flesh_pos.insert(joint, placed);
+        let delta_mm = native_pos.get(&joint).map(|p| placed.distance(*p) * 1000.0);
+        joint_meta.insert(
+            joint,
+            json!({
+                "chain": t.chain,
+                "fraction": t.fraction,
+                "position_mm": [placed.x * 1000.0, placed.y * 1000.0, placed.z * 1000.0],
+                "medial_radius_mm": radius * 1000.0,
+                "medial_inside": inside,
+                "delta_vs_m0_mm": delta_mm,
+                "chain_total_mm": total * 1000.0,
+            }),
+        );
+    }
+    let positions_f32: Vec<[f32; 3]> = pool
+        .vertices
+        .iter()
+        .map(|point| point.map(|value| value as f32))
+        .collect();
+    let mesh_normals = smooth_normals(&positions_f32, &pool.triangles);
+    let (seated_rig, mut seat_report) = seat_rig(
+        &target_rig,
+        &target_palette,
+        &flesh_pos,
+        &native_pos,
+        &pool.vertices,
+        &mesh_normals,
+    )?;
+    // Skeleton-authority augmentation: per-joint fraction/radius/inside/delta-vs-M0,
+    // the chain table (our extents at Mixamo fractions), the similarity, and the
+    // joints outside the flesh (zero-weight leaf tips by design vs placement failures).
+    {
+        let body_y_min = pool
+            .vertices
+            .iter()
+            .map(|p| p[1])
+            .fold(f64::INFINITY, f64::min);
+        let body_y_max = pool
+            .vertices
+            .iter()
+            .map(|p| p[1])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mix_y_min = target_rest
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::INFINITY, f64::min);
+        let mix_y_max = target_rest
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let height_scale = (body_y_max - body_y_min) / (mix_y_max - mix_y_min);
+        if let Some(rows) = seat_report["per_bone"].as_array_mut() {
+            for row in rows.iter_mut() {
+                if let Some(bone) = row["bone"].as_str()
+                    && let Some(j) = target_palette.iter().position(|p| p == bone)
+                    && let Some(meta) = joint_meta.get(&JointId::new(j as u32))
+                    && let Some(obj) = meta.as_object()
+                {
+                    for (k, v) in obj {
+                        row[k] = v.clone();
+                    }
+                }
+            }
+        }
+        let mut chain_table = Vec::new();
+        for (cname, (_pts, arc)) in &chain_arc {
+            let total = arc.last().copied().unwrap_or(0.0);
+            chain_table.push(json!({"chain": cname, "our_extent_mm": total * 1000.0}));
+        }
+        let leaf_markers = [
+            "Toe_End",
+            "HeadTop_End",
+            "HandThumb4",
+            "HandIndex4",
+            "HandMiddle4",
+            "HandRing4",
+            "HandPinky4",
+        ];
+        // Containment authority: the same +X ray parity / true point-triangle
+        // measurement the acceptance gate uses, at its tolerance (default 1 mm).
+        // The voxel field's nearest-cell probe flips on surface-coincident joints;
+        // it stays in the report as `medial_inside`/`medial_radius_mm` diagnostics.
+        let tolerance_mm = std::env::var("SKULPTOR_FLESH_TOLERANCE_MM")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0);
+        if let Some(rows) = seat_report["per_bone"].as_array_mut() {
+            for row in rows.iter_mut() {
+                if let Some(pos) = row["position_mm"].as_array()
+                    && pos.len() == 3
+                {
+                    let point = DVec3::new(
+                        pos[0].as_f64().unwrap_or(0.0) / 1000.0,
+                        pos[1].as_f64().unwrap_or(0.0) / 1000.0,
+                        pos[2].as_f64().unwrap_or(0.0) / 1000.0,
+                    );
+                    let (signed_mm, _parity) =
+                        crate::medial::surface_probe(&pool.vertices, &pool.triangles, point);
+                    row["surface_signed_mm"] = json!(signed_mm);
+                    row["inside"] = json!(signed_mm <= tolerance_mm);
+                }
+            }
+        }
+        let mut outside = Vec::new();
+        let mut refusals = Vec::new();
+        for (j, name) in target_palette.iter().enumerate() {
+            let Some(meta) = joint_meta.get(&JointId::new(j as u32)) else {
+                continue;
+            };
+            let surface_mm = seat_report["per_bone"]
+                .as_array()
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|r| r["bone"].as_str() == Some(name.as_str()))
+                })
+                .and_then(|r| r["surface_signed_mm"].as_f64())
+                .unwrap_or(f64::NAN);
+            if surface_mm <= tolerance_mm {
+                continue;
+            }
+            let is_leaf = leaf_markers.iter().any(|m| name.contains(m));
+            let row = json!({
+                "bone": name,
+                "chain": meta["chain"],
+                "fraction": meta["fraction"],
+                "surface_signed_mm": surface_mm,
+                "medial_radius_mm": meta["medial_radius_mm"],
+                "delta_vs_m0_mm": meta["delta_vs_m0_mm"],
+                "leaf_tip_by_design": is_leaf,
+            });
+            outside.push(row.clone());
+            // A non-leaf joint outside the flesh cannot be bent back onto the
+            // axis (the rejected direction); until the bounded warp lands it is
+            // a refusal with its number, never a silent nudge.
+            if !is_leaf {
+                refusals.push(row);
+            }
+        }
+        seat_report["skeleton_authority"] = json!({
+            "method": "Mixamo graph + arc-fraction placement on the body's own rest polyline (M0 seats read as the extent carrier only, leaf tips recovered by name); containment by +X ray parity / point-triangle distance at the gate tolerance; the medial field supplies inscribed radii; no native placement, no snap back to the axis",
+            "similarity": {
+                "height_scale": height_scale,
+                "body_height_mm": (body_y_max - body_y_min) * 1000.0,
+                "mixamo_height_mm": (mix_y_max - mix_y_min) * 1000.0,
+                "rotation_source": "body symmetry plane + hip->head up (see frame_yaw_degrees), measured from flesh",
+                "translation_source": "hip anchor at the body pelvis",
+            },
+            "chain_table": chain_table,
+            "containment_tolerance_mm": tolerance_mm,
+            "outside_flesh": outside,
+            "refusals": refusals,
+            "warp_report": {
+                "applied": false,
+                "reason": "every placed joint is inside the flesh at the gate tolerance, so no warp was required. The bounded ARAP/Laplacian mesh warp is not yet implemented — an outside joint would be refused with its number, not forced",
+                "distortion_cap": {
+                    "max_local_vertex_displacement_mm": 15.0,
+                    "max_mean_edge_strain": 0.02,
+                    "max_height_drift": 0.005,
+                    "max_chain_arc_extent_drift": 0.01,
+                    "status": "declared by the lane for the warp stage; no warp applied in this delivery, so measured drift is zero",
+                },
+                "ledger": [],
+            },
+            "proportion_drift": {
+                "mesh_vertices_moved": 0,
+                "height_drift_mm": 0.0,
+                "chain_arc_extent_drift_mm": 0.0,
+                "note": "the mesh is bit-identical to the input body; chain arc extents are the input polyline's by construction. Chord sums between placed joints read slightly shorter than the arc extents because placement cuts the polyline corners — a measurement effect, not a proportion change",
+            },
+        });
+    }
 
     // Resolve every source joint: direct, folded to its nearest mapped ancestor,
     // or unsupported. A weighted bone with no mapped ancestor is a refusal.

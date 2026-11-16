@@ -223,10 +223,10 @@ fn a_soft_bone_folds_onto_the_seated_target_and_geometry_survives() {
 }
 
 #[test]
-fn an_unmapped_tip_seats_at_the_authored_world_offset_under_a_scaled_skeleton() {
+fn a_scaled_skeleton_seats_per_chain_without_throwing_tips_out_of_range() {
     // The target skeleton carries a Blender-style 0.01 armature scale and a leaf
-    // marker (HeadTop_End) the source cannot name. The tip must keep its authored
-    // world offset from the seated parent, not the offset amplified by 1/scale.
+    // marker (HeadTop_End) the source cannot name. The per-chain seat proportions
+    // the spine to the flesh and must not amplify the tip by the inverse scale.
     let source = Rig::new(
         vec![
             joint("NPC Pelvis [Pelv]", None, [0.0, 0.9, 0.0]),
@@ -278,7 +278,7 @@ fn an_unmapped_tip_seats_at_the_authored_world_offset_under_a_scaled_skeleton() 
     let out_path = temp_path("scaled-out");
     std::fs::write(&actor_path, &source_bytes).expect("write actor");
     std::fs::write(&skeleton_path, &skeleton_bytes).expect("write skeleton");
-    run(&RebindParams {
+    let report = run(&RebindParams {
         actor: actor_path.clone(),
         skeleton: skeleton_path.clone(),
         out: Some(out_path.clone()),
@@ -286,35 +286,30 @@ fn an_unmapped_tip_seats_at_the_authored_world_offset_under_a_scaled_skeleton() 
     })
     .expect("rebind succeeds");
 
-    // The seated tip keeps the authored world offset from its seated parent.
-    let authored_offset = {
-        let spine = target.joint_by_name("mixamorig:Spine").unwrap();
-        let tip = target.joint_by_name("mixamorig:HeadTop_End").unwrap();
-        let a = DMat4::from_cols_array_2d(&target.rest_world(spine).unwrap())
-            .w_axis
-            .truncate();
-        let b = DMat4::from_cols_array_2d(&target.rest_world(tip).unwrap())
-            .w_axis
-            .truncate();
-        a.distance(b)
-    };
+    // The seat is per-chain (Mixamo directions, flesh-proportioned lengths), and a
+    // 0.01-scaled skeleton must not throw the leaf metres away: the tip lands at a
+    // flesh-proportioned height, not amplified by the inverse armature scale.
+    assert!(
+        report["seat"]["method"]
+            .as_str()
+            .unwrap()
+            .contains("per-chain")
+    );
+    let spine_scale = report["seat"]["chain_scale"]["spine"].as_f64().unwrap();
+    assert!(
+        spine_scale.is_finite() && spine_scale > 0.0,
+        "spine scale {spine_scale}"
+    );
     let out_bytes = std::fs::read(&out_path).expect("read output");
     let out = Actor::from_glb(&out_bytes).expect("output actor");
     let (out_rig, _) = sculpto_engine::adapt::actor_rig(&out).expect("output rig");
-    let seated_offset = {
-        let spine = out_rig.joint_by_name("mixamorig:Spine").unwrap();
-        let tip = out_rig.joint_by_name("mixamorig:HeadTop_End").unwrap();
-        let a = DMat4::from_cols_array_2d(&out_rig.rest_world(spine).unwrap())
-            .w_axis
-            .truncate();
-        let b = DMat4::from_cols_array_2d(&out_rig.rest_world(tip).unwrap())
-            .w_axis
-            .truncate();
-        a.distance(b)
-    };
+    let tip = out_rig.joint_by_name("mixamorig:HeadTop_End").unwrap();
+    let tip_y = DMat4::from_cols_array_2d(&out_rig.rest_world(tip).unwrap())
+        .w_axis
+        .y;
     assert!(
-        (seated_offset - authored_offset).abs() < 1e-4,
-        "tip offset amplified: seated {seated_offset} vs authored {authored_offset}"
+        tip_y > 1.0 && tip_y < 2.0,
+        "tip thrown out of range: y={tip_y}"
     );
     for path in [&actor_path, &skeleton_path, &out_path] {
         let _ = std::fs::remove_file(path);

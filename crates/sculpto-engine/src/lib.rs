@@ -23,6 +23,7 @@ pub mod export_glb;
 mod handlers;
 pub mod havok;
 pub mod measures;
+pub mod medial;
 pub mod obj;
 pub mod ops;
 mod parts;
