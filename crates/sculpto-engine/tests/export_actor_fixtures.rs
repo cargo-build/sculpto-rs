@@ -78,6 +78,10 @@ fn params(case: &Value, out_dir: &Path) -> ExportActorParams {
                     .get("drop_strands")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                seat: layer.get("seat").map(|seat| {
+                    serde_json::from_value(seat.clone())
+                        .expect("the layer seat matches the declaration")
+                }),
             })
             .collect(),
         skeleton: Some(path(case, "skeleton")),

@@ -63,6 +63,7 @@ use sculpto_mesh::check::surface_distances;
 use sculpto_mesh::dress::{SEAM_WELD_EPSILON, SeamWeldReport, seam_weld};
 use sculpto_mesh::garment::{Influences, TransferError, TransferOptions, transfer};
 use sculpto_mesh::mask::VertexMask;
+use sculpto_mesh::seat::SeatOptions;
 use sculpto_mesh::strand::{DropStrands, StrandOptions, drop_unsupported_strands};
 use sculpto_mesh::weight_norm::{MAX_INFLUENCES, SUM_TOLERANCE, pack_influences};
 use sculpto_nif::ShapePlacement;
@@ -190,6 +191,28 @@ pub struct ActorLayer {
     /// Opt-in per layer because the rule deletes authored geometry.
     #[serde(default)]
     pub drop_strands: bool,
+    /// Seat one height band of this layer onto the body at a declared
+    /// clearance, after the strand rule and before the weld. Opt-in per
+    /// layer because it reshapes authored geometry: an underwear waistband
+    /// authored to clear a whole preset family can stand so far off its own
+    /// body that its edge reads as a step in the silhouette. @req DECL0013
+    #[serde(default)]
+    pub seat: Option<LayerSeat>,
+}
+
+/// One band seat on a layer, in the layer OBJ's own units.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LayerSeat {
+    /// Height band `[lo, hi]` along the frame's up axis whose silhouette
+    /// is seated.
+    pub band: [f32; 2],
+    /// Target standoff outside the body surface for the band's silhouette.
+    pub clearance: f32,
+    /// Height above the band's low edge over which the correction fades in;
+    /// `0` seats the whole band at once.
+    #[serde(default)]
+    pub blend: f32,
 }
 
 /// One authored weight source: a shape whose skin the parts may copy.
@@ -315,6 +338,8 @@ struct SourcePart {
     seam_weld: Option<SeamWeldReport>,
     /// What the opt-in strand rule removed from this layer, if it ran.
     strands: Option<DropStrands>,
+    /// What the opt-in band seat moved on this layer, if it ran.
+    seat: Option<sculpto_mesh::seat::SeatReport>,
 }
 
 /// What one part copied from one weight source.
@@ -388,6 +413,7 @@ struct PartRow {
     partition: u16,
     seam_weld: Option<SeamWeldReport>,
     strands: Option<DropStrands>,
+    seat: Option<sculpto_mesh::seat::SeatReport>,
 }
 
 /// Export one rigged, coloured actor GLB and render its report.
@@ -655,6 +681,7 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
             partition,
             seam_weld: part.seam_weld.clone(),
             strands: part.strands.clone(),
+            seat: part.seat.clone(),
         });
         rows.extend(skin.rows.iter().cloned());
         part_skins.push(skin);
@@ -1006,6 +1033,20 @@ fn part_value(part: &PartRow, skin: &BoundPart) -> Value {
                 "thickness": kept.thickness,
                 "unsupported_share": kept.unsupported_share,
                 "refusal": kept.refusal.as_str(),
+            })).collect::<Vec<_>>(),
+        });
+    }
+    if let Some(seat) = &part.seat {
+        value["seat"] = json!({
+            "in_band": seat.in_band,
+            "moved": seat.moved,
+            "max_shift": seat.max_shift,
+            "clamped": seat.clamped,
+            "slices": seat.slices.iter().map(|slice| json!({
+                "height": slice.height,
+                "bins_seated": slice.bins_seated,
+                "worst_standoff_before": slice.worst_before,
+                "worst_standoff_after": slice.worst_after,
             })).collect::<Vec<_>>(),
         });
     }
@@ -1448,6 +1489,7 @@ fn read_part(
         triangles: triangles.to_vec(),
         seam_weld: None,
         strands: None,
+        seat: None,
     })
 }
 
@@ -1494,6 +1536,31 @@ fn read_layer(
         }
         strands = Some(dropped);
     }
+    // The seat runs on the authored pieces in the same frame as the strand
+    // rule — both meshes are still in the layer OBJ's own units — and before
+    // the weld: coincident seam copies share one (slice, bin), so they seat
+    // as one vertex and the weld then merges exactly what it merged before.
+    let mut seat_report = None;
+    if let Some(seat) = &layer.seat {
+        let options = SeatOptions {
+            band: seat.band,
+            clearance: seat.clearance,
+            blend: seat.blend,
+            up: sculpto_mesh::seat::UpAxis::Z,
+            ..SeatOptions::default()
+        };
+        let (seated, report) = sculpto_mesh::seat::seat_band(
+            &positions, &body.0, &body.1, &options,
+        )
+        .map_err(|error| {
+            refused(
+                "export_actor_layer_seat",
+                format!("{}: {error}", path.display()),
+            )
+        })?;
+        positions = seated;
+        seat_report = Some(report);
+    }
     let (welded, welded_triangles, seam_weld) = weld_layer(&positions, &triangles);
     let name = path
         .file_stem()
@@ -1511,6 +1578,7 @@ fn read_layer(
         triangles: welded_triangles,
         seam_weld: Some(seam_weld),
         strands,
+        seat: seat_report,
     })
 }
 

@@ -49,6 +49,7 @@ pub mod parts;
 mod point_query;
 pub mod rig;
 pub mod seam;
+pub mod seat;
 pub mod silhouette;
 pub mod spatial_split;
 pub mod strand;
