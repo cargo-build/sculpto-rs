@@ -559,6 +559,35 @@ fn indexes_embedded_actor_clips_and_prunes_them() {
 }
 
 #[test]
+fn index_file_refuses_prune_instead_of_silently_ignoring_it() {
+    let root = temp_dir("single-file-prune");
+    fs::write(root.join("keep.nif"), b"KEEP").expect("keep");
+    let db = root.with_extension("redb");
+    let store = Store::open(&db).expect("store");
+    let report = boethos_catalogue::index_file(
+        &store,
+        &root.join("keep.nif"),
+        "downloads",
+        &IndexOptions {
+            archive_entries: false,
+            prune: true,
+        },
+    );
+    assert_eq!(report.inserted, 0, "a refused call must not index");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("--prune applies to --root")),
+        "{:?}",
+        report.errors
+    );
+    assert!(store.iter_kind::<Assets>().expect("rows").is_empty());
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn index_file_selects_one_path_without_walking_its_directory() {
     let root = temp_dir("single-file");
     fs::write(root.join("keep.nif"), b"KEEP").expect("keep");

@@ -180,6 +180,16 @@ pub fn index_root(store: &Store, root: &Path, source: &str, options: &IndexOptio
 /// archive files still gain their members.
 pub fn index_file(store: &Store, path: &Path, source: &str, options: &IndexOptions) -> IndexReport {
     let mut report = IndexReport::default();
+    // `prune` deletes every row of a source that the walk did not see, and a single file
+    // is not a boundary: honouring it here would wipe the rest of the source. Refuse
+    // rather than accept a flag we would have to ignore.
+    if options.prune {
+        report.errors.push(format!(
+            "{}: --prune applies to --root walks; a single file has no boundary to prune against",
+            path.display()
+        ));
+        return report;
+    }
     if !path.is_file() {
         report
             .errors
