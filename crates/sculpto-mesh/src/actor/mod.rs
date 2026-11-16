@@ -342,6 +342,18 @@ impl Actor {
         animation::worlds(self, &[], pose)
     }
 
+    /// Every node's local rotation at one pose, without composing the hierarchy.
+    ///
+    /// The frame a retarget's local delta lives in: a clip written against one
+    /// skeleton's rest is turned into a delta by dividing that rest out here, not
+    /// by comparing world matrices two different bases built.
+    ///
+    /// # Errors
+    /// The same clip refusals as [`Actor::skeleton_worlds`].
+    pub fn skeleton_locals(&self, pose: Pose<'_>) -> Result<Vec<DQuat>, ActorError> {
+        animation::locals(self, &[], pose)
+    }
+
     /// Reduced skin correspondence for the same explicit parts and pose.
     /// @req DECL0013
     pub fn rig_sample(

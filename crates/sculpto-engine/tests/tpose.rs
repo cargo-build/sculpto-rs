@@ -406,6 +406,7 @@ fn the_arm_chain_is_re_aimed_onto_the_reference_t_pose() {
         pose_clip: None,
         pose_time: None,
         pose_scan: false,
+        pose_rest: None,
     })
     .expect("the bake succeeds");
 
@@ -560,6 +561,7 @@ fn a_reference_that_is_not_a_t_pose_is_refused() {
         pose_clip: None,
         pose_time: None,
         pose_scan: false,
+        pose_rest: None,
     })
     .expect_err("a drooping reference is not a T-pose");
     assert!(

@@ -10,7 +10,8 @@ use sculpto_engine::rest::{TPoseParams, run as tpose_run, verdict};
 
 const USAGE: &str = "usage: sculpto actor tpose --actor actor.glb --reference skeleton.glb \
     [--out tposed.glb] [--report tpose.json] \
-    [--pose pose-actor.glb --pose-clip NAME (--pose-time SECONDS | --pose-scan)]";
+    [--pose pose-actor.glb --pose-clip NAME (--pose-time SECONDS | --pose-scan) \
+    [--pose-rest havok-report.json]]";
 
 pub(super) fn run(args: &[String]) -> ExitCode {
     let params = match arguments(args) {
@@ -39,7 +40,7 @@ fn arguments(args: &[String]) -> Result<TPoseParams, String> {
                 scan = true;
             }
             "--actor" | "--reference" | "--out" | "--report" | "--pose" | "--pose-clip"
-            | "--pose-time" => {
+            | "--pose-time" | "--pose-rest" => {
                 let value = iter.next().ok_or_else(|| format!("{key} needs a value"))?;
                 if flags.insert(key, value.as_str()).is_some() {
                     return Err(format!("duplicate {key}"));
@@ -78,6 +79,7 @@ fn arguments(args: &[String]) -> Result<TPoseParams, String> {
         pose_clip: value("--pose-clip"),
         pose_time,
         pose_scan: scan,
+        pose_rest: value("--pose-rest").map(Into::into),
     })
 }
 

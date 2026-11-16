@@ -59,6 +59,43 @@ pub(super) fn worlds(
     compose_worlds(actor, &transforms)
 }
 
+/// One pose's own local rotations, per node, without composing the hierarchy.
+///
+/// A retarget needs the *local* rotation a clip writes for one bone — the frame a
+/// local delta lives in — where a world composition would bury it under the
+/// parent chain. Nodes the clip does not key keep their authored rotation.
+pub(super) fn locals(
+    actor: &Actor,
+    selected: &[usize],
+    pose: Pose<'_>,
+) -> Result<Vec<DQuat>, ActorError> {
+    let mut transforms = actor.transforms.clone();
+    if let Pose::Clip { name, time } = pose {
+        let clips: Vec<_> = actor
+            .document
+            .animations()
+            .filter(|clip| clip.name() == Some(name))
+            .collect();
+        let clip = match clips.as_slice() {
+            [clip] => clip,
+            _ => {
+                return Err(ActorError::Clip {
+                    name: name.to_owned(),
+                    matches: clips.len(),
+                });
+            }
+        };
+        apply(actor, clip, selected, time, &mut transforms)?;
+    }
+    Ok(transforms
+        .into_iter()
+        .map(|transform| match transform {
+            Transform::Matrix(matrix) => matrix.to_scale_rotation_translation().1,
+            Transform::Trs { rotation, .. } => rotation,
+        })
+        .collect())
+}
+
 /// Parent-before-child world transforms for an explicit local-transform set.
 ///
 /// Shared by clip evaluation and the joint-pose probe so both compose the same

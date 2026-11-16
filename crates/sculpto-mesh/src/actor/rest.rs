@@ -36,6 +36,12 @@ pub struct RestAim {
     /// arm raised from an A-pose, a paddle. A caller that has a reference basis
     /// passes the whole turn here and the bone's orientation is set exactly.
     pub turn: Option<[f64; 4]>,
+    /// A local rotation delta to apply in the bone's own frame.
+    ///
+    /// The retarget-correct input for a clip authored against another skeleton's
+    /// rest: `d = rest⁻¹ · pose` is frame-free, where a world turn would mix two
+    /// bases. Applied as `new_local = authored_local · d`.
+    pub local_turn: Option<[f64; 4]>,
 }
 
 /// One applied aim, measured before and after.
@@ -156,7 +162,30 @@ pub fn bake_rest(actor: &Actor, parts: &[&str], aims: &[RestAim]) -> Result<Rest
         // written direction reaches the target in either case.
         let mut residual = before.angle_between(target).to_degrees();
         let mut turns_applied = 0;
-        if let Some(turn) = aim.turn {
+        if let Some(local_turn) = aim.local_turn {
+            let shaft = DQuat::from_array(local_turn).normalize();
+            let parent_world_rotation = match actor.parents[aim.joint] {
+                Some(parent) => world_rotation(worlds[parent]),
+                None => DQuat::IDENTITY,
+            };
+            let own_world = world_rotation(worlds[aim.joint]);
+            locals[aim.joint] = Transform::Trs {
+                translation,
+                rotation: (parent_world_rotation.inverse() * (own_world * shaft)).normalize(),
+                scale,
+            };
+            worlds = animation::compose_worlds(actor, &locals)?;
+            turns_applied = 1;
+            let pivot = worlds[aim.joint].transform_point3(DVec3::ZERO);
+            let child = worlds[aim.child].transform_point3(DVec3::ZERO);
+            let offset = child - pivot;
+            residual = match offset.length() > 0.0 {
+                true => (offset / offset.length())
+                    .angle_between(target)
+                    .to_degrees(),
+                false => f64::INFINITY,
+            };
+        } else if let Some(turn) = aim.turn {
             let parent_world_rotation = match actor.parents[aim.joint] {
                 Some(parent) => world_rotation(worlds[parent]),
                 None => DQuat::IDENTITY,
@@ -185,7 +214,7 @@ pub fn bake_rest(actor: &Actor, parts: &[&str], aims: &[RestAim]) -> Result<Rest
             };
         }
         for _ in 0..MAX_AIM_ITERATIONS {
-            if aim.turn.is_some() || residual <= AIM_CONVERGENCE_DEG {
+            if aim.turn.is_some() || aim.local_turn.is_some() || residual <= AIM_CONVERGENCE_DEG {
                 break;
             }
             let pivot = worlds[aim.joint].transform_point3(DVec3::ZERO);

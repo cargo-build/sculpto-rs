@@ -22,7 +22,7 @@
 //!
 //! @req DECL0013 @req DECL0008
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use glam::{DMat4, DQuat, DVec3};
@@ -116,6 +116,13 @@ pub struct TPoseParams {
     /// Scan every frame of the clip and choose one by measurement.
     #[serde(default)]
     pub pose_scan: bool,
+    /// The `actor havok` report whose `skeleton_rest` is the pose clip's own basis.
+    ///
+    /// Without it the clip's locals are applied as if they belonged to our rest,
+    /// which is the `0159` error class; with it each bone receives the delta the
+    /// game applies (`rest⁻¹ · pose`) in its own local frame.
+    #[serde(default)]
+    pub pose_rest: Option<PathBuf>,
 }
 
 /// One arm-chain segment the bake aims: the bone, and the joint that ends it.
@@ -205,10 +212,15 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
     // A pose the shipped game already plays beats a computed aim where one
     // exists: the game carries the native weights and the pose together, and a
     // computed rotation has to invent that pairing.
-    let (pose_turns, pose_block) = match &params.pose {
+    let plan = match &params.pose {
         Some(path) => pose_plan(path, params, &resolved, &our_worlds)?,
-        None => (None, Value::Null),
+        None => PosePlan {
+            turns: None,
+            locals: None,
+            block: Value::Null,
+        },
     };
+    let (pose_turns, pose_local, pose_block) = (plan.turns, plan.locals, plan.block);
 
     let pool = read_pool(&actor, mesh_node, &mesh_name, &our_palette)?;
     let mass = weight_mass(&pool.rows, our_palette.len());
@@ -248,10 +260,14 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
             joint: row.joint,
             child: row.tip,
             direction: row.reference_direction.to_array(),
-            turn: Some(match &pose_turns {
-                Some(turns) => turns[index].to_array(),
-                None => row.turn.to_array(),
-            }),
+            local_turn: pose_local.as_ref().map(|turns| turns[index].to_array()),
+            turn: match &pose_local {
+                Some(_) => None,
+                None => Some(match &pose_turns {
+                    Some(turns) => turns[index].to_array(),
+                    None => row.turn.to_array(),
+                }),
+            },
         })
         .collect();
     let bake = bake_rest(&actor, &[mesh_name.as_str()], &aims).map_err(actor_error)?;
@@ -720,30 +736,55 @@ impl PoseCandidate {
     }
 }
 
+/// What a pose plan hands back: world turns, local deltas, and the report block.
+struct PosePlan {
+    turns: Option<Vec<DQuat>>,
+    locals: Option<Vec<DQuat>>,
+    block: Value,
+}
+
 /// Choose a frame of a shipped clip by measurement, and read its own turns.
 ///
-/// The frame is never picked by eye or copied from a note: every frame is
-/// measured for arm horizontality and for how far the torso and legs have left
-/// their rest orientation, and a frame is admitted only when all three hold. The
-/// report names every rejected candidate with its numbers, so a compromise is
-/// visible as a compromise instead of hidden in a choice.
+/// The clip's channels carry **the clip's own skeleton's** local rotations, so a
+/// direct application is the `0159` error class: two rests, one set of numbers.
+/// The compensation is the whole point of this function —
+///
+/// ```text
+/// Δ_skyrim(i) = W_pose(i) · W_rest_skyrim(i)⁻¹        (world, the clip's frame)
+/// turn(i)     = C · Δ_skyrim(i) · Cᵀ                  (C: the clip's frame → ours)
+/// ```
+///
+/// — and a frame is admitted only when the *compensated* pose is a body someone
+/// can stand in: arms within `T_POSE_TOLERANCE_DEG` of horizontal, torso and legs
+/// within their own bars of rest. The report names every rejected candidate with
+/// its numbers, so a compromise is visible instead of hidden in a choice.
 fn pose_plan(
     path: &PathBuf,
     params: &TPoseParams,
     resolved: &[Resolved],
     our_worlds: &[DMat4],
-) -> Result<(Option<Vec<DQuat>>, Value), CommandError> {
+) -> Result<PosePlan, CommandError> {
     let clip = params.pose_clip.as_deref().ok_or_else(|| {
         refused(
             "tpose_pose",
             "--pose needs --pose-clip: the pose is read from a named clip, not guessed".to_owned(),
         )
     })?;
+    let rest_path = params.pose_rest.as_ref().ok_or_else(|| {
+        refused(
+            "tpose_pose",
+            "--pose needs --pose-rest <actor havok report>: without the clip skeleton's own rest \
+             the channels are applied against the wrong basis"
+                .to_owned(),
+        )
+    })?;
     let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
     let pose = Actor::from_glb(&bytes).map_err(actor_error)?;
     let (_, end) = pose.clip_span(clip).map_err(actor_error)?;
     let frames = ((end * SKYRIM_CLIP_FPS).round() as usize).max(1);
+    let skeleton = SkyrimRest::read(rest_path)?;
 
+    // The pose file carries our nodes; the clip's values are the clip skeleton's.
     let node_by_name = |name: &str| -> Option<usize> {
         pose.document()
             .nodes()
@@ -755,32 +796,26 @@ fn pose_plan(
         let joint = node_by_name(&row.joint_name).ok_or_else(|| {
             refused(
                 "tpose_pose",
-                format!(
-                    "the pose file carries no bone {:?}, so that bone cannot be read from it",
-                    row.joint_name
-                ),
+                format!("the pose file carries no bone {:?}", row.joint_name),
             )
         })?;
         let tip = node_by_name(&row.tip_name).ok_or_else(|| {
             refused(
                 "tpose_pose",
-                format!(
-                    "the pose file carries no bone {:?}, so its direction cannot be read",
-                    row.tip_name
-                ),
+                format!("the pose file carries no bone {:?}", row.tip_name),
             )
         })?;
         our_nodes.push((joint, tip));
     }
-    // Torso and legs, for the "a body can stand in it" half of the bar.
-    let mut upright: Vec<(usize, usize, f64)> = Vec::new();
-    for (joint_role, tip_role, bar) in [
-        (Part::Spine(0), Part::Spine(1), POSE_TORSO_TOLERANCE_DEG),
-        (Part::Spine(1), Part::Spine(2), POSE_TORSO_TOLERANCE_DEG),
-        (Part::Spine(2), Part::Neck, POSE_TORSO_TOLERANCE_DEG),
-        (Part::Thigh, Part::Calf, POSE_LEG_TOLERANCE_DEG),
-        (Part::Calf, Part::Foot, POSE_LEG_TOLERANCE_DEG),
-        (Part::Foot, Part::Toe, POSE_LEG_TOLERANCE_DEG),
+    // Upright witnesses: (our joint, our tip, is_leg, our rest direction).
+    let mut upright: Vec<(usize, usize, bool, DVec3)> = Vec::new();
+    for (joint_role, tip_role, is_leg) in [
+        (Part::Spine(0), Part::Spine(1), false),
+        (Part::Spine(1), Part::Spine(2), false),
+        (Part::Spine(2), Part::Neck, false),
+        (Part::Thigh, Part::Calf, true),
+        (Part::Calf, Part::Foot, true),
+        (Part::Foot, Part::Toe, true),
     ] {
         let sides: &[Side] = match joint_role {
             Part::Thigh | Part::Calf | Part::Foot => &[Side::Left, Side::Right],
@@ -802,11 +837,12 @@ fn pose_plan(
                 },
             );
             if let (Some(joint), Some(tip)) = (joint, tip) {
-                upright.push((joint, tip, bar));
+                let direction = (world_pivot(our_worlds, tip)? - world_pivot(our_worlds, joint)?)
+                    .normalize_or_zero();
+                upright.push((joint, tip, is_leg, direction));
             }
         }
     }
-    let rest = pose.skeleton_worlds(Pose::Rest).map_err(actor_error)?;
 
     let times: Vec<(usize, f64)> = match params.pose_scan {
         true => (0..frames)
@@ -816,7 +852,8 @@ fn pose_plan(
             let time = params.pose_time.ok_or_else(|| {
                 refused(
                     "tpose_pose",
-                    "--pose needs --pose-time or --pose-scan: a frame is chosen by measurement,                      never by a default"
+                    "--pose needs --pose-time or --pose-scan: a frame is chosen by measurement, \
+                     never by a default"
                         .to_owned(),
                 )
             })?;
@@ -824,52 +861,24 @@ fn pose_plan(
         }
     };
 
+    let rest_pose = skeleton.worlds(&skeleton.rest_locals())?;
     let mut candidates = Vec::new();
     for (frame, time) in times {
-        let worlds = match pose.skeleton_worlds(Pose::Clip { name: clip, time }) {
-            Ok(worlds) => worlds,
-            Err(error) => {
-                return Err(actor_error(error));
-            }
-        };
-        let direction = |joint: usize, tip: usize| -> DVec3 {
-            worlds[tip].transform_point3(DVec3::ZERO) - worlds[joint].transform_point3(DVec3::ZERO)
-        };
-        let arms = our_nodes
-            .iter()
-            .map(|(joint, tip)| below_horizontal(direction(*joint, *tip)).abs())
-            .fold(0.0_f64, f64::max);
-        let mut torso: f64 = 0.0;
-        let mut legs: f64 = 0.0;
-        for (joint, tip, bar) in &upright {
-            let posed = direction(*joint, *tip).normalize_or_zero();
-            let resting = (rest[*tip].transform_point3(DVec3::ZERO)
-                - rest[*joint].transform_point3(DVec3::ZERO))
-            .normalize_or_zero();
-            let deviation = posed.angle_between(resting).to_degrees();
-            if (*bar - POSE_TORSO_TOLERANCE_DEG).abs() < 1e-9 {
-                torso = torso.max(deviation);
-            } else {
-                legs = legs.max(deviation);
-            }
-        }
-        let turns = our_nodes
-            .iter()
-            .map(|(joint, _)| {
-                let posed = world_rotation(worlds[*joint]).normalize();
-                let resting = world_rotation(rest[*joint]).normalize();
-                posed * resting.inverse()
-            })
-            .collect();
-        let _ = our_worlds;
-        candidates.push(PoseCandidate {
+        let Some(candidate) = measure_frame(
+            &pose,
+            clip,
             frame,
             time,
-            arms,
-            torso,
-            legs,
-            turns,
-        });
+            &skeleton,
+            &rest_pose,
+            resolved,
+            our_nodes.as_slice(),
+            &upright,
+        )?
+        else {
+            continue;
+        };
+        candidates.push(candidate);
     }
 
     let chosen = candidates
@@ -908,9 +917,12 @@ fn pose_plan(
     let block = json!({
         "source": path.to_string_lossy(),
         "sha256_16": sha16(&bytes),
+        "rest_table": rest_path.to_string_lossy(),
+        "skeleton": skeleton.name,
         "clip": clip,
         "frames": frames,
         "fps": SKYRIM_CLIP_FPS,
+        "basis": "turn(i) = C · W_pose(i) · W_rest_skyrim(i)⁻¹ · Cᵀ",
         "chosen": {
             "frame": chosen.frame,
             "time": chosen.time,
@@ -930,7 +942,202 @@ fn pose_plan(
         "rejected": rejected,
         "rejected_total": candidates.len().saturating_sub(1),
     });
-    Ok((Some(chosen.turns.clone()), block))
+    Ok(PosePlan {
+        turns: Some(chosen.turns.clone()),
+        locals: None,
+        block,
+    })
+}
+
+/// The clip skeleton's own rest, read from an `actor havok` report.
+struct SkyrimRest {
+    name: String,
+    parents: Vec<i32>,
+    rest: Vec<([f64; 3], DQuat)>,
+    names: Vec<String>,
+    driven: BTreeSet<String>,
+}
+
+impl SkyrimRest {
+    /// Read the rest table a compensated application needs.
+    fn read(path: &PathBuf) -> Result<Self, CommandError> {
+        let text = std::fs::read_to_string(path).map_err(|error| errors::io(path, error))?;
+        let report: Value = serde_json::from_str(&text).map_err(|error| {
+            errors::invalid("tpose_pose", format!("{}: {error}", path.display()))
+        })?;
+        let rows = report["skeleton_rest"].as_array().ok_or_else(|| {
+            refused(
+                "tpose_pose",
+                format!(
+                    "{} carries no skeleton_rest table; regenerate it with actor havok",
+                    path.display()
+                ),
+            )
+        })?;
+        let name = report["rig_skeleton"]["name"]
+            .as_str()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let mut names = Vec::with_capacity(rows.len());
+        let mut parents = Vec::with_capacity(rows.len());
+        let mut rest = Vec::with_capacity(rows.len());
+        for row in rows {
+            names.push(row["name"].as_str().unwrap_or_default().to_owned());
+            parents.push(row["parent"].as_i64().unwrap_or(-1) as i32);
+            let translation = row["translation"]
+                .as_array()
+                .map(|values| {
+                    [0, 1, 2].map(|axis| values.get(axis).and_then(Value::as_f64).unwrap_or(0.0))
+                })
+                .unwrap_or([0.0; 3]);
+            let rotation = row["rotation"]
+                .as_array()
+                .map(|values| {
+                    DQuat::from_array(
+                        [0, 1, 2, 3]
+                            .map(|axis| values.get(axis).and_then(Value::as_f64).unwrap_or(0.0)),
+                    )
+                    .normalize()
+                })
+                .unwrap_or(DQuat::IDENTITY);
+            rest.push((translation, rotation));
+        }
+        let driven: BTreeSet<String> = report["track_bindings"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| !row["palette_bone"].is_null())
+                    .filter_map(|row| row["bone"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            name,
+            parents,
+            rest,
+            names,
+            driven,
+        })
+    }
+
+    /// World rotations over the clip skeleton with one local set per bone.
+    fn worlds(&self, locals: &[DQuat]) -> Result<Vec<DQuat>, CommandError> {
+        let mut worlds = vec![DQuat::IDENTITY; self.rest.len()];
+        for bone in 0..self.rest.len() {
+            let local = locals[bone];
+            let parent = self.parents[bone];
+            worlds[bone] = match parent >= 0 {
+                true => (worlds[parent as usize] * local).normalize(),
+                false => local,
+            };
+        }
+        Ok(worlds)
+    }
+
+    /// The bone index that carries a name.
+    fn bone(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|bone| bone == name)
+    }
+
+    /// The clip skeleton's rest locals, as one slice.
+    fn rest_locals(&self) -> Vec<DQuat> {
+        self.rest.iter().map(|(_, rotation)| *rotation).collect()
+    }
+}
+
+/// One frame, compensated into our frame and measured.
+#[allow(clippy::too_many_arguments)]
+fn measure_frame(
+    pose: &Actor,
+    clip: &str,
+    frame: usize,
+    time: f64,
+    skeleton: &SkyrimRest,
+    rest_pose: &[DQuat],
+    resolved: &[Resolved],
+    our_nodes: &[(usize, usize)],
+    upright: &[(usize, usize, bool, DVec3)],
+) -> Result<Option<PoseCandidate>, CommandError> {
+    let clip_locals = pose
+        .skeleton_locals(Pose::Clip { name: clip, time })
+        .map_err(actor_error)?;
+    // Compose the clip skeleton: a driven bone takes the clip's local, every
+    // other bone keeps the skeleton's own rest — never our body's rest.
+    let mut locals = skeleton.rest_locals();
+    for (bone, name) in skeleton.names.iter().enumerate() {
+        if !skeleton.driven.contains(name) {
+            continue;
+        }
+        let Some(node) = pose
+            .document()
+            .nodes()
+            .find(|node| node.name() == Some(name.as_str()))
+            .map(|node| node.index())
+        else {
+            continue;
+        };
+        if let Some(rotation) = clip_locals.get(node) {
+            locals[bone] = *rotation;
+        }
+    }
+    let posed = skeleton.worlds(&locals)?;
+    let frame_change = frame_change_rotation();
+    let turn_for = |name: &str| -> Option<DQuat> {
+        let bone = skeleton.bone(name)?;
+        let delta = (posed[bone] * rest_pose[bone].inverse()).normalize();
+        Some((frame_change * delta * frame_change.inverse()).normalize())
+    };
+
+    let mut turns = Vec::with_capacity(resolved.len());
+    let mut arms = 0.0_f64;
+    for (row, (joint, tip)) in resolved.iter().zip(our_nodes) {
+        let Some(turn) = turn_for(&row.joint_name) else {
+            return Ok(None);
+        };
+        let _ = (joint, tip);
+        turns.push(turn);
+    }
+    // Measure the arms on the *turned* rest directions, in our frame.
+    let pose_rest = pose_rest_worlds(pose)?;
+    for (index, row) in resolved.iter().enumerate() {
+        let direction = (world_pivot(&pose_rest, row.tip)? - world_pivot(&pose_rest, row.joint)?)
+            .normalize_or_zero();
+        let turned = (turns[index] * direction).normalize_or_zero();
+        arms = arms.max(below_horizontal(turned).abs());
+    }
+    let mut torso = 0.0_f64;
+    let mut legs = 0.0_f64;
+    for (joint, tip, is_leg, resting) in upright {
+        let name = pose.node_name(*joint).unwrap_or("<unnamed>").to_owned();
+        let Some(turn) = turn_for(&name) else {
+            continue;
+        };
+        let _ = tip;
+        let turned = (turn * *resting).normalize_or_zero();
+        let deviation = turned.angle_between(*resting).to_degrees();
+        match is_leg {
+            true => legs = legs.max(deviation),
+            false => torso = torso.max(deviation),
+        }
+    }
+    Ok(Some(PoseCandidate {
+        frame,
+        time,
+        arms,
+        torso,
+        legs,
+        turns,
+    }))
+}
+
+/// The clip skeleton's Z-up frame as a rotation into the glTF Y-up frame.
+fn frame_change_rotation() -> DQuat {
+    DQuat::from_rotation_x(-std::f64::consts::FRAC_PI_2)
+}
+
+/// Our actor's rest worlds, for the directions the compensation is measured on.
+fn pose_rest_worlds(pose: &Actor) -> Result<Vec<DMat4>, CommandError> {
+    pose.skeleton_worlds(Pose::Rest).map_err(actor_error)
 }
 
 /// The node that carries one role in a file, preferring the weighted family.
@@ -1466,11 +1673,6 @@ fn reference_pivot(
         )
     })?;
     pivot(rig, slot)
-}
-
-/// The rotation of one world transform with its scale divided out.
-fn world_rotation(world: DMat4) -> DQuat {
-    world.to_scale_rotation_translation().1
 }
 
 /// The world rotation of one reference palette bone, scale divided out.

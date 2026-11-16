@@ -148,6 +148,32 @@ pub struct RigSkeleton {
     pub rest: Vec<([f64; 3], [f64; 4])>,
 }
 
+/// The rig skeleton's per-bone rest, as the table a retarget needs.
+///
+/// The clip's channels are the *skeleton's* local rotations, so an application
+/// onto another rig has to divide this rest out first
+/// (`turn = pose · rest⁻¹`, or a local `d = rest⁻¹ · pose`); without it the
+/// result is the `0159` class of error — a 90° gap that looks like a broken clip
+/// and is really two different bases. Name, parent, translation and rotation are
+/// enough to compose both sides.
+fn skeleton_rest(skeleton: &RigSkeleton) -> Vec<Value> {
+    skeleton
+        .bones
+        .iter()
+        .enumerate()
+        .map(|(bone, name)| {
+            let (translation, rotation) = skeleton.rest[bone];
+            json!({
+                "bone": bone,
+                "name": name,
+                "parent": skeleton.parents[bone],
+                "translation": translation,
+                "rotation": rotation,
+            })
+        })
+        .collect()
+}
+
 /// `run`: decode, bind, write, report.
 pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
     if params.scale <= 0.0 {
@@ -184,6 +210,7 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
                 "bones": skeleton.bones.len(),
                 "bone_names": skeleton.bones,
             },
+            "skeleton_rest": skeleton_rest(&skeleton),
             "scale": params.scale,
         });
         if let Some(path) = params.report.as_deref() {
@@ -312,6 +339,7 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
             "name": skeleton.name,
             "bones": skeleton.bones.len(),
         },
+        "skeleton_rest": skeleton_rest(&skeleton),
         "blend_hint": clip.blend_hint,
         "root_motion_samples": clip.root_motion.len(),
         "annotations": clip.annotation_tracks.iter()
