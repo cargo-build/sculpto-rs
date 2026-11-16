@@ -206,6 +206,74 @@ struct HelpOverlay;
 #[derive(Resource, Clone, Copy)]
 struct ClipSelection(usize);
 
+/// Root joint held at its loaded translation, so a clip plays without carrying the
+/// figure across the floor (operator, 2026-11-16: a preview walks in place — world
+/// displacement hides joint motion behind a moving camera).
+#[derive(Component, Clone, Copy)]
+struct InPlaceRoot {
+    translation: Vec3,
+}
+
+/// `SCULPTO_VIEWER_IN_PLACE=0` restores world displacement for a deliberate check.
+#[derive(Resource, Clone, Copy)]
+struct InPlaceEnabled(bool);
+
+/// Tag each skeleton's topmost bone once, at its loaded translation.
+fn tag_in_place_roots(
+    mut commands: Commands,
+    skins: Query<&SkinnedMesh>,
+    transforms: Query<&Transform>,
+    names: Query<&Name>,
+    parents: Query<&ChildOf>,
+    tagged: Query<(), With<InPlaceRoot>>,
+) {
+    let joint: std::collections::HashSet<Entity> = skins
+        .iter()
+        .flat_map(|skin| skin.joints.iter().copied())
+        .collect();
+    let debug = std::env::var("SCULPTO_VIEWER_IN_PLACE_DEBUG").is_ok();
+    // The mover is the skin's root joint, not the armature node above it: clamping
+    // the armature left the hips free to carry the figure across the floor.
+    for entity in &joint {
+        if tagged.get(*entity).is_ok() {
+            continue;
+        }
+        let parent_is_joint = parents
+            .get(*entity)
+            .map(|parent| joint.contains(&parent.parent()))
+            .unwrap_or(false);
+        if parent_is_joint {
+            continue;
+        }
+        let Ok(transform) = transforms.get(*entity) else {
+            continue;
+        };
+        if debug {
+            let name = names
+                .get(*entity)
+                .map(|n| n.as_str().to_string())
+                .unwrap_or_else(|_| format!("{entity}"));
+            eprintln!("in-place: joint root {name} at {:?}", transform.translation);
+        }
+        commands.entity(*entity).insert(InPlaceRoot {
+            translation: transform.translation,
+        });
+    }
+}
+
+/// Restore the root translation after the animation pass; rotation stays animated.
+fn hold_roots_in_place(
+    enabled: Res<InPlaceEnabled>,
+    mut roots: Query<(&InPlaceRoot, &mut Transform)>,
+) {
+    if !enabled.0 {
+        return;
+    }
+    for (root, mut transform) in &mut roots {
+        transform.translation = root.translation;
+    }
+}
+
 /// Whether `SCULPTO_VIEWER_ACTOR_ANIMATION` names an extra actor clip (index ≥ 2).
 fn has_actor_extra() -> bool {
     std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
@@ -268,6 +336,25 @@ fn parse_args() -> CliOptions {
     options
 }
 
+/// Number of animations a GLB carries, read from its JSON chunk.
+///
+/// A requested clip index the file does not have used to play nothing and leave
+/// the figure in its rest pose, which reads as "the clip is broken" rather than
+/// "the index is wrong". Reporting the real count keeps the preview honest.
+fn glb_animation_count(path: &std::path::Path) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 20 || &bytes[0..4] != b"glTF" {
+        return None;
+    }
+    let chunk_len = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let chunk_type = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+    if chunk_type != 0x4E4F_534A || 20 + chunk_len > bytes.len() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + chunk_len]).ok()?;
+    Some(json.get("animations")?.as_array()?.len())
+}
+
 fn main() {
     let options = parse_args();
     let (asset_dir, asset_file) = if let Some(ref glb) = options.glb_path {
@@ -302,13 +389,35 @@ fn main() {
         std::time::Duration::from_secs_f64(1.0 / 60.0)
     };
 
+    // A clip index the file does not carry is a caller error, not a broken clip.
+    // Say it in the status line and fall back to the last clip that exists.
+    let asset_path = std::path::Path::new(&asset_dir).join(&asset_file);
+    let requested_clip = std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let clip_note = match (requested_clip, glb_animation_count(&asset_path)) {
+        (Some(index), Some(count)) if count > 0 && index >= count => {
+            let fallback = count - 1;
+            std::env::set_var("SCULPTO_VIEWER_ACTOR_ANIMATION", fallback.to_string());
+            eprintln!(
+                "viewer: requested actor clip {index}, file carries {count} — showing {fallback}"
+            );
+            format!(" [no clip {index}: file has {count}, showing {fallback}]")
+        }
+        _ => String::new(),
+    };
+
     let config = ViewerConfig {
         report_mode: options.report,
         debug_scene: options.debug_scene,
         interactive: options.interactive,
         flat: std::env::var("SCULPTO_VIEWER_FLAT").is_ok(),
         asset_file,
-        status: std::env::var("SCULPTO_VIEWER_STATUS").unwrap_or_else(|_| "InProgress".to_string()),
+        status: format!(
+            "{}{}",
+            std::env::var("SCULPTO_VIEWER_STATUS").unwrap_or_else(|_| "InProgress".to_string()),
+            clip_note
+        ),
     };
     let asset_plugin = AssetPlugin {
         file_path: asset_dir,
@@ -354,6 +463,9 @@ fn main() {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
+        ))
+        .insert_resource(InPlaceEnabled(
+            std::env::var("SCULPTO_VIEWER_IN_PLACE").map_or(true, |value| value != "0"),
         ))
         .insert_resource(LightOrbit::from_position(Vec3::new(3.0, 5.0, 2.0)))
         .insert_resource(CharacterPose {
@@ -444,6 +556,15 @@ fn main() {
             ),
         )
         .add_systems(Update, (control_playback, apply_playback))
+        .add_systems(Update, tag_in_place_roots)
+        // After the animation pass, before transform propagation, so the held
+        // translation is what the skin actually renders this frame.
+        .add_systems(
+            PostUpdate,
+            hold_roots_in_place
+                .after(bevy::app::AnimationSystems)
+                .before(bevy::transform::TransformSystems::Propagate),
+        )
         .run();
 }
 
@@ -1443,7 +1564,8 @@ fn select_clip(
         Some(0)
     } else if keys.just_pressed(KeyCode::Digit1) {
         Some(1)
-    } else if keys.just_pressed(KeyCode::Digit2) && graph.as_ref().is_some_and(|g| g.nodes.len() > 2)
+    } else if keys.just_pressed(KeyCode::Digit2)
+        && graph.as_ref().is_some_and(|g| g.nodes.len() > 2)
     {
         Some(2)
     } else {
