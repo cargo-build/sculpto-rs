@@ -2306,7 +2306,64 @@ pub fn plan_clip_with(
                 // offsets along the source's bone axis, measured 121.91° apart.
                 ClipSemantics::Pose => {
                     let delta = source_rotation * rest_source_rests[position].inverse();
-                    (frame_rotation * delta * frame_rotation.inverse()) * rest_rotations[position]
+                    let fallback = || {
+                        (frame_rotation * delta * frame_rotation.inverse())
+                            * rest_rotations[position]
+                    };
+                    // Digits keep the delta copy: Mixamo's four phalanges fold into our
+                    // three, their roll is not comparable, and aiming each one drags the
+                    // fingertip (measured 5.1x on a 5 mm finger edge). The long bones
+                    // are where the aim pays: it reproduces the elbow (flexion 26.5°
+                    // against the source's 26.5°, bend plane half the error) where the
+                    // world delta bends it about the source's roll (36.0°, plane 45.6°
+                    // off, the operator's "arms bent sideways").
+                    let aimable = track_roles[position].is_some_and(|role| {
+                        matches!(
+                            role.part,
+                            crate::retarget::Part::Clavicle
+                                | crate::retarget::Part::UpperArm
+                                | crate::retarget::Part::Forearm
+                                | crate::retarget::Part::Hand
+                                | crate::retarget::Part::Thigh
+                                | crate::retarget::Part::Calf
+                                | crate::retarget::Part::Foot
+                                | crate::retarget::Part::Spine(_)
+                                | crate::retarget::Part::Neck
+                                | crate::retarget::Part::Head
+                        )
+                    });
+                    match directions[position].filter(|_| aimable) {
+                        Some((_, child)) => {
+                            let child_position = tracks
+                                .iter()
+                                .position(|other| other.node == child)
+                                .expect("a direction child is a tracked bone");
+                            let ours = DVec3::from_array(
+                                rig.joint(tracks[child_position].joint)
+                                    .expect("a mapped bone is a rig joint")
+                                    .rest
+                                    .translation
+                                    .map(f64::from),
+                            )
+                            .normalize_or_zero();
+                            let target = (frame_rotation
+                                * (source_worlds
+                                    .world(child, sample, &mut worlds)
+                                    .w_axis
+                                    .truncate()
+                                    - bone.w_axis.truncate()))
+                            .normalize_or_zero();
+                            let rest_axis = rest_rotations[position] * ours;
+                            match ours.length_squared() > 0.5 && target.length_squared() > 0.5 {
+                                true => {
+                                    DQuat::from_rotation_arc(rest_axis.normalize(), target)
+                                        * rest_rotations[position]
+                                }
+                                false => fallback(),
+                            }
+                        }
+                        None => fallback(),
+                    }
                 }
             };
             for (node, reference) in &fold_reference[position] {
