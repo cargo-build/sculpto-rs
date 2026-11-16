@@ -305,3 +305,171 @@ fn a_shell_inherits_the_flesh_it_lies_on() {
         }
     }
 }
+
+/// A limb butted onto a fat trunk, one connected surface: the limb's base ring is
+/// the trunk's own ring of vertices, so a geodesic path must cross the crease.
+///
+/// The trunk is six times the limb's thickness. Flesh on the far side of the trunk
+/// is nearer the limb's axis than to the trunk's own axis, which is exactly the M2
+/// defect in miniature: an A-pose arm rests against a ribcage, and the ribcage's
+/// wall is 74 mm from the arm axis and 113 mm of surface path from the arm's skin.
+fn limb_on_trunk() -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<DeformBone>) {
+    const SIDES: usize = 24;
+    // Trunk: a fat tube along +Y, its wall at radius 0.12.
+    let (trunk_points, trunk_triangles) =
+        tube(DVec3::new(0.0, -0.20, 0.0), DVec3::Y, 0.40, 0.12, 12, SIDES);
+    let mut points = trunk_points.clone();
+    let mut triangles = trunk_triangles;
+    // The limb grows out of the trunk's ring at y = 0, from the trunk wall to 0.30.
+    let ring_start = 8 * SIDES; // the ring at t = 8/11 of the trunk, near its middle
+    let base: Vec<[f64; 3]> = points[ring_start..ring_start + SIDES].to_vec();
+    let mut limb_points = Vec::new();
+    for step in 1..=8 {
+        let t = step as f64 / 8.0;
+        let x = 0.12 + 0.20 * t;
+        let radius = 0.12 - 0.10 * t; // a cone from the trunk's wall to the limb's radius
+        for vertex in &base {
+            // Outward direction of this ring vertex, in the trunk's own frame.
+            let dir = DVec3::from_array(*vertex).normalize();
+            limb_points.push((DVec3::new(x, 0.0, 0.0) + dir * radius).to_array());
+        }
+    }
+    let offset = points.len() as u32;
+    points.extend(limb_points);
+    // Bridge the trunk ring to the first limb ring, then ring to ring.
+    let ring = |step: usize, side: usize| -> u32 {
+        match step {
+            0 => ring_start as u32 + (side % SIDES) as u32,
+            _ => offset + ((step - 1) * SIDES + side % SIDES) as u32,
+        }
+    };
+    for step in 0..8 {
+        for side in 0..SIDES {
+            let a = ring(step, side);
+            let b = ring(step, side + 1);
+            let c = ring(step + 1, side);
+            let d = ring(step + 1, side + 1);
+            triangles.push([a, c, b]);
+            triangles.push([b, c, d]);
+        }
+    }
+    let bones = vec![
+        DeformBone {
+            name: "Trunk".into(),
+            side: None,
+            segments: vec![(DVec3::new(0.0, -0.20, 0.0), DVec3::new(0.0, 0.20, 0.0))],
+        },
+        DeformBone {
+            name: "Limb".into(),
+            side: None,
+            segments: vec![(DVec3::new(0.12, 0.0, 0.0), DVec3::new(0.32, 0.0, 0.0))],
+        },
+    ];
+    (points, triangles, bones)
+}
+
+#[test]
+fn a_limb_never_owns_the_trunk_it_is_seated_in() {
+    let (points, triangles, bones) = limb_on_trunk();
+    let flesh = vec![true; points.len()];
+    let authored = author_weights(
+        &points,
+        &triangles,
+        &bones,
+        &flesh,
+        &AuthorSettings::default(),
+    )
+    .expect("the fused surface is valid");
+
+    for row in &authored.rows {
+        let sum: f32 = row.values().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "row sum {sum}");
+    }
+
+    // The limb's own middle is the limb, rigidly.
+    let limb_mid = points
+        .iter()
+        .enumerate()
+        .filter(|(_, point)| (point[0] - 0.26).abs() < 0.02)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(!limb_mid.is_empty());
+    for vertex in &limb_mid {
+        assert!(
+            weight(&authored.rows[*vertex], "Limb") > 0.8,
+            "limb mid weight {}",
+            weight(&authored.rows[*vertex], "Limb")
+        );
+    }
+
+    // The trunk's own flesh — the wall on the far side and the ends — carries no
+    // limb weight at all: the envelope stops at the crease instead of thinning out.
+    let mut trunk_far = 0;
+    for (vertex, point) in points.iter().enumerate() {
+        if point[0] > -0.02 {
+            continue;
+        }
+        trunk_far += 1;
+        let borrowed = weight(&authored.rows[vertex], "Limb");
+        assert!(
+            borrowed < 0.01,
+            "trunk vertex {vertex} at {point:?} borrowed {borrowed} of the limb"
+        );
+    }
+    assert!(trunk_far > 100, "the far trunk wall was measured");
+    assert!(
+        authored.report.envelope_cut_vertices > 0,
+        "the reach bound cut the limb's tail"
+    );
+}
+
+#[test]
+fn the_reach_bound_is_a_zero_not_a_tail() {
+    // The bound on its own: ownership decay switched off, so the only thing that can
+    // stop the limb's inverse-distance tail is the surface-path cut. Without it the
+    // far trunk keeps a fraction of a percent, which is what tore the chest; with it
+    // those vertices are exactly zero.
+    let (points, triangles, bones) = limb_on_trunk();
+    let flesh = vec![true; points.len()];
+    let no_decay = AuthorSettings {
+        ownership_band: 1e6,
+        ..AuthorSettings::default()
+    };
+    let loose = AuthorSettings {
+        reach_band: 40.0,
+        ..no_decay.clone()
+    };
+    let tight = AuthorSettings {
+        reach_band: 1.0,
+        ..no_decay
+    };
+    let loose = author_weights(&points, &triangles, &bones, &flesh, &loose)
+        .expect("the fused surface is valid");
+    let tight = author_weights(&points, &triangles, &bones, &flesh, &tight)
+        .expect("the fused surface is valid");
+
+    let far: Vec<usize> = points
+        .iter()
+        .enumerate()
+        .filter(|(_, point)| point[1].abs() > 0.15)
+        .map(|(vertex, _)| vertex)
+        .collect();
+    assert!(far.len() > 50, "the trunk beyond the bound was measured");
+    let tail = far
+        .iter()
+        .map(|vertex| weight(&loose.rows[*vertex], "Limb"))
+        .fold(0.0_f64, f64::max);
+    assert!(tail > 0.0, "without the bound the limb leaves a tail");
+    for vertex in &far {
+        assert_eq!(
+            weight(&tight.rows[*vertex], "Limb"),
+            0.0,
+            "vertex {vertex} kept limb weight beyond the bound"
+        );
+    }
+    assert_eq!(tight.report.envelope_restored, 0, "the bound starved a row");
+    assert!(
+        tight.report.envelope_cut_vertices > 0,
+        "the bound removed mass"
+    );
+}

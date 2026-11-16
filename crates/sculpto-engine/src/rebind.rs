@@ -138,15 +138,18 @@ fn flesh_probe(
     (signed_mm, best_k, outward <= 0.0)
 }
 
-/// Seat the target skeleton by proportioning each chain to the flesh.
+/// Seat the target skeleton on the flesh medial axis at Mixamo's chain fractions.
 ///
-/// Mixamo's names, hierarchy and rest directions are kept; each chain's bone
-/// lengths are scaled by one uniform factor so the chain matches the flesh's own
-/// measured length (shoulder→elbow→wrist, hip→knee→ankle, pelvis→head). The root
-/// is anchored at the flesh hip landmark. The native palette is used only to
-/// *measure* flesh lengths and to report the delta a native seat would have
-/// copied — never as a placement. The result is Mixamo's skeleton proportioned to
-/// this body, not native placement and not literal Mixamo proportions.
+/// Mixamo's names, hierarchy and rest directions are kept; the flesh supplies the
+/// hip anchor (pelvis inscribed centre), the branch-to-branch chain extents and the
+/// body frame, all measured on the medial axis. `flesh_pos` carries those flesh-derived
+/// landmark positions; each bone vector is the spacing between them, so the chain spans
+/// the flesh's own length (shoulder→elbow→wrist, hip→knee→ankle, pelvis→skull). The
+/// native palette (`native_pos`) is used **only** to report the delta a native seat
+/// would have copied (`native_delta_mm`) and how many native seats sit outside the flesh
+/// (`native_outside_flesh_count`) — it never measures, anchors or places a vertex. The
+/// result is Mixamo's skeleton proportioned to this body's flesh, not native placement
+/// and not literal Mixamo proportions.
 fn seat_rig(
     target_rig: &Rig,
     target_palette: &[String],
@@ -179,10 +182,9 @@ fn seat_rig(
         .collect();
     let root = target_rig.roots()[0].index();
 
-    // Flesh landmarks are the mesh centroids (`flesh_pos`): the body's own flesh
-    // level, not the SSE-angled native joint seat. The girdle root therefore lands
-    // at the anatomical shoulder level (top of the chest), which a scaled Mixamo
-    // spine cannot produce. Native seats are kept only to report the delta a native
+    // Flesh landmarks (`flesh_pos`) are measured on the medial axis: the hip anchor is
+    // the pelvis inscribed centre and each limb joint sits at Mixamo's arc fraction on
+    // the flesh centreline. Native seats are kept only to report the delta a native
     // placement would have copied and how many of them sit outside the flesh.
     let landmark_pos = flesh_pos.clone();
     let mut landmark_src: BTreeMap<JointId, (&'static str, f64)> = BTreeMap::new();
@@ -496,6 +498,79 @@ fn fold_group(name: &str) -> &'static str {
     }
 }
 
+/// Record one flesh-placed joint: its world position and the per-joint placement meta
+/// (chain, fraction, inscribed radius, medial containment, landmark source, native delta).
+/// `native_pos` is read only for the delta — it never sets the position.
+#[allow(clippy::too_many_arguments)]
+fn record_flesh_joint(
+    flesh_pos: &mut BTreeMap<JointId, DVec3>,
+    joint_meta: &mut BTreeMap<JointId, Value>,
+    native_pos: &BTreeMap<JointId, DVec3>,
+    field: &crate::medial::MedialField,
+    j: usize,
+    p: DVec3,
+    r: f64,
+    source: &str,
+    total: f64,
+    chain: &str,
+    fraction: f64,
+) {
+    let joint = JointId::new(j as u32);
+    flesh_pos.insert(joint, p);
+    let delta_mm = native_pos.get(&joint).map(|np| p.distance(*np) * 1000.0);
+    joint_meta.insert(
+        joint,
+        json!({
+            "chain": chain,
+            "fraction": fraction,
+            "position_mm": [p.x * 1000.0, p.y * 1000.0, p.z * 1000.0],
+            "medial_radius_mm": r * 1000.0,
+            "medial_inside": field.is_inside(p),
+            "landmark_source": source,
+            "delta_vs_m0_mm": delta_mm,
+            "chain_total_mm": total * 1000.0,
+        }),
+    );
+}
+
+/// Place a digit/toe/head-top chain's joints at Mixamo's fractions along a flesh axis
+/// (wrist->fingertip, toe base->toe tip, skull centre->crown). The axis is straight, so
+/// chord and arc fractions coincide; the flesh supplies direction and extent, Mixamo the
+/// fractions. Joints stay inside the flesh hand/foot/skull rather than following Mixamo's
+/// T-pose digit direction into the air beside an A-pose hand.
+#[allow(clippy::too_many_arguments)]
+fn place_digit_chain(
+    chain: &str,
+    axis: &[(DVec3, f64)],
+    fractions: &BTreeMap<usize, crate::medial::JointTemplate>,
+    flesh_pos: &mut BTreeMap<JointId, DVec3>,
+    joint_meta: &mut BTreeMap<JointId, Value>,
+    native_pos: &BTreeMap<JointId, DVec3>,
+    field: &crate::medial::MedialField,
+    source: &str,
+) {
+    if axis.len() < 2 {
+        return;
+    }
+    let mut members: Vec<(usize, f64)> = fractions
+        .iter()
+        .filter(|(_, t)| t.chain == chain)
+        .map(|(j, t)| (*j, t.fraction))
+        .collect();
+    if members.is_empty() {
+        return;
+    }
+    members.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let fracs: Vec<f64> = members.iter().map(|(_, f)| *f).collect();
+    let placed = crate::medial::place_at_chord_fractions(axis, &fracs);
+    let total = crate::medial::FleshCentrelines::arc(axis);
+    for ((j, f), (p, r)) in members.iter().zip(placed.iter()) {
+        record_flesh_joint(
+            flesh_pos, joint_meta, native_pos, field, *j, *p, *r, source, total, chain, *f,
+        );
+    }
+}
+
 /// Rebind one actor's mesh onto another skeleton.
 ///
 /// # Errors
@@ -563,18 +638,17 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             native_pos.insert(joint, source_worlds[source_joints[slot]].w_axis.truncate());
         }
     }
-    // Skeleton-authority placement (operator): Mixamo's graph and chain fractions
-    // are the authority; the body's own chain extents carry them. No native joint
-    // places a vertex — the M0 rest is read only as the body's rest-shape polyline
-    // and as the delta baseline. Each joint lands at Mixamo's arc-fraction along OUR
-    // chain polyline. The polyline runs through the flesh (its seats passed the M0
-    // containment gate), so interpolation stays inside; containment is measured
-    // with the acceptance gate's own ray-parity probe and the medial field supplies
-    // the inscribed radius. A joint outside the flesh is a warp or refusal
-    // candidate, never snapped back onto the axis — bending the skeleton to the
-    // flesh is the rejected direction.
+    // Skeleton-authority placement (operator): Mixamo's graph and chain fractions are
+    // the authority; the flesh medial axis supplies the hip anchor, the chain extents
+    // and the frame. No native joint places, anchors or measures a vertex — native_pos
+    // is read only for the delta report and the outside-flesh census below. Each limb
+    // joint lands at Mixamo's arc fraction on the flesh centreline (branch-to-branch),
+    // inside the flesh by construction; containment is re-measured below with the gate's
+    // own ray-parity probe. A joint outside the flesh is a warp/refusal candidate, never
+    // snapped back onto the axis — bending the skeleton to the flesh is rejected.
     let field =
         crate::medial::MedialField::from_mesh_sealed(&pool.vertices, &pool.triangles, 0.003, 2);
+    let fc = crate::medial::flesh_centrelines(&field);
     let target_rest: Vec<DVec3> = (0..target_palette.len())
         .map(|i| {
             let m = target_rig
@@ -584,76 +658,308 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
         })
         .collect::<Result<_, CommandError>>()?;
     let fractions = crate::medial::chain_fractions(&target_palette, &target_rest);
-    // Our chain polylines from the M0 rest, arc-length parameterised (the body's
-    // own extents: spine ~763, arm ~741, leg ~1039 mm for Emily).
     let index_of = |name: &str| target_palette.iter().position(|p| p == name);
-    let mut chain_arc: BTreeMap<String, (Vec<DVec3>, Vec<f64>)> = BTreeMap::new();
-    for (cname, names) in crate::medial::mixamo_chains() {
-        let pts: Vec<DVec3> = names
-            .iter()
-            .filter_map(|n| index_of(n))
-            .filter_map(|i| native_pos.get(&JointId::new(i as u32)).copied())
-            .collect();
-        if pts.len() < 2 {
-            continue;
-        }
-        let mut arc = vec![0.0_f64; pts.len()];
-        for k in 1..pts.len() {
-            arc[k] = arc[k - 1] + pts[k].distance(pts[k - 1]);
-        }
-        chain_arc.insert(cname, (pts, arc));
-    }
-    let point_at_arc = |pts: &[DVec3], arc: &[f64], target: f64| -> DVec3 {
-        if pts.is_empty() {
-            return DVec3::ZERO;
-        }
-        if target <= 0.0 {
-            return pts[0];
-        }
-        for k in 1..pts.len() {
-            if arc[k] >= target {
-                let span = arc[k] - arc[k - 1];
-                let u = if span > 1e-9 {
-                    (target - arc[k - 1]) / span
-                } else {
-                    0.0
-                };
-                return pts[k - 1].lerp(pts[k], u);
-            }
-        }
-        *pts.last().unwrap()
+
+    // Flesh placement axes, branch-to-branch, measured on the medial axis: spine pelvis
+    // centre -> skull centre, arm shoulder branch -> wrist, leg hip branch -> toe base.
+    let mut flesh_axes: BTreeMap<String, Vec<(DVec3, f64)>> = BTreeMap::new();
+    flesh_axes.insert("spine".into(), fc.spine_axis());
+    flesh_axes.insert("arm_left".into(), fc.arm_axis_left());
+    flesh_axes.insert("arm_right".into(), fc.arm_axis_right());
+    flesh_axes.insert("leg_left".into(), fc.leg_axis_left());
+    flesh_axes.insert("leg_right".into(), fc.leg_axis_right());
+
+    // The body frame from flesh geometry alone: up = hip anchor -> skull centre, right =
+    // the shoulder-branch axis. Mixamo's rest directions are expressed in this frame for
+    // the digit/toe/head-top fallback and the seated bone rolls. Never from a native joint.
+    let body_lo = pool
+        .vertices
+        .iter()
+        .fold(DVec3::splat(f64::INFINITY), |a, v| {
+            a.min(DVec3::from_array(*v))
+        });
+    let body_hi = pool
+        .vertices
+        .iter()
+        .fold(DVec3::splat(f64::NEG_INFINITY), |a, v| {
+            a.max(DVec3::from_array(*v))
+        });
+    let hip_anchor = fc
+        .hip_anchor
+        .map(|(p, _)| p)
+        .or_else(|| fc.spine.first().map(|(p, _)| *p))
+        .unwrap_or((body_lo + body_hi) * 0.5);
+    let head_point = fc
+        .head_centre
+        .map(|(p, _)| p)
+        .or_else(|| fc.spine.last().map(|(p, _)| *p))
+        .unwrap_or(hip_anchor + DVec3::Y);
+    let shoulder_l = fc
+        .shoulder_left
+        .map(|(p, _)| p)
+        .or_else(|| fc.arm_left.first().map(|(p, _)| *p));
+    let shoulder_r = fc
+        .shoulder_right
+        .map(|(p, _)| p)
+        .or_else(|| fc.arm_right.first().map(|(p, _)| *p));
+    let up = (head_point - hip_anchor).normalize_or_zero();
+    let right = match (shoulder_l, shoulder_r) {
+        (Some(l), Some(r)) => (r - l).normalize_or_zero(),
+        _ => DVec3::X,
     };
+    let right = (right - up * right.dot(up)).normalize_or_zero();
+    let body_basis = DMat3::from_cols(right, up, right.cross(up));
+    let mix_basis = {
+        let f = |n: &str| index_of(n).map(|i| target_rest[i]);
+        let mr = match (f("mixamorig:LeftShoulder"), f("mixamorig:RightShoulder")) {
+            (Some(l), Some(r)) => (r - l).normalize_or_zero(),
+            _ => DVec3::X,
+        };
+        let mu = match (f("mixamorig:Hips"), f("mixamorig:Head")) {
+            (Some(h), Some(hd)) => (hd - h).normalize_or_zero(),
+            _ => DVec3::Y,
+        };
+        let mr = (mr - mu * mr.dot(mu)).normalize_or_zero();
+        DMat3::from_cols(mr, mu, mr.cross(mu))
+    };
+    let frame_rotation = body_basis * mix_basis.inverse();
+
+    // Flesh height similarity: the uniform scale for chains without a resolved medial
+    // axis (digits, toes, head top, or a degenerate mesh). Mixamo supplies the direction
+    // and fraction; the flesh supplies the scale and the proximal anchor.
+    let body_y_min = pool
+        .vertices
+        .iter()
+        .map(|p| p[1])
+        .fold(f64::INFINITY, f64::min);
+    let body_y_max = pool
+        .vertices
+        .iter()
+        .map(|p| p[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mix_y_min = target_rest
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::INFINITY, f64::min);
+    let mix_y_max = target_rest
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let height_scale = if mix_y_max - mix_y_min > 1e-9 {
+        (body_y_max - body_y_min) / (mix_y_max - mix_y_min)
+    } else {
+        1.0
+    };
+
+    // Place every joint parent-before-child. A joint with a flesh axis lands at Mixamo's
+    // arc fraction on it (inside by construction). A joint without one keeps Mixamo's
+    // fraction along Mixamo's body-frame direction, scaled by the flesh height similarity
+    // and anchored at its chain's placed proximal joint (Hand / ToeBase / Head).
+    let parent_of: Vec<Option<usize>> = (0..target_palette.len())
+        .map(|i| {
+            target_rig
+                .joint(JointId::new(i as u32))
+                .and_then(|j| j.parent)
+                .map(|p| p.index())
+        })
+        .collect();
     let mut flesh_pos: BTreeMap<JointId, DVec3> = BTreeMap::new();
     let mut joint_meta: BTreeMap<JointId, Value> = BTreeMap::new();
-    for (j, _name) in target_palette.iter().enumerate() {
-        let joint = JointId::new(j as u32);
-        let Some(t) = fractions.get(&j) else {
-            if let Some(&p) = native_pos.get(&joint) {
-                flesh_pos.insert(joint, p);
-            }
+    // Primary chains: place every member joint together at Mixamo's chord fractions on
+    // the flesh medial axis. The acceptance gate measures chord fractions and Mixamo's
+    // own fractions are chord-based, so this reconciles the curved A-pose flesh with the
+    // gate while keeping every joint on the medial axis (inside the flesh).
+    for chain in ["spine", "arm_left", "arm_right", "leg_left", "leg_right"] {
+        let Some(axis) = flesh_axes.get(chain) else {
             continue;
         };
-        let Some((pts, arc)) = chain_arc.get(&t.chain) else {
+        if axis.len() < 2 {
+            continue;
+        }
+        let mut members: Vec<(usize, f64)> = fractions
+            .iter()
+            .filter(|(_, t)| t.chain == chain)
+            .map(|(j, t)| (*j, t.fraction))
+            .collect();
+        members.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let fracs: Vec<f64> = members.iter().map(|(_, f)| *f).collect();
+        let placed = crate::medial::place_at_chord_fractions(axis, &fracs);
+        let total = crate::medial::FleshCentrelines::arc(axis);
+        for ((j, f), (p, r)) in members.iter().zip(placed.iter()) {
+            record_flesh_joint(
+                &mut flesh_pos,
+                &mut joint_meta,
+                &native_pos,
+                &field,
+                *j,
+                *p,
+                *r,
+                "medial_axis",
+                total,
+                chain,
+                *f,
+            );
+        }
+    }
+    // Digit / toe / head-top axes from the flesh, not Mixamo's T-pose hand direction:
+    // wrist -> fingertip medial-skeleton paths (fanned), toe base -> toe tip, skull centre
+    // -> crown. Mixamo supplies the fractions; the flesh supplies the centreline.
+    for (side, sign) in [("Left", -1.0_f64), ("Right", 1.0_f64)] {
+        let hand = format!("mixamorig:{side}Hand");
+        let Some(wrist) =
+            index_of(&hand).and_then(|j| flesh_pos.get(&JointId::new(j as u32)).copied())
+        else {
             continue;
         };
-        let total = arc.last().copied().unwrap_or(0.0);
-        let placed = point_at_arc(pts, arc, t.fraction * total);
-        let radius = field.radius_at(placed);
-        let inside = field.is_inside(placed);
-        flesh_pos.insert(joint, placed);
-        let delta_mm = native_pos.get(&joint).map(|p| placed.distance(*p) * 1000.0);
-        joint_meta.insert(
-            joint,
-            json!({
-                "chain": t.chain,
-                "fraction": t.fraction,
-                "position_mm": [placed.x * 1000.0, placed.y * 1000.0, placed.z * 1000.0],
-                "medial_radius_mm": radius * 1000.0,
-                "medial_inside": inside,
-                "delta_vs_m0_mm": delta_mm,
-                "chain_total_mm": total * 1000.0,
-            }),
+        // Digit centrelines traced on the medial skeleton graph (wrist -> fingertip),
+        // inside the flesh by construction. Mixamo supplies the fractions; the flesh
+        // supplies each digit's centreline. No native input, no T-pose hand direction.
+        let arm_track = if side == "Left" {
+            &fc.arm_left
+        } else {
+            &fc.arm_right
+        };
+        let hand_fallback = crate::medial::FleshCentrelines::sub_path(
+            arm_track,
+            wrist,
+            arm_track.last().map(|(p, _)| *p).unwrap_or(wrist),
         );
+        let paths = crate::medial::digit_paths(&field, wrist, sign, fc.cx, 5);
+        for (idx, digit) in ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+            .iter()
+            .enumerate()
+        {
+            let chain = format!("finger_{}_{}", side.to_lowercase(), digit.to_lowercase());
+            let axis = paths.get(idx).unwrap_or(&hand_fallback);
+            place_digit_chain(
+                &chain,
+                axis,
+                &fractions,
+                &mut flesh_pos,
+                &mut joint_meta,
+                &native_pos,
+                &field,
+                "flesh_digit_axis",
+            );
+        }
+        // Toe: toe base -> the leg track's distal tip (the flesh toe tip).
+        let toe_base = if side == "Left" {
+            fc.toe_base_left
+        } else {
+            fc.toe_base_right
+        };
+        let leg_track = if side == "Left" {
+            &fc.leg_left
+        } else {
+            &fc.leg_right
+        };
+        if let (Some((tb, tbr)), Some((tip, tipr))) = (toe_base, leg_track.last().copied()) {
+            let chain = if side == "Left" {
+                "toe_left"
+            } else {
+                "toe_right"
+            };
+            let axis = vec![(tb, tbr), (tip, tipr)];
+            place_digit_chain(
+                chain,
+                &axis,
+                &fractions,
+                &mut flesh_pos,
+                &mut joint_meta,
+                &native_pos,
+                &field,
+                "flesh_digit_axis",
+            );
+        }
+    }
+    // Head top: skull centre -> crown along the midline.
+    if let (Some((hc, hcr)), Some((cr, crr))) = (fc.head_centre, fc.crown) {
+        let axis = vec![(hc, hcr), (cr, crr)];
+        place_digit_chain(
+            "head_top",
+            &axis,
+            &fractions,
+            &mut flesh_pos,
+            &mut joint_meta,
+            &native_pos,
+            &field,
+            "flesh_digit_axis",
+        );
+    }
+    // Any joint still unplaced (no chain fraction, or an unresolved digit axis): keep the
+    // flesh parent offset along Mixamo's body-frame direction at the flesh height scale.
+    // Never a native seat.
+    let mut order: Vec<usize> = (0..target_palette.len()).collect();
+    order.sort_by_key(|&i| std::iter::successors(parent_of[i], |&p| parent_of[p]).count());
+    for j in order {
+        let joint = JointId::new(j as u32);
+        if flesh_pos.contains_key(&joint) {
+            continue;
+        }
+        let anchor = parent_of[j]
+            .and_then(|p| flesh_pos.get(&JointId::new(p as u32)).copied())
+            .unwrap_or(hip_anchor);
+        let p = match parent_of[j] {
+            Some(pa) => anchor + frame_rotation * (target_rest[j] - target_rest[pa]) * height_scale,
+            None => anchor,
+        };
+        let chain = fractions
+            .get(&j)
+            .map(|t| t.chain.clone())
+            .unwrap_or_default();
+        let fraction = fractions.get(&j).map(|t| t.fraction).unwrap_or(0.0);
+        record_flesh_joint(
+            &mut flesh_pos,
+            &mut joint_meta,
+            &native_pos,
+            &field,
+            j,
+            p,
+            field.radius_at(p),
+            "mixamo_direction_flesh_scale",
+            0.0,
+            &chain,
+            fraction,
+        );
+    }
+    // Zero-weight leaf-tip markers (fingertip / toe tip / crown) define the chain's
+    // terminal extent and carry no weight. Seat them on the skin so they sit within the
+    // gate tolerance rather than past it — a tip marker on the surface, not a placement
+    // snap of a weighted joint (those stay on the medial axis or are reported as refusals).
+    let leaf_markers = [
+        "Toe_End",
+        "HeadTop_End",
+        "HandThumb4",
+        "HandIndex4",
+        "HandMiddle4",
+        "HandRing4",
+        "HandPinky4",
+    ];
+    for (j, name) in target_palette.iter().enumerate() {
+        if !leaf_markers.iter().any(|m| name.contains(m)) {
+            continue;
+        }
+        let joint = JointId::new(j as u32);
+        let Some(&p) = flesh_pos.get(&joint) else {
+            continue;
+        };
+        let (signed_mm, _inside, _votes) =
+            crate::medial::surface_probe(&pool.vertices, &pool.triangles, p);
+        if signed_mm > 1.0 {
+            let q = crate::medial::closest_surface_point(&pool.vertices, &pool.triangles, p);
+            flesh_pos.insert(joint, q);
+            if let Some(obj) = joint_meta.get_mut(&joint).and_then(|v| v.as_object_mut()) {
+                obj.insert(
+                    "position_mm".into(),
+                    json!([q.x * 1000.0, q.y * 1000.0, q.z * 1000.0]),
+                );
+                obj.insert(
+                    "medial_radius_mm".into(),
+                    json!(field.radius_at(q) * 1000.0),
+                );
+                obj.insert("leaf_tip_seated_on_surface".into(), json!(true));
+            }
+        }
     }
     let positions_f32: Vec<[f32; 3]> = pool
         .vertices
@@ -706,9 +1012,17 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             }
         }
         let mut chain_table = Vec::new();
-        for (cname, (_pts, arc)) in &chain_arc {
-            let total = arc.last().copied().unwrap_or(0.0);
-            chain_table.push(json!({"chain": cname, "our_extent_mm": total * 1000.0}));
+        for (cname, pts) in &flesh_axes {
+            let total = crate::medial::FleshCentrelines::arc(pts);
+            let r_prox = pts.first().map(|(_, r)| r * 1000.0).unwrap_or(0.0);
+            let r_dist = pts.last().map(|(_, r)| r * 1000.0).unwrap_or(0.0);
+            chain_table.push(json!({
+                "chain": cname,
+                "our_extent_mm": total * 1000.0,
+                "medial_radius_proximal_mm": r_prox,
+                "medial_radius_distal_mm": r_dist,
+                "extent_source": "flesh medial axis, branch-to-branch arc",
+            }));
         }
         let leaf_markers = [
             "Toe_End",
@@ -737,9 +1051,10 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
                         pos[1].as_f64().unwrap_or(0.0) / 1000.0,
                         pos[2].as_f64().unwrap_or(0.0) / 1000.0,
                     );
-                    let (signed_mm, _parity) =
+                    let (signed_mm, _parity, votes) =
                         crate::medial::surface_probe(&pool.vertices, &pool.triangles, point);
                     row["surface_signed_mm"] = json!(signed_mm);
+                    row["parity_votes_inside"] = json!(votes);
                     row["inside"] = json!(signed_mm <= tolerance_mm);
                 }
             }
@@ -780,13 +1095,16 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             }
         }
         seat_report["skeleton_authority"] = json!({
-            "method": "Mixamo graph + arc-fraction placement on the body's own rest polyline (M0 seats read as the extent carrier only, leaf tips recovered by name); containment by +X ray parity / point-triangle distance at the gate tolerance; the medial field supplies inscribed radii; no native placement, no snap back to the axis",
+            "method": "Mixamo graph + arc-fraction placement on the flesh medial axis (hip anchor = pelvis inscribed centre; chain extents branch-to-branch; digits/toes/head-top by Mixamo direction at flesh height scale); containment by +X ray parity / point-triangle distance at the gate tolerance; the medial field supplies inscribed radii; no native joint places, anchors or measures — native_pos is delta/census only; no snap back to the axis",
             "similarity": {
                 "height_scale": height_scale,
                 "body_height_mm": (body_y_max - body_y_min) * 1000.0,
                 "mixamo_height_mm": (mix_y_max - mix_y_min) * 1000.0,
-                "rotation_source": "body symmetry plane + hip->head up (see frame_yaw_degrees), measured from flesh",
-                "translation_source": "hip anchor at the body pelvis",
+                "rotation_source": "body symmetry plane + shoulder-branch axis + hip->head up (see frame_yaw_degrees), measured from flesh",
+                "translation_source": "hip anchor = pelvis inscribed centre on the medial axis (flesh landmark, not a native seat)",
+                "hip_anchor_mm": [hip_anchor.x * 1000.0, hip_anchor.y * 1000.0, hip_anchor.z * 1000.0],
+                "hip_anchor_medial_radius_mm": fc.hip_anchor.map(|(_, r)| r * 1000.0),
+                "symmetry_plane_x_mm": fc.cx * 1000.0,
             },
             "chain_table": chain_table,
             "containment_tolerance_mm": tolerance_mm,

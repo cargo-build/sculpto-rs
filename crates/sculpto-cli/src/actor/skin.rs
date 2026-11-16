@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use sculpto_engine::skin::{SkinParams, run as skin_run, verdict};
 
 const USAGE: &str = "usage: sculpto actor skin --actor actor.glb [--out skinned.glb] \
-    [--report skin.json]";
+    [--report skin.json] [--expect-input-sha HEX]";
 
 pub(super) fn run(args: &[String]) -> ExitCode {
     let params = match arguments(args) {
@@ -33,7 +33,7 @@ fn arguments(args: &[String]) -> Result<SkinParams, String> {
     let mut iter = args.iter();
     while let Some(key) = iter.next().map(String::as_str) {
         match key {
-            "--actor" | "--out" | "--report" => {
+            "--actor" | "--out" | "--report" | "--expect-input-sha" => {
                 let value = iter.next().ok_or_else(|| format!("{key} needs a value"))?;
                 if flags.insert(key, value.as_str()).is_some() {
                     return Err(format!("duplicate {key}"));
@@ -48,6 +48,9 @@ fn arguments(args: &[String]) -> Result<SkinParams, String> {
         .ok_or("--actor is required")?;
     let out = flags.get("--out").map(|value| (*value).to_owned());
     let report = flags.get("--report").map(|value| (*value).to_owned());
+    let expect_input_sha = flags
+        .get("--expect-input-sha")
+        .map(|value| (*value).to_owned());
     if out.as_deref() == Some(actor.as_str()) || report.as_deref() == Some(actor.as_str()) {
         return Err("input and output paths must differ".to_owned());
     }
@@ -55,6 +58,7 @@ fn arguments(args: &[String]) -> Result<SkinParams, String> {
         actor: actor.into(),
         out: out.map(Into::into),
         report: report.map(Into::into),
+        expect_input_sha,
     })
 }
 

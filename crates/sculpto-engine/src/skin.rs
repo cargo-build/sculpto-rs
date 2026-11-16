@@ -51,6 +51,14 @@ pub struct SkinParams {
     /// Write the JSON report here.
     #[serde(default)]
     pub report: Option<PathBuf>,
+    /// Refuse the actor unless its `sha256` starts with this hex prefix.
+    ///
+    /// A chain that consumes a file by name silently re-authors whatever sits at
+    /// that path; the stale seat that produced the M2 audit was exactly that. The
+    /// expectation travels with the command, so a superseded input is refused
+    /// before any weight is authored. At least eight hex digits.
+    #[serde(default)]
+    pub expect_input_sha: Option<String>,
 }
 
 /// Author a skin for one actor's own skeleton.
@@ -62,6 +70,10 @@ pub struct SkinParams {
 pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
     let actor_bytes =
         std::fs::read(&params.actor).map_err(|error| errors::io(&params.actor, error))?;
+    let actor_sha = sha_hex(&Sha256::digest(&actor_bytes));
+    if let Some(expected) = &params.expect_input_sha {
+        verify_input_sha(&actor_sha, expected)?;
+    }
     let actor = Actor::from_glb(&actor_bytes).map_err(actor_error)?;
     let (rig, palette) = actor_rig(&actor)?;
     if rig.roots().len() != 1 {
@@ -220,6 +232,27 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
         write_report(path, &report)?;
     }
     Ok(report)
+}
+
+/// Refuse an input whose digest is not the one the caller pinned.
+///
+/// The prefix form exists because the reports quote sixteen hex digits; a shorter
+/// expectation would match too much to be evidence, so it is refused outright.
+fn verify_input_sha(actual: &str, expected: &str) -> Result<(), CommandError> {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() < 8 {
+        return Err(refused(
+            "skin_input_sha",
+            format!("expected input sha {expected:?} is shorter than eight hex digits"),
+        ));
+    }
+    if actual.starts_with(&expected) {
+        return Ok(());
+    }
+    Err(refused(
+        "skin_input_sha",
+        format!("input sha256 {actual} does not match the expected {expected}"),
+    ))
 }
 
 /// The one-line verdict the CLI prints.
@@ -501,7 +534,8 @@ fn build_report(input: ReportInputs<'_>) -> Value {
         .map(|footprint| {
             json!({
                 "bone": footprint.name,
-                "radius_mm": (footprint.radius * 1000.0 * 1000.0).round() / 1000.0,
+                "section_mm": (footprint.section * 1000.0 * 1000.0).round() / 1000.0,
+                "reach_mm": (footprint.reach * 1000.0 * 1000.0).round() / 1000.0,
                 "seeds": footprint.seeds,
                 "dominated": footprint.dominated,
                 "dominance": (footprint.dominance * 10000.0).round() / 10000.0,
@@ -529,6 +563,7 @@ fn build_report(input: ReportInputs<'_>) -> Value {
         "input": {
             "actor": input.params.actor.to_string_lossy(),
             "sha256": sha_hex(&Sha256::digest(input.actor_bytes)),
+            "expect_sha256": input.params.expect_input_sha,
         },
         "output": {
             "path": input.params.out.as_ref().map(|path| path.to_string_lossy().to_string()),
@@ -537,12 +572,15 @@ fn build_report(input: ReportInputs<'_>) -> Value {
         },
         "method": {
             "name": "geodesic bone envelopes",
-            "description": "owned-region seeds per bone, surface-geodesic inverse-distance falloff, \
+            "description": "flesh-section capsules per bone, surface-geodesic inverse-distance \
+                            falloff in bone sections, a hard reach bound at the armpit crease, \
                             side isolation, relative prune, strict four-slot pack",
             "settings": {
                 "exponent": settings.exponent,
-                "radius_quantile": settings.radius_quantile,
                 "blend_in_flesh_radii": settings.blend_in_flesh_radii,
+                "reach_band": settings.reach_band,
+                "ownership_band": settings.ownership_band,
+                "falloff_band": settings.falloff_band,
                 "prune_ratio": settings.prune_ratio,
                 "smoothing": settings.smoothing,
                 "midline_dead_zone": settings.midline_dead_zone,
@@ -563,6 +601,10 @@ fn build_report(input: ReportInputs<'_>) -> Value {
             "side_masked_vertices": input.authored.report.side_masked_vertices,
             "side_masked_mass": input.authored.report.side_masked_mass,
             "side_mask_restored": input.authored.report.side_mask_restored,
+            "off_nearest_bone": input.authored.report.off_nearest,
+            "envelope_cut_vertices": input.authored.report.envelope_cut_vertices,
+            "envelope_cut_mass": input.authored.report.envelope_cut_mass,
+            "envelope_restored": input.authored.report.envelope_restored,
             "pruned": input.authored.report.pruned,
             "discarded": discarded,
             "lateral_axis": input.authored.report.lateral_axis,

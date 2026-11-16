@@ -25,6 +25,7 @@ fn authored(name: &str) -> Option<serde_json::Value> {
             actor,
             out: None,
             report: None,
+            expect_input_sha: None,
         })
         .expect("the seated actor authors a skin"),
     )

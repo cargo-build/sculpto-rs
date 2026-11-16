@@ -1,19 +1,52 @@
 //! Author skin weights for a deform skeleton directly from the flesh.
 //!
-//! The method is **geodesic bone envelopes**: every deform bone owns a capsule
-//! around the segments it spans, the capsule radius is its own flesh radius
-//! (the 75th percentile of the surface distance to the bone among the vertices
-//! the bone is Euclidean-nearest to), and a vertex's weight for a bone falls off
-//! with the **surface-geodesic** distance from that bone's capsule. Geodesic
-//! distance is the occlusion term: a torso-wall vertex beside the armpit is two
-//! centimetres from the arm axis but a long way round the crease, so the arm
-//! cannot reach it the way a Euclidean envelope would.
+//! The method is **geodesic bone envelopes**: every deform bone owns the flesh
+//! around the segments it spans, the envelope is measured in that bone's own flesh
+//! section, and a vertex's weight for a bone falls off with the **surface-geodesic**
+//! distance from it. Geodesic distance is the occlusion term: a torso-wall vertex
+//! beside the armpit is two centimetres from the arm axis but a long way round the
+//! crease, so the arm cannot reach it the way a Euclidean envelope would.
+//!
+//! ## The ownership boundary
+//!
+//! An envelope is bounded, and the bound is what keeps an arm from owning a chest.
+//! [`section_radii`] measures each bone's **own flesh section**: the inscribed
+//! radius of the surface along the bone's own segments, read off the geometry
+//! rather than off a vertex ownership that a fat trunk would inflate — the older
+//! rule reported the ribcage's thickness as the arm's own radius (121 mm) and the
+//! arm owned 190 mm of back with it. Three layers then bound the envelope:
+//!
+//! 1. **Ownership.** Flesh belongs to the bone whose *section* is nearest to it,
+//!    not whose axis is: the spine's 90 mm section reaches the chest wall that its
+//!    0 mm axis cannot, and the arm's 29 mm section stops where its axis would not.
+//! 2. **Decay.** A bone's ownership falls off with `ownership_band` sections of
+//!    excess distance past its own flesh, so the handover between two bones is a
+//!    continuous field rather than a step at a partition boundary.
+//! 3. **Reach.** A bone's influence is cut to zero at `reach_band` sections of
+//!    **surface path** from the flesh it seeds. Beyond that the weight is zero, not
+//!    small: three percent of arm weight on a sternum tears it three times over.
+//!
+//! That is the armpit crease, measured instead of named. The crease is the narrowest
+//! flesh between the deltoid and the ribcage: the surface path from the arm's own
+//! skin to the chest wall crosses it, and the chest wall stands a whole trunk section
+//! away from the arm section. Measured on the M2 body at seat `eb318020`, the chest
+//! wall is 74 mm from the arm axis and 113 mm of surface path from the arm's own
+//! skin; the arm's section is 29 mm. Before this boundary existed chest flesh carried
+//! up to `0.797` arm weight and an arm rotation dragged the ribcage 100 mm; with it,
+//! arm weight on chest flesh is exactly zero and the chest moves 0.0 mm.
+//!
+//! The residual limit is the axilla fold itself: flesh between the deltoid and the
+//! ribcage is 90-130 mm from the shoulder joint, and any handover there moves a
+//! vertex that far under arm rotation. The decay and the smoothing widen the
+//! handover band until the field would stop being one owner per limb; a shoulder
+//! joint seated closer to the flesh is what shortens the lever, and that is a seat
+//! problem, not a weight one.
 //!
 //! Concentration comes from the falloff exponent, not from a smoothing hack: a
-//! vertex inside one capsule carries one owner at weight one, and only the
-//! overlap of two capsules (a joint) produces a blend. A shell that no bone
-//! seeds (a garment primitive is its own surface) falls back to the Euclidean
-//! distance, which is declared in the report, never silent.
+//! vertex inside one section carries one owner at weight one, and only the overlap
+//! of two sections (a joint) produces a blend. A shell that no bone seeds (a garment
+//! primitive is its own surface) inherits the flesh it lies on, which is declared in
+//! the report, never silent.
 //!
 //! Normalization and the four-slot cap stay with
 //! [`pack_influences`](crate::weight_norm::pack_influences); this module only
@@ -65,12 +98,19 @@ pub struct DeformBone {
 pub struct AuthorSettings {
     /// Falloff exponent on the inverse geodesic distance.
     pub exponent: f64,
-    /// Falloff distances are measured in units of the vertex's own flesh
-    /// thickness, so one rule serves a nine-centimetre hip and an eight
-    /// millimetre finger.
+    /// Falloff distances are measured in units of the bone's own flesh section,
+    /// so one rule serves a nine-centimetre hip and an eight-millimetre finger.
     pub blend_in_flesh_radii: bool,
-    /// Quantile of a bone's own-owner distances reported as its flesh radius.
-    pub radius_quantile: f64,
+    /// Sections of surface path a bone's influence may travel beyond the flesh it
+    /// seeds before it is cut to zero: the crease an envelope may not cross.
+    pub reach_band: f64,
+    /// Sections over which ownership decays past a bone's own flesh. Two neighbouring
+    /// fingers are one section apart; the crease between an arm and a ribcage is one
+    /// section of the thinner bone.
+    pub ownership_band: f64,
+    /// Sections of a bone's own flesh over which its geodesic falloff decays: the
+    /// width of a joint's blend band, in the units of the bone that reaches.
+    pub falloff_band: f64,
     /// Weights under this fraction of a row's maximum are dropped before packing.
     pub prune_ratio: f64,
     /// Surface smoothing passes over the weight field.
@@ -85,9 +125,11 @@ impl Default for AuthorSettings {
         Self {
             exponent: 4.0,
             blend_in_flesh_radii: true,
-            radius_quantile: 0.75,
+            reach_band: 3.0,
+            ownership_band: 0.6,
+            falloff_band: 2.0,
             prune_ratio: 0.02,
-            smoothing: 2,
+            smoothing: 3,
             midline_dead_zone: 0.010,
         }
     }
@@ -98,8 +140,10 @@ impl Default for AuthorSettings {
 pub struct BoneFootprint {
     /// Bone name.
     pub name: String,
-    /// Capsule radius used for its seeds, metres.
-    pub radius: f64,
+    /// Its own flesh section: the inscribed radius measured along its segments.
+    pub section: f64,
+    /// The surface path its influence is allowed to travel, from the section.
+    pub reach: f64,
     /// Vertices inside the capsule that seeded the geodesic field.
     pub seeds: usize,
     /// Vertices the bone dominates, and their mean dominant weight.
@@ -132,6 +176,16 @@ pub struct AuthorReport {
     pub side_masked_mass: f64,
     /// Vertices whose only influence was the opposite side and kept it.
     pub side_mask_restored: usize,
+    /// Flesh vertices the section rule owns through a bone other than the nearest
+    /// one: the flesh the boundary moved, reported rather than assumed.
+    pub off_nearest: usize,
+    /// Vertices whose envelope mass the reach bound removed.
+    pub envelope_cut_vertices: usize,
+    /// Mass the reach bound removed, in raw pre-pack units.
+    pub envelope_cut_mass: f64,
+    /// Vertices the reach bound would have emptied and left with their heaviest
+    /// influence: the bound must never starve a row, and the exception is counted.
+    pub envelope_restored: usize,
     /// Weights dropped by the relative prune, before the strict pack.
     pub pruned: usize,
     /// Positive weights the strict four-slot pack still dropped.
@@ -273,27 +327,34 @@ pub fn author_weights(
     let count = points.len();
     let surface = Surface::build(&points, triangles);
     let euclidean = euclidean_fields(&points, bones);
-    let radius = flesh_radii(&points, bones, &euclidean, count, settings);
+    // The bone's own flesh section, measured from the surface. Ownership uses it
+    // as a capsule; the falloff and the reach bound use it as their unit.
+    let section = section_radii(&points, bones);
     // The flesh is the caller's body; a garment primitive or any other layer is
     // a shell that has no anatomy of its own and inherits the flesh it lies on.
-    let seeds = seed_sets(&euclidean, bones.len(), count, flesh);
+    let (seeds, off_nearest) = seed_sets(&euclidean, &section, bones.len(), count, flesh);
     let geodesic = geodesic_fields(&surface, &seeds, bones.len());
 
-    // The vertex's own flesh thickness: its Euclidean distance to the bone that
-    // owns it, which every vertex has by construction.
-    let mut local = vec![0.0_f64; count];
-    for vertex in 0..count {
-        local[vertex] = (0..bones.len())
-            .map(|bone| euclidean[bone * count + vertex])
-            .fold(f64::INFINITY, f64::min);
-    }
-    let mut weights = falloff(&geodesic.squared, &local, bones.len(), count, settings);
+    let mut weights = falloff(
+        &geodesic.squared,
+        &euclidean,
+        &section,
+        bones.len(),
+        count,
+        settings,
+    );
     let (axis, origin) = lateral_frame(bones);
     let mask = side_mask(&points, &axis, &origin, settings.midline_dead_zone);
     let mut neighbours = Neighbours::from_surface(&surface);
     for _ in 0..settings.smoothing {
         neighbours.smooth(&mut weights, bones.len(), count);
     }
+    // The bound runs after smoothing and before the shell inheritance: a smoothing
+    // pass would carry cut mass back across the crease, and a shell must inherit
+    // the bounded field of the flesh it lies on.
+    let reach = reach_bounds(&section, settings);
+    let (envelope_cut_vertices, envelope_cut_mass, envelope_restored) =
+        apply_envelope_bound(&mut weights, &geodesic.squared, &reach, bones.len(), count);
     // The mask runs last: a smoothing pass would carry masked mass back across
     // the midline from the dead-zone band, and side isolation is a product gate
     // on the encoded rows, not an aspiration.
@@ -302,7 +363,7 @@ pub fn author_weights(
         apply_side_mask(&mut weights, &mask, bones, count);
 
     let packed = pack_rows(&weights, bones, count, settings)?;
-    let footprints = footprints(&packed.rows, bones, &radius, &seeds);
+    let footprints = footprints(&packed.rows, bones, &section, &reach, &seeds);
     Ok(AuthoredSkin {
         rows: packed.rows,
         report: AuthorReport {
@@ -315,6 +376,10 @@ pub fn author_weights(
             side_masked_vertices: masked_vertices,
             side_masked_mass: masked_mass,
             side_mask_restored: mask_restored,
+            off_nearest,
+            envelope_cut_vertices,
+            envelope_cut_mass,
+            envelope_restored,
             pruned: packed.pruned,
             discarded: packed.discarded,
             lateral_axis: axis.to_array(),
@@ -416,6 +481,16 @@ fn label_components(offsets: &[u32], neighbours: &[u32], vertices: usize) -> usi
     components
 }
 
+/// Where a bone's own flesh section is sampled along its segments: the caps are
+/// skipped, because a bone that ends at the skin measures its own tip there.
+const SECTION_START: f64 = 0.12;
+/// Upper end of the same interior span.
+const SECTION_END: f64 = 0.88;
+/// Sample spacing along a segment when measuring the section, metres.
+const SECTION_STEP: f64 = 0.010;
+/// A section never shrinks below this, so a degenerate bone still gets a unit.
+const SECTION_FLOOR_M: f64 = 1e-3;
+
 /// Euclidean distance from every vertex to every bone's segment set.
 fn euclidean_fields(points: &[DVec3], bones: &[DeformBone]) -> Vec<f64> {
     let count = points.len();
@@ -444,73 +519,155 @@ fn segment_distance(point: DVec3, head: DVec3, tail: DVec3) -> (f64, f64) {
     (point.distance(head + axis * t), t)
 }
 
-/// Each bone's flesh radius: a quantile of the surface distance among the
-/// vertices the bone owns. Diagnostic only — seeding is by ownership, so a bone
-/// cannot gain flesh by having a fat measured radius.
-fn flesh_radii(
-    points: &[DVec3],
-    bones: &[DeformBone],
-    euclidean: &[f64],
-    count: usize,
-    settings: &AuthorSettings,
-) -> Vec<f64> {
-    let mut owned: Vec<Vec<f64>> = vec![Vec::new(); bones.len()];
-    for vertex in 0..count {
-        let mut best = 0;
-        let mut best_distance = f64::INFINITY;
-        for bone in 0..bones.len() {
-            let distance = euclidean[bone * count + vertex];
-            if distance < best_distance {
-                best_distance = distance;
-                best = bone;
+/// Each bone's own flesh section: the largest inscribed radius of the surface
+/// along the interior of its segments, metres.
+///
+/// Measured from the surface, never from the vertices the bone happens to be
+/// nearest to: a limb axis seated inside a fat trunk would report the trunk's
+/// thickness as its own radius, which is how an arm envelope grew to 121 mm and
+/// swallowed the ribcage. A segment's caps are skipped, because a bone that ends
+/// at the skin (a crown, a fingertip) measures its own tip there, not its section.
+fn section_radii(points: &[DVec3], bones: &[DeformBone]) -> Vec<f64> {
+    let all: Vec<usize> = (0..points.len()).collect();
+    let grid = Grid::build(points, &all);
+    bones
+        .iter()
+        .map(|bone| {
+            let mut best = 0.0_f64;
+            for (head, tail) in &bone.segments {
+                let axis = *tail - *head;
+                let length = axis.length();
+                if length <= f64::EPSILON {
+                    continue;
+                }
+                let steps = ((length * (SECTION_END - SECTION_START) / SECTION_STEP).ceil()
+                    as usize)
+                    .max(2);
+                for step in 0..=steps {
+                    let t =
+                        SECTION_START + (SECTION_END - SECTION_START) * step as f64 / steps as f64;
+                    let sample = *head + axis * t;
+                    if let Some(distance) = grid.distance_to_nearest(points, sample) {
+                        best = best.max(distance);
+                    }
+                }
             }
-        }
-        if best_distance.is_finite() {
-            owned[best].push(best_distance);
-        }
-    }
-    let _ = points;
-    owned
-        .iter_mut()
-        .map(|distances| {
-            if distances.is_empty() {
-                return 0.0;
-            }
-            distances.sort_by(f64::total_cmp);
-            let index = ((distances.len() - 1) as f64 * settings.radius_quantile).round() as usize;
-            distances[index]
+            best
         })
         .collect()
 }
 
-/// Each bone's seed set: the surface it is Euclidean-nearest to.
+/// Each bone's seed set: the flesh belongs to the bone whose **own section** is
+/// nearest to it.
 ///
-/// Ownership, not a capsule, is what makes the field truthful. A capsule is a
-/// guess at a bone's thickness, and a torso bone's wide capsule reaches into the
-/// biceps while a finger's narrow one loses the palm. The nearest-owner region
-/// needs no such guess: a bone seeds exactly the flesh it is closest to, and the
-/// geodesic field then carries its influence across the joint band and no
-/// further. A bone with no owned vertices seeds nothing and carries no weight.
-fn seed_sets(euclidean: &[f64], bones: usize, count: usize, flesh: &[bool]) -> Vec<Vec<u32>> {
+/// A capsule is a guess at a bone's thickness, and a torso bone's wide capsule
+/// reaches into the biceps while a finger's narrow one loses the palm. Seeding by
+/// the bare nearest bone has the opposite defect on a fat body: an A-pose arm
+/// rests against the ribcage, so the chest wall is nearer to the arm axis than to
+/// the midline spine column and one arm owned 190 mm of back. Measuring the
+/// distance to the bone's *section* instead of to the bone settles both: the
+/// spine's 90 mm section reaches the chest wall that its 0 mm axis cannot, and the
+/// arm's 29 mm section stops at the armpit crease that its axis would cross.
+///
+/// Every flesh vertex gets exactly one owner, so the field starts at weight one and
+/// blends only where two sections meet. The report counts the vertices this rule
+/// moves off the nearest bone — [`AuthorReport::off_nearest_bone`] — so the effect of
+/// the boundary is measurable, not asserted.
+fn seed_sets(
+    euclidean: &[f64],
+    section: &[f64],
+    bones: usize,
+    count: usize,
+    flesh: &[bool],
+) -> (Vec<Vec<u32>>, usize) {
     let mut seeds = vec![Vec::new(); bones];
+    let mut off_nearest = 0;
     for vertex in 0..count {
         if !flesh[vertex] {
             continue;
         }
-        let mut best = 0;
-        let mut best_distance = f64::INFINITY;
+        let mut best = None::<((f64, f64), usize)>;
+        let mut nearest = None::<(f64, usize)>;
         for bone in 0..bones {
             let distance = euclidean[bone * count + vertex];
-            if distance < best_distance {
-                best_distance = distance;
-                best = bone;
+            if !distance.is_finite() {
+                continue;
+            }
+            if nearest.is_none_or(|(known, _)| distance < known) {
+                nearest = Some((distance, bone));
+            }
+            let surface = (distance - section[bone]).max(0.0);
+            let key = (surface, distance);
+            if best.is_none_or(|(known, _)| key < known) {
+                best = Some((key, bone));
             }
         }
-        if best_distance.is_finite() {
-            seeds[best].push(vertex as u32);
+        if let Some((_, bone)) = best {
+            if nearest.is_some_and(|(_, raw)| raw != bone) {
+                off_nearest += 1;
+            }
+            seeds[bone].push(vertex as u32);
         }
     }
-    seeds
+    (seeds, off_nearest)
+}
+
+/// How far each bone's influence may travel, metres: its own section, scaled.
+fn reach_bounds(section: &[f64], settings: &AuthorSettings) -> Vec<f64> {
+    section
+        .iter()
+        .map(|radius| settings.reach_band * radius.max(SECTION_FLOOR_M))
+        .collect()
+}
+
+/// Cut every bone's weight beyond its reach, and never starve a row.
+///
+/// This is the ownership boundary itself: a bone whose surface path to a vertex
+/// is longer than its reach owns nothing there, so the arm's envelope stops at
+/// the armpit crease instead of thinning out across the chest. A row that would
+/// be emptied keeps its heaviest influence, and the count of those is reported.
+fn apply_envelope_bound(
+    weights: &mut [f64],
+    squared: &[f64],
+    reach: &[f64],
+    bones: usize,
+    count: usize,
+) -> (usize, f64, usize) {
+    let mut vertices = 0;
+    let mut mass = 0.0;
+    let mut restored = 0;
+    for vertex in 0..count {
+        let mut removed = 0.0;
+        let mut heaviest = None::<(f64, usize)>;
+        for bone in 0..bones {
+            let weight = weights[bone * count + vertex];
+            if weight <= 0.0 {
+                continue;
+            }
+            if squared[bone * count + vertex] <= reach[bone] * reach[bone] {
+                continue;
+            }
+            removed += weight;
+            if heaviest.is_none_or(|(known, _)| weight > known) {
+                heaviest = Some((weight, bone));
+            }
+            weights[bone * count + vertex] = 0.0;
+        }
+        if removed <= 0.0 {
+            continue;
+        }
+        vertices += 1;
+        mass += removed;
+        let remaining: f64 = (0..bones).map(|bone| weights[bone * count + vertex]).sum();
+        if remaining > 0.0 {
+            continue;
+        }
+        if let Some((weight, bone)) = heaviest {
+            weights[bone * count + vertex] = weight;
+            restored += 1;
+        }
+    }
+    (vertices, mass, restored)
 }
 
 /// Give every shell vertex the weights of the nearest flesh vertex.
@@ -588,8 +745,17 @@ impl Grid {
     /// inner boundary of the next shell, so a loose layer standing off the body
     /// (a boxer short at 110 mm) is still resolved exactly.
     fn nearest(&self, points: &[DVec3], vertex: usize) -> Option<usize> {
-        let (x, y, z) = Self::key(points[vertex], self.cell);
-        let point = points[vertex];
+        self.search(points, points[vertex])
+            .map(|(_, source)| source)
+    }
+
+    /// Distance from an arbitrary point to the nearest source vertex.
+    fn distance_to_nearest(&self, points: &[DVec3], point: DVec3) -> Option<f64> {
+        self.search(points, point).map(|(distance, _)| distance)
+    }
+
+    fn search(&self, points: &[DVec3], point: DVec3) -> Option<(f64, usize)> {
+        let (x, y, z) = Self::key(point, self.cell);
         let mut best: Option<(f64, usize)> = None;
         for ring in 0..=64_i64 {
             if let Some((distance, _)) = best
@@ -616,7 +782,7 @@ impl Grid {
                 }
             }
         }
-        best.map(|(_, source)| source)
+        best
     }
 }
 
@@ -705,15 +871,28 @@ impl Ord for Candidate {
     }
 }
 
-/// Inverse-distance falloff over each bone's geodesic field.
+/// Inverse-distance falloff over each bone's geodesic field, gated by ownership.
 ///
-/// `w = (r / (d + r))^p` with `r` the vertex's own flesh thickness — its
-/// Euclidean distance to the bone that owns it. A joint therefore blends over a
-/// band proportional to the flesh it joins: wide at the hip, narrow at a finger,
-/// with no per-region number anywhere. An unreachable bone contributes nothing.
+/// `w = ownership * (r / (d + r))^p`, with `r` the **bone's own** flesh section and
+/// `d` the surface path from the bone's seeds. A joint therefore blends over a
+/// band the size of the bone's own flesh: a thin arm decays over its own
+/// centimetres and cannot smear across a trunk, while a fat trunk blends wide as
+/// it should. Using the *vertex's* thickness here — the older rule — let an arm
+/// reach 90 mm into a chest, because the reach was the chest's fatness rather than
+/// the arm's.
+///
+/// `ownership = exp(-(d_e - r) / (reach_band r))` is what keeps the boundary from
+/// becoming a step. A hard partition (one owner at one, everyone else from the falloff) puts
+/// the whole weight jump on the two rings that straddle the crease; at a 130 mm
+/// lever arm that is a tear of several times the rest length. The excess distance
+/// past a bone's own section is continuous in space, so an exponential in it makes
+/// the ownership itself continuous, and the blend spans about one section of the
+/// thinner bone — the width of the crease being crossed. An unreachable bone
+/// contributes nothing.
 fn falloff(
     squared: &[f64],
-    local: &[f64],
+    euclidean: &[f64],
+    section: &[f64],
     bones: usize,
     count: usize,
     settings: &AuthorSettings,
@@ -721,17 +900,22 @@ fn falloff(
     let mut weights = vec![0.0_f64; bones * count];
     for bone in 0..bones {
         let row = &squared[bone * count..(bone + 1) * count];
+        let distance = &euclidean[bone * count..(bone + 1) * count];
         let target = &mut weights[bone * count..(bone + 1) * count];
+        let flesh = section[bone].max(SECTION_FLOOR_M);
+        let reach = match settings.blend_in_flesh_radii {
+            true => flesh * settings.falloff_band,
+            false => 1.0,
+        };
+        let span = (flesh * settings.ownership_band).max(SECTION_FLOOR_M);
         for vertex in 0..count {
             if !row[vertex].is_finite() {
                 continue;
             }
-            let reach = match settings.blend_in_flesh_radii {
-                true => local[vertex].max(1e-4),
-                false => 1.0,
-            };
+            let excess = (distance[vertex] - section[bone]).max(0.0);
+            let ownership = (-excess / span).exp();
             let ratio = reach / (row[vertex].sqrt() + reach);
-            target[vertex] = ratio.powf(settings.exponent);
+            target[vertex] = ownership * ratio.powf(settings.exponent);
         }
     }
     weights
@@ -953,7 +1137,8 @@ fn pack_rows(
 fn footprints(
     rows: &[Influences],
     bones: &[DeformBone],
-    radius: &[f64],
+    section: &[f64],
+    reach: &[f64],
     seeds: &[Vec<u32>],
 ) -> Vec<BoneFootprint> {
     let mut mass = vec![0.0_f64; bones.len()];
@@ -986,7 +1171,8 @@ fn footprints(
         .enumerate()
         .map(|(slot, bone)| BoneFootprint {
             name: bone.name.clone(),
-            radius: radius[slot],
+            section: section[slot],
+            reach: reach[slot],
             seeds: seeds[slot].len(),
             dominated: dominated[slot],
             dominance: match dominated[slot] {

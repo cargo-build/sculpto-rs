@@ -551,46 +551,140 @@ pub fn snap_to_medial(field: &MedialField, point: DVec3, max_dist: f64) -> Optio
 }
 
 /// Signed surface distance of a point, millimetres: the true point-triangle
-/// distance to the nearest face, signed by +X ray parity (odd crossings = inside).
-/// This is the containment authority the acceptance gate uses; the voxel field's
-/// nearest-cell probe flips on surface-coincident joints at 3 mm resolution, so
-/// placement reports measure with this instead. A point on the surface reads
+/// distance to the nearest face, signed by ray parity voted over the six axis
+/// directions. A single +X ray degenerates where it runs along a finger row or
+/// grazes a seam (measured: LeftHandPinky1 counts 10 crossings on +X but 1 on
+/// every other axis), so inside is the majority vote; a 3-3 tie falls back to
+/// +X and is visible in the vote count. This is the containment authority the
+/// acceptance gate should use; the voxel field's nearest-cell probe flips on
+/// surface-coincident joints at 3 mm resolution. A point on the surface reads
 /// ±hundredths of a millimetre — parity is undecidable there, hence the gate's
 /// 1 mm tolerance.
-pub fn surface_probe(vertices: &[[f64; 3]], triangles: &[[u32; 3]], point: DVec3) -> (f64, bool) {
-    let mut crossings = 0_u32;
+pub fn surface_probe(
+    vertices: &[[f64; 3]],
+    triangles: &[[u32; 3]],
+    point: DVec3,
+) -> (f64, bool, u32) {
     let mut best = f64::INFINITY;
+    let mut crossings = [0_u32; 6];
+    let dirs = [
+        DVec3::X,
+        -DVec3::X,
+        DVec3::Y,
+        -DVec3::Y,
+        DVec3::Z,
+        -DVec3::Z,
+    ];
     for tri in triangles {
         let a = DVec3::from_array(vertices[tri[0] as usize]);
         let b = DVec3::from_array(vertices[tri[1] as usize]);
         let c = DVec3::from_array(vertices[tri[2] as usize]);
         best = best.min(point_tri_distance(point, a, b, c));
-        // Moller-Trumbore along +X.
         let edge1 = b - a;
         let edge2 = c - a;
-        let h = DVec3::X.cross(edge2);
-        let det = edge1.dot(h);
-        if det.abs() < 1e-12 {
-            continue;
-        }
-        let inv = 1.0 / det;
         let s = point - a;
-        let u = s.dot(h) * inv;
-        if !(0.0..=1.0).contains(&u) {
-            continue;
-        }
         let q = s.cross(edge1);
-        let v = q.x * inv;
-        if v < 0.0 || u + v > 1.0 {
-            continue;
-        }
-        let t = edge2.dot(q) * inv;
-        if t > 1e-9 {
-            crossings += 1;
+        for (k, dir) in dirs.iter().enumerate() {
+            // Moller-Trumbore along `dir`.
+            let h = dir.cross(edge2);
+            let det = edge1.dot(h);
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let u = s.dot(h) * inv;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let v = q.dot(*dir) * inv;
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let t = edge2.dot(q) * inv;
+            if t > 1e-9 {
+                crossings[k] += 1;
+            }
         }
     }
-    let inside = crossings % 2 == 1;
-    (best * 1000.0 * if inside { -1.0 } else { 1.0 }, inside)
+    let votes: u32 = crossings.iter().map(|&c| u32::from(c % 2 == 1)).sum();
+    let inside = if votes == 3 {
+        crossings[0] % 2 == 1
+    } else {
+        votes > 3
+    };
+    (
+        best * 1000.0 * if inside { -1.0 } else { 1.0 },
+        inside,
+        votes,
+    )
+}
+
+/// The closest point on the flesh surface to `point` (nearest triangle projection,
+/// Ericson). Used to seat the zero-weight leaf-tip markers (fingertip / toe tip / crown)
+/// on the skin: they define the chain's terminal extent and carry no weight, so placing
+/// them on the surface keeps them within the gate tolerance instead of past it.
+pub fn closest_surface_point(vertices: &[[f64; 3]], triangles: &[[u32; 3]], point: DVec3) -> DVec3 {
+    let mut best = f64::INFINITY;
+    let mut out = point;
+    for tri in triangles {
+        let a = DVec3::from_array(vertices[tri[0] as usize]);
+        let b = DVec3::from_array(vertices[tri[1] as usize]);
+        let c = DVec3::from_array(vertices[tri[2] as usize]);
+        let (d, p) = closest_point_on_tri(point, a, b, c);
+        if d < best {
+            best = d;
+            out = p;
+        }
+    }
+    out
+}
+
+/// Closest point on a triangle to `p` and its distance (Ericson, Real-Time Collision
+/// Detection): the barycentric region test, clamped to the nearest edge/vertex.
+fn closest_point_on_tri(p: DVec3, a: DVec3, b: DVec3, c: DVec3) -> (f64, DVec3) {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return (ap.length(), a);
+    }
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return (bp.length(), b);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        let q = a + ab * v;
+        return ((p - q).length(), q);
+    }
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return (cp.length(), c);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        let q = a + ac * w;
+        return ((p - q).length(), q);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let q = b + (c - b) * w;
+        return ((p - q).length(), q);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    let q = a + ab * v + ac * w;
+    ((p - q).length(), q)
 }
 
 /// Half 1 — the anatomy template of a skeleton's own body, as data.
@@ -1092,7 +1186,7 @@ pub fn flesh_centrelines(field: &MedialField) -> FleshCentrelines {
     let waist = pelvis_peak.and_then(|p| (p..n.saturating_sub(1)).find(|&k| is_min(k)));
     let hip_anchor = waist
         .and_then(|w| lobe_max(&spine, 0, w))
-        .or_else(|| pelvis_peak.map(|k| k))
+        .or(pelvis_peak)
         .or_else(|| lobe_max(&spine, 0, n / 3))
         .map(|k| spine[k]);
     let chest = waist.and_then(|w| lobe_max(&spine, w, n)).unwrap_or(n / 2);
@@ -1138,6 +1232,224 @@ pub fn flesh_centrelines(field: &MedialField) -> FleshCentrelines {
         hip_left,
         hip_right,
     }
+}
+
+/// Flesh digit centrelines: the medial-skeleton graph paths from an anchor junction
+/// (wrist / toe base) to the `count` farthest reachable fingertip endpoints on a side.
+/// Each path is a centreline inside the flesh by construction (skeleton cells are inside),
+/// so digit joints placed along it stay in the hand/foot rather than following Mixamo's
+/// T-pose digit direction into the air beside an A-pose hand. Paths are ordered by the
+/// endpoint angle around the anchor so the digits fan in anatomical order. No native input.
+pub fn digit_paths(
+    field: &MedialField,
+    anchor: DVec3,
+    side: f64,
+    cx: f64,
+    count: usize,
+) -> Vec<Vec<(DVec3, f64)>> {
+    let [nx, ny, nz] = field.grid.dims;
+    let nxy = nx * ny;
+    let skel: Vec<usize> = (0..field.skeleton.len())
+        .filter(|&i| field.skeleton[i])
+        .collect();
+    if skel.is_empty() {
+        return Vec::new();
+    }
+    let slot: BTreeMap<usize, usize> = skel.iter().enumerate().map(|(s, &c)| (c, s)).collect();
+    let world = |c: usize| {
+        let x = c % nx;
+        let y = (c / nx) % ny;
+        let z = c / nxy;
+        field.grid.world(x, y, z)
+    };
+    // Anchor cell: the skeleton cell nearest the anchor junction.
+    let anchor_slot = skel
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            world(*a.1)
+                .distance(anchor)
+                .total_cmp(&world(*b.1).distance(anchor))
+        })
+        .map(|(s, _)| s)
+        .unwrap_or(0);
+    // BFS over the 26-adjacent skeleton graph, recording parents for path reconstruction.
+    let mut parent: Vec<Option<usize>> = vec![None; skel.len()];
+    let mut seen = vec![false; skel.len()];
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    seen[anchor_slot] = true;
+    queue.push_back(anchor_slot);
+    while let Some(u) = queue.pop_front() {
+        let c = skel[u];
+        let x = (c % nx) as i32;
+        let y = ((c / nx) % ny) as i32;
+        let z = (c / nxy) as i32;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let (xx, yy, zz) = (x + dx, y + dy, z + dz);
+                    if xx < 0 || yy < 0 || zz < 0 {
+                        continue;
+                    }
+                    let (xx, yy, zz) = (xx as usize, yy as usize, zz as usize);
+                    if xx >= nx || yy >= ny || zz >= nz {
+                        continue;
+                    }
+                    if let Some(&v) = slot.get(&field.grid.idx(xx, yy, zz))
+                        && !seen[v]
+                    {
+                        seen[v] = true;
+                        parent[v] = Some(u);
+                        queue.push_back(v);
+                    }
+                }
+            }
+        }
+    }
+    // Fingertip endpoints on this side, far lateral and within reach of the anchor.
+    let mut ends: Vec<(f64, usize)> = skeleton_endpoints(field)
+        .into_iter()
+        .filter(|(p, _)| {
+            (p.x - cx) * side > 0.25 && p.distance(anchor) > 0.04 && p.distance(anchor) < 0.26
+        })
+        .filter_map(|(p, _)| {
+            let c = field.grid.idx(
+                ((p.x - field.grid.origin.x) / field.grid.h).round() as usize,
+                ((p.y - field.grid.origin.y) / field.grid.h).round() as usize,
+                ((p.z - field.grid.origin.z) / field.grid.h).round() as usize,
+            );
+            slot.get(&c).map(|&s| (p.distance(anchor), s))
+        })
+        .filter(|(_, s)| seen[*s])
+        .collect();
+    ends.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ends.truncate(count);
+    // Order by endpoint angle around the anchor (anatomical fan order).
+    ends.sort_by(|a, b| {
+        let pa = world(skel[a.1]);
+        let pb = world(skel[b.1]);
+        let aa = (pa.z - anchor.z).atan2((pa.x - anchor.x) * side);
+        let bb = (pb.z - anchor.z).atan2((pb.x - anchor.x) * side);
+        aa.total_cmp(&bb)
+    });
+    // Reconstruct each anchor -> endpoint path as a centreline polyline.
+    let mut out = Vec::new();
+    for (_, end_slot) in ends {
+        let mut path = Vec::new();
+        let mut cur = Some(end_slot);
+        while let Some(s) = cur {
+            let c = skel[s];
+            path.push((world(c), f64::from(field.radius[c])));
+            if s == anchor_slot {
+                break;
+            }
+            cur = parent[s];
+        }
+        path.reverse();
+        if path.len() >= 2 {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Place points on a centreline at target **chord** fractions (the fraction of the
+/// cumulative straight-line distance between consecutive placed points, which is how
+/// Mixamo's own chain fractions and the acceptance gate are measured). The points stay
+/// on the medial axis — only their arc parameters are adjusted so the seated chord
+/// fractions match the targets. A gently curved centreline converges in a few passes;
+/// this reconciles arc-length placement with the chord-fraction gate without bending
+/// the skeleton off the flesh.
+pub fn place_at_chord_fractions(pts: &[(DVec3, f64)], fractions: &[f64]) -> Vec<(DVec3, f64)> {
+    let m = fractions.len();
+    if m == 0 || pts.is_empty() {
+        return Vec::new();
+    }
+    if m == 1 {
+        return vec![FleshCentrelines::point_at(pts, fractions[0])];
+    }
+    let mut t: Vec<f64> = fractions.to_vec();
+    let mut out: Vec<(DVec3, f64)> = Vec::new();
+    for _ in 0..12 {
+        out = t
+            .iter()
+            .map(|&f| FleshCentrelines::point_at(pts, f))
+            .collect();
+        let mut cum = vec![0.0_f64; m];
+        for k in 1..m {
+            cum[k] = cum[k - 1] + out[k].0.distance(out[k - 1].0);
+        }
+        let total = cum[m - 1];
+        if total < 1e-9 {
+            break;
+        }
+        let mut max_err = 0.0_f64;
+        for k in 1..m - 1 {
+            let cf = cum[k] / total;
+            let err = fractions[k] - cf;
+            max_err = max_err.max(err.abs());
+            t[k] = (t[k] + err).clamp(0.0, 1.0);
+        }
+        // Keep the arc parameters monotonic so the points stay ordered along the axis.
+        for k in 1..m {
+            if t[k] < t[k - 1] {
+                t[k] = t[k - 1];
+            }
+        }
+        if max_err < 1e-4 {
+            break;
+        }
+    }
+    out
+}
+
+/// Skeleton endpoints: cells with <= 1 skeleton neighbour in the 26-neighbourhood, with
+/// inscribed radius. The fingertips and toe tips are endpoints of the thinned centreline;
+/// they seed the flesh-derived digit axes (no native input).
+pub fn skeleton_endpoints(field: &MedialField) -> Vec<(DVec3, f64)> {
+    let [nx, ny, nz] = field.grid.dims;
+    let nxy = nx * ny;
+    let skel: Vec<usize> = (0..field.skeleton.len())
+        .filter(|&i| field.skeleton[i])
+        .collect();
+    let set: std::collections::BTreeSet<usize> = skel.iter().copied().collect();
+    let mut out = Vec::new();
+    for &i in &skel {
+        let x = (i % nx) as i32;
+        let y = ((i / nx) % ny) as i32;
+        let z = (i / nxy) as i32;
+        let mut deg = 0;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let (xx, yy, zz) = (x + dx, y + dy, z + dz);
+                    if xx < 0 || yy < 0 || zz < 0 {
+                        continue;
+                    }
+                    let (xx, yy, zz) = (xx as usize, yy as usize, zz as usize);
+                    if xx >= nx || yy >= ny || zz >= nz {
+                        continue;
+                    }
+                    if set.contains(&field.grid.idx(xx, yy, zz)) {
+                        deg += 1;
+                    }
+                }
+            }
+        }
+        if deg <= 1 {
+            out.push((
+                field.grid.world(x as usize, y as usize, z as usize),
+                f64::from(field.radius[i]),
+            ));
+        }
+    }
+    out
 }
 
 /// One anatomical chain's flesh centreline, extracted from the medial skeleton.
@@ -1648,11 +1960,18 @@ mod tests {
         let r = 0.10;
         let (v, t) = sphere(r, 48, 48);
         // Centre: inside by parity, one radius from the surface.
-        let (mm, inside) = surface_probe(&v, &t, DVec3::ZERO);
+        let (mm, inside, votes) = surface_probe(&v, &t, DVec3::ZERO);
         assert!(inside, "sphere centre must be inside");
+        // The probe's contract is a majority vote, not unanimity: the ±Y rays pass
+        // through the sphere's pole vertices, where parity is degenerate, so up to two
+        // axes may disagree. A convex centre still wins the vote (>= 4 of 6).
+        assert!(
+            votes >= 4,
+            "a convex body wins the axis vote, got {votes}/6"
+        );
         assert!((mm + r * 1000.0).abs() < 1.0, "centre signed {mm} vs -100");
         // Outside on +X: positive, distance to the surface.
-        let (mm, inside) = surface_probe(&v, &t, DVec3::new(0.2, 0.0, 0.0));
+        let (mm, inside, _) = surface_probe(&v, &t, DVec3::new(0.2, 0.0, 0.0));
         assert!(!inside, "exterior point must be outside");
         assert!(
             (mm - r * 1000.0).abs() < 1.0,
@@ -1660,7 +1979,7 @@ mod tests {
         );
         // On the surface: distance ~0; parity is undecidable there (the gate's
         // 1 mm tolerance exists for exactly this coincidence).
-        let (mm, _) = surface_probe(&v, &t, DVec3::new(r, 0.0, 0.0));
+        let (mm, _, _) = surface_probe(&v, &t, DVec3::new(r, 0.0, 0.0));
         assert!(mm.abs() < 1.0, "surface point signed {mm}");
     }
 
