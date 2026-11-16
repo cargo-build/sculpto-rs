@@ -20,8 +20,8 @@ use glam::{DMat4, DQuat, DVec3};
 use gltf::binary::Glb;
 use sculpto_engine::regression::{
     ClearanceFrame, RegressionActor, RegressionParams, chain_aligned, chain_local, clearance_gate,
-    clearance_metrics, clothing_gate, rest_frame_axes, run_params, spine_gate, spine_metrics,
-    stretch_gate,
+    clearance_metrics, clothing_gate, rest_frame_axes, rotation_range_deg, run_params, spine_gate,
+    spine_metrics, stretch_gate,
 };
 use serde_json::{Value, json};
 
@@ -484,7 +484,9 @@ fn the_spine_gate_refuses_on_the_floor_when_the_own_walk_is_straight() {
     let mut bent = straight.clone();
     bent.peak_lateral_deviation_mm = 138.0;
     bent.peak_lateral_tilt_deg = 12.0;
-    let verdict = spine_gate(&straight, &bent, "actor/adapted");
+    // A reference default (a clip that animates the torso) keeps the
+    // relative-with-floor form: 138 mm over a straight reference fails.
+    let verdict = spine_gate(&straight, &bent, "actor/adapted", true);
     assert!(!verdict.pass, "{verdict:?}");
     assert_eq!(verdict.gate, "spine_lateral");
     // The floors exist so a straight default cannot absorb the gate; a small
@@ -492,8 +494,53 @@ fn the_spine_gate_refuses_on_the_floor_when_the_own_walk_is_straight() {
     let mut sway = straight.clone();
     sway.peak_lateral_deviation_mm = 4.0;
     sway.peak_lateral_tilt_deg = 1.0;
-    let verdict = spine_gate(&straight, &sway, "actor/adapted");
+    let verdict = spine_gate(&straight, &sway, "actor/adapted", true);
     assert!(verdict.pass, "{verdict:?}");
+}
+
+#[test]
+fn an_unanimated_own_walk_never_serves_as_the_spine_reference() {
+    // The measured bracket, absolute: the healthy aimed transfer (27.6 mm
+    // peak, 5.1° tilt) passes; the pre-fix defect (138 mm, 24°) fails. The
+    // detail must say the default clip drives no torso channel.
+    let straight = spine_metrics(&straight_chain(), &[(0.5, straight_chain())]);
+    let mut healthy = straight.clone();
+    healthy.peak_lateral_deviation_mm = 27.6;
+    healthy.peak_lateral_tilt_deg = 5.09;
+    let verdict = spine_gate(&straight, &healthy, "actor/adapted", false);
+    assert!(verdict.pass, "{verdict:?}");
+    assert!(verdict.detail.contains("no spine or neck"), "{verdict:?}");
+    let mut defect = straight.clone();
+    defect.peak_lateral_deviation_mm = 138.0;
+    defect.peak_lateral_tilt_deg = 24.0;
+    let verdict = spine_gate(&straight, &defect, "actor/adapted", false);
+    assert!(!verdict.pass, "{verdict:?}");
+    // A sway that only fails because the unanimated default reads 0.0 is the
+    // trap the flag exists for: 27.6 mm would fail a 5 mm floor but must pass
+    // the bracket.
+    let mut marginal = straight.clone();
+    marginal.peak_lateral_deviation_mm = 6.0;
+    marginal.peak_lateral_tilt_deg = 1.5;
+    assert!(spine_gate(&straight, &marginal, "actor/adapted", false).pass);
+}
+
+#[test]
+fn rotation_range_reads_the_travel_of_one_channel() {
+    let static_values = vec![[0.0, 0.0, 0.0, 1.0]; 4];
+    assert!(rotation_range_deg(&static_values) < 1e-9);
+    let mut swing = static_values.clone();
+    let half = (30.0_f64).to_radians() / 2.0;
+    swing[1] = [0.0, 0.0, half.sin(), half.cos()];
+    swing[2] = [0.0, 0.0, -half.sin(), half.cos()];
+    let range = rotation_range_deg(&swing);
+    assert!(
+        (range - 60.0).abs() < 0.5,
+        "the swing spans 60 degrees: {range}"
+    );
+    // Identity quats list: the same 60 degrees, not doubled by the pairing.
+    let mut wrapped = swing.clone();
+    wrapped.push([0.0, 0.0, 0.0, -1.0]);
+    assert!(rotation_range_deg(&wrapped) <= 180.0);
 }
 
 #[test]
@@ -614,6 +661,10 @@ fn the_harness_names_the_rows_the_broken_transfer_breaks() {
             stress_clips: Vec::new(),
             body: "Body".to_owned(),
             garments: Vec::new(),
+            source: None,
+            source_clip: None,
+            native: None,
+            native_clip: None,
         }],
         frames: 8,
         tolerance: 0.0021,

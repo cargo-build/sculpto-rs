@@ -261,7 +261,10 @@ fn actor_error(error: sculpto_mesh::actor::ActorError) -> CommandError {
 }
 
 /// The clip the source GLB carries, by name or by being the only one.
-fn source_clip_name(actor: &Actor, declared: Option<&str>) -> Result<String, CommandError> {
+pub(crate) fn source_clip_name(
+    actor: &Actor,
+    declared: Option<&str>,
+) -> Result<String, CommandError> {
     let names: Vec<String> = actor
         .clip_names()
         .into_iter()

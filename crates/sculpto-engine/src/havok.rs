@@ -16,7 +16,7 @@
 //! hk_2010 layouts of the classes read here are fixed, and a version mismatch is a
 //! named refusal, not a guess.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use glam::{DQuat, DVec3};
@@ -24,6 +24,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use sculpto_gltf::pack::{PackWriter, Track};
 use sculpto_mesh::actor::Actor;
 
 use crate::export_glb::refused;
@@ -202,18 +203,19 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
         })
         .collect();
 
-    let actor = match params.actor.as_deref() {
+    let (actor, actor_bytes) = match params.actor.as_deref() {
         Some(path) => {
             let bytes = std::fs::read(path).map_err(|error| errors::io(path, error))?;
-            Some(Actor::from_glb(&bytes).map_err(|error| {
+            let actor = Actor::from_glb(&bytes).map_err(|error| {
                 CommandError::new(
                     ErrorKind::InvalidRequest,
                     "havok_actor",
                     format!("{}: {error}", path.display()),
                 )
-            })?)
+            })?;
+            (Some(actor), Some(bytes))
         }
-        None => None,
+        None => (None, None),
     };
     let palette: Vec<String> = match &actor {
         Some(actor) => actor
@@ -239,12 +241,14 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
         .collect();
 
     let mut unbound_tracks: Vec<Value> = Vec::new();
+    let mut palette_slots: Vec<Option<usize>> = Vec::with_capacity(clip.tracks.len());
     let mut rows: Vec<Value> = Vec::with_capacity(clip.tracks.len());
     for (track_index, track) in clip.tracks.iter().enumerate() {
         let bone_index = track_bones.get(track_index).copied().flatten();
         let bone_name = bone_index.map(|bone| skeleton.bones[bone].as_str());
         let slot =
             bone_name.and_then(|name| slot_of_name.get(&crate::retarget::compact(name)).copied());
+        palette_slots.push(slot);
         let motion = track_motion(track, params.scale);
         if slot.is_none() {
             unbound_tracks.push(json!({
@@ -319,12 +323,36 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
         std::fs::write(path, text).map_err(|error| errors::io(path, error))?;
     }
     if let Some(path) = params.out.as_deref() {
-        let bytes = write_source_glb(&skeleton, &clip, &track_bones, params.scale)?;
+        let clip_name = clip_stem(params);
+        let (bytes, written_name) = match (&actor, &actor_bytes) {
+            // With an actor, the clip lands in a copy of the actor: mesh,
+            // garments and skin survive, so the artifact measures and shows.
+            (Some(actor), Some(bytes)) => (
+                write_actor_clip(
+                    bytes,
+                    actor,
+                    &clip,
+                    &palette_slots,
+                    params.scale,
+                    &clip_name,
+                )?,
+                clip_name,
+            ),
+            // Without one, the rig-only source GLB the adapt path consumes.
+            _ => (
+                write_source_glb(&skeleton, &clip, &track_bones, params.scale, &clip_name)?,
+                clip_name,
+            ),
+        };
         std::fs::write(path, &bytes).map_err(|error| errors::io(path, error))?;
-        report["source_glb"] = json!({
+        report["written_clip"] = json!({
             "path": path.display().to_string(),
             "bytes": bytes.len(),
-            "clip": "attack",
+            "name": written_name,
+            "mode": match actor.is_some() {
+                true => "actor-bound",
+                false => "rig-only source",
+            },
         });
         // Rewrite with the GLB facts now that the file exists.
         if let Some(report_path) = params.report.as_deref() {
@@ -334,6 +362,127 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
         }
     }
     Ok(report)
+}
+
+/// The written clip's name: the member or file stem, so a decoded walk is
+/// `1hm_walkforward` instead of the writer's old `attack` default.
+fn clip_stem(params: &HavokParams) -> String {
+    let stem = match params.member.as_deref() {
+        Some(member) => std::path::Path::new(member)
+            .file_stem()
+            .and_then(|stem| stem.to_str()),
+        None => params
+            .file
+            .as_deref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str()),
+    };
+    stem.unwrap_or("havok").to_owned()
+}
+
+/// glTF LINEAR rotation keys must share a hemisphere: flip each key that dots
+/// negative against its predecessor.
+fn hemisphere_fixed(rotations: &[[f64; 4]]) -> Vec<[f64; 4]> {
+    let mut hemisphere = [1.0_f64; 4];
+    rotations
+        .iter()
+        .map(|quaternion| {
+            let mut q = *quaternion;
+            if !q.iter().all(|value| value.is_finite()) {
+                q = [0.0, 0.0, 0.0, 1.0];
+            }
+            if q.iter()
+                .zip(hemisphere.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
+                < 0.0
+            {
+                q = q.map(|value| -value);
+            }
+            hemisphere = q;
+            q
+        })
+        .collect()
+}
+
+/// Write the decoded clip into a copy of the actor GLB: nodes, mesh, garments
+/// and skin are the actor's own, and only the animation block grows. The clip
+/// takes the walk slot (index 1), the slot the viewer plays as the walk, and
+/// the name is the clip stem. The first track bound to a palette slot wins; a
+/// later duplicate is named in the refusal rather than silently overwriting.
+fn write_actor_clip(
+    actor_bytes: &[u8],
+    actor: &Actor,
+    clip: &SplineClip,
+    palette_slots: &[Option<usize>],
+    scale: f64,
+    name: &str,
+) -> Result<Vec<u8>, CommandError> {
+    let invalid = |detail: String| errors::invalid("havok_glb", detail);
+    let times = clip.times();
+    if times.len() < 2 {
+        return Err(invalid(format!(
+            "the clip has {} frame(s); a written clip needs at least two",
+            times.len()
+        )));
+    }
+    let joints = actor.skin_joints().map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidRequest,
+            "havok_actor",
+            format!("the actor palette cannot be read: {error}"),
+        )
+    })?;
+    let mut tracks: Vec<Track> = Vec::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    for (track_index, slot) in palette_slots.iter().enumerate() {
+        let Some(slot) = slot else {
+            continue;
+        };
+        if !seen.insert(*slot) {
+            return Err(invalid(format!(
+                "track {track_index} binds to palette slot {slot}, which an earlier track \
+                 already drives; the decoded clip carries two tracks for one bone"
+            )));
+        }
+        let track = &clip.tracks[track_index];
+        let node = joints[*slot];
+        tracks.push(Track::Rotation {
+            node,
+            values: hemisphere_fixed(&track.rotations)
+                .iter()
+                .map(|quaternion| quaternion.map(|value| value as f32))
+                .collect(),
+        });
+        tracks.push(Track::Translation {
+            node,
+            values: track
+                .translations
+                .iter()
+                .map(|translation| {
+                    [
+                        (translation[0] * scale) as f32,
+                        (translation[1] * scale) as f32,
+                        (translation[2] * scale) as f32,
+                    ]
+                })
+                .collect(),
+        });
+    }
+    if tracks.is_empty() {
+        return Err(invalid(
+            "no track binds to the actor palette, so the actor-bound GLB would carry an \
+             empty clip"
+                .to_owned(),
+        ));
+    }
+    let times_f32: Vec<f32> = times.iter().map(|time| *time as f32).collect();
+    let mut writer =
+        PackWriter::from_glb(actor_bytes).map_err(|error| invalid(error.to_string()))?;
+    writer
+        .insert_animation(1, name, &times_f32, &tracks)
+        .map_err(|error| invalid(error.to_string()))?;
+    writer.finish().map_err(|error| invalid(error.to_string()))
 }
 
 /// Clip bytes from a BSA member or a loose file.
@@ -1594,6 +1743,7 @@ fn write_source_glb(
     clip: &SplineClip,
     track_bones: &[Option<usize>],
     scale: f64,
+    name: &str,
 ) -> Result<Vec<u8>, CommandError> {
     let invalid = |detail: String| errors::invalid("havok_glb", detail);
     let times = clip.times();
@@ -1680,28 +1830,10 @@ fn write_source_glb(
         let Some(bone) = track_bones.get(track_index).copied().flatten() else {
             continue;
         };
-        let mut hemisphere = [1.0_f64; 4];
-        let rotations: Vec<f32> = track
-            .rotations
+        let rotations = hemisphere_fixed(&track.rotations);
+        let rotations: Vec<f32> = rotations
             .iter()
-            .flat_map(|q| {
-                // glTF LINEAR rotation keys must share a hemisphere: flip each key
-                // that dots negative against its predecessor.
-                let mut q = *q;
-                if !q.iter().all(|value| value.is_finite()) {
-                    q = [0.0, 0.0, 0.0, 1.0];
-                }
-                if q.iter()
-                    .zip(hemisphere.iter())
-                    .map(|(a, b)| a * b)
-                    .sum::<f64>()
-                    < 0.0
-                {
-                    q = q.map(|value| -value);
-                }
-                hemisphere = q;
-                q.map(|value| value as f32)
-            })
+            .flat_map(|q| q.map(|value| value as f32))
             .collect();
         let translations: Vec<f32> = track
             .translations
@@ -1737,7 +1869,7 @@ fn write_source_glb(
         "scenes": [{"nodes": roots}],
         "nodes": nodes,
         "animations": [{
-            "name": "attack",
+            "name": name,
             "samplers": samplers,
             "channels": channels,
         }],

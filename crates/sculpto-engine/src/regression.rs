@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use glam::{DMat4, DVec3};
+use glam::{DMat4, DQuat, DVec3};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -43,12 +43,13 @@ use serde_json::{Value, json};
 
 use sculpto_mesh::actor::{Actor, Pose, StressPlan, stress};
 
+pub(crate) use crate::adapt::source_clip_name;
 use crate::export_actor::CLIP_ROLES;
 use crate::measures::{
     RELATIVE_STRETCH, STANCE_MEDIAN_BAR, edge_stretch, measurable_parts, palette_names,
     palette_reconstruction, toe_slide,
 };
-use crate::retarget::{BoneRole, Part, Side, coverage_token, palette_role};
+use crate::retarget::{BoneRole, Part, Side, coverage_token, palette_role, role_of};
 use crate::{CommandError, ErrorKind, errors};
 
 /// Lateral mm the adapted chain may drift beyond `1.10 ×` the own walk's drift.
@@ -90,6 +91,17 @@ pub const CLEARANCE_MARGIN: f64 = 0.25;
 /// Admitted adapted stretch as a multiple of the own clip's stretch at the
 /// same witnesses: a body-owned tear (Mike's crotch) shows in both rows.
 pub const CLOTHING_RELATIVE: f64 = 1.10;
+
+/// The chain roles whose absence makes a baseline unanimated: spine and neck.
+///
+/// The head is deliberately absent: today's gait drives a ±5° head
+/// counter-yaw while the spine segments stay at rest, so a head channel does
+/// not make a baseline animated where the chain is concerned.
+pub const SPINE_CHAIN_ROLES: [&str; 2] = ["spine", "neck"];
+/// Human-scale sanity bound for a reference's peak chain deviation: a real
+/// walk bends a spine millimetres to centimetres; beyond this the figure
+/// collapsed and the numbers are debris, not measurements.
+pub const REFERENCE_SANITY_MM: f64 = 5000.0;
 
 /// The command input.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
@@ -135,6 +147,21 @@ pub struct RegressionActor {
     /// Garment part addresses graded against the body every frame.
     #[serde(default)]
     pub garments: Vec<String>,
+    /// The conversion's source GLB; when declared, the motion row grows the
+    /// role-matched travel amplification (adapted vs source per role) and the
+    /// `mixamo-source` reference block (the same rows, on the source's own rig).
+    #[serde(default)]
+    pub source: Option<PathBuf>,
+    /// The source clip name; with the file carrying exactly one, optional.
+    #[serde(default)]
+    pub source_clip: Option<String>,
+    /// The native reference: a decoded Skyrim walk bound onto this body
+    /// (`actor havok --actor …`), measured with the same rows, report-only.
+    #[serde(default)]
+    pub native: Option<PathBuf>,
+    /// The native clip name as `actor havok` wrote it (the member stem).
+    #[serde(default)]
+    pub native_clip: Option<String>,
 }
 
 fn default_frames() -> usize {
@@ -210,6 +237,53 @@ pub struct ClearanceMetrics {
     pub target: String,
     /// Frames sampled.
     pub frames: usize,
+}
+
+/// One bone's angular travel in one clip: the largest rotation between any
+/// two samples of the bone's rotation channel, degrees.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MotionRange {
+    /// The bone name as the clip addresses it.
+    pub bone: String,
+    /// The bone's standard role label (`L hand`, `spine1`, `pelvis`).
+    pub role: String,
+    /// Peak-to-peak rotation of the channel, degrees.
+    pub range_deg: f64,
+}
+
+/// Per-clip motion inventory: how many bones the clip drives and how far the
+/// loudest move. This is what separates an animated baseline from an
+/// unanimated one — a clip can carry a skeleton and animate no spine or neck.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MotionMetrics {
+    /// Distinct bones with a rotation channel.
+    pub driven_bones: usize,
+    /// Driven bones whose travel reaches one degree.
+    pub moving_bones: usize,
+    /// Every driven bone with its travel, loudest first.
+    pub rows: Vec<MotionRange>,
+}
+
+impl MotionMetrics {
+    /// The loudest `n` movers, for tables.
+    pub fn loudest(&self, n: usize) -> &[MotionRange] {
+        &self.rows[..n.min(self.rows.len())]
+    }
+}
+
+/// One matched source↔adapted travel pair: the amplification the conversion
+/// applies to one role. The finger fan lives here — our walk moves fingers
+/// 28–34° where the source moves them 18°.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AmplificationRow {
+    /// The matched role label.
+    pub role: String,
+    /// The source clip's travel for the role, degrees.
+    pub source_deg: f64,
+    /// The adapted clip's travel for the role, degrees.
+    pub adapted_deg: f64,
+    /// `adapted / source`; a source role that does not move yields no row.
+    pub ratio: f64,
 }
 
 /// The roles one clip drives, read from the file's own channels.
@@ -532,15 +606,102 @@ pub fn clip_role_coverage(
     })
 }
 
+/// Largest rotation between any two samples of one rotation channel, degrees.
+///
+/// Constant channels measure 0.0; the shortest-path angle keeps the result in
+/// [0°, 180°] even across a wrap.
+pub fn rotation_range_deg(values: &[[f64; 4]]) -> f64 {
+    let quats: Vec<DQuat> = values
+        .iter()
+        .filter(|value| value.iter().all(|component| component.is_finite()))
+        .map(|value| DQuat::from_array(*value).normalize())
+        .collect();
+    let mut max = 0.0_f64;
+    for (index, first) in quats.iter().enumerate() {
+        for second in &quats[index + 1..] {
+            let delta = first.inverse() * *second;
+            let angle = 2.0 * delta.w.clamp(-1.0, 1.0).abs().acos();
+            max = max.max(angle.to_degrees());
+        }
+    }
+    max
+}
+
+/// Per-bone angular travel of one clip, classified by `classify` (the palette
+/// classifier for our clips, the source-name classifier for foreign ones).
+///
+/// # Errors
+/// A missing or ambiguous clip.
+pub fn motion_ranges(
+    actor: &Actor,
+    clip: &str,
+    classify: fn(&str) -> Option<BoneRole>,
+) -> Result<MotionMetrics, CommandError> {
+    let source = actor
+        .clip_shared(clip)
+        .map_err(crate::measures::actor_error)?;
+    // One range per bone: the loudest of its rotation channels. Translation
+    // channels carry no angle and are not part of this row.
+    let mut per_bone: BTreeMap<String, f64> = BTreeMap::new();
+    for channel in &source.channels {
+        if !matches!(
+            channel.property,
+            sculpto_mesh::actor::SourceProperty::Rotation
+        ) {
+            continue;
+        }
+        let sculpto_mesh::actor::SourceValues::Rotation(values) = &channel.values else {
+            continue;
+        };
+        let Some(name) = &channel.node_name else {
+            continue;
+        };
+        let range = rotation_range_deg(values);
+        per_bone
+            .entry(name.clone())
+            .and_modify(|current| *current = current.max(range))
+            .or_insert(range);
+    }
+    let mut rows: Vec<MotionRange> = per_bone
+        .into_iter()
+        .map(|(bone, range_deg)| MotionRange {
+            role: classify(&bone).map(|role| role.label()).unwrap_or_default(),
+            bone,
+            range_deg,
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| b.range_deg.total_cmp(&a.range_deg));
+    let moving = rows.iter().filter(|row| row.range_deg >= 1.0).count();
+    Ok(MotionMetrics {
+        driven_bones: rows.len(),
+        moving_bones: moving,
+        rows,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // gates
 // ---------------------------------------------------------------------------
 
-/// Spine straightness: the adapted chain may not bend beyond a floor plus the
-/// own walk's share. The floor is what makes a straight default mean anything.
-pub fn spine_gate(default: &SpineMetrics, adapted: &SpineMetrics, row: &str) -> GateVerdict {
-    let deviation_bound = (SPINE_DEVIATION_FLOOR_MM).max(1.10 * default.peak_lateral_deviation_mm);
-    let tilt_bound = SPINE_TILT_FLOOR_DEG.max(1.10 * default.peak_lateral_tilt_deg);
+/// Spine straightness: the adapted chain may not bend beyond the measured
+/// bracket. `default_drives_spine_chain` decides the form: against a clip that
+/// actually animates the spine the bound is relative to it; against an
+/// unanimated own walk there is no reference and the bracket floors apply to
+/// the adapted row absolutely.
+pub fn spine_gate(
+    default: &SpineMetrics,
+    adapted: &SpineMetrics,
+    row: &str,
+    default_drives_spine_chain: bool,
+) -> GateVerdict {
+    let deviation_bound = match default_drives_spine_chain {
+        true => SPINE_DEVIATION_FLOOR_MM.max(1.10 * default.peak_lateral_deviation_mm),
+        false => SPINE_DEVIATION_FLOOR_MM,
+    };
+    let tilt_bound = match default_drives_spine_chain {
+        true => SPINE_TILT_FLOOR_DEG.max(1.10 * default.peak_lateral_tilt_deg),
+        false => SPINE_TILT_FLOOR_DEG,
+    };
     let pass = adapted.peak_lateral_deviation_mm <= deviation_bound
         && adapted.peak_lateral_tilt_deg <= tilt_bound;
     GateVerdict {
@@ -548,16 +709,26 @@ pub fn spine_gate(default: &SpineMetrics, adapted: &SpineMetrics, row: &str) -> 
         row: row.to_owned(),
         pass,
         detail: format!(
-            "peak lateral deviation {:.1} mm (bound {:.1}, default {:.1}), peak lateral tilt \
-             {:.2}° at t={:.3} (bound {:.2}, default {:.2}), sagittal {:.2}° (reported, not gated)",
+            "peak lateral deviation {:.1} mm (bound {:.1}, default {}), peak lateral tilt \
+             {:.2}° at t={:.3} (bound {:.2}, default {:.2}), sagittal {:.2}° (reported, not gated){}",
             adapted.peak_lateral_deviation_mm,
             deviation_bound,
-            default.peak_lateral_deviation_mm,
+            match default_drives_spine_chain {
+                true => format!("{:.1}", default.peak_lateral_deviation_mm),
+                false => "unanimated — the own clip animates no spine or neck bone, so the \
+                          bound is the absolute bracket (healthy 27.6 mm / 5.1° versus defect \
+                          138 mm / ≥24°)"
+                    .to_owned(),
+            },
             adapted.peak_lateral_tilt_deg,
             adapted.peak_lateral_time,
             tilt_bound,
             default.peak_lateral_tilt_deg,
             adapted.peak_sagittal_tilt_deg,
+            match default_drives_spine_chain {
+                true => "",
+                false => "; no reference clip animates the spine chain on our side yet",
+            },
         ),
     }
 }
@@ -1212,6 +1383,51 @@ fn measure_actor(
     let adapted_coverage =
         clip_role_coverage(&adapted_actor, &params.adapted_clip, &adapted_palette)?;
 
+    // Motion inventory on both sides: how many bones each clip drives and how
+    // far. An own walk that animates no spine or neck bone is an unanimated
+    // baseline, not a healthy one, and the spine gate must say so.
+    let default_motion_rows = motion_ranges(&default_actor, &params.default_clip, palette_role)?;
+    let adapted_motion_rows = motion_ranges(&adapted_actor, &params.adapted_clip, palette_role)?;
+    let default_drives_spine_chain = default_coverage
+        .driven_roles
+        .iter()
+        .any(|role| SPINE_CHAIN_ROLES.contains(role));
+
+    // Travel amplification against the conversion's source, matched by role:
+    // both sides classify their own bone names, and the standard role labels
+    // are the join key (source `mixamorig:LeftHand` and palette
+    // `NPC L Hand [LHnd]` are both `L hand`).
+    let mut amplification: Vec<AmplificationRow> = Vec::new();
+    if let Some(source_path) = &params.source {
+        let source_bytes =
+            std::fs::read(source_path).map_err(|error| errors::io(source_path, error))?;
+        let source_actor =
+            Actor::from_glb(&source_bytes).map_err(|error| actor_read(source_path, error))?;
+        let declared = source_clip_name(&source_actor, params.source_clip.as_deref())?;
+        let source_motion = motion_ranges(&source_actor, &declared, role_of)?;
+        let adapted_by_role: BTreeMap<&str, f64> = adapted_motion_rows
+            .rows
+            .iter()
+            .filter(|row| !row.role.is_empty())
+            .map(|row| (row.role.as_str(), row.range_deg))
+            .collect();
+        for row in &source_motion.rows {
+            let Some(adapted_deg) = adapted_by_role.get(row.role.as_str()) else {
+                continue;
+            };
+            if row.range_deg < 1.0 {
+                continue;
+            }
+            amplification.push(AmplificationRow {
+                role: row.role.clone(),
+                source_deg: row.range_deg,
+                adapted_deg: *adapted_deg,
+                ratio: adapted_deg / row.range_deg,
+            });
+        }
+        amplification.sort_unstable_by(|a, b| b.ratio.total_cmp(&a.ratio));
+    }
+
     // Rest reconstruction: the adapted artifact's rest must be the default's.
     let reconstruction = palette_reconstruction(&default_actor, &adapted_actor)?;
 
@@ -1273,6 +1489,7 @@ fn measure_actor(
         &default_motion.spine,
         &adapted_motion.spine,
         &adapted_row,
+        default_drives_spine_chain,
     ));
     gates.push(clearance_gate(
         &default_motion.clearance,
@@ -1353,6 +1570,7 @@ fn measure_actor(
     let motion_value = |side: &str,
                         clip: &str,
                         rows: &MotionRows,
+                        motion: &MotionMetrics,
                         stance: &Value,
                         stretch: &Value,
                         coverage: &CoverageMetrics| {
@@ -1370,6 +1588,14 @@ fn measure_actor(
             "stance": stance,
             "edge_stretch": stretch,
             "coverage": coverage,
+            "motion": motion,
+            "drives_spine_chain": match side {
+                "default" => default_drives_spine_chain,
+                _ => adapted_coverage
+                    .driven_roles
+                    .iter()
+                    .any(|role| SPINE_CHAIN_ROLES.contains(role)),
+            },
         })
     };
     let value = json!({
@@ -1378,6 +1604,7 @@ fn measure_actor(
             "default",
             &params.default_clip,
             &default_motion,
+            &default_motion_rows,
             &default_stance,
             &default_stretch,
             &default_coverage,
@@ -1386,10 +1613,31 @@ fn measure_actor(
             "adapted",
             &params.adapted_clip,
             &adapted_motion,
+            &adapted_motion_rows,
             &adapted_stance,
             &adapted_stretch,
             &adapted_coverage,
         ),
+        "amplification": match amplification.is_empty() {
+            true => json!(null),
+            false => json!({
+                "source": params.source.as_ref().map(|path| path.to_string_lossy()),
+                "rows": amplification,
+            }),
+        },
+        "source_reference": match &params.source {
+            Some(path) => reference_block(
+                "mixamo-source",
+                path,
+                params.source_clip.as_deref(),
+                frames,
+            ),
+            None => json!({"status": "not declared"}),
+        },
+        "native_reference": match &params.native {
+            Some(path) => reference_block("native", path, params.native_clip.as_deref(), frames),
+            None => json!({"status": "not declared"}),
+        },
         "clothing": {
             "artifact": params.adapted.to_string_lossy(),
             "anchor_clip": anchor_clip,
@@ -1407,6 +1655,110 @@ fn measure_actor(
         "gates": gates,
     });
     Ok(ActorReport { value, gates })
+}
+
+/// One reference measurement: the same instruments the judged rows run, on
+/// any (artifact, clip) pair, report-only — no gate derives from it. A
+/// missing artifact or unmeasurable pair is reported as `unavailable` with
+/// the reason; a reference is never faked.
+fn reference_block(
+    label: &str,
+    artifact: &Path,
+    declared_clip: Option<&str>,
+    frames: usize,
+) -> Value {
+    let inner = measure_reference_inner(artifact, declared_clip, frames);
+    let clip = declared_clip.unwrap_or("(the file's only clip)").to_owned();
+    let block = match inner {
+        Ok(block) => block,
+        Err(error) => {
+            return json!({
+                "label": label,
+                "artifact": artifact.to_string_lossy(),
+                "clip": clip,
+                "status": "unavailable",
+                "reason": error.to_string(),
+            });
+        }
+    };
+    // A collapsed figure is not a measurement: peak chain deviations beyond a
+    // human-scale bound mean the artifact's pose is debris (the first native
+    // decode produced exact-zero translations from frame 1, collapsing the
+    // skeleton into the origin). Report the collapse, never the numbers.
+    let deviation = block["spine"]["peak_lateral_deviation_mm"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let stretch = block["edge_stretch"]["max_ratio"].as_f64().unwrap_or(0.0);
+    if !deviation.is_finite() || deviation > REFERENCE_SANITY_MM || !stretch.is_finite() {
+        return json!({
+            "label": label,
+            "artifact": artifact.to_string_lossy(),
+            "clip": block["clip"],
+            "status": "degenerate",
+            "reason": format!(
+                "the posed figure is not human-scale (peak chain deviation {:.3e} mm, worst \
+                 edge ratio {:.3e}); the clip's pose collapses the skeleton — suspected decode \
+                 defect, see the havok report's binding rows",
+                deviation, stretch
+            ),
+        });
+    }
+    json!({
+        "label": label,
+        "artifact": artifact.to_string_lossy(),
+        "clip": block["clip"],
+        "status": "measured",
+        "spine": block["spine"],
+        "spine_frame_joint": block["spine_frame_joint"],
+        "clearance": block["clearance"],
+        "stance": block["stance"],
+        "edge_stretch": block["edge_stretch"],
+        "coverage": block["coverage"],
+        "motion": block["motion"],
+        "drives_spine_chain": block["drives_spine_chain"],
+    })
+}
+
+fn measure_reference_inner(
+    artifact: &Path,
+    declared_clip: Option<&str>,
+    frames: usize,
+) -> Result<Value, CommandError> {
+    let bytes = std::fs::read(artifact).map_err(|error| errors::io(artifact, error))?;
+    let actor = Actor::from_glb(&bytes).map_err(|error| actor_read(artifact, error))?;
+    let palette = palette_names(&actor)?;
+    let clip = match declared_clip {
+        Some(declared) => declared.to_owned(),
+        None => source_clip_name(&actor, None)?,
+    };
+    let joints = resolve_joints(&palette)?;
+    let motion = measure_motion(&actor, &clip, frames, &joints, &palette)?;
+    let toes: Vec<String> = palette
+        .iter()
+        .filter(|name| palette_role(name).is_some_and(|role| matches!(role.part, Part::Toe)))
+        .cloned()
+        .collect();
+    let stance = match toes.is_empty() {
+        true => json!({"pass": false, "reason": "the palette carries no toe joint"}),
+        false => toe_slide(&actor, &clip, &palette, &toes, frames)?,
+    };
+    let stretch = edge_stretch(&actor, &clip, frames)?;
+    let coverage = clip_role_coverage(&actor, &clip, &palette)?;
+    let motion_rows = motion_ranges(&actor, &clip, palette_role)?;
+    Ok(json!({
+        "clip": clip,
+        "spine": motion.spine,
+        "spine_frame_joint": motion.frame_joint,
+        "clearance": motion.clearance,
+        "stance": stance,
+        "edge_stretch": stretch,
+        "coverage": coverage,
+        "motion": motion_rows,
+        "drives_spine_chain": coverage
+            .driven_roles
+            .iter()
+            .any(|role| SPINE_CHAIN_ROLES.contains(role)),
+    }))
 }
 
 fn actor_read(path: &Path, error: sculpto_mesh::actor::ActorError) -> CommandError {
@@ -1494,15 +1846,26 @@ pub fn table_lines(report: &Value) -> Vec<String> {
             let clearance = &row["clearance"];
             let stance = &row["stance"];
             let stretch = &row["edge_stretch"];
+            // A clip that animates no spine or neck bone cannot carry a spine
+            // reading: the numbers would be rest values printed as if they
+            // were measured.
+            let drives_spine_chain = row["drives_spine_chain"].as_bool().unwrap_or(true);
+            let spine_text = match drives_spine_chain {
+                true => format!(
+                    "spine lat {:.2}° sag {:.2}° dev {:.1} mm",
+                    spine["peak_lateral_tilt_deg"].as_f64().unwrap_or(0.0),
+                    spine["peak_sagittal_tilt_deg"].as_f64().unwrap_or(0.0),
+                    spine["peak_lateral_deviation_mm"].as_f64().unwrap_or(0.0),
+                ),
+                false => "spine unanimated — clip animates no spine or neck".to_owned(),
+            };
             lines.push(format!(
-                "{} {} clip={:?} | spine lat {:.2}° sag {:.2}° dev {:.1} mm | clearance {:.2} mm \
-                 @t={:.3} ({}↔{}) | stance med {:.3} max {:.3} m/s | stretch ≥5 mm {:.2}x | roles {}",
+                "{} {} clip={:?} | {} | clearance {:.2} mm @t={:.3} ({}↔{}) | stance med {:.3} \
+                 max {:.3} m/s | stretch ≥5 mm {:.2}x | roles {}",
                 actor["name"].as_str().unwrap_or("?"),
                 side,
                 row["clip"].as_str().unwrap_or("?"),
-                spine["peak_lateral_tilt_deg"].as_f64().unwrap_or(0.0),
-                spine["peak_sagittal_tilt_deg"].as_f64().unwrap_or(0.0),
-                spine["peak_lateral_deviation_mm"].as_f64().unwrap_or(0.0),
+                spine_text,
                 clearance["min_mm"].as_f64().unwrap_or(0.0),
                 clearance["time"].as_f64().unwrap_or(0.0),
                 clearance["joint"].as_str().unwrap_or("?"),
@@ -1516,6 +1879,125 @@ pub fn table_lines(report: &Value) -> Vec<String> {
                     .as_array()
                     .map(|roles| roles.len())
                     .unwrap_or(0),
+            ));
+        }
+        // The motion inventory, plus the amplification when a source is
+        // declared: how many bones each clip drives, how far the loudest
+        // move, and where the conversion amplifies travel.
+        let motion = |side: &str, n: usize| -> String {
+            actor[side]["motion"]["rows"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .take(n)
+                        .filter_map(|row| {
+                            let degrees = row["range_deg"].as_f64()?;
+                            (degrees >= 1.0).then(|| {
+                                format!(
+                                    "{} {}°",
+                                    row["role"].as_str().unwrap_or("?"),
+                                    degrees.round() as i64
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        };
+        let default_driven = actor["default"]["motion"]["driven_bones"]
+            .as_u64()
+            .unwrap_or(0);
+        let adapted_driven = actor["adapted"]["motion"]["driven_bones"]
+            .as_u64()
+            .unwrap_or(0);
+        let mut motion_line = format!(
+            "{} motion: default clip drives {} bones (top: {}) | adapted drives {} (top: {})",
+            actor["name"].as_str().unwrap_or("?"),
+            default_driven,
+            motion("default", 3),
+            adapted_driven,
+            motion("adapted", 4),
+        );
+        if let Some(rows) = actor["amplification"]["rows"].as_array() {
+            let top: Vec<String> = rows
+                .iter()
+                .take(3)
+                .filter_map(|row| {
+                    Some(format!(
+                        "{} {}° vs {}° = {:.2}x",
+                        row["role"].as_str()?,
+                        row["adapted_deg"].as_f64()?.round() as i64,
+                        row["source_deg"].as_f64()?.round() as i64,
+                        row["ratio"].as_f64()?,
+                    ))
+                })
+                .collect();
+            if !top.is_empty() {
+                motion_line.push_str(&format!(" | amplification vs source: {}", top.join(", ")));
+            }
+        }
+        lines.push(motion_line);
+        // The three references, each on one line: mixamo (its own rig),
+        // synthesis (our default row, above — labelled here for the
+        // three-way read), native (the decoded Skyrim walk on this body).
+        for (label, key) in [
+            ("reference mixamo", "source_reference"),
+            ("reference native", "native_reference"),
+        ] {
+            let block = &actor[key];
+            match block["status"].as_str() {
+                Some("measured") => {
+                    let spine = &block["spine"];
+                    let clearance = &block["clearance"];
+                    lines.push(format!(
+                        "{} {} reference clip={:?} | spine lat {:.2}° sag {:.2}° dev {:.1} mm | \
+                         clearance {:.2} mm @t={:.3} | stance med {:.3} max {:.3} m/s | \
+                         stretch ≥5 mm {:.2}x | roles {} (driven {})",
+                        actor["name"].as_str().unwrap_or("?"),
+                        label,
+                        block["clip"].as_str().unwrap_or("?"),
+                        spine["peak_lateral_tilt_deg"].as_f64().unwrap_or(0.0),
+                        spine["peak_sagittal_tilt_deg"].as_f64().unwrap_or(0.0),
+                        spine["peak_lateral_deviation_mm"].as_f64().unwrap_or(0.0),
+                        clearance["min_mm"].as_f64().unwrap_or(0.0),
+                        clearance["time"].as_f64().unwrap_or(0.0),
+                        block["stance"]["worst_median_speed"]
+                            .as_f64()
+                            .unwrap_or(0.0),
+                        block["stance"]["max_horizontal_speed"]
+                            .as_f64()
+                            .unwrap_or(0.0),
+                        block["edge_stretch"]["max_ratio_edges_at_least_5mm"]
+                            .as_f64()
+                            .unwrap_or(0.0),
+                        block["coverage"]["driven_roles"]
+                            .as_array()
+                            .map(|roles| roles.len())
+                            .unwrap_or(0),
+                        block["motion"]["driven_bones"].as_u64().unwrap_or(0),
+                    ));
+                }
+                Some(status) => lines.push(format!(
+                    "{} {} reference: {status} — {}",
+                    actor["name"].as_str().unwrap_or("?"),
+                    label,
+                    block["reason"]
+                        .as_str()
+                        .unwrap_or(block["status"].as_str().unwrap_or("?")),
+                )),
+                _ => {}
+            }
+        }
+        if actor["default"]["drives_spine_chain"].as_bool() == Some(false) {
+            lines.push(format!(
+                "NOTE: the own walk ({} bones driven) animates no spine or neck channel, so \
+                 `default` is an unanimated baseline, not a spine reference — the three-way \
+                 comparison has no clip that animates the spine chain on our side until a real \
+                 reference walk exists (the Mixamo source played through our converter is not \
+                 independent; a native Skyrim walk from the catalogue might be, since `.hkx` \
+                 binds by skeleton order and needs no conversion).",
+                default_driven,
             ));
         }
         let clothing = &actor["clothing"];

@@ -129,10 +129,13 @@ fn the_source_glb_round_trips_through_the_actor_loader() {
         ],
         ..SplineClip::default()
     };
-    let bytes = write_source_glb(&skeleton, &clip, &[Some(0), Some(1)], 0.014).expect("glb");
+    let bytes =
+        write_source_glb(&skeleton, &clip, &[Some(0), Some(1)], 0.014, "walk").expect("glb");
     let actor = Actor::from_glb(&bytes).expect("the written GLB must load");
-    assert_eq!(actor.clip_names(), vec![Some("attack")]);
-    let clip_read = actor.clip("attack").expect("clip read");
+    // The clip name comes from the caller (the member stem), never the
+    // writer's old `attack` default.
+    assert_eq!(actor.clip_names(), vec![Some("walk")]);
+    let clip_read = actor.clip("walk").expect("clip read");
     assert_eq!(clip_read.times.len(), 3);
     assert_eq!(
         clip_read.channels.len(),
@@ -167,7 +170,7 @@ fn a_fully_unbound_clip_is_a_named_refusal() {
         tracks: vec![SplineTrack::default()],
         ..SplineClip::default()
     };
-    let error = write_source_glb(&skeleton, &clip, &[None], 0.014).expect_err("refused");
+    let error = write_source_glb(&skeleton, &clip, &[None], 0.014, "walk").expect_err("refused");
     assert!(error.to_string().contains("no track binds to a rig bone"));
 }
 
@@ -186,6 +189,6 @@ fn a_one_frame_clip_is_refused() {
         tracks: vec![SplineTrack::default()],
         ..SplineClip::default()
     };
-    let error = write_source_glb(&skeleton, &clip, &[Some(0)], 0.014).expect_err("refused");
+    let error = write_source_glb(&skeleton, &clip, &[Some(0)], 0.014, "walk").expect_err("refused");
     assert!(error.to_string().contains("at least two"));
 }
