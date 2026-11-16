@@ -135,14 +135,22 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
         &cell_bones(&bones),
         CELL_BAND_MAX_M,
     );
-    let ownership = ownership(&cells, &pool.vertices, &flesh);
+    // A body whose solid does not resolve into cells (open seams let the exterior
+    // flood into the flesh, so whole bones lose their seeds) keeps the surface
+    // field: the cell is the stronger rule, not a rule applied to garbage. The
+    // report says whether it was applied and names the bones it could not seat.
+    let ownership = cells
+        .volumes
+        .iter()
+        .all(|volume| *volume > 0)
+        .then(|| ownership(&cells, &pool.vertices, &flesh));
     let authored = author_weights_within(
         &pool.vertices,
         &pool.triangles,
         &bones,
         &flesh,
         &settings,
-        Some(&ownership),
+        ownership.as_ref(),
     )
     .map_err(|error| refused("skin_author", error.to_string()))?;
 
