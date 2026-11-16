@@ -21,3 +21,15 @@ sculpto-blender = { path = "crates/sculpto-blender" }
 roxmltree = "0.21"
 glam = "0.34"
 toml = "0.9"
+
+# Builds are the bottleneck of this project and debug info is pure cost: no
+# gate reads a debugger, and it multiplies both compile time and target size
+# (33 jj workspaces held 421 GB of `target/`). Operator decision 2026-11-17.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[profile.dev.build-override]
+debug = 0

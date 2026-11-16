@@ -43,3 +43,4 @@ bevy = { version = "0.20", default-features = false, features = [
 
 [profile.dev]
 opt-level = 1
+debug = 0
