@@ -230,6 +230,12 @@ fn clip_role_names_the_standard_rig_roles() {
         ("NPC Head [Head]", Some("head")),
         ("NPC L ForearmTwist1 [LLt1]", Some("twists")),
         ("NPC R UpperarmTwist2 [RUt2]", Some("twists")),
+        // The torso chain: the hips carry it, and the mirror family roots its
+        // upper body one level above the spine bones.
+        ("NPC Spine [Spn0]", Some("spine")),
+        ("NPC Spine1 [Spn1]", Some("spine")),
+        ("CME Spine2 [Spn2]", Some("spine")),
+        ("CME UBody [UBody]", Some("spine")),
         // Physics and scaffolding bones carry no role: a clip that drives only
         // these has not moved a limb.
         ("NPC L Butt", None),
@@ -246,7 +252,7 @@ fn clip_role_names_the_standard_rig_roles() {
 #[test]
 fn an_eighteen_of_126_clip_is_refused_when_roles_are_required() {
     let plan = plan("WalkForward", &EMILY_DRIVEN, true);
-    let refused = admit_clip(&plan, &emily_palette(), &required_all(), false, 0.05)
+    let refused = admit_clip(&plan, &emily_palette(), &required_all(), false, false, 0.05)
         .expect_err("the stub clip drives no toe, neck or head at all");
     assert_eq!(refused.code(), "export_actor_clip_role_coverage");
     let message = format!("{refused}");
@@ -255,7 +261,7 @@ fn an_eighteen_of_126_clip_is_refused_when_roles_are_required() {
         "18 of 126 palette bones",
         "14.3 %",
         "toes, neck, head, twists",
-        "covered: hips, knees, ankles, shoulders, elbows, hands",
+        "covered: hips, spine, knees, ankles, shoulders, elbows, hands",
     ] {
         assert!(
             message.contains(expected),
@@ -267,7 +273,7 @@ fn an_eighteen_of_126_clip_is_refused_when_roles_are_required() {
 #[test]
 fn a_rest_incompatible_clip_is_refused_by_default_and_admitted_with_the_flag() {
     let plan = plan("WalkForward", &EMILY_DRIVEN, false);
-    let refused = admit_clip(&plan, &emily_palette(), &[], false, 0.05)
+    let refused = admit_clip(&plan, &emily_palette(), &[], false, false, 0.05)
         .expect_err("a 0.48 m rest residual is not this rig at rest");
     assert_eq!(refused.code(), "export_actor_clip_rest_incompatible");
     let message = format!("{refused}");
@@ -283,7 +289,7 @@ fn a_rest_incompatible_clip_is_refused_by_default_and_admitted_with_the_flag() {
             "the refusal names {expected:?}: {message}"
         );
     }
-    let coverage = admit_clip(&plan, &emily_palette(), &[], true, 0.05)
+    let coverage = admit_clip(&plan, &emily_palette(), &[], true, false, 0.05)
         .expect("the override admits the measured clip");
     assert_eq!(coverage.mapped_bones, 18);
 }
@@ -307,10 +313,10 @@ fn a_partial_upper_body_clip_is_admitted_under_report_only() {
     ];
     let plan = plan("Idle", &driven, true);
     let coverage =
-        admit_clip(&plan, &emily_palette(), &[], false, 0.05).expect("no role is required");
+        admit_clip(&plan, &emily_palette(), &[], false, false, 0.05).expect("no role is required");
     assert_eq!(
         coverage.roles_covered,
-        vec!["shoulders", "elbows", "hands", "neck", "head"]
+        vec!["spine", "shoulders", "elbows", "hands", "neck", "head"]
     );
     assert_eq!(
         coverage.roles_missing,
@@ -347,9 +353,10 @@ fn a_clip_covering_every_role_passes_the_full_requirement() {
         "NPC Head [Head]",
         "NPC L ForearmTwist1 [LLt1]",
         "NPC R UpperarmTwist2 [RUt2]",
+        "NPC Spine2 [Spn2]",
     ];
     let plan = plan("WalkForward", &driven, true);
-    let coverage = admit_clip(&plan, &emily_palette(), &required_all(), false, 0.05)
+    let coverage = admit_clip(&plan, &emily_palette(), &required_all(), false, false, 0.05)
         .expect("every required role has a driven bone");
     assert_eq!(coverage.roles_missing, Vec::<&str>::new());
     // Either family answers for the role, so the CME bones count with the NPC
@@ -357,6 +364,54 @@ fn a_clip_covering_every_role_passes_the_full_requirement() {
     let hands = coverage.role_bones.get("hands").expect("the hands role");
     assert!(hands.contains(&"NPC L Hand [LHnd]".to_owned()));
     assert!(hands.contains(&"CME R Hand [RHnd]".to_owned()));
+}
+
+#[test]
+fn a_pelvis_driven_clip_without_a_spine_bone_is_refused_as_a_rigid_torso() {
+    let driven = [
+        "NPC Pelvis [Pelv]",
+        "NPC L Thigh [LThg]",
+        "NPC R Thigh [RThg]",
+        "NPC L Calf [LClf]",
+        "NPC R Calf [RClf]",
+        "NPC L Foot [Lft ]",
+        "NPC R Foot [Rft ]",
+    ];
+    let plan = plan("Idle", &driven, true);
+    let refused = admit_clip(&plan, &emily_palette(), &[], false, false, 0.05)
+        .expect_err("the hips move and nothing above them does");
+    assert_eq!(refused.code(), "export_actor_clip_torso_rigid");
+    let message = format!("{refused}");
+    for expected in [
+        "\"Idle\"",
+        "NPC Pelvis [Pelv]",
+        "no spine bone",
+        "allow_rigid_torso",
+    ] {
+        assert!(
+            message.contains(expected),
+            "the refusal names {expected:?}: {message}"
+        );
+    }
+    // The declared pose is admitted, and the row says it was.
+    let coverage = admit_clip(&plan, &emily_palette(), &[], false, true, 0.05)
+        .expect("a rigid torso is a pose a caller may declare");
+    let row = clip_value(0, &plan, &coverage);
+    assert_eq!(row["rigid_torso_admitted"], true);
+    assert!(
+        row["roles_missing"]
+            .as_array()
+            .is_some_and(|roles| { roles.iter().any(|role| role.as_str() == Some("spine")) })
+    );
+}
+
+#[test]
+fn a_clip_that_never_drives_the_pelvis_is_not_a_rigid_torso() {
+    let driven = ["NPC L Hand [LHnd]", "NPC R Hand [RHnd]"];
+    let plan = plan("Wave", &driven, true);
+    let coverage = admit_clip(&plan, &emily_palette(), &[], false, false, 0.05)
+        .expect("a hand-only clip moves no hips, so no torso is carried rigidly");
+    assert!(coverage.roles_missing.contains(&"spine"));
 }
 
 #[test]
@@ -416,6 +471,7 @@ fn a_required_role_the_vocabulary_does_not_know_is_a_usage_refusal() {
         clip_names: vec!["WalkForward".into()],
         require_clip_roles: vec!["arms".into()],
         allow_incompatible_rest: false,
+        allow_rigid_torso: false,
         units_per_metre: None,
         rest_translation_tolerance: None,
         rest_scale_tolerance: None,

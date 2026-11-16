@@ -305,7 +305,8 @@ pub fn run(params: &ExportGlbParams) -> Result<Value, CommandError> {
 
     let nif_bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&nif_bytes).map_err(errors::nif)?;
-    let rig = complete_rig(&document, params.skeleton.as_deref())?;
+    let completed = complete_rig(&document, params.skeleton.as_deref())?;
+    let (rig, _) = follow_hips(&completed)?;
 
     let body = resolve_shape(&document, &params.body_shape, "body_shape")?;
     let mut garment_indices = Vec::with_capacity(params.garment_shapes.len());
@@ -555,6 +556,129 @@ pub(crate) fn complete_rig(
             format!("{}: {error}", path.display()),
         )
     })
+}
+
+/// The palette bone that roots the torso chain, by SSE name.
+pub const TORSO_ANCHOR: &str = "NPC Spine [Spn0]";
+
+/// The palette bone that roots the hips, by SSE name.
+pub const HIPS_ANCHOR: &str = "NPC Pelvis [Pelv]";
+
+/// What [`follow_hips`] did to the completed rig, for the export report.
+///
+/// A palette without both anchors (`mixamorig:*`, a custom rig) keeps its
+/// authored tree and says so here instead of silently pretending the rule ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorsoParent {
+    /// The joint moved under the hips, when the palette carried both anchors.
+    pub moved: Option<String>,
+    /// Its new parent.
+    pub parent: Option<String>,
+    /// Its previous parent.
+    pub previous: Option<String>,
+    /// One sentence naming what happened, for the report.
+    pub note: &'static str,
+}
+
+/// Parent the torso branch under the hips, preserving every rest world.
+///
+/// The palette authors the torso and the hips as two branches under the static
+/// root offset, so a pelvis rotation moves the hips and leaves the shoulders
+/// where they were (measured 0.00 mm of shoulder travel at 5° of pelvis yaw).
+/// Every source clip is authored against the anatomical tree, where the spine
+/// hangs off the hips; this step makes the destination agree with them once,
+/// instead of every clip compensating. It is a graph edit only: rest worlds,
+/// joint order and bind matrices are unchanged.
+///
+/// It walks the graph instead of naming both sides of the move: the torso branch
+/// root is the child of the two branches' nearest common ancestor on the torso's
+/// path, and the new parent is the hips joint in that branch's own naming family
+/// (`CME Pelvis` for a `CME UBody` branch, `NPC Pelvis` for an `NPC Spine` one),
+/// so a mirrored skeleton stays a mirror. @req DECL0008
+///
+/// # Errors
+/// A named anchor that the rig declares twice, or a move the
+/// [`complete_family_rig`] rest proof refuses.
+pub fn follow_hips(rig: &Rig) -> Result<(Rig, TorsoParent), CommandError> {
+    let opened = |note: &'static str| TorsoParent {
+        moved: None,
+        parent: None,
+        previous: None,
+        note,
+    };
+    let (torso, hips) = match (
+        rig.joint_by_name(TORSO_ANCHOR),
+        rig.joint_by_name(HIPS_ANCHOR),
+    ) {
+        (Ok(torso), Ok(hips)) => (torso, hips),
+        (Err(sculpto_core::rig::RigError::UnknownJointName { .. }), _)
+        | (_, Err(sculpto_core::rig::RigError::UnknownJointName { .. })) => {
+            return Ok((rig.clone(), opened("palette carries no hips/torso anchors")));
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            return Err(refused("export_glb_incomplete_rig", error.to_string()));
+        }
+    };
+    let name = |joint: JointId| rig.joint(joint).and_then(|node| node.name.clone());
+    let family = |joint: JointId| {
+        name(joint).and_then(|name| name.split_once(' ').map(|(family, _)| family.to_string()))
+    };
+    // The torso branch root is the last joint before the two branches meet.
+    let mut branch = torso;
+    let mut common = None;
+    while let Some(parent) = rig.joint(branch).and_then(|node| node.parent) {
+        if parent == hips || rig.is_ancestor(parent, hips).unwrap_or(false) {
+            common = Some(parent);
+            break;
+        }
+        branch = parent;
+    }
+    let Some(common) = common else {
+        return Ok((rig.clone(), opened("torso and hips share no ancestor")));
+    };
+    if branch == hips {
+        return Ok((rig.clone(), opened("hips already follow the torso")));
+    }
+    let target = match (family(branch), family(hips), name(hips)) {
+        (Some(left), Some(right), Some(hips_name)) if left != right => match hips_name
+            .split_once(' ')
+            .map(|(_, rest)| format!("{left} {rest}"))
+            .and_then(|mirror| rig.joint_by_name(&mirror).ok())
+        {
+            Some(mirror) => mirror,
+            None => {
+                return Ok((
+                    rig.clone(),
+                    opened("no hips counterpart in the torso's naming family"),
+                ));
+            }
+        },
+        _ => hips,
+    };
+    if rig.joint(branch).and_then(|node| node.parent) == Some(target) {
+        return Ok((rig.clone(), opened("already follows the hips")));
+    }
+    let previous = name(common);
+    let moved_rig =
+        sculpto_core::rig::template::reparent(rig, branch, target).map_err(|error| {
+            refused(
+                "export_glb_incomplete_rig",
+                format!(
+                    "torso re-parent {} -> {}: {error}",
+                    name(branch).unwrap_or_default(),
+                    name(target).unwrap_or_default()
+                ),
+            )
+        })?;
+    Ok((
+        moved_rig,
+        TorsoParent {
+            moved: name(branch),
+            parent: name(target),
+            previous,
+            note: "torso now rooted under the hips",
+        },
+    ))
 }
 
 /// Resolve one declared shape name; both a missing and an ambiguous name refuse.

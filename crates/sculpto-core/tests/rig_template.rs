@@ -1,6 +1,6 @@
 use std::f32::consts::FRAC_1_SQRT_2;
 
-use sculpto_core::rig::template::{TemplateError, TemplateRoots, complete_family_rig};
+use sculpto_core::rig::template::{TemplateError, TemplateRoots, complete_family_rig, reparent};
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigFrame};
 
 const ROOT: JointId = JointId::new(0);
@@ -103,5 +103,73 @@ fn the_template_cannot_replace_an_authored_non_root_parent() {
             authored: Some(JointId::new(1)),
             template: JointId::new(3),
         }),
+    );
+}
+
+/// The palette's shape around the hips: one static root offset, the pelvis and
+/// the torso as its two children, and the torso chain above the spine.
+fn hips_and_torso() -> Rig {
+    let spine = LocalTransform {
+        translation: [0.0, 0.0, 0.96],
+        ..LocalTransform::default()
+    };
+    let pelvis = LocalTransform {
+        translation: [0.0, 0.0, 0.95],
+        ..LocalTransform::default()
+    };
+    let above = LocalTransform {
+        translation: [0.0, 0.05, 0.0],
+        rotation: [0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2],
+        scale: 1.0,
+    };
+    rig(vec![
+        joint("NPC COM", None, LocalTransform::default()),
+        joint("NPC Spine", Some(ROOT), spine),
+        joint("NPC Pelvis", Some(ROOT), pelvis),
+        joint("NPC Spine1", Some(JointId::new(1)), above),
+    ])
+}
+
+#[test]
+fn reparent_preserves_every_rest_world_and_only_moves_the_link() {
+    let source = hips_and_torso();
+    let spine = source.joint_by_name("NPC Spine").expect("torso root");
+    let pelvis = source.joint_by_name("NPC Pelvis").expect("hips");
+    let moved = reparent(&source, spine, pelvis).expect("torso follows the hips");
+    assert_eq!(moved.joints().len(), source.joints().len());
+    assert_eq!(
+        moved.joint(spine).expect("moved joint").parent,
+        Some(pelvis)
+    );
+    for (before, after) in source.joints().iter().zip(moved.joints()) {
+        assert_eq!(before.name, after.name, "joint identity is unchanged");
+    }
+    for &id in source.topological_order() {
+        let before = source.rest_world(id).expect("source world");
+        let after = moved.rest_world(id).expect("re-parented world");
+        let drift = before
+            .iter()
+            .flatten()
+            .zip(after.iter().flatten())
+            .map(|(before, after)| (before - after).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(drift < 1e-9, "joint {id} rest world drift {drift:e}");
+    }
+    // The moved local is the parent-relative one, not the old offset.
+    let local = moved.joint(spine).expect("moved joint").rest;
+    assert!((local.translation[2] - 0.01).abs() < 1e-6);
+}
+
+#[test]
+fn reparent_refuses_a_parent_inside_the_moved_subtree() {
+    let source = hips_and_torso();
+    let spine = source.joint_by_name("NPC Spine").expect("torso root");
+    let above = source.joint_by_name("NPC Spine1").expect("spine child");
+    assert_eq!(
+        reparent(&source, spine, above),
+        Err(TemplateError::ParentCycle {
+            joint: spine,
+            parent: above,
+        })
     );
 }

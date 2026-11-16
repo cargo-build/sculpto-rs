@@ -115,6 +115,34 @@ pub fn complete_family_rig(
     Ok(completed)
 }
 
+/// Move one joint under a different parent, keeping every rest world unchanged.
+///
+/// The graph is otherwise identity-preserving: joint ids, names, count and every
+/// other local stay as authored, so a bind proof taken against the source rig
+/// still holds. The moved joint's local is recomputed from the new parent's rest
+/// world, and the resulting worlds are verified against the source with
+/// [`REST_TOLERANCE`]. @req DECL0008
+///
+/// # Errors
+/// Refuses an id outside either rig, a joint as its own parent, a parent inside
+/// the joint's own subtree, and any unrepresentable or drifting rest transform.
+pub fn reparent(rig: &Rig, joint: JointId, parent: JointId) -> Result<Rig, TemplateError> {
+    if joint == parent || rig.is_ancestor(joint, parent).map_err(TemplateError::Rig)? {
+        return Err(TemplateError::ParentCycle { joint, parent });
+    }
+    let parent_world = rest_world(rig, parent)?;
+    let mut joints = rig.joints().to_vec();
+    let moved = joints
+        .get_mut(joint.index())
+        .ok_or(TemplateError::InvalidRest { joint })?;
+    let local = reparent_rest(rig, joint, parent_world)?;
+    moved.parent = Some(parent);
+    moved.rest = local;
+    let moved_rig = Rig::new(joints, rig.frame()).map_err(TemplateError::Rig)?;
+    verify_authored_worlds(rig, &moved_rig)?;
+    Ok(moved_rig)
+}
+
 fn index_names<'a>(
     rig: &'a Rig,
     side: &'static str,
@@ -235,6 +263,8 @@ pub enum TemplateError {
         authored: Option<JointId>,
         template: JointId,
     },
+    /// A re-parent would put a joint inside its own subtree.
+    ParentCycle { joint: JointId, parent: JointId },
     /// The result exceeds the joint ID space.
     TooManyJoints,
     /// A rest transform cannot be represented.
@@ -274,6 +304,10 @@ impl fmt::Display for TemplateError {
             } => write!(
                 formatter,
                 "joint {joint} has authored parent {authored:?} and template parent {template}"
+            ),
+            Self::ParentCycle { joint, parent } => write!(
+                formatter,
+                "joint {joint} cannot be parented under {parent}, which is inside its own subtree"
             ),
             Self::TooManyJoints => write!(formatter, "completed rig exceeds the joint ID range"),
             Self::InvalidRest { joint } => write!(

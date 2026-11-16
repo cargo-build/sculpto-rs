@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: sculpto actor gait --input actor.glb --cycle SECONDS --samples N \
     [--hip DEG] [--knee DEG] [--ankle DEG] [--toe DEG] [--arm DEG] [--elbow DEG] \
-    [--bob METRES] [--pelvis-rot DEG] [--knee-phase FRACTION] --out gait.glb \
+    [--bob METRES] [--pelvis-rot DEG] [--head-counter FRACTION] [--knee-phase FRACTION] \
+    --out gait.glb \
     [--report gait.json] [--clip NAME]";
 
 struct Arguments<'arg> {
@@ -45,7 +46,7 @@ fn arguments(args: &[String]) -> Result<Arguments<'_>, String> {
         match key {
             "--input" | "--out" | "--report" | "--clip" | "--cycle" | "--samples" | "--hip"
             | "--knee" | "--ankle" | "--toe" | "--arm" | "--elbow" | "--bob" | "--pelvis-rot"
-            | "--knee-phase" => {
+            | "--head-counter" | "--knee-phase" => {
                 let value = iter.next().ok_or_else(|| format!("{key} needs a value"))?;
                 if flags.insert(key, value.as_str()).is_some() {
                     return Err(format!("duplicate {key}"));
@@ -86,6 +87,7 @@ fn arguments(args: &[String]) -> Result<Arguments<'_>, String> {
         elbow_amplitude_deg: number("--elbow", defaults.elbow_amplitude_deg)?,
         pelvis_bob: number("--bob", defaults.pelvis_bob)?,
         pelvis_rotation_deg: number("--pelvis-rot", defaults.pelvis_rotation_deg)?,
+        head_counter: number("--head-counter", defaults.head_counter)?,
         knee_phase: number("--knee-phase", defaults.knee_phase)?,
     };
     let input = required("--input")?;
@@ -148,6 +150,7 @@ fn report(
             "elbow_amplitude_deg": params.elbow_amplitude_deg,
             "pelvis_bob_m": params.pelvis_bob,
             "pelvis_rotation_deg": params.pelvis_rotation_deg,
+            "head_counter": params.head_counter,
             "knee_phase": params.knee_phase,
         },
         "time_seconds": outcome.times,
@@ -161,6 +164,10 @@ fn report(
             "foot_lift_right_m": measures.foot_lift_right,
             "arm_swing_left_deg_pp": measures.arm_swing_left_deg,
             "arm_swing_right_deg_pp": measures.arm_swing_right_deg,
+            "chest_yaw_deg_pp": measures.chest_yaw_deg,
+            "head_yaw_deg_pp": measures.head_yaw_deg,
+            "shoulder_travel_left_m": measures.shoulder_travel_left,
+            "shoulder_travel_right_m": measures.shoulder_travel_right,
         },
     })
 }

@@ -9,7 +9,7 @@
 //! The gait targets the standard NPC palette (the rig the engine binds to). A
 //! missing role joint is a named refusal, not a silently skipped limb.
 
-use glam::{DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3};
 use sculpto_gltf::pack::{PackWriter, Track};
 
 use super::{Actor, ActorError, Transform, animation, invalid, packing::packed, rig};
@@ -30,6 +30,12 @@ pub struct GaitParameters {
     /// Pelvis vertical travel, metres (peak-to-peak).
     pub pelvis_bob: f64,
     pub pelvis_rotation_deg: f64,
+    /// Fraction of the pelvis yaw the head cancels at `NPC Head`, 0…=1: the
+    /// pelvis yaw reaches the face through the spine now that the torso hangs
+    /// off the hips, so a walk that keeps the gaze forward writes the opposite
+    /// yaw there. The neck carries no weight on Emily, which is why the counter
+    /// belongs at the head and not at the neck bone.
+    pub head_counter: f64,
     /// Cycle-fraction shift of the knee flexion peak.
     pub knee_phase: f64,
 }
@@ -47,6 +53,7 @@ impl Default for GaitParameters {
             elbow_amplitude_deg: 10.0,
             pelvis_bob: 0.03,
             pelvis_rotation_deg: 5.0,
+            head_counter: 1.0,
             knee_phase: 0.0,
         }
     }
@@ -72,6 +79,15 @@ pub struct GaitMeasures {
     /// direction at any two cycle samples, degrees.
     pub arm_swing_left_deg: f64,
     pub arm_swing_right_deg: f64,
+    /// Peak-to-peak world yaw of the chest (the second spine joint), degrees.
+    pub chest_yaw_deg: f64,
+    /// Peak-to-peak world yaw of the head, degrees. The head counter track
+    /// drives this toward zero while the chest still follows the pelvis.
+    pub head_yaw_deg: f64,
+    /// Shoulder-joint travel over the cycle, metres: how far the arm root moves
+    /// once the torso inherits the pelvis.
+    pub shoulder_travel_left: f64,
+    pub shoulder_travel_right: f64,
 }
 
 /// Generated tracks plus the measured report.
@@ -222,6 +238,41 @@ pub fn gait(actor: &Actor, params: &GaitParameters) -> Result<GaitOutcome, Actor
         "pelvis_yaw",
         pelvis_quats,
     ));
+    // Head counter track: the pelvis yaw now reaches the face through the spine,
+    // so the walk writes the opposite yaw at the head and keeps the gaze forward.
+    // The counter belongs at `NPC Head`, not at the neck: the neck bone carries
+    // no influence weight on the standard body, so a neck counter moves nothing.
+    let mut head_range: Option<JointRange> = None;
+    if params.head_counter > 0.0 {
+        let head_node = rig::resolve(actor, &["NPC Head [Head]"])?[0].node;
+        let Transform::Trs { rotation, .. } = &actor.transforms[head_node] else {
+            return Err(invalid("gait head", "static matrix node cannot be driven"));
+        };
+        let yaw_axis = rest_worlds[head_node]
+            .inverse()
+            .transform_vector3(DVec3::Y)
+            .normalize();
+        let quats: Vec<DQuat> = pelvis_yaw_angles
+            .iter()
+            .map(|angle| {
+                let delta =
+                    DQuat::from_axis_angle(yaw_axis, (-params.head_counter * angle).to_radians());
+                (*rotation * delta).normalize()
+            })
+            .collect();
+        let turned: Vec<f64> = pelvis_yaw_angles
+            .iter()
+            .map(|angle| -params.head_counter * angle)
+            .collect();
+        head_range = Some(JointRange {
+            name: "NPC Head [Head]".to_owned(),
+            node: head_node,
+            role: "head_yaw",
+            min_deg: turned.iter().cloned().fold(f64::INFINITY, f64::min),
+            max_deg: turned.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        });
+        rotations.push((head_node, "NPC Head [Head]".to_owned(), "head_yaw", quats));
+    }
     // Pelvis bob translation track.
     let mut bob_heights = Vec::with_capacity(samples);
     let mut pelvis_trans = Vec::with_capacity(samples);
@@ -263,6 +314,7 @@ pub fn gait(actor: &Actor, params: &GaitParameters) -> Result<GaitOutcome, Actor
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max),
         }))
+        .chain(head_range)
         .collect();
 
     let measures = measure(actor, &times, &rotations, &translations, pelvis_node)?;
@@ -326,14 +378,19 @@ fn validate(params: &GaitParameters) -> Result<(), ActorError> {
         params.elbow_amplitude_deg,
         params.pelvis_bob,
         params.pelvis_rotation_deg,
+        params.head_counter,
         params.knee_phase,
     ]
     .into_iter()
     .all(|value| value.is_finite());
-    if !finite || params.cycle_seconds <= 0.0 || params.samples < 2 {
+    if !finite
+        || params.cycle_seconds <= 0.0
+        || params.samples < 2
+        || !(0.0..=1.0).contains(&params.head_counter)
+    {
         return Err(invalid(
             "gait parameters",
-            "need finite values, a positive cycle and at least two samples",
+            "need finite values, a positive cycle, at least two samples and a head counter in 0..=1",
         ));
     }
     Ok(())
@@ -356,6 +413,9 @@ fn measure(
     let arm_right = find("NPC R UpperArm [RUar]")?;
     let elbow_left = find("NPC L Forearm [LLar]")?;
     let elbow_right = find("NPC R Forearm [RLar]")?;
+    let chest = find("NPC Spine2 [Spn2]")?;
+    let head = find("NPC Head [Head]")?;
+    let rest_worlds = animation::compose_worlds(actor, &actor.transforms)?;
 
     let mut pelvis_y = Vec::with_capacity(times.len());
     let mut foot_y = [
@@ -363,6 +423,12 @@ fn measure(
         Vec::with_capacity(times.len()),
     ];
     let mut arm_dir = [
+        Vec::with_capacity(times.len()),
+        Vec::with_capacity(times.len()),
+    ];
+    let mut chest_yaw = Vec::with_capacity(times.len());
+    let mut head_yaw = Vec::with_capacity(times.len());
+    let mut shoulder = [
         Vec::with_capacity(times.len()),
         Vec::with_capacity(times.len()),
     ];
@@ -384,10 +450,23 @@ fn measure(
         foot_y[1].push(worlds[foot_right].transform_point3(DVec3::ZERO).y);
         arm_dir[0].push(arm_direction(&worlds, arm_left, elbow_left));
         arm_dir[1].push(arm_direction(&worlds, arm_right, elbow_right));
+        chest_yaw.push(world_yaw(&worlds, &rest_worlds, chest));
+        head_yaw.push(world_yaw(&worlds, &rest_worlds, head));
+        shoulder[0].push(worlds[arm_left].transform_point3(DVec3::ZERO));
+        shoulder[1].push(worlds[arm_right].transform_point3(DVec3::ZERO));
     }
     let range = |values: &[f64]| {
         values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
             - values.iter().cloned().fold(f64::INFINITY, f64::min)
+    };
+    let travel = |positions: &[DVec3]| {
+        let mut extent = 0.0_f64;
+        for (index, a) in positions.iter().enumerate() {
+            for b in &positions[index + 1..] {
+                extent = extent.max(a.distance(*b));
+            }
+        }
+        extent
     };
     Ok(GaitMeasures {
         pelvis_vertical_range: range(&pelvis_y),
@@ -395,7 +474,19 @@ fn measure(
         foot_lift_right: range(&foot_y[1]),
         arm_swing_left_deg: swing_peak_to_peak(&arm_dir[0]),
         arm_swing_right_deg: swing_peak_to_peak(&arm_dir[1]),
+        chest_yaw_deg: range(&chest_yaw),
+        head_yaw_deg: range(&head_yaw),
+        shoulder_travel_left: travel(&shoulder[0]),
+        shoulder_travel_right: travel(&shoulder[1]),
     })
+}
+
+/// The yaw, about the world's vertical, that one joint's posed world adds to its
+/// rest world, in degrees.
+fn world_yaw(worlds: &[DMat4], rest: &[DMat4], node: usize) -> f64 {
+    let turn = DQuat::from_mat4(&worlds[node]) * DQuat::from_mat4(&rest[node]).inverse();
+    let forward = turn * DVec3::X;
+    (-forward.z).atan2(forward.x).to_degrees()
 }
 
 /// Unit world direction of the upper arm (shoulder toward elbow).

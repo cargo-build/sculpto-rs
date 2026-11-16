@@ -70,9 +70,9 @@ use sculpto_nif::ShapePlacement;
 use crate::export_glb::{
     ArenaInfluences, ClipAnchor, ClipPlan, ClipTolerances, DEFAULT_REST_SCALE_TOLERANCE,
     DEFAULT_REST_TRANSLATION_TOLERANCE, DEFAULT_ROLL_TOLERANCE_DEGREES, actor_error, bind_palette,
-    bounds, complete_rig, conjugate, conjugate_f64, glb_error, hex as sha_hex, influence_summary,
-    palette_of, plan_clip, refused, resolve_shape, rest_error, scale_clip, scale_rig,
-    weighted_bones, write_bytes, write_report,
+    bounds, complete_rig, conjugate, conjugate_f64, follow_hips, glb_error, hex as sha_hex,
+    influence_summary, palette_of, plan_clip, refused, resolve_shape, rest_error, scale_clip,
+    scale_rig, weighted_bones, write_bytes, write_report,
 };
 use crate::obj::read_obj_surface;
 use crate::{CommandError, ErrorKind, errors};
@@ -125,15 +125,19 @@ pub struct ExportActorParams {
     /// Clip names to write, in written order (index 0 first).
     #[serde(default)]
     pub clip_names: Vec<String>,
-    /// Standard rig roles every written clip must drive (`hips`, `knees`, …);
-    /// a clip that misses one refuses the export. Empty keeps the coverage
-    /// report-only, so a legitimately partial clip still exports.
+    /// Standard rig roles every written clip must drive (`hips`, `spine`,
+    /// `knees`, …); a clip that misses one refuses the export. Empty keeps the
+    /// coverage report-only, so a legitimately partial clip still exports.
     #[serde(default)]
     pub require_clip_roles: Vec<String>,
     /// Export a clip whose rest pose is not comparable with the rig instead of
     /// refusing it; the report carries the measured rotation and residual.
     #[serde(default)]
     pub allow_incompatible_rest: bool,
+    /// Export a clip that drives the pelvis and no spine bone instead of
+    /// refusing it; the report row is marked `rigid_torso_admitted`.
+    #[serde(default)]
+    pub allow_rigid_torso: bool,
     /// Source units per metre; the written file is scaled to metres.
     #[serde(default)]
     pub units_per_metre: Option<f64>,
@@ -397,7 +401,8 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
 
     let nif_bytes = std::fs::read(&params.nif).map_err(|error| errors::io(&params.nif, error))?;
     let document = sculpto_nif::read(&nif_bytes).map_err(errors::nif)?;
-    let mut rig = complete_rig(&document, params.skeleton.as_deref())?;
+    let (mut rig, torso_parent) =
+        follow_hips(&complete_rig(&document, params.skeleton.as_deref())?)?;
     let shape = resolve_shape(&document, &params.body_shape, "body_shape")?;
     let source = document.shapes.get(shape).ok_or_else(|| {
         errors::invalid(
@@ -738,6 +743,7 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
             &palette,
             &params.require_clip_roles,
             params.allow_incompatible_rest,
+            params.allow_rigid_torso,
             tolerances.translation_relative,
         )?);
     }
@@ -855,6 +861,12 @@ pub fn run(params: &ExportActorParams) -> Result<Value, CommandError> {
         "parts": part_values,
         "palette": {
             "bones": palette.len(),
+            "torso_parent": {
+                "moved": torso_parent.moved,
+                "parent": torso_parent.parent,
+                "previous": torso_parent.previous,
+                "note": torso_parent.note,
+            },
             "authored": authored.iter().filter(|entry| entry.is_some()).count(),
             "bind_residual": bound.bind_residual,
             "source_bind_mismatch": bound.source_bind_mismatch,
@@ -1047,7 +1059,17 @@ pub fn clip_value(index: usize, plan: &ClipPlan, coverage: &ClipCoverage) -> Val
     if !plan.rest_pose_comparable {
         value["rest_incompatible_admitted"] = json!(true);
     }
+    if drives_pelvis(plan) && coverage.roles_missing.contains(&"spine") {
+        value["rigid_torso_admitted"] = json!(true);
+    }
     value
+}
+
+/// Whether one planned clip drives the hip joint the torso hangs from.
+pub fn drives_pelvis(plan: &ClipPlan) -> bool {
+    plan.mapped_bone_names
+        .iter()
+        .any(|bone| is_pelvis_bone(bone))
 }
 
 /// Refuse the declarations that cannot produce one well-defined actor.
@@ -1123,8 +1145,13 @@ fn validate(params: &ExportActorParams) -> Result<(), CommandError> {
 /// order. A role is the anatomical function, not one bone: `hips` is the
 /// thigh/hip pair, `shoulders` the clavicle/upper-arm pair, so either family's
 /// bone (`NPC`, `CME`) answers for it.
-pub const CLIP_ROLES: [&str; 10] = [
+///
+/// `spine` is the torso chain the hips carry. A clip that drives the hips and
+/// none of it leaves the torso rigid with respect to the pelvis, which
+/// [`admit_clip`] refuses unless the caller declares that pose intended.
+pub const CLIP_ROLES: [&str; 11] = [
     "hips",
+    "spine",
     "knees",
     "ankles",
     "toes",
@@ -1136,20 +1163,33 @@ pub const CLIP_ROLES: [&str; 10] = [
     "twists",
 ];
 
+/// One palette bone name without its family prefix and `[xxxx]` suffix.
+fn plain_bone(bone: &str) -> &str {
+    let stripped = bone
+        .strip_prefix("NPC ")
+        .or_else(|| bone.strip_prefix("CME "))
+        .unwrap_or(bone);
+    match stripped.split_once(" [") {
+        Some((plain, _)) => plain,
+        None => stripped,
+    }
+}
+
+/// Whether this palette bone is the hip joint the torso hangs from.
+///
+/// `NPC Pelvis [Pelv]` and `CME Pelvis [Pelv]` both answer; the thigh pair is
+/// the `hips` role and a different joint.
+pub fn is_pelvis_bone(bone: &str) -> bool {
+    plain_bone(bone) == "Pelvis"
+}
+
 /// The standard rig role one palette bone belongs to, by its SSE name.
 ///
 /// `None` means the bone is not a role carrier: scaffolding (`Scene Root`,
 /// `NPC COM`), physics helpers (`NPC L Butt`) and the finger chains are
 /// reported as untouched palette bones instead of pretending a role moved.
 pub fn clip_role(bone: &str) -> Option<&'static str> {
-    let stripped = bone
-        .strip_prefix("NPC ")
-        .or_else(|| bone.strip_prefix("CME "))
-        .unwrap_or(bone);
-    let name = match stripped.split_once(" [") {
-        Some((plain, _)) => plain,
-        None => stripped,
-    };
+    let name = plain_bone(bone);
     match name {
         "L Thigh" | "R Thigh" | "L Hip" | "R Hip" => return Some("hips"),
         "L Calf" | "R Calf" | "L Knee" | "R Knee" => return Some("knees"),
@@ -1157,6 +1197,9 @@ pub fn clip_role(bone: &str) -> Option<&'static str> {
         "Neck" => return Some("neck"),
         "Head" => return Some("head"),
         "L Hand" | "R Hand" => return Some("hands"),
+        // The mirror family roots its upper body at `UBody`, one level above the
+        // spine chain; driving it moves the same torso the spine bones carry.
+        "Spine" | "Spine1" | "Spine2" | "Spine3" | "UBody" => return Some("spine"),
         _ => {}
     }
     let side = name
@@ -1246,14 +1289,21 @@ pub fn clip_coverage(plan: &ClipPlan, palette: &[String]) -> ClipCoverage {
 /// drives refuses it outright; the coverage report itself never blocks a clip,
 /// so a legitimately partial clip (an upper-body idle) still exports.
 ///
+/// One structural pose is refused without being asked for: a clip that drives
+/// the pelvis and no spine bone leaves the torso rigid with respect to the hips,
+/// so the whole upper body turns as one piece with the pelvis and no clip can
+/// counter-rotate or bend it. That is a deliberate pose for some material, so
+/// `allow_rigid_torso` admits it and marks the report row.
+///
 /// # Errors
-/// `export_actor_clip_rest_incompatible` and `export_actor_clip_role_coverage`,
-/// each naming the clip and its measurement.
+/// `export_actor_clip_rest_incompatible`, `export_actor_clip_torso_rigid` and
+/// `export_actor_clip_role_coverage`, each naming the clip and its measurement.
 pub fn admit_clip(
     plan: &ClipPlan,
     palette: &[String],
     required: &[String],
     allow_incompatible_rest: bool,
+    allow_rigid_torso: bool,
     admitted_residual: f64,
 ) -> Result<ClipCoverage, CommandError> {
     if !plan.rest_pose_comparable && !allow_incompatible_rest {
@@ -1273,6 +1323,28 @@ pub fn admit_clip(
         ));
     }
     let coverage = clip_coverage(plan, palette);
+    let rigid_torso =
+        drives_pelvis(plan) && coverage.roles_missing.contains(&"spine") && !allow_rigid_torso;
+    if rigid_torso {
+        return Err(refused(
+            "export_actor_clip_torso_rigid",
+            format!(
+                "clip {:?} drives the pelvis ({}) and no spine bone, so the torso is carried \
+                 rigidly by the hips: {} of {} palette bones move and the spine role is missing; \
+                 drive at least one spine bone, or declare `allow_rigid_torso` when a rigid torso \
+                 is the intended pose",
+                plan.clip.name,
+                plan.mapped_bone_names
+                    .iter()
+                    .filter(|bone| is_pelvis_bone(bone))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                coverage.mapped_bones,
+                coverage.palette_bones,
+            ),
+        ));
+    }
     if !required.is_empty() {
         let missing: Vec<&str> = required
             .iter()

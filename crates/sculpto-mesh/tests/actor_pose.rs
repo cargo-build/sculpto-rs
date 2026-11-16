@@ -70,6 +70,104 @@ fn zero_angle_probe_leaves_geometry_at_rest() {
     assert!(outcome.probes[0].max_displacement < 1e-6);
 }
 
+/// The standard palette's hip joint rests under a −90° X rotation, so its local
+/// `y` is the world's horizontal `−z`. A joint like that is the reason the probe
+/// axis names the world axis: a yaw written as a local `y` would roll the body.
+fn rolled_pelvis() -> Fixture {
+    let mut fixture = Fixture::triangle();
+    let half = std::f32::consts::FRAC_1_SQRT_2;
+    fixture.json["nodes"] = json!([
+        {"name": "Root", "translation": [0., 0., 0.], "children": [1]},
+        {
+            "name": "Pelvis",
+            "translation": [0., 0., 0.],
+            "rotation": [-half, 0., 0., half],
+            "children": [2],
+        },
+        {"name": "Spine", "translation": [0., 0.5, 0.]},
+        {"name": "Body", "mesh": 0, "skin": 0},
+    ]);
+    fixture.json["skins"] = json!([{"joints": [1, 2]}]);
+    // Three vertices above the spine pivot in the bone's own frame, fully
+    // weighted to the spine (skin lane 1), so a world yaw swings them.
+    let positions = fixture.floats(&[0.2, 0.5, 0.1, 0.3, 0.5, -0.1, 0.2, 0.7, 0.0], "VEC3", 3);
+    fixture.json["accessors"][positions]["min"] = json!([0.2, 0.5, -0.1]);
+    fixture.json["accessors"][positions]["max"] = json!([0.3, 0.7, 0.1]);
+    fixture.json["meshes"][0]["primitives"][0]["attributes"]["POSITION"] = json!(positions);
+    let joints = fixture.accessor(&[1, 0, 0, 0].repeat(3), 5121, "VEC4", 3);
+    let weights = fixture.floats(&[1., 0., 0., 0.].repeat(3), "VEC4", 3);
+    fixture.json["meshes"][0]["primitives"][0]["attributes"]["JOINTS_0"] = json!(joints);
+    fixture.json["meshes"][0]["primitives"][0]["attributes"]["WEIGHTS_0"] = json!(weights);
+    fixture
+}
+
+#[test]
+fn the_probe_axis_is_the_world_axis_through_the_joint() {
+    let actor = Actor::from_glb(&rolled_pelvis().bytes()).unwrap();
+    let outcome = probe(
+        &actor,
+        &["Body"],
+        &[JointPose {
+            name: "Spine",
+            axis: Axis::Y,
+            angle_deg: 90.0,
+        }],
+    )
+    .unwrap();
+    let joint = &outcome.probes[0];
+    assert_eq!(joint.moved_vertices, 3);
+    assert_eq!(joint.axis_world, [0.0, 1.0, 0.0]);
+    // Local +Z is world +Y under the pelvis's −90° X rest, and the probe reports
+    // the axis it actually wrote instead of pretending the two frames agree.
+    assert!(
+        (joint.axis_local[2] - 1.0).abs() < 1e-9,
+        "{:?}",
+        joint.axis_local
+    );
+    assert!(joint.axis_local[0].abs() < 1e-9, "{:?}", joint.axis_local);
+    // A rotation about the world's vertical keeps every height: this is a yaw,
+    // where the same letter read as a local axis would have rolled the figure.
+    assert!(
+        (joint.farthest_rest[1] - joint.farthest_posed[1]).abs() < 1e-9,
+        "world yaw changed the height: {:?} -> {:?}",
+        joint.farthest_rest,
+        joint.farthest_posed
+    );
+}
+
+#[test]
+fn a_world_axis_letter_is_not_the_joint_local_axis() {
+    let actor = Actor::from_glb(&rolled_pelvis().bytes()).unwrap();
+    let yaw = probe(
+        &actor,
+        &["Body"],
+        &[JointPose {
+            name: "Spine",
+            axis: Axis::Y,
+            angle_deg: 90.0,
+        }],
+    )
+    .unwrap();
+    let tilt = probe(
+        &actor,
+        &["Body"],
+        &[JointPose {
+            name: "Spine",
+            axis: Axis::Z,
+            angle_deg: 90.0,
+        }],
+    )
+    .unwrap();
+    let height_change = |outcome: &sculpto_mesh::actor::PoseOutcome| {
+        (outcome.probes[0].farthest_rest[1] - outcome.probes[0].farthest_posed[1]).abs()
+    };
+    assert!(height_change(&yaw) < 1e-9, "`y` is the yaw");
+    assert!(
+        height_change(&tilt) > 1e-3,
+        "`z` is the world's horizontal axis, so it tips the figure"
+    );
+}
+
 #[test]
 fn written_probe_clip_reproduces_the_measured_pose() {
     let bytes = pose_fixture().bytes();

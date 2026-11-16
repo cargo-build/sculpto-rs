@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::write_obj;
 
 const USAGE: &str = "usage: sculpto actor pose --input actor.glb --joint NAME --angle DEG \
-    [--axis x|y|z] [--joint NAME --angle DEG ...] [--part NAME ...] --out posed.glb \
+    [--axis x|y|z (world axis)] [--joint NAME --angle DEG ...] [--part NAME ...] --out posed.glb \
     [--report posed.json] [--obj posed.obj] [--clip NAME]";
 
 struct ProbeArg<'arg> {
@@ -198,6 +198,9 @@ fn report(
             "name": joint.name,
             "node": joint.node,
             "axis": axis_letter(joint.axis),
+            "axis_frame": "world",
+            "axis_world": joint.axis_world,
+            "axis_local": joint.axis_local,
             "angle_deg": joint.angle_deg,
             "delta_quaternion_xyzw": joint.delta_quaternion,
             "rest_rotation_xyzw": joint.rest_rotation,

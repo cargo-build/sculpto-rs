@@ -174,12 +174,15 @@ export-actor options:
   --clips <path>          source actor GLB whose clips are mapped by bone name
   --clip <name>           clip to write (repeatable; the written order is this order)
   --require-clip-roles <list>
-                          comma-separated roles every clip must drive (hips, knees,
-                          ankles, toes, shoulders, elbows, hands, neck, head, twists);
-                          a clip that misses one refuses the export
+                          comma-separated roles every clip must drive (hips, spine,
+                          knees, ankles, toes, shoulders, elbows, hands, neck, head,
+                          twists); a clip that misses one refuses the export
   --allow-incompatible-rest
                           export a rest-incompatible clip instead of refusing it;
                           stderr and the report carry the measured rotation and residual
+  --allow-rigid-torso
+                          export a clip that drives the pelvis and no spine bone instead
+                          of refusing it; the report row is marked rigid_torso_admitted
   --units-per-metre <n>   scale the written file to metres (BodySlide sources: 71.4286)
   --reach <units>         reach inside which a part takes copied body weights (default 3)
   --smooth <n>            smoothing passes over the bound region (default 6)
@@ -1417,6 +1420,7 @@ fn export_actor(args: &[String]) -> ExitCode {
     let mut frame: Option<f64> = None;
     let mut require_roles: Vec<String> = Vec::new();
     let mut allow_incompatible_rest = false;
+    let mut allow_rigid_torso = false;
     let mut iter = args.iter();
     let reject = |message: String| -> ExitCode {
         eprintln!("export-actor: {message}");
@@ -1430,6 +1434,10 @@ fn export_actor(args: &[String]) -> ExitCode {
     while let Some(key) = iter.next() {
         if key == "--allow-incompatible-rest" {
             allow_incompatible_rest = true;
+            continue;
+        }
+        if key == "--allow-rigid-torso" {
+            allow_rigid_torso = true;
             continue;
         }
         let Some(name) = key.strip_prefix("--") else {
@@ -1563,6 +1571,9 @@ fn export_actor(args: &[String]) -> ExitCode {
     if allow_incompatible_rest {
         input["allow_incompatible_rest"] = serde_json::json!(true);
     }
+    if allow_rigid_torso {
+        input["allow_rigid_torso"] = serde_json::json!(true);
+    }
     let result = sculpto_engine::dispatch("export.actor", &input);
     // The override the operator asked for prints its own price: every clip the
     // rest gate would have refused names its measured rotation and residual.
@@ -1583,6 +1594,16 @@ fn export_actor(args: &[String]) -> ExitCode {
                 "export-actor: clip `{name}` exported despite an incompatible rest pose: max rest \
                  rotation {rotation:.2}°, max bone-position residual {residual:.4} relative; the \
                  motion plays, the stance does not"
+            );
+        }
+        for clip in report["clips"].as_array().into_iter().flatten() {
+            if clip["rigid_torso_admitted"].as_bool() != Some(true) {
+                continue;
+            }
+            let name = clip["name"].as_str().unwrap_or("<unnamed>");
+            eprintln!(
+                "export-actor: clip `{name}` drives the hips and no spine bone; the torso is \
+                 rigid with respect to the pelvis in every frame"
             );
         }
     }

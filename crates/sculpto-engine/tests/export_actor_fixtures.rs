@@ -102,6 +102,10 @@ fn params(case: &Value, out_dir: &Path) -> ExportActorParams {
             .get("allow_incompatible_rest")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        allow_rigid_torso: case
+            .get("allow_rigid_torso")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         units_per_metre: case.get("units_per_metre").and_then(Value::as_f64),
         rest_translation_tolerance: None,
         rest_scale_tolerance: None,

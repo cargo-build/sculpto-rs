@@ -52,7 +52,11 @@ fn gait_fixture() -> Fixture {
     fixture.json["nodes"] = json!([
         {"name": "Scene Root", "children": [1]},
         {"name": "NPC COM [COM ]", "translation": [0., 0.96, 0.], "children": [2]},
-        {"name": "NPC Pelvis [Pelv]", "translation": [0., 0., 0.], "children": [3, 7, 11, 13]},
+        {
+            "name": "NPC Pelvis [Pelv]",
+            "translation": [0., 0., 0.],
+            "children": [3, 7, 11, 13, 15],
+        },
         {"name": "NPC L Thigh [LThg]", "translation": [-0.1, 0., 0.], "children": [4]},
         {"name": "NPC L Calf [LClf]", "translation": [0., -0.45, 0.], "children": [5]},
         {"name": "NPC L Foot [Lft ]", "translation": [0., -0.4, 0.], "children": [6]},
@@ -65,6 +69,9 @@ fn gait_fixture() -> Fixture {
         {"name": "NPC L Forearm [LLar]", "translation": [0., -0.3, 0.]},
         {"name": "NPC R UpperArm [RUar]", "translation": [0.2, 0.5, 0.], "children": [14]},
         {"name": "NPC R Forearm [RLar]", "translation": [0., -0.3, 0.]},
+        {"name": "NPC Spine [Spn0]", "translation": [0., 0.2, 0.], "children": [16]},
+        {"name": "NPC Spine2 [Spn2]", "translation": [0., 0.2, 0.], "children": [17]},
+        {"name": "NPC Head [Head]", "translation": [0., 0.1, 0.]},
     ]);
     fixture.json["meshes"] = json!([]);
     fixture
@@ -102,6 +109,7 @@ fn actor_pose_writes_a_probe_clip_report_and_obj() {
     assert_eq!(metadata["clip"]["name"], "Pose");
     let joint = &metadata["joints"][0];
     assert_eq!(joint["name"], "J1");
+    assert_eq!(joint["axis_frame"], "world");
     assert_eq!(joint["moved_vertices"], 3);
     let displacement = joint["max_displacement_m"].as_f64().unwrap();
     assert!((displacement - 2.0 * 2.0_f64.sqrt()).abs() < 1e-6);
@@ -166,6 +174,9 @@ fn actor_gait_writes_a_symmetric_cycle_and_report() {
     let bob = measures["pelvis_vertical_range_m"].as_f64().unwrap();
     assert!((bob - 0.03).abs() < 1e-6);
     assert!(measures["arm_swing_left_deg_pp"].as_f64().unwrap() > 10.0);
+    // The pelvis yaw reaches the chest and the head counter holds the face.
+    assert!(measures["chest_yaw_deg_pp"].as_f64().unwrap() > 5.0);
+    assert!(measures["head_yaw_deg_pp"].as_f64().unwrap() < 0.5);
     // The written GLB carries the gait clip at the walk slot.
     let actor = sculpto_mesh::actor::Actor::from_glb(&fs::read(&output).unwrap()).unwrap();
     assert!(actor.clip_names().contains(&Some("Gait")));

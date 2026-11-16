@@ -1,18 +1,22 @@
 //! Explicit joint-angle probes on top of rest, with a world-space displacement
 //! report. @req DECL0013
 //!
-//! A probe rotates named joints about their own local axes and leaves every
-//! other joint at rest. It is the controlled pose that separates a rig defect
-//! from a borrowed-clip defect: the same evaluator that plays a clip composes
-//! the probe, so the reported displacement is exactly what a written probe clip
-//! reproduces.
+//! A probe rotates named joints about a **world** axis through their own pivot
+//! and leaves every other joint at rest. The axis letter names the world axis,
+//! not the joint's local one: the pelvis's rest world is a −90° X rotation, so
+//! its local `y` is the world's horizontal `−z` and a "yaw" written as a local
+//! `y` would roll the figure. Reading the letter as the world axis makes
+//! `--axis y` mean the vertical everywhere, which is what a yaw probe wants.
+//! The local delta the probe writes is reported next to it, so both frames are
+//! visible. The same evaluator that plays a clip composes the probe, so the
+//! reported displacement is exactly what a written probe clip reproduces.
 
 use glam::{DQuat, DVec3};
 use sculpto_gltf::pack::{PackWriter, Track};
 
 use super::{Actor, ActorError, Transform, animation, geometry, invalid, packing::packed, rig};
 
-/// The local axis a probe rotates about.
+/// The world axis a probe rotates about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
     X,
@@ -21,7 +25,7 @@ pub enum Axis {
 }
 
 impl Axis {
-    /// The unit basis vector of this axis in the joint's local frame.
+    /// The unit basis vector of this axis in world space.
     pub fn vector(self) -> DVec3 {
         match self {
             Self::X => DVec3::X,
@@ -44,7 +48,7 @@ impl Axis {
     }
 }
 
-/// One requested probe: a joint name, a local axis and an angle in degrees.
+/// One requested probe: a joint name, a world axis and an angle in degrees.
 #[derive(Clone, Copy, Debug)]
 pub struct JointPose<'name> {
     pub name: &'name str,
@@ -59,6 +63,10 @@ pub struct PosedJoint {
     pub node: usize,
     pub axis: Axis,
     pub angle_deg: f64,
+    /// The requested world axis.
+    pub axis_world: DVec3,
+    /// The same axis in the joint's local frame, as written to the clip.
+    pub axis_local: DVec3,
     /// The applied local-frame rotation (the delta on top of rest).
     pub delta: DQuat,
     pub rest_rotation: DQuat,
@@ -75,6 +83,8 @@ pub struct JointProbe {
     pub node: usize,
     pub axis: Axis,
     pub angle_deg: f64,
+    pub axis_world: [f64; 3],
+    pub axis_local: [f64; 3],
     pub delta_quaternion: [f64; 4],
     pub rest_rotation: [f64; 4],
     pub posed_rotation: [f64; 4],
@@ -138,7 +148,12 @@ pub fn probe(
                 "joint is a static matrix; it has no local rotation to probe",
             ));
         };
-        let delta = DQuat::from_axis_angle(request.axis.vector(), request.angle_deg.to_radians());
+        // A world axis becomes a local delta through the joint's rest world, so
+        // `posed_world = axis_rotation · rest_world` exactly: the probe turns the
+        // joint (and its subtree) about the requested world axis through its pivot.
+        let rest_world_rotation = DQuat::from_mat4(&rest_worlds[resolved.node]);
+        let axis_local = (rest_world_rotation.inverse() * request.axis.vector()).normalize();
+        let delta = DQuat::from_axis_angle(axis_local, request.angle_deg.to_radians());
         let posed_rotation = (*rotation * delta).normalize();
         posed_transforms[resolved.node] = Transform::Trs {
             translation: *translation,
@@ -150,6 +165,8 @@ pub fn probe(
             node: resolved.node,
             axis: request.axis,
             angle_deg: request.angle_deg,
+            axis_world: request.axis.vector(),
+            axis_local,
             delta,
             rest_rotation: *rotation,
             posed_rotation,
@@ -189,6 +206,8 @@ pub fn probe(
                 node: joint.node,
                 axis: joint.axis,
                 angle_deg: joint.angle_deg,
+                axis_world: joint.axis_world.to_array(),
+                axis_local: joint.axis_local.to_array(),
                 delta_quaternion: joint.delta.to_array(),
                 rest_rotation: joint.rest_rotation.to_array(),
                 posed_rotation: joint.posed_rotation.to_array(),

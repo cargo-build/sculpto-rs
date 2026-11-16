@@ -12,7 +12,11 @@ fn gait_fixture() -> Fixture {
     fixture.json["nodes"] = json!([
         {"name": "Scene Root", "children": [1]},
         {"name": "NPC COM [COM ]", "translation": [0., 0.96, 0.], "children": [2]},
-        {"name": "NPC Pelvis [Pelv]", "translation": [0., 0., 0.], "children": [3, 7, 11, 13]},
+        {
+            "name": "NPC Pelvis [Pelv]",
+            "translation": [0., 0., 0.],
+            "children": [3, 7, 11, 13, 15],
+        },
         {"name": "NPC L Thigh [LThg]", "translation": [-0.1, 0., 0.], "children": [4]},
         {"name": "NPC L Calf [LClf]", "translation": [0., -0.45, 0.], "children": [5]},
         {"name": "NPC L Foot [Lft ]", "translation": [0., -0.4, 0.], "children": [6]},
@@ -25,6 +29,11 @@ fn gait_fixture() -> Fixture {
         {"name": "NPC L Forearm [LLar]", "translation": [0., -0.3, 0.]},
         {"name": "NPC R UpperArm [RUar]", "translation": [0.2, 0.5, 0.], "children": [14]},
         {"name": "NPC R Forearm [RLar]", "translation": [0., -0.3, 0.]},
+        // The torso hangs off the hips, so the head inherits the pelvis yaw and
+        // the counter track has something to cancel.
+        {"name": "NPC Spine [Spn0]", "translation": [0., 0.2, 0.], "children": [16]},
+        {"name": "NPC Spine2 [Spn2]", "translation": [0., 0.2, 0.], "children": [17]},
+        {"name": "NPC Head [Head]", "translation": [0., 0.1, 0.]},
     ]);
     // The gait never samples geometry; drop the triangle mesh the base fixture
     // carries so this is a pure skeleton.
@@ -59,9 +68,58 @@ fn gait_is_symmetric_and_bobs_the_pelvis_by_the_requested_amount() {
     assert_eq!(outcome.times.len(), params.samples);
     assert_eq!(outcome.times[0], 0.0);
     assert!((outcome.times[params.samples - 1] - params.cycle_seconds).abs() < 1e-9);
-    // 12 limb rotation tracks + pelvis yaw, and one pelvis bob translation.
-    assert_eq!(outcome.rotations.len(), 13);
+    // 12 limb rotation tracks + pelvis yaw + head counter, and one bob.
+    assert_eq!(outcome.rotations.len(), 14);
     assert_eq!(outcome.translations.len(), 1);
+}
+
+#[test]
+fn the_head_counter_holds_the_gaze_while_the_chest_follows_the_pelvis() {
+    let actor = Actor::from_glb(&gait_fixture().bytes()).unwrap();
+    let params = GaitParameters {
+        samples: 29,
+        ..GaitParameters::default()
+    };
+    let outcome = gait(&actor, &params).unwrap();
+    let measures = &outcome.measures;
+    assert!(
+        (measures.chest_yaw_deg - 2.0 * params.pelvis_rotation_deg).abs() < 0.5,
+        "the chest follows the pelvis: {}",
+        measures.chest_yaw_deg
+    );
+    assert!(
+        measures.head_yaw_deg < 0.5,
+        "the head counter leaves the face forward: {}",
+        measures.head_yaw_deg
+    );
+    // Without the counter the pelvis yaw reaches the face unchanged.
+    let uncountered = gait(
+        &actor,
+        &GaitParameters {
+            head_counter: 0.0,
+            ..params
+        },
+    )
+    .unwrap();
+    assert!(
+        (uncountered.measures.head_yaw_deg - measures.chest_yaw_deg).abs() < 0.5,
+        "no counter means the head turns with the chest: {}",
+        uncountered.measures.head_yaw_deg
+    );
+}
+
+#[test]
+fn a_head_counter_outside_the_unit_interval_is_a_named_refusal() {
+    let actor = Actor::from_glb(&gait_fixture().bytes()).unwrap();
+    let refused = gait(
+        &actor,
+        &GaitParameters {
+            head_counter: 1.5,
+            ..GaitParameters::default()
+        },
+    )
+    .expect_err("a counter above one over-rotates the head");
+    assert!(format!("{refused}").contains("head counter in 0..=1"));
 }
 
 #[test]
