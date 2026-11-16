@@ -10,6 +10,7 @@ mod rebind;
 mod regression;
 mod rig;
 mod shoulder;
+mod skin;
 mod stress;
 mod torso;
 
@@ -67,6 +68,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "rebind") {
         return rebind::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "skin") {
+        return skin::run(&args[1..]);
     }
     if args.first().is_some_and(|command| command == "havok") {
         return havok::run(&args[1..]);

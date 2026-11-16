@@ -13,6 +13,7 @@
 
 use serde_json::{Value, json};
 
+mod actor_io;
 pub mod adapt;
 mod assemble;
 mod component;
@@ -30,6 +31,7 @@ pub mod regression;
 pub mod retarget;
 pub mod rules;
 mod seal;
+pub mod skin;
 mod stress;
 mod viewer;
 

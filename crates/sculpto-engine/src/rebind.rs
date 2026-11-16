@@ -26,16 +26,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use sculpto_core::mesh::{MeshAsset, PartitionId, Skin};
+use sculpto_core::mesh::{MeshAsset, Skin};
 use sculpto_core::rig::rest::{RestBinding, SkinRestSource};
 use sculpto_core::rig::{Joint, JointId, LocalTransform, Rig, RigFrame};
 use sculpto_core::skin::SkinWeights;
 use sculpto_gltf::review::smooth_normals;
 use sculpto_gltf::{PartMaterial, write_partitioned_rigged_glb};
-use sculpto_mesh::actor::{Actor, Pose};
+use sculpto_mesh::actor::Actor;
 use sculpto_mesh::rig::map::{BoneMap, Destination};
 use sculpto_mesh::rig::remap::{RemapSettings, remap_skin};
 
+use crate::actor_io::{
+    Pool, Validation, f32_of, identity_f32, part_materials, pool_weights, read_pool, validate_skin,
+};
 use crate::adapt::{actor_rest_worlds, actor_rig};
 use crate::export_glb::{
     actor_error, bounds, glb_error, hex as sha_hex, refused, rest_error, write_report,
@@ -220,16 +223,6 @@ fn fold_group(name: &str) -> &'static str {
     } else {
         "helpers"
     }
-}
-
-fn f32_of(value: DMat4) -> [[f32; 4]; 4] {
-    value
-        .to_cols_array_2d()
-        .map(|column| column.map(|x| x as f32))
-}
-
-fn identity_f32() -> [[f32; 4]; 4] {
-    f32_of(DMat4::IDENTITY)
 }
 
 /// Rebind one actor's mesh onto another skeleton.
@@ -489,114 +482,6 @@ fn nearest_mapped_ancestor(
 }
 
 /// One skin row per pool vertex: palette slots and raw weights.
-struct Pool {
-    vertices: Vec<[f64; 3]>,
-    triangles: Vec<[u32; 3]>,
-    partitions: Vec<PartitionId>,
-    rows: Vec<Vec<(u16, f32)>>,
-    parts: Vec<PoolPart>,
-}
-
-/// One primitive's identity in the shared pool.
-struct PoolPart {
-    triangles: usize,
-}
-
-/// Read the actor's one shared skinned pool through the validated actor reader.
-fn read_pool(
-    actor: &Actor,
-    mesh_node: usize,
-    mesh_name: &str,
-    source_palette: &[String],
-) -> Result<Pool, CommandError> {
-    actor.shared_pool_parts(mesh_node).map_err(actor_error)?;
-    let palette_refs: Vec<&str> = source_palette.iter().map(String::as_str).collect();
-    let sampled = actor
-        .rig_sample(&[mesh_name], Pose::Rest, &palette_refs)
-        .map_err(actor_error)?;
-    let parts = &sampled.sample.parts;
-    let pool_range = parts[0].vertices.clone();
-    let pool_count = pool_range.len();
-    if parts.iter().any(|part| part.vertices.len() != pool_count) {
-        return Err(refused(
-            "rebind_source",
-            "the actor's primitives read different vertex counts".to_owned(),
-        ));
-    }
-    let vertices = sampled.sample.vertices[pool_range.clone()].to_vec();
-    let node_of_rig: Vec<usize> = sampled.rig.iter().map(|rig| rig.node).collect();
-    let slot_of_node: BTreeMap<usize, usize> = actor
-        .skin_joints()
-        .map_err(actor_error)?
-        .iter()
-        .enumerate()
-        .map(|(slot, node)| (*node, slot))
-        .collect();
-    let mut rows = Vec::with_capacity(pool_count);
-    for influence_row in &sampled.influences[pool_range] {
-        let mut row = Vec::new();
-        for influence in influence_row {
-            if influence.weight <= 0.0 {
-                continue;
-            }
-            let node = node_of_rig[influence.rig];
-            let slot = slot_of_node.get(&node).ok_or_else(|| {
-                refused(
-                    "rebind_source",
-                    format!("an influence lands on node {node}, outside the source palette"),
-                )
-            })?;
-            row.push((*slot as u16, influence.weight as f32));
-        }
-        rows.push(row);
-    }
-    let mut triangles = Vec::new();
-    let mut partitions = Vec::new();
-    let mut pool_parts = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        let offset = part.vertices.start;
-        let count = part.triangles.len();
-        for triangle in &sampled.sample.triangles[part.triangles.clone()] {
-            let shifted = triangle.map(|vertex| (vertex - offset) as u32);
-            if shifted.iter().any(|&vertex| vertex as usize >= pool_count) {
-                return Err(refused(
-                    "rebind_source",
-                    "a primitive index leaves the shared vertex pool".to_owned(),
-                ));
-            }
-            triangles.push(shifted);
-            partitions.push(PartitionId(index as u16));
-        }
-        pool_parts.push(PoolPart { triangles: count });
-    }
-    Ok(Pool {
-        vertices,
-        triangles,
-        partitions,
-        rows,
-        parts: pool_parts,
-    })
-}
-
-/// Encode pool rows as source skin weights over the palette.
-fn pool_weights(rows: &[Vec<(u16, f32)>], palette: usize) -> Result<SkinWeights, CommandError> {
-    let mut offsets = vec![0_u32];
-    let mut joints = Vec::new();
-    let mut values = Vec::new();
-    for row in rows {
-        for &(slot, weight) in row {
-            joints.push(slot);
-            values.push(weight);
-        }
-        offsets.push(
-            u32::try_from(joints.len())
-                .map_err(|_| refused("rebind_source", "influence entries exceed u32"))?,
-        );
-    }
-    SkinWeights::new(offsets, joints, values, palette)
-        .map_err(|error| errors::invalid("rebind_source", format!("source weights: {error}")))
-}
-
 /// Every vertex rigidly bound to one root: a valid seat carrier skin.
 fn rigid_root_skin(rig: &Rig, root: JointId, vertices: usize) -> Result<Skin, CommandError> {
     let name = rig
@@ -684,74 +569,6 @@ fn complete_palette(
         bind_inverse,
         influences,
     })
-}
-
-/// Measured output guarantees: unit rows, no empty row, per-bone mass.
-struct Validation {
-    max_sum_error: f64,
-    empty_rows: usize,
-    widest: usize,
-    per_bone: Vec<f64>,
-}
-
-fn validate_skin(skin: &Skin, vertices: usize) -> Result<Validation, CommandError> {
-    let mut max_sum_error = 0.0_f64;
-    let mut empty_rows = 0;
-    let mut widest = 0;
-    let mut per_bone = vec![0.0_f64; skin.bones.len()];
-    for vertex in 0..skin.influences.rows() {
-        let row = skin
-            .influences
-            .row(vertex)
-            .expect("row below the checked count");
-        let mut sum = 0.0_f64;
-        let mut positive = 0;
-        for (&slot, &weight) in row.joints.iter().zip(row.weights) {
-            if weight > 0.0 {
-                positive += 1;
-                sum += f64::from(weight);
-                per_bone[usize::from(slot)] += f64::from(weight);
-            }
-        }
-        widest = widest.max(positive);
-        if positive == 0 {
-            empty_rows += 1;
-        }
-        max_sum_error = max_sum_error.max((sum - 1.0).abs());
-    }
-    if empty_rows > 0 {
-        return Err(refused(
-            "rebind_validation",
-            format!("{empty_rows} vertices carry no influence after the transfer"),
-        ));
-    }
-    if max_sum_error > 1e-5 {
-        return Err(refused(
-            "rebind_validation",
-            format!("output rows sum to one within {max_sum_error:.3e}, above 1e-5"),
-        ));
-    }
-    let _ = vertices;
-    Ok(Validation {
-        max_sum_error,
-        empty_rows,
-        widest,
-        per_bone,
-    })
-}
-
-/// Read each primitive's part material; refuse textures the part route drops.
-fn part_materials(actor: &Actor, mesh_node: usize) -> Result<Vec<PartMaterial>, CommandError> {
-    let colors = actor.part_colors(mesh_node).map_err(actor_error)?;
-    Ok(colors
-        .into_iter()
-        .enumerate()
-        .map(|(index, color)| PartMaterial {
-            partition: index as u16,
-            name: color.name,
-            color: color.color,
-        })
-        .collect())
 }
 
 /// Everything the report folds together.
