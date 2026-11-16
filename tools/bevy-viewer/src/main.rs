@@ -10,6 +10,15 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use serde::{Deserialize, Serialize};
 
+mod pose;
+
+/// A palette name that draws as a bone. The skeleton overlay and pose mode
+/// agree on this set, so a joint you can see is a joint you can turn.
+pub(crate) fn is_bone_name(name: &str) -> bool {
+    (name.starts_with("NPC ") || name.starts_with("CME ") || name.starts_with("mixamorig"))
+        && !name.ends_with("Mesh")
+}
+
 fn env_f32(key: &str, default: f32) -> f32 {
     std::env::var(key)
         .ok()
@@ -219,6 +228,7 @@ struct InPlaceRoot {
 struct InPlaceEnabled(bool);
 
 /// Tag each skeleton's topmost bone once, at its loaded translation.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn tag_in_place_roots(
     mut commands: Commands,
     skins: Query<&SkinnedMesh>,
@@ -431,7 +441,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: format!(
-                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, Space pause, Ctrl+,/. speed, H help",
+                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, P pose, T Mixamo T, Y reference, M bone style, Space pause, Ctrl+,/. speed, H help",
                             config.status
                         ),
                         resolution: (1280, 900).into(),
@@ -488,6 +498,10 @@ fn main() {
                 .unwrap_or(2),
         })
         .insert_resource(Playback::default())
+        .insert_resource(pose::PoseMode::from_environment())
+        .insert_resource(pose::ReferenceOverlay::default())
+        .insert_resource(pose::RefCache::default())
+        .insert_resource(pose::RefReport::default())
         .insert_resource(SkelPool::default())
         .insert_resource(GlassRestore::default())
         .insert_resource(Units(options.units))
@@ -557,13 +571,39 @@ fn main() {
         )
         .add_systems(Update, (control_playback, apply_playback))
         .add_systems(Update, tag_in_place_roots)
+        .add_systems(
+            Update,
+            (
+                pose::pose_keys,
+                pose::pose_drag,
+                pose::pose_seed,
+                pose::reference_keys,
+                pose::draw_reference.after(pose::pose_seed),
+                pose::draw_reference_labels.after(pose::draw_reference),
+                pose::pose_marker.after(pose::draw_reference_labels),
+            ),
+        )
+        // The rest pose is captured before the first animation pass, so every
+        // later write is a delta on the file's own rest rather than on a frame
+        // of a clip that happened to be playing.
+        .add_systems(
+            PostUpdate,
+            pose::capture_rest.before(bevy::app::AnimationSystems),
+        )
         // After the animation pass, before transform propagation, so the held
         // translation is what the skin actually renders this frame.
         .add_systems(
             PostUpdate,
-            hold_roots_in_place
-                .after(bevy::app::AnimationSystems)
-                .before(bevy::transform::TransformSystems::Propagate),
+            (
+                hold_roots_in_place
+                    .after(bevy::app::AnimationSystems)
+                    .before(bevy::transform::TransformSystems::Propagate),
+                // After the clip and after the root hold: a pose is what renders.
+                pose::apply_pose
+                    .after(bevy::app::AnimationSystems)
+                    .after(hold_roots_in_place)
+                    .before(bevy::transform::TransformSystems::Propagate),
+            ),
         )
         .run();
 }
@@ -699,6 +739,7 @@ fn apply_playback(playback: Res<Playback>, mut players: Query<&mut AnimationPlay
 
 /// Alpha the actor materials while the overlay is on and restore them after.
 /// glTF materials stream in after startup, so the "on" branch runs every frame.
+#[allow(clippy::type_complexity)]
 fn apply_skeleton_mode(
     skel: Res<SkelMode>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -732,6 +773,7 @@ fn apply_skeleton_mode(
 
 /// Build the overlay once, then move it to the live joint positions every frame:
 /// a sphere per joint and a cylinder from each joint to its parent bone.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn draw_skeleton(
     mut commands: Commands,
     skel: Res<SkelMode>,
@@ -781,10 +823,7 @@ fn draw_skeleton(
         }
         pool.built = true;
     }
-    let is_bone = |name: &str| {
-        (name.starts_with("NPC ") || name.starts_with("CME ") || name.starts_with("mixamorig"))
-            && !name.ends_with("Mesh")
-    };
+    let is_bone = is_bone_name;
     // Only joints the skin actually drives, plus their ancestors: the SSE
     // skeleton also carries tail, wing and HDT bones that sit metres outside a
     // humanoid body and hide the real chain.
@@ -893,6 +932,7 @@ fn draw_skeleton(
 /// default rig shows only the key, and `3` shows the fill/rim pair as well.
 /// The ground is interactive-only and hides in flat so the silhouette stays
 /// against the black backdrop.
+#[allow(clippy::type_complexity)]
 fn apply_review_visibility(
     flat: Res<FlatMode>,
     rig: Res<RigMode>,
@@ -906,14 +946,11 @@ fn apply_review_visibility(
         Or<(With<ReviewLight>, With<ReviewGround>)>,
     >,
 ) {
-    for (mut visibility, key, fill, ground) in &mut lights {
-        let wanted = if flat.0 {
-            Visibility::Hidden
-        } else if ground.is_some() {
-            Visibility::Inherited
-        } else if key.is_some() {
-            Visibility::Inherited
-        } else if fill.is_some() && !rig.three_point {
+    for (mut visibility, _key, fill, ground) in &mut lights {
+        // Flat hides everything; otherwise the ground and the key always show and
+        // the fill pair only in the optional three-point rig.
+        let hidden = flat.0 || (ground.is_none() && fill.is_some() && !rig.three_point);
+        let wanted = if hidden {
             Visibility::Hidden
         } else {
             Visibility::Inherited
@@ -966,6 +1003,7 @@ struct PlayerGraph {
     cloth: Option<AnimationNodeIndex>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -1130,6 +1168,7 @@ fn setup(
             ReviewModel,
         ));
     }
+    pose::spawn_overlay(&mut commands, &mut meshes, &mut materials);
     if config.interactive {
         commands
             .spawn((
@@ -1175,6 +1214,9 @@ fn setup(
                         "0 idle · 1 walk · Space pause · Ctrl+, slower · Ctrl+. faster"
                     },
                     "R reset · L lit/flat · 3 rig · B bones (chain/all) · H help",
+                    "P pose mode · T Mixamo T · Tab joint · R reset joint · Shift+R file rest",
+                    "Pose: drag LMB turn joint · Shift+LMB own axes · RMB orbit · arrows 5°",
+                    "Y reference skeleton · M dots/lines ⇄ Mixamo octahedral",
                 ] {
                     card.spawn((
                         Text::new(line),
@@ -1267,6 +1309,7 @@ impl OrbitCamera {
 /// a 100-unit Fox both open at a readable distance. The model itself is never
 /// rescaled; `SCULPTO_VIEWER_SCALE` still controls source-unit conversion.
 /// Interactive only, so headless captures keep their fixed review camera.
+#[allow(clippy::type_complexity)]
 fn fit_camera_to_scene(
     config: Res<ViewerConfig>,
     mut fitted: Local<bool>,
@@ -1326,9 +1369,13 @@ fn fit_camera_to_scene(
 
 /// Interactive-only orbit camera: LMB drag orbits, RMB drag pans, wheel zooms,
 /// R resets. It never runs in the headless capture path.
+#[allow(clippy::too_many_arguments)]
 fn orbit_controls(
     config: Res<ViewerConfig>,
     orbit: Option<ResMut<OrbitCamera>>,
+    // Pose mode takes the left button for the selected joint, so orbiting moves
+    // to the right button while it is on.
+    pose: Option<Res<pose::PoseMode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut motion: MessageReader<MouseMotion>,
@@ -1353,16 +1400,22 @@ fn orbit_controls(
         };
     }
 
-    if keys.just_pressed(KeyCode::KeyR) {
+    let posing = pose.is_some_and(|pose| pose.active);
+    if keys.just_pressed(KeyCode::KeyR) && !posing {
         orbit.reset();
     }
     let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
-    if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
+    let orbit_button = if posing {
+        MouseButton::Right
+    } else {
+        MouseButton::Left
+    };
+    if buttons.pressed(orbit_button) && !moving_light && !moving_character {
         orbit.yaw -= delta.x * 0.005;
         orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
     }
-    if buttons.pressed(MouseButton::Right) && !moving_character {
+    if buttons.pressed(MouseButton::Right) && !moving_character && !posing {
         let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
         let right = rotation * Vec3::X;
         let up = rotation * Vec3::Y;
@@ -1386,13 +1439,16 @@ fn orbit_controls(
 /// a shadow comparison is a light change, not a pose change.
 fn light_controls(
     config: Res<ViewerConfig>,
+    // In pose mode Shift+LMB turns the joint about its own axes, so the light
+    // keeps its place instead of following the same drag.
+    pose: Option<Res<pose::PoseMode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut motion: MessageReader<MouseMotion>,
     orbit: Option<ResMut<LightOrbit>>,
     mut lights: Query<&mut Transform, With<KeyLight>>,
 ) {
-    if !config.interactive {
+    if !config.interactive || pose.is_some_and(|pose| pose.active) {
         return;
     }
     let Some(mut orbit) = orbit else {

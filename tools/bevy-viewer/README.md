@@ -84,6 +84,29 @@ material presence and skin joints, and takes two playback snapshots (active
 clips, elapsed time, summed morph weights) before exiting. This is the command
 behind the A00B numbers.
 
+## Reference overlay and the census
+
+`Y` draws a reference skeleton over the loaded one and `M` switches the drawing
+between dots+lines and cone/octahedral bones. Nothing is drawn unless two
+censuses agree, because a window that calls a native 126-joint rig "Mixamo" is a
+defect, not a preference:
+
+- the loaded skin must census `65 joints · 65 mixamorig · 0 native`;
+- the reference file (`SCULPTO_VIEWER_REFERENCE`, default
+  `~/Models/sculpto-jokes-20261115/ybot_walking.glb`) must census the same;
+- otherwise the card says `reference: unavailable — the loaded file is a native
+  carrier` (or which file failed which rule) and no geometry appears.
+
+The card always prints the census: `skeleton: 126 joints · 0 mixamorig · 126
+native · native carrier`. The word **Mixamo** appears only at `65 / 65`.
+
+The overlay is placed by the seat similarity — measured yaw and tilt from the two
+flesh frames, scale from the pelvis→head plus pelvis→toe span, hips on hips —
+never by the reference file's own units (Mixamo's armature carries scale 0.01
+and would otherwise draw a hundred times too large). Only the *matched* joints
+are drawn, and each pair's distance in millimetres is printed beside it; the card
+carries `Δ max` and `mean`.
+
 ## 0.17.3 compatibility
 
 The pre-0.20 viewer is retained in jj history at revision `f280a6a3` (its
@@ -124,3 +147,51 @@ loads `Animation0` and `Animation1`; the cloth clip keeps running). A top-left
 controls card lists the keys and `H` hides or shows it. Keyboard events need the
 window focused — agent-opened preview windows start unfocused by design, so click
 the figure once.
+
+## Pose mode
+
+`P` turns pose mode on and off, and `T` poses the loaded skeleton to a reference
+file's bone **directions** — the Mixamo T — without writing a file. A pose is a
+rotation **delta on the file's rest**, never an absolute local write:
+`local.rotation = delta * rest.rotation`, and translation and scale are copied
+from the rest untouched. A rotation cannot move a child's bone offset or inflate
+it, so the skin neither detaches nor scales, and a joint nobody touched is
+written back as the captured rest bits. `Shift+R` puts the whole body back on
+the file's rest.
+
+| Key | Effect |
+|---|---|
+| `P` | pose mode on/off (off plays the clips again) |
+| `T` | Mixamo T from the reference skeleton, live |
+| `Tab` / `Shift+Tab` | next / previous joint of the selected limb chain |
+| `R` / `Shift+R` | reset the selected joint / every joint to the file rest |
+| drag `LMB` | turn the selected joint about the **camera's** axes |
+| drag `Shift+LMB` | turn it about the **joint's own** axes |
+| arrows | 5° steps, `←`/`→` about the camera, `↑`/`↓` about the joint |
+| drag `RMB` | orbit the camera (pose mode takes the left button) |
+| wheel, `Ctrl+LMB`, `Ctrl+RMB` | zoom, turn the figure, move it sideways |
+
+The selected joint is a magenta marker with its bone name drawn beside it, so a
+3 mm bone does not have to be clicked exactly. `Tab` walks the limb of the
+current selection (clavicle → hand, thigh → toe) ordered by hierarchy depth.
+
+`T` reads `SCULPTO_VIEWER_REFERENCE` or, when unset,
+`~/Models/sculpto-jokes-20261115/ybot_walking.glb`. The body frame is
+**measured**, not assumed: both skeletons give a left axis from the two thighs
+and an up axis from thigh → calf, and the transfer between those frames is the
+yaw the seat lanes found by other means. `T` refuses instead of guessing when a
+skeleton has no thigh pair, and a direction-only aim leaves the roll of each
+bone where the file put it.
+
+A headless capture can open on a pose, which is how a still of a defect is made:
+
+```sh
+SCULPTO_VIEWER_HEADLESS=1 SCULPTO_VIEWER_POSE_MODE=1 \
+SCULPTO_VIEWER_POSE_JOINT='NPC L UpperArm' SCULPTO_VIEWER_POSE_ROTATE='0,0,-25' \
+SCULPTO_VIEWER_POSE_TPOSE=1 SCULPTO_VIEWER_PNG=/tmp/opencode/pose.png \
+  ./target/debug/cloth-viewer --headless --glb ~/Models/sculpto-tpose-20261116/emily-tpose.glb
+```
+
+`SCULPTO_VIEWER_POSE_ROTATE=x,y,z` is degrees about the camera's axes, applied
+to `SCULPTO_VIEWER_POSE_JOINT` (a substring of a palette name). The seeded pose
+is logged, so a capture carries the numbers that produced it.
