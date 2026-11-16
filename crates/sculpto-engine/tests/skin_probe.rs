@@ -110,3 +110,43 @@ fn every_bone_the_authoring_admits_carries_weight() {
         "a deform bone with no flesh: {unweighted:?}"
     );
 }
+
+/// The native T-rest bodies carry the Skyrim palette, where a zero-length `CME`
+/// link sits in front of every `NPC` bone. The authored skin must give a ghost
+/// twin no weight at all — two live twins would split a limb between them.
+#[test]
+fn a_ghost_twin_carries_no_weight_on_the_t_rest_bodies() {
+    for name in ["emily-tpose", "mike-tpose"] {
+        let actor = home().join(format!("Models/sculpto-tpose-20261116/{name}.glb"));
+        if !actor.exists() {
+            eprintln!("skip: t-rest fixture {name}.glb absent");
+            continue;
+        }
+        let report = run(&SkinParams {
+            actor,
+            out: None,
+            report: None,
+        })
+        .expect("the t-rest body authors a skin");
+        let footprints = report["footprints"].as_array().unwrap();
+        let ghost: f64 = footprints
+            .iter()
+            .filter(|row| row["bone"].as_str().unwrap_or_default().starts_with("CME"))
+            .map(|row| row["mass_share"].as_f64().unwrap())
+            .sum();
+        eprintln!(
+            "{name}: {} deform bones, {} coincident bones dropped, ghost mass {ghost:.6}",
+            report["palette"]["deform_bones"],
+            report["palette"]["coincident_bones_dropped"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default()
+        );
+        assert_eq!(ghost, 0.0, "{name}: a ghost twin carries weight");
+        assert_eq!(report["validation"]["empty_rows"], 0);
+        assert_eq!(report["validation"]["widest_row"], 4);
+        assert!(report["validation"]["max_sum_error"].as_f64().unwrap() < 1e-5);
+        assert_eq!(report["gates"]["side_isolation"]["left_violations"], 0);
+        assert_eq!(report["gates"]["leaf_weight_mass"].as_f64().unwrap(), 0.0);
+    }
+}

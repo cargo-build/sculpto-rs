@@ -93,7 +93,18 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
             "no primitive of the actor is the body".to_owned(),
         ));
     }
-    let (bones, leaves) = deform_bones(&rig, &palette)?;
+    let mut input_mass = vec![0.0_f64; palette.len()];
+    for row in &pool.rows {
+        for &(slot, weight) in row {
+            input_mass[usize::from(slot)] += f64::from(weight);
+        }
+    }
+    let palette_bones = deform_bones(&rig, &palette, &input_mass)?;
+    let PaletteBones {
+        bones,
+        leaves,
+        dropped: duplicates,
+    } = palette_bones;
     if bones.is_empty() {
         return Err(refused(
             "skin_bones",
@@ -197,6 +208,7 @@ pub fn run(params: &SkinParams) -> Result<Value, CommandError> {
         palette: &palette,
         bones: &bones,
         leaves: &leaves,
+        duplicates: &duplicates,
         authored: &authored,
         validation: &validation,
         gates: &gates,
@@ -232,31 +244,118 @@ pub fn verdict(report: &Value) -> String {
 fn deform_bones(
     rig: &Rig,
     palette: &[String],
-) -> Result<(Vec<DeformBone>, Vec<String>), CommandError> {
-    let mut bones = Vec::new();
+    input_mass: &[f64],
+) -> Result<PaletteBones, CommandError> {
+    let children = children_of(rig, palette.len());
+    let mut candidates: Vec<(DeformBone, f64)> = Vec::new();
     let mut leaves = Vec::new();
     for (slot, name) in palette.iter().enumerate() {
-        let joint = JointId::new(slot as u32);
-        let head = world_origin(rig, joint)?;
-        let mut segments = Vec::new();
-        for (child_slot, _) in palette.iter().enumerate() {
-            let child = JointId::new(child_slot as u32);
-            if rig.joint(child).and_then(|joint| joint.parent) != Some(joint) {
-                continue;
-            }
-            segments.push((head, world_origin(rig, child)?));
-        }
-        if segments.is_empty() {
+        let head = world_origin(rig, JointId::new(slot as u32))?;
+        let tails = effective_tails(rig, &children, slot as u32, head, 0)?;
+        if tails.is_empty() {
             leaves.push(name.clone());
             continue;
         }
-        bones.push(DeformBone {
-            name: name.clone(),
-            side: side_of(name),
-            segments,
-        });
+        candidates.push((
+            DeformBone {
+                name: name.clone(),
+                side: side_of(name),
+                segments: tails.into_iter().map(|tail| (head, tail)).collect(),
+            },
+            input_mass[slot],
+        ));
     }
-    Ok((bones, leaves))
+    // A weightless bone whose head sits on a joint that does carry weight is a
+    // ghost link: the Skyrim palette threads a zero-length `CME` twin in front of
+    // every `NPC` bone, and two live twins would split a limb between them. The
+    // input skin says which twin the body was authored against, so the tie-break
+    // reads its mass — an identity rule, never a weight source. A bone with mass
+    // is never dropped (two twist bones share a head and both are real), and a
+    // weightless bone with no weighted twin stays (a neck need not carry weight).
+    let mut dropped = Vec::new();
+    let mut kept: Vec<(DeformBone, f64)> = Vec::new();
+    for (bone, mass) in candidates {
+        let head = bone
+            .segments
+            .first()
+            .map(|(head, _)| *head)
+            .unwrap_or_default();
+        let twin = kept.iter().position(|(known, _)| {
+            known
+                .segments
+                .first()
+                .is_some_and(|(known_head, _)| known_head.distance(head) <= 1e-3)
+        });
+        match (mass > 0.0, twin) {
+            // A weighted bone never loses its identity; it displaces a weightless
+            // twin declared before it.
+            (true, Some(index)) if kept[index].1 <= 0.0 => {
+                dropped.push(kept[index].0.name.clone());
+                kept[index] = (bone, mass);
+            }
+            (true, Some(_)) | (true, None) => kept.push((bone, mass)),
+            // A weightless bone keeps the identity only if nothing coincident was
+            // declared before it.
+            (false, Some(_)) => dropped.push(bone.name),
+            (false, None) => kept.push((bone, mass)),
+        }
+    }
+    Ok(PaletteBones {
+        bones: kept.into_iter().map(|(bone, _)| bone).collect(),
+        leaves,
+        dropped,
+    })
+}
+
+/// The bones the authoring step may reach, and the palette members it excludes.
+struct PaletteBones {
+    bones: Vec<DeformBone>,
+    /// Joints with no lever of their own: a leaf deforms nothing.
+    leaves: Vec<String>,
+    /// Coincident twins that lost the identity tie-break.
+    dropped: Vec<String>,
+}
+
+/// Each palette joint's children, by slot.
+fn children_of(rig: &Rig, palette: usize) -> Vec<Vec<u32>> {
+    let mut children = vec![Vec::new(); palette];
+    for slot in 0..palette {
+        let joint = JointId::new(slot as u32);
+        if let Some(parent) = rig.joint(joint).and_then(|joint| joint.parent) {
+            children[parent.index()].push(slot as u32);
+        }
+    }
+    children
+}
+
+/// The joints a bone's lever arm actually reaches.
+///
+/// A child sitting on its parent's own origin is a pass-through link: the bone's
+/// rotation still carries it, but it has no lever of its own, so the arm runs on
+/// to that link's own distinct children. A chain of only coincident links is a
+/// tip and yields nothing.
+fn effective_tails(
+    rig: &Rig,
+    children: &[Vec<u32>],
+    slot: u32,
+    head: glam::DVec3,
+    depth: usize,
+) -> Result<Vec<glam::DVec3>, CommandError> {
+    const COINCIDENT_M: f64 = 1e-3;
+    const MAX_DEPTH: usize = 8;
+    let mut tails = Vec::new();
+    for &child in &children[slot as usize] {
+        let child_head = world_origin(rig, JointId::new(child))?;
+        if child_head.distance(head) > COINCIDENT_M {
+            tails.push(child_head);
+            continue;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        tails.extend(effective_tails(rig, children, child, head, depth + 1)?);
+    }
+    Ok(tails)
 }
 
 /// One joint's rest origin in world metres.
@@ -269,14 +368,18 @@ fn world_origin(rig: &Rig, joint: JointId) -> Result<glam::DVec3, CommandError> 
 }
 
 /// The side a bone's name declares, if it declares one.
+///
+/// Mixamo spells the side out (`mixamorig:LeftArm`); the Skyrim palette marks it
+/// as a standalone token (`NPC L UpperArm [LUar]`, `CME R Clavicle [RClv]`), where
+/// a bare `L`/`R` glued to a word (`CME LBody`) is a body part, not a side.
 fn side_of(name: &str) -> Option<BodySide> {
-    let tokens = ["Left", "Right"];
-    if name.contains(tokens[0]) {
+    if name.contains("Left") || name.contains(" L ") || name.starts_with("L ") {
         return Some(BodySide::Left);
     }
-    if name.contains(tokens[1]) {
+    if name.contains("Right") || name.contains(" R ") || name.starts_with("R ") {
         return Some(BodySide::Right);
     }
+    let lower = name.to_lowercase();
     for (suffix, side) in [
         ("_l", BodySide::Left),
         ("_r", BodySide::Right),
@@ -285,7 +388,7 @@ fn side_of(name: &str) -> Option<BodySide> {
         (" l", BodySide::Left),
         (" r", BodySide::Right),
     ] {
-        if name.to_lowercase().ends_with(suffix) {
+        if lower.ends_with(suffix) {
             return Some(side);
         }
     }
@@ -371,6 +474,7 @@ struct ReportInputs<'a> {
     palette: &'a [String],
     bones: &'a [DeformBone],
     leaves: &'a [String],
+    duplicates: &'a [String],
     authored: &'a sculpto_mesh::rig::author::AuthoredSkin,
     validation: &'a crate::actor_io::Validation,
     gates: &'a Gates,
@@ -448,6 +552,7 @@ fn build_report(input: ReportInputs<'_>) -> Value {
             "bones": input.palette.len(),
             "deform_bones": input.bones.len(),
             "leaves_excluded": input.leaves,
+            "coincident_bones_dropped": input.duplicates,
         },
         "authoring": {
             "vertices": input.authored.report.vertices,
