@@ -1204,8 +1204,9 @@ pub fn role_coverage(correspondence: &Correspondence) -> RoleCoverage {
     }
     // Chain roles answer for their bone: a correspondence that maps a thigh but no
     // calf still drives `hips`, and the report says exactly that.
-    const ALL: [&str; 10] = [
+    const ALL: [&str; 11] = [
         "hips",
+        "spine",
         "knees",
         "ankles",
         "toes",
