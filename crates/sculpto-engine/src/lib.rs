@@ -13,6 +13,7 @@
 
 use serde_json::{Value, json};
 
+pub mod adapt;
 mod assemble;
 mod component;
 pub mod errors;
@@ -22,6 +23,7 @@ mod handlers;
 pub mod obj;
 pub mod ops;
 mod parts;
+pub mod retarget;
 pub mod rules;
 mod seal;
 mod stress;

@@ -4,7 +4,7 @@
 use sculpto_engine::export_actor::{
     CLIP_ROLES, ExportActorParams, admit_clip, clip_coverage, clip_role, clip_value, run,
 };
-use sculpto_engine::export_glb::ClipPlan;
+use sculpto_engine::export_glb::{ClipPlan, ClipSemantics, RootMotion};
 use sculpto_gltf::Clip;
 
 /// Emily's real 126-bone palette, as the export wrote it: the standard rig,
@@ -204,6 +204,18 @@ fn plan(name: &str, mapped: &[&str], rest_comparable: bool) -> ClipPlan {
         scale_max: 71.5,
         scale_shared: 1.0,
         scale_outliers: Vec::new(),
+        semantics: ClipSemantics::Motion,
+        axis_convention_degrees: 0.0,
+        direction_error_median_degrees: 0.0,
+        direction_error_max_degrees: 0.0,
+        pose_error_median_degrees: 0.0,
+        pose_error_max_degrees: 0.0,
+        pose_error_outlier: String::new(),
+        root_motion: RootMotion::Keep,
+        root_motion_bone: None,
+        source_root_bone: None,
+        root_motion_travel: 0.0,
+        root_travel: 0.0,
     }
 }
 

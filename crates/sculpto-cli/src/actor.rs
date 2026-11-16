@@ -1,5 +1,6 @@
 //! File and serialization surface for the pure actor sampler. @req DECL0013
 
+mod adapt;
 mod fit;
 mod gait;
 mod pack;
@@ -49,6 +50,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "fit") {
         return fit::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "adapt") {
+        return adapt::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,

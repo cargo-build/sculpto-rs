@@ -154,6 +154,95 @@ impl Actor {
         })
     }
 
+    /// One named clip with every channel resampled onto one shared time grid.
+    ///
+    /// A tool that keys only the bones that move leaves the constants on two
+    /// samples while the motion carries thirty, and the strict [`Actor::clip`]
+    /// refuses that mix. A converter still has to read such a file: this read
+    /// keeps the densest channel's own times and interpolates the rest onto
+    /// them (linear for vectors, shortest-path slerp for rotations), clamping
+    /// outside a channel's own span.
+    ///
+    /// # Errors
+    /// The same refusals [`Actor::clip`] states, except the shared-time one.
+    pub fn clip_shared(&self, name: &str) -> Result<SourceClip, ActorError> {
+        let clips: Vec<_> = self
+            .document
+            .animations()
+            .filter(|clip| clip.name() == Some(name))
+            .collect();
+        let clip = match clips.as_slice() {
+            [clip] => clip,
+            _ => {
+                return Err(ActorError::Clip {
+                    name: name.to_owned(),
+                    matches: clips.len(),
+                });
+            }
+        };
+        let read = animation::read(self, clip, &[])?;
+        let grid: Vec<f64> = read
+            .channels
+            .iter()
+            .map(|channel| (channel.times.len(), channel.times.clone()))
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|row| row.1)
+            .unwrap_or_default();
+        let mut channels = Vec::with_capacity(read.channels.len());
+        for channel in read.channels {
+            let context = format!("clip {} channel node {}", clip.index(), channel.node);
+            // A `STEP` channel holds its previous sample until the next one; a
+            // resample reproduces that exactly, which is why a constant channel
+            // taken from a tool that writes two `STEP` keys still reads.
+            let hold = channel.step;
+            let property = match channel.property {
+                gltf::animation::Property::Translation => SourceProperty::Translation,
+                gltf::animation::Property::Rotation => SourceProperty::Rotation,
+                gltf::animation::Property::Scale => SourceProperty::Scale,
+                gltf::animation::Property::MorphTargetWeights => {
+                    return Err(unsupported(&context, "morph weight clip channel"));
+                }
+            };
+            let values = match (property, channel.values) {
+                (SourceProperty::Rotation, animation::Values::Rotation(values)) => {
+                    SourceValues::Rotation(
+                        sample(&grid, &channel.times, &values, hold)
+                            .into_iter()
+                            .map(|value| value.to_array())
+                            .collect(),
+                    )
+                }
+                (SourceProperty::Translation, animation::Values::Vector(values))
+                | (SourceProperty::Scale, animation::Values::Vector(values)) => {
+                    SourceValues::Vector(
+                        sample(&grid, &channel.times, &values, hold)
+                            .into_iter()
+                            .map(|value| value.to_array())
+                            .collect(),
+                    )
+                }
+                _ => {
+                    return Err(invalid(&context, "animation property/output mismatch"));
+                }
+            };
+            channels.push(SourceChannel {
+                node: channel.node,
+                node_name: self.node_name(channel.node).map(str::to_owned),
+                parent: self.parents[channel.node],
+                parent_name: self.parents[channel.node]
+                    .and_then(|parent| self.node_name(parent))
+                    .map(str::to_owned),
+                property,
+                values,
+            });
+        }
+        Ok(SourceClip {
+            name: name.to_owned(),
+            times: grid.iter().map(|time| *time as f32).collect(),
+            channels,
+        })
+    }
+
     /// One node's rest local transform.
     ///
     /// # Errors
@@ -186,6 +275,28 @@ impl Actor {
         &self.parents
     }
 
+    /// The palette: node indices of the first skin's joint array, in authored
+    /// order.
+    ///
+    /// A caller retargeting a clip onto an existing actor needs the palette the
+    /// skin actually binds, not every node the file carries; the joint array is
+    /// that list, and its order is the order the writer indexes.
+    ///
+    /// # Errors
+    /// A file with no skin: without one there is no palette to drive.
+    pub fn skin_joints(&self) -> Result<Vec<usize>, ActorError> {
+        self.document
+            .skins()
+            .next()
+            .map(|skin| skin.joints().map(|joint| joint.index()).collect())
+            .ok_or_else(|| {
+                invalid(
+                    "actor skin",
+                    "the file carries no skin, so it has no joint palette",
+                )
+            })
+    }
+
     /// One node's rest local transform as a matrix, static matrix nodes included.
     ///
     /// # Errors
@@ -214,5 +325,71 @@ impl Actor {
             .filter_map(|node| node.name())
             .filter(|name| seen.insert(*name))
             .collect()
+    }
+}
+
+/// One channel's values sampled at the shared grid.
+fn sample<T>(grid: &[f64], times: &[f64], values: &[T], hold: bool) -> Vec<T>
+where
+    T: SampleInterpolate,
+{
+    debug_assert_eq!(times.len(), values.len());
+    match (times.first(), values.first()) {
+        (Some(_), Some(first)) if times.len() == 1 => vec![*first; grid.len()],
+        _ => grid
+            .iter()
+            .map(|time| match hold {
+                true => T::held(*time, times, values),
+                false => T::at(*time, times, values),
+            })
+            .collect(),
+    }
+}
+
+/// One channel value interpolated between two authored samples.
+trait SampleInterpolate: Copy {
+    fn between(first: Self, second: Self, alpha: f64) -> Self;
+
+    /// The previous authored sample, which is what `STEP` means.
+    fn held(time: f64, times: &[f64], values: &[Self]) -> Self {
+        let after = times.partition_point(|sample| *sample <= time);
+        values[after.saturating_sub(1).min(values.len() - 1)]
+    }
+
+    fn at(time: f64, times: &[f64], values: &[Self]) -> Self {
+        let Some(first) = times.first() else {
+            unreachable!("a channel carries samples");
+        };
+        if time <= *first {
+            return values[0];
+        }
+        let Some(last) = times.last() else {
+            unreachable!("a channel carries samples");
+        };
+        if time >= *last {
+            return values[values.len() - 1];
+        }
+        let after = times
+            .partition_point(|sample| *sample <= time)
+            .min(times.len() - 1);
+        let before = after.saturating_sub(1);
+        let span = times[after] - times[before];
+        let alpha = match span > 0.0 {
+            true => (time - times[before]) / span,
+            false => 0.0,
+        };
+        Self::between(values[before], values[after], alpha)
+    }
+}
+
+impl SampleInterpolate for glam::DVec3 {
+    fn between(first: Self, second: Self, alpha: f64) -> Self {
+        first.lerp(second, alpha)
+    }
+}
+
+impl SampleInterpolate for glam::DQuat {
+    fn between(first: Self, second: Self, alpha: f64) -> Self {
+        animation::interpolate(first, second, alpha)
     }
 }

@@ -1,0 +1,760 @@
+//! The correspondence layer and the two unit corrections, on synthetic
+//! skeletons whose bodies, names and units are chosen by the test.
+//!
+//! Every skeleton here is built in the test — hierarchy, rest, unit node and a
+//! clip — so a failure names the property that broke rather than a fixture's
+//! history: a different body, a different naming convention, a centimetre file
+//! under a 0.01 ancestor, and a pose the source really performs.
+//!
+//! @req DECL0013
+
+use std::borrow::Cow;
+
+use glam::{DMat4, DQuat, DVec3};
+use gltf::binary::Glb;
+use sculpto_core::rig::{Joint, LocalTransform, Rig, RigFrame};
+use sculpto_engine::export_actor::admit_clip;
+use sculpto_engine::export_glb::{
+    ClipAnchor, ClipSemantics, ClipTolerances, RootMotion, plan_clip_with,
+};
+use sculpto_engine::retarget::{
+    Correspondence, Method, Part, Side, correspondence_report, role_of,
+};
+use sculpto_mesh::actor::Actor;
+use serde_json::{Value, json};
+
+/// One synthetic bone: name, parent, and its rest local transform.
+#[derive(Clone, Copy)]
+struct Bone {
+    name: &'static str,
+    parent: Option<usize>,
+    translation: [f64; 3],
+    rotation: [f64; 4],
+}
+
+const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+
+fn bone(name: &'static str, parent: Option<usize>, translation: [f64; 3]) -> Bone {
+    Bone {
+        name,
+        parent,
+        translation,
+        rotation: IDENTITY,
+    }
+}
+
+/// One animation channel over a synthetic skeleton.
+struct Channel {
+    node: usize,
+    path: &'static str,
+    values: Vec<Vec<f64>>,
+}
+
+/// Frame a document as a GLB with the binary chunk it references.
+fn frame(document: Value, bin: Vec<u8>) -> Vec<u8> {
+    Glb {
+        header: gltf::binary::Header {
+            magic: *b"glTF",
+            version: 2,
+            length: 0,
+        },
+        json: Cow::Owned(serde_json::to_vec(&document).expect("a document serialises")),
+        bin: Some(Cow::Owned(bin)),
+    }
+    .to_vec()
+    .expect("a framed container")
+}
+
+/// Pad the binary chunk to a four-byte boundary.
+fn align(bin: &mut Vec<u8>) {
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+}
+
+/// Build one skinned, optionally animated GLB from a bone list.
+///
+/// `root_scale` and `root_rotation` go on the armature node above every bone,
+/// which is where a Blender/FBX export puts its centimetre factor; `clip` adds
+/// one animation named `walk`.
+fn skeleton(bones: &[Bone], root_scale: f64, root_rotation: [f64; 4], clip: &[Channel]) -> Vec<u8> {
+    let mut bin: Vec<u8> = Vec::new();
+    let mut views: Vec<Value> = Vec::new();
+    let mut accessors: Vec<Value> = Vec::new();
+    let push = |bin: &mut Vec<u8>,
+                views: &mut Vec<Value>,
+                accessors: &mut Vec<Value>,
+                bytes: Vec<u8>,
+                kind: &str,
+                count: usize,
+                width: usize|
+     -> usize {
+        align(bin);
+        let offset = bin.len();
+        bin.extend_from_slice(&bytes);
+        views.push(json!({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": bytes.len(),
+        }));
+        accessors.push(json!({
+            "bufferView": views.len() - 1,
+            "componentType": match kind {
+                "f32" => 5126,
+                _ => 5123,
+            },
+            "count": count,
+            "type": match width {
+                3 => "VEC3",
+                4 => "VEC4",
+                16 => "MAT4",
+                _ => "SCALAR",
+            },
+        }));
+        accessors.len() - 1
+    };
+
+    // World rest transforms, so the inverse bind matrices are the real ones.
+    let mut worlds = vec![DMat4::IDENTITY; bones.len()];
+    for (index, definition) in bones.iter().enumerate() {
+        let local = DMat4::from_scale_rotation_translation(
+            DVec3::ONE,
+            DQuat::from_array(definition.rotation),
+            DVec3::from_array(definition.translation),
+        );
+        worlds[index] = match definition.parent {
+            Some(parent) => worlds[parent] * local,
+            None => local,
+        };
+    }
+    let armature = DMat4::from_scale_rotation_translation(
+        DVec3::splat(root_scale),
+        DQuat::from_array(root_rotation),
+        DVec3::ZERO,
+    );
+    let mut bind: Vec<f64> = Vec::with_capacity(bones.len() * 16);
+    for world in &worlds {
+        let inverse = (armature * *world).inverse();
+        bind.extend(inverse.to_cols_array());
+    }
+    let bind_bytes: Vec<u8> = bind
+        .iter()
+        .flat_map(|value| (*value as f32).to_le_bytes())
+        .collect();
+    let bind_accessor = push(
+        &mut bin,
+        &mut views,
+        &mut accessors,
+        bind_bytes,
+        "f32",
+        bones.len(),
+        16,
+    );
+
+    // One triangle, weighted to the first bone.
+    let positions: Vec<u8> = [[0.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        .into_iter()
+        .flatten()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let position_accessor = push(&mut bin, &mut views, &mut accessors, positions, "f32", 3, 3);
+    accessors[position_accessor]["min"] = json!([0.0, 0.0, 0.0]);
+    accessors[position_accessor]["max"] = json!([0.0, 1.0, 1.0]);
+    let joints: Vec<u8> = [0_u16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let joint_accessor = push(&mut bin, &mut views, &mut accessors, joints, "u16", 3, 4);
+    let weights: Vec<u8> = [[1.0_f32, 0.0, 0.0, 0.0]; 3]
+        .into_iter()
+        .flatten()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let weight_accessor = push(&mut bin, &mut views, &mut accessors, weights, "f32", 3, 4);
+    let indices: Vec<u8> = [0_u16, 1, 2]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let index_accessor = push(&mut bin, &mut views, &mut accessors, indices, "u16", 3, 1);
+
+    // The hierarchy: armature node 0, bones from node 1, mesh node last.
+    let mut nodes: Vec<Value> = Vec::with_capacity(bones.len() + 2);
+    let roots: Vec<usize> = bones
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| definition.parent.is_none())
+        .map(|(index, _)| index + 1)
+        .collect();
+    nodes.push(
+        json!({"name": "Armature", "scale": [root_scale, root_scale, root_scale],
+        "rotation": [root_rotation[0], root_rotation[1], root_rotation[2], root_rotation[3]],
+        "children": roots}),
+    );
+    for (index, definition) in bones.iter().enumerate() {
+        let children: Vec<usize> = bones
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| other.parent == Some(index))
+            .map(|(child, _)| child + 1)
+            .collect();
+        nodes.push(json!({
+            "name": definition.name,
+            "translation": definition.translation,
+            "rotation": definition.rotation,
+            "children": children,
+        }));
+    }
+    let mesh_node = nodes.len();
+    nodes.push(json!({"name": "Body", "mesh": 0, "skin": 0}));
+    nodes[0]["children"]
+        .as_array_mut()
+        .expect("armature children")
+        .push(json!(mesh_node));
+
+    let mut samplers: Vec<Value> = Vec::new();
+    let mut channels: Vec<Value> = Vec::new();
+    let mut animations: Vec<Value> = Vec::new();
+    if !clip.is_empty() {
+        let times: Vec<f32> = (0..clip[0].values.len())
+            .map(|index| index as f32 / 30.0)
+            .collect();
+        let time_bytes: Vec<u8> = times.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let time_accessor = push(
+            &mut bin,
+            &mut views,
+            &mut accessors,
+            time_bytes,
+            "f32",
+            times.len(),
+            1,
+        );
+        for channel in clip {
+            let flat: Vec<f32> = channel
+                .values
+                .iter()
+                .flatten()
+                .map(|value| *value as f32)
+                .collect();
+            let width = channel.values.first().map(Vec::len).unwrap_or(3);
+            let values: Vec<u8> = flat.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let accessor = push(
+                &mut bin,
+                &mut views,
+                &mut accessors,
+                values,
+                "f32",
+                channel.values.len(),
+                width,
+            );
+            let sampler = samplers.len();
+            samplers.push(
+                json!({"input": time_accessor, "output": accessor, "interpolation": "LINEAR"}),
+            );
+            channels.push(json!({
+                "sampler": sampler,
+                "target": {"node": channel.node, "path": channel.path},
+            }));
+        }
+        animations.push(json!({"name": "walk", "channels": channels, "samplers": samplers}));
+    }
+
+    let document = json!({
+        "asset": {"version": "2.0"},
+        "buffers": [{"byteLength": bin.len()}],
+        "bufferViews": views,
+        "accessors": accessors,
+        "meshes": [{"name": "Body", "primitives": [{
+            "attributes": {
+                "POSITION": position_accessor,
+                "JOINTS_0": joint_accessor,
+                "WEIGHTS_0": weight_accessor,
+            },
+            "indices": index_accessor,
+        }]}],
+        "skins": [{"joints": (1..=bones.len()).collect::<Vec<_>>(),
+                    "inverseBindMatrices": bind_accessor}],
+        "nodes": nodes,
+        "scenes": [{"nodes": [0]}],
+        "scene": 0,
+        "animations": animations,
+    });
+    frame(document, bin)
+}
+
+/// A generic humanoid with a name supplied per bone: `names` short-circuits the
+/// convention, so the same body can be tested under Mixamo, SSE, bare and
+/// meaningless names.
+fn humanoid(names: &[&'static str; 13]) -> Vec<Bone> {
+    vec![
+        bone(names[0], None, [0.0, 1.0, 0.0]),
+        bone(names[1], Some(0), [0.0, 0.10, 0.0]),
+        bone(names[2], Some(1), [0.0, 0.10, 0.0]),
+        bone(names[3], Some(2), [0.0, 0.10, 0.0]),
+        bone(names[4], Some(3), [0.0, 0.10, 0.0]),
+        bone(names[5], Some(4), [0.0, 0.10, 0.0]),
+        bone(names[6], Some(2), [-0.20, 0.0, 0.0]),
+        bone(names[7], Some(6), [-0.28, 0.0, 0.0]),
+        bone(names[8], Some(7), [-0.25, 0.0, 0.0]),
+        bone(names[9], Some(0), [-0.10, -0.10, 0.0]),
+        bone(names[10], Some(9), [0.0, -0.45, 0.0]),
+        bone(names[11], Some(10), [0.0, -0.45, 0.0]),
+        bone(names[12], Some(11), [0.0, -0.05, 0.10]),
+    ]
+}
+
+/// A walk-shaped clip: the pelvis travels and the arm swings, so a conversion
+/// has moving channels to write and a root trajectory to measure. `unit` is the
+/// skeleton's local unit, so a centimetre skeleton gets a centimetre clip.
+fn walk_in(unit: f64) -> Vec<Channel> {
+    vec![
+        Channel {
+            node: 1,
+            path: "translation",
+            values: (0..8)
+                .map(|index| vec![0.0, 1.0 * unit, 0.4 * unit * index as f64 / 7.0])
+                .collect(),
+        },
+        Channel {
+            node: 8,
+            path: "rotation",
+            values: (0..8)
+                .map(|index| {
+                    let angle = 40.0_f64.to_radians() * index as f64 / 7.0;
+                    DQuat::from_rotation_z(angle).to_array().to_vec()
+                })
+                .collect(),
+        },
+    ]
+}
+
+fn walk() -> Vec<Channel> {
+    walk_in(1.0)
+}
+
+const MIXAMO: [&str; 13] = [
+    "mixamorig:Hips",
+    "mixamorig:Spine",
+    "mixamorig:Spine1",
+    "mixamorig:Spine2",
+    "mixamorig:Neck",
+    "mixamorig:Head",
+    "mixamorig:LeftShoulder",
+    "mixamorig:LeftArm",
+    "mixamorig:LeftForeArm",
+    "mixamorig:LeftUpLeg",
+    "mixamorig:LeftLeg",
+    "mixamorig:LeftFoot",
+    "mixamorig:LeftToeBase",
+];
+
+const SSE: [&str; 13] = [
+    "NPC Pelvis [Pelv]",
+    "NPC Spine [Spn0]",
+    "NPC Spine1 [Spn1]",
+    "NPC Spine2 [Spn2]",
+    "NPC Neck [Neck]",
+    "NPC Head [Head]",
+    "NPC L Clavicle [LClv]",
+    "NPC L UpperArm [LUar]",
+    "NPC L Forearm [LLar]",
+    "NPC L Thigh [LThg]",
+    "NPC L Calf [LClf]",
+    "NPC L Foot [Lft ]",
+    "NPC L Toe0 [LToe]",
+];
+
+const OPAQUE: [&str; 13] = [
+    "Bone_000", "Bone_001", "Bone_002", "Bone_003", "Bone_004", "Bone_005", "Bone_006", "Bone_007",
+    "Bone_008", "Bone_009", "Bone_010", "Bone_011", "Bone_012",
+];
+
+/// The actor's palette as a rig, the same construction `adapt` performs.
+fn actor_rig(actor: &Actor) -> (Rig, Vec<String>) {
+    let joints = actor.skin_joints().expect("a skin");
+    let palette: Vec<String> = joints
+        .iter()
+        .map(|node| actor.node_name(*node).expect("named joints").to_owned())
+        .collect();
+    let mut worlds = vec![DMat4::IDENTITY; actor.node_parents().len()];
+    fn resolve(actor: &Actor, node: usize, worlds: &mut Vec<DMat4>) -> DMat4 {
+        let local = DMat4::from_cols_array_2d(&actor.rest_local_matrix(node).expect("rest"));
+        let world = match actor.node_parents()[node] {
+            Some(parent) => resolve(actor, parent, worlds) * local,
+            None => local,
+        };
+        worlds[node] = world;
+        world
+    }
+    for node in 0..worlds.len() {
+        resolve(actor, node, &mut worlds);
+    }
+    let mut rows = Vec::with_capacity(joints.len());
+    for (slot, node) in joints.iter().enumerate() {
+        let mut parent = actor.node_parents()[*node];
+        let mut parent_slot = None;
+        while let Some(candidate) = parent {
+            match joints.iter().position(|other| *other == candidate) {
+                Some(found) => {
+                    parent_slot = Some(found);
+                    break;
+                }
+                None => parent = actor.node_parents()[candidate],
+            }
+        }
+        let parent_world = match parent_slot {
+            Some(slot) => worlds[joints[slot]],
+            None => DMat4::IDENTITY,
+        };
+        let local = parent_world.inverse() * worlds[*node];
+        let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        rows.push(Joint {
+            name: Some(palette[slot].clone()),
+            parent: parent_slot.map(|slot| sculpto_core::rig::JointId::new(slot as u32)),
+            rest: LocalTransform {
+                translation: translation.to_array().map(|value| value as f32),
+                rotation: rotation.to_array().map(|value| value as f32),
+                scale: scale.x as f32,
+            },
+        });
+    }
+    (
+        Rig::new(rows, RigFrame::YUp).expect("a valid palette rig"),
+        palette,
+    )
+}
+
+/// Plan a clip from the source GLB onto the target actor.
+fn plan(
+    target: &[u8],
+    source: &[u8],
+    semantics: ClipSemantics,
+) -> (
+    Correspondence,
+    sculpto_engine::export_glb::ClipPlan,
+    Vec<String>,
+) {
+    let actor = Actor::from_glb(target).expect("target decodes");
+    let (rig, palette) = actor_rig(&actor);
+    let source_actor = Actor::from_glb(source).expect("source decodes");
+    let correspondence =
+        Correspondence::build(&source_actor, &rig, &palette).expect("a correspondence");
+    let clip = source_actor.clip("walk").expect("the source clip");
+    let anchor = ClipAnchor::of(&source_actor, &clip).expect("an anchor");
+    let plan = plan_clip_with(
+        &clip,
+        &source_actor,
+        &anchor,
+        &rig,
+        &palette,
+        &ClipTolerances::default(),
+        Some(&correspondence),
+        semantics,
+        RootMotion::Keep,
+    )
+    .expect("the clip plans");
+    (correspondence, plan, palette)
+}
+
+#[test]
+fn names_resolve_in_every_convention_the_product_reads() {
+    let expected = [
+        ("mixamorig:LeftArm", Side::Left, Part::UpperArm),
+        ("mixamorig1:RightUpLeg", Side::Right, Part::Thigh),
+        ("NPC L Forearm [LLar]", Side::Left, Part::Forearm),
+        ("RightHand", Side::Right, Part::Hand),
+        ("upper_arm.L", Side::Left, Part::UpperArm),
+        ("thigh.R", Side::Right, Part::Thigh),
+        (
+            "NPC L Finger10 [LF10]",
+            Side::Left,
+            Part::Digit {
+                digit: 1,
+                segment: 0,
+            },
+        ),
+        (
+            "mixamorig:LeftHandIndex3",
+            Side::Left,
+            Part::Digit {
+                digit: 1,
+                segment: 2,
+            },
+        ),
+        (
+            "mixamorig:LeftHandThumb1",
+            Side::Left,
+            Part::Digit {
+                digit: 0,
+                segment: 0,
+            },
+        ),
+        ("mixamorig:Hips", Side::Centre, Part::Pelvis),
+        ("mixamorig:Spine2", Side::Centre, Part::Spine(2)),
+        ("NPC Head [Head]", Side::Centre, Part::Head),
+        (
+            "NPC L UpperarmTwist1 [LUt1]",
+            Side::Left,
+            Part::Twist {
+                forearm: false,
+                index: 1,
+            },
+        ),
+        ("mixamorig:LeftToeBase", Side::Left, Part::Toe),
+        ("mixamorig:HeadTop_End", Side::Centre, Part::Marker),
+        ("L Breast03", Side::Centre, Part::Soft),
+    ];
+    for (name, side, part) in expected {
+        let role = role_of(name).unwrap_or_else(|| panic!("{name} resolves"));
+        assert_eq!(role.side, side, "{name}");
+        assert_eq!(role.part, part, "{name}");
+    }
+    assert!(
+        role_of("Armature").is_some(),
+        "scaffolding is named, not resolved"
+    );
+    assert!(role_of("Bone_042").is_none());
+}
+
+#[test]
+fn a_mixamo_named_source_resolves_by_convention() {
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let source = skeleton(&humanoid(&MIXAMO), 1.0, IDENTITY, &[]);
+    let actor = Actor::from_glb(&target).expect("target");
+    let (rig, palette) = actor_rig(&actor);
+    let source_actor = Actor::from_glb(&source).expect("source");
+    let correspondence = Correspondence::build(&source_actor, &rig, &palette).expect("built");
+    let report = correspondence_report(&correspondence);
+    assert_eq!(report["mapped"], json!(13));
+    assert_eq!(report["unmatched_palette"], json!([]));
+    // `Spine`, `Spine1` and `Spine2` keep their own names through the prefix, so
+    // they resolve as names while the sided bones resolve by convention.
+    for pair in &correspondence.pairs {
+        assert!(
+            matches!(pair.method, Method::Name | Method::Convention),
+            "{} resolved by {}",
+            pair.palette,
+            pair.method.token()
+        );
+        let source_name = pair.source_name.as_deref().expect("a source bone");
+        assert!(source_name.starts_with("mixamorig:"));
+    }
+}
+
+#[test]
+fn an_unnamed_skeleton_resolves_by_geometry_and_reports_what_it_could_not() {
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    // A source with meaningless names but the same body, plus one extra bone the
+    // palette has no place for.
+    let mut bones = humanoid(&OPAQUE);
+    bones.push(bone("Bone_999", Some(0), [0.5, 0.2, 0.0]));
+    let source = skeleton(&bones, 1.0, IDENTITY, &[]);
+    let actor = Actor::from_glb(&target).expect("target");
+    let (rig, palette) = actor_rig(&actor);
+    let source_actor = Actor::from_glb(&source).expect("source");
+    let correspondence = Correspondence::build(&source_actor, &rig, &palette).expect("built");
+    let geometry = correspondence
+        .pairs
+        .iter()
+        .filter(|pair| pair.method == Method::Geometry)
+        .count();
+    assert!(
+        geometry >= 12,
+        "the geometry fallback must carry a source whose names mean nothing, got {geometry}: {:?}",
+        correspondence
+            .pairs
+            .iter()
+            .map(|pair| (pair.palette.as_str(), pair.method.token()))
+            .collect::<Vec<_>>()
+    );
+    assert!(correspondence.unmatched_palette().is_empty());
+    assert!(
+        correspondence
+            .unmatched
+            .iter()
+            .any(|row| row.name == "Bone_999"),
+        "an extra source bone is reported, never guessed"
+    );
+}
+
+#[test]
+fn a_centimetre_source_under_a_scale_node_passes_the_rest_gate() {
+    // The same skeleton, one in metres and one in centimetres under a 0.01
+    // ancestor. The previous form multiplied a *world* position by a per-local
+    // unit ratio and reported a residual near 1.0 on this exact conversion.
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let mut source = humanoid(&MIXAMO);
+    for definition in &mut source {
+        for axis in &mut definition.translation {
+            *axis *= 100.0;
+        }
+    }
+    let source = skeleton(&source, 0.01, [0.0, 0.0, 0.0, 1.0], &walk_in(100.0));
+    let (_, plan, _) = plan(&target, &source, ClipSemantics::Pose);
+    assert!(
+        plan.max_rest_translation_residual < 1e-3,
+        "a correct centimetre conversion must reconstruct the rest, residual {}",
+        plan.max_rest_translation_residual
+    );
+    assert!(
+        plan.rest_pose_comparable,
+        "the same body in another unit is comparable"
+    );
+    // The unit is palette units per *world* unit, and both worlds are metres: the
+    // centimetre factor lives on the source's ancestor, not in the clip.
+    assert!((plan.scale - 1.0).abs() < 1e-6, "unit {}", plan.scale);
+    // The travel keeps its authored length through the conversion, which is the
+    // property the old double-scaled form destroyed.
+    assert!(
+        (plan.root_travel - 0.4).abs() < 0.02,
+        "root travel {} m over the clip",
+        plan.root_travel
+    );
+}
+
+#[test]
+fn a_different_body_reports_its_proportions_instead_of_refusing() {
+    // The same names and the same joints, but the source's clavicles and thighs
+    // are three times the length: a different body, which the old per-bone unit
+    // floor refused outright.
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let mut source = humanoid(&MIXAMO);
+    source[6].translation = [-0.60, 0.0, 0.0];
+    source[7].translation = [-0.85, 0.0, 0.0];
+    source[8].translation = [-0.75, 0.0, 0.0];
+    source[9].translation = [-0.30, -0.30, 0.0];
+    let source = skeleton(&source, 1.0, IDENTITY, &walk());
+    let (_, plan, _) = plan(&target, &source, ClipSemantics::Motion);
+    assert!(
+        plan.scale_shared < 0.8,
+        "a different body shares no per-bone ratio, measured {}",
+        plan.scale_shared
+    );
+    assert!(
+        !plan.rest_pose_comparable,
+        "a different body is not rest-comparable; the declaration is the honest record"
+    );
+}
+
+#[test]
+fn the_pose_copy_carries_the_source_stance_and_the_motion_copy_does_not() {
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    // The clip holds the forearm 40 degrees from its own rest for the whole clip —
+    // a *stance*, not a motion. A pose copy carries it; a motion copy anchored at
+    // the clip's first sample sees no change and keeps our rest.
+    let held = DQuat::from_rotation_x(40.0_f64.to_radians()).to_array();
+    let mut clip = walk();
+    clip.push(Channel {
+        node: 9,
+        path: "rotation",
+        values: vec![held.to_vec(); 8],
+    });
+    let source = skeleton(&humanoid(&MIXAMO), 1.0, IDENTITY, &clip);
+    let (_, pose, _) = plan(&target, &source, ClipSemantics::Pose);
+    let (_, motion, _) = plan(&target, &source, ClipSemantics::Motion);
+    // The synthetic palette is built in `humanoid` order: node 9 is bone 8, the
+    // forearm, palette slot 8.
+    let forearm = 8_usize;
+    let first_local = |plan: &sculpto_engine::export_glb::ClipPlan| -> DQuat {
+        for channel in &plan.clip.channels {
+            if let sculpto_gltf::ClipChannel::Rotation { bone, values } = channel
+                && *bone == forearm
+            {
+                return DQuat::from_array(values[0].map(f64::from));
+            }
+        }
+        panic!("the forearm carries a rotation channel")
+    };
+    let angle = |value: DQuat| -> f64 { 2.0 * value.w.abs().clamp(-1.0, 1.0).acos().to_degrees() };
+    let pose_angle = angle(first_local(&pose));
+    let motion_angle = angle(first_local(&motion));
+    assert!(
+        pose_angle > 20.0,
+        "the pose copy carries the held stance, measured {pose_angle:.1}°"
+    );
+    assert!(
+        motion_angle < 5.0,
+        "the motion copy keeps the rig's own rest instead, measured {motion_angle:.1}°"
+    );
+}
+
+#[test]
+fn the_motion_copy_keeps_this_rigs_rest_and_transfers_the_swing() {
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    // A source whose rest differs from ours by a 30 degree bone frame, performing
+    // the same 40 degree swing the palette then has to show.
+    let mut source = humanoid(&MIXAMO);
+    source[6].rotation = DQuat::from_rotation_x(30.0_f64.to_radians()).to_array();
+    let source = skeleton(&source, 1.0, IDENTITY, &walk());
+    let (_, plan, _) = plan(&target, &source, ClipSemantics::Motion);
+    // The mixer is not the source's pose: the rest difference is *not* carried,
+    // which is the whole point of this semantics on a different body.
+    assert!(
+        plan.max_motion_degrees > 30.0,
+        "the arm swing reached the palette, measured {}",
+        plan.max_motion_degrees
+    );
+    assert!(
+        plan.moving_channels >= 2,
+        "both the travel and the swing are written, {} moving channels",
+        plan.moving_channels
+    );
+    // Every written channel is a legal rotation: a scaled world matrix read as a
+    // quaternion is the failure this asserts against.
+    for channel in &plan.clip.channels {
+        if let sculpto_gltf::ClipChannel::Rotation { values, .. } = channel {
+            for value in values {
+                let norm: f32 = value.iter().map(|lane| lane * lane).sum();
+                assert!(
+                    (norm.sqrt() - 1.0).abs() < 1e-5,
+                    "unit quaternion, got {norm}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_clip_that_covers_no_required_role_is_refused_by_the_admission_gate() {
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let source = skeleton(&humanoid(&MIXAMO), 1.0, IDENTITY, &walk());
+    let (_, plan, palette) = plan(&target, &source, ClipSemantics::Pose);
+    let required = vec!["hands".to_owned()];
+    let error = admit_clip(
+        &plan,
+        &palette,
+        &required,
+        true,
+        ClipTolerances::default().translation_relative,
+    )
+    .expect_err("a role no mapped bone carries refuses the export");
+    assert!(
+        error.to_string().contains("hands"),
+        "the refusal names the role: {error}"
+    );
+}
+
+#[test]
+fn duplicated_roles_are_reported_with_the_rule_that_resolved_them() {
+    // The ghost `CME` family keys a second skeleton at the same rest; a clip that
+    // drives both is ambiguous about which bone answers the role.
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let mut bones = humanoid(&MIXAMO);
+    bones.push(bone("CME Pelvis", None, [0.0, 1.0, 0.0]));
+    let source = skeleton(&bones, 1.0, IDENTITY, &[]);
+    let actor = Actor::from_glb(&target).expect("target");
+    let (rig, palette) = actor_rig(&actor);
+    let source_actor = Actor::from_glb(&source).expect("source");
+    let correspondence = Correspondence::build(&source_actor, &rig, &palette).expect("built");
+    let report = correspondence_report(&correspondence);
+    let ambiguous = report["ambiguous"].as_array().expect("the ambiguity table");
+    assert!(
+        ambiguous.iter().any(|row| row["role"] == "pelvis"),
+        "a doubled role is reported: {report}"
+    );
+    let chosen = ambiguous
+        .iter()
+        .find(|row| row["role"] == "pelvis")
+        .and_then(|row| row["chosen"].as_str())
+        .expect("a chosen bone");
+    assert_eq!(chosen, "mixamorig:Hips", "the shortest claimed name wins");
+}

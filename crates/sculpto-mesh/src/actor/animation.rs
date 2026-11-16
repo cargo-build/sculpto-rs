@@ -297,6 +297,12 @@ fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result
     Ok(())
 }
 
+/// Shortest-path interpolation between two authored samples, exposed to the
+/// palette-free clip read so a resampled channel keeps the authored arc.
+pub(super) fn interpolate(a: DQuat, b: DQuat, alpha: f64) -> DQuat {
+    slerp(a, b, alpha)
+}
+
 fn slerp(a: DQuat, mut b: DQuat, alpha: f64) -> DQuat {
     if a.dot(b) < 0.0 {
         b = -b;
