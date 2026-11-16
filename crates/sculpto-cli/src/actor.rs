@@ -4,6 +4,7 @@ mod adapt;
 mod fit;
 mod gait;
 mod havok;
+mod joints;
 mod pack;
 mod pose;
 mod rebind;
@@ -36,7 +37,9 @@ usage: sculpto actor torso-fit --input actor.glb --body NAME[#i] [--layer NAME[#
 usage: sculpto actor shoulder-seat --input actor.glb --body NAME[#i] \
     [--layer NAME[#i] ...] [--report report.json]
 usage: sculpto actor tpose --actor actor.glb --reference skeleton.glb [--out tposed.glb] \
-    [--report tpose.json]";
+    [--report tpose.json]
+usage: sculpto actor joints --input actor.glb [--rest | --clip NAME --frames N] \
+    [--survey --radius MM] [--report joints.json]";
 
 #[derive(Debug)]
 struct Arguments<'arg> {
@@ -62,6 +65,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "gait") {
         return gait::run(&args[1..]);
+    }
+    if args.first().is_some_and(|command| command == "joints") {
+        return joints::run(&args[1..]);
     }
     if args.first().is_some_and(|command| command == "fit") {
         return fit::run(&args[1..]);

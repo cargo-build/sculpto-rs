@@ -1,0 +1,1495 @@
+# Joint articulation schema: type, axis (bone frame), limits.
+#
+# Product data for the 65-joint Mixamo palette; the engine parses this file
+# (sculpto-engine/src/joints.rs) and enforces it through `sculpto actor joints`.
+#
+# Frames: `axis` is the axis in the driven bone's own rest-local frame, measured
+# on the Mixamo reference rig Y_Bot.glb (sha256 b7c58bf206e5..., T-pose rest,
+# Y along the bone). `anchor` is the same axis as a world direction in that rest,
+# the rig-agnostic route used when the actor's palette is not mixamorig and the
+# entry is resolved by anatomical role instead of name.
+#
+# Signs: positive is the anatomical movement named by the axis. Hinge families
+# (elbow, knee, toes, finger PIP/DIP) are sign-calibrated on the healthy Mixamo
+# walk (sha256 875f9ce148eb..., observed: knee 16-68, elbow 24-66, hip 10-40,
+# toes 0-55 deg extension). Axes without a calibration carry a symmetric envelope
+# so an unknown sign cannot produce a wrong violation.
+#
+# Limit bases: `anatomical` = cited value used directly; `envelope` = conservative
+# working bound derived from a cited complex total (derivation stated in the note);
+# unresolved splits say what measurement would settle them. A made-up number is
+# worse than a hole, and the holes are named.
+
+schema_version = 1
+palette = "mixamorig"
+rest = "T-pose"
+
+[[joint]]
+name = "mixamorig:Hips"
+role = "pelvis"
+type = "root"
+slack_deg = 0
+axis_basis = "measured"
+note = "The pelvis is the root: 6-DOF, no articulation limit by design. The operator's open question about the pelvis (recorded verbatim in the owning issue) resolves structurally: what bends above it is the spine chain, what hangs from it are the hips."
+
+[[joint]]
+name = "mixamorig:Spine"
+role = "spine0"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Spine segment: 3-DOF with coupled limits. The VA/Physiopedia values are for the thoracolumbar spine as a single segment (flexion 90, extension 30, lateral 30, rotation 30 each); the per-segment split across Spine/Spine1/Spine2 is unresolved. The envelope below is the conservative total/3; settle the split with a MOCAP norm dataset or a flush test per segment."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, -0.0001, 0]
+anchor = [1, 0, 0]
+min_deg = -10
+max_deg = 30
+basis = "envelope"
+cite = "VA/Physiopedia thoracolumbar single-segment: extension 30, flexion 90"
+note = "positive = bend forward"
+
+[[joint.axis]]
+name = "lateral"
+axis = [0, 0.0057, -1]
+anchor = [0, 0, -1]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "VA/Physiopedia: lateral flexion 30 each; /3"
+note = ""
+
+[[joint.axis]]
+name = "twist"
+axis = [0.5556, 0.8286, 0.0689]
+anchor = [0.5555, 0.829, 0.0642]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "VA/Physiopedia: rotation 30 each; /3"
+note = ""
+
+[[joint]]
+name = "mixamorig:Spine1"
+role = "spine1"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Spine segment: 3-DOF with coupled limits. The VA/Physiopedia values are for the thoracolumbar spine as a single segment (flexion 90, extension 30, lateral 30, rotation 30 each); the per-segment split across Spine/Spine1/Spine2 is unresolved. The envelope below is the conservative total/3; settle the split with a MOCAP norm dataset or a flush test per segment."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, -0.0001, 0]
+anchor = [1, 0, 0]
+min_deg = -10
+max_deg = 30
+basis = "envelope"
+cite = "VA/Physiopedia thoracolumbar single-segment: extension 30, flexion 90"
+note = "positive = bend forward"
+
+[[joint.axis]]
+name = "lateral"
+axis = [0, 0.0057, -1]
+anchor = [0, 0, -1]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "VA/Physiopedia: lateral flexion 30 each; /3"
+note = ""
+
+[[joint.axis]]
+name = "twist"
+axis = [0.5556, 0.8286, 0.0689]
+anchor = [0.5555, 0.829, 0.0642]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "VA/Physiopedia: rotation 30 each; /3"
+note = ""
+
+[[joint]]
+name = "mixamorig:Spine2"
+role = "spine2"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Spine segment: 3-DOF with coupled limits. The VA/Physiopedia values are for the thoracolumbar spine as a single segment (flexion 90, extension 30, lateral 30, rotation 30 each); the per-segment split across Spine/Spine1/Spine2 is unresolved. The envelope below is the conservative total/3; settle the split with a MOCAP norm dataset or a flush test per segment. Spine2's rest frame in Y_Bot is tilted with the chest; the axis anchor carries that tilt."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, -0.0001, 0]
+anchor = [1, 0, 0]
+min_deg = -10
+max_deg = 30
+basis = "envelope"
+cite = "VA/Physiopedia thoracolumbar single-segment: extension 30, flexion 90"
+note = "positive = bend forward"
+
+[[joint.axis]]
+name = "lateral"
+axis = [0, 0.0057, -1]
+anchor = [0, 0, -1]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "VA/Physiopedia: lateral flexion 30 each; /3"
+note = ""
+
+[[joint.axis]]
+name = "twist"
+axis = [0.5556, 0.8286, 0.0689]
+anchor = [0.5555, 0.829, 0.0642]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "VA/Physiopedia: rotation 30 each; /3"
+note = ""
+
+[[joint]]
+name = "mixamorig:Neck"
+role = "neck"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Cervical complex (AAOS: flexion 45, extension 45, lateral 45, rotation 60) split across Neck and Head. This node carries the subaxial (C3-C7) share: lateral flexion dominates here. Split unresolved; settle with a MOCAP norm dataset. C1-C2 carries ~50 deg of rotation (Physiopedia cervical biomechanics), assigned to the Head entry."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, -0.0001, 0]
+anchor = [1, 0, 0]
+min_deg = -25
+max_deg = 25
+basis = "envelope"
+cite = "AAOS cervical complex 45/45; subaxial share"
+note = "positive = nod forward"
+
+[[joint.axis]]
+name = "lateral"
+axis = [0, 0, -1]
+anchor = [0, 0, -1]
+min_deg = -35
+max_deg = 35
+basis = "envelope"
+cite = "AAOS lateral 45; subaxial share dominates"
+note = "sign uncalibrated; symmetric"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 0.9566, 0.2912]
+anchor = [-0.0001, 0.9567, 0.2912]
+min_deg = -25
+max_deg = 25
+basis = "envelope"
+cite = "subaxial share of AAOS rotation 60-80"
+note = "sign uncalibrated; symmetric"
+
+[[joint]]
+name = "mixamorig:Head"
+role = "head"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Upper cervical share (C0-C2): rotation is dominated by C1-C2 (~50 deg, cited); nodding at C0-C1 ~20 deg. Ball with a smaller cone than the whole complex. Split unresolved; settle with a MOCAP norm dataset."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, -0.0001, 0]
+anchor = [1, 0, 0]
+min_deg = -20
+max_deg = 20
+basis = "envelope"
+cite = "C0-C1 nod ~20 deg (cervical biomechanics literature)"
+note = "positive = nod forward"
+
+[[joint.axis]]
+name = "lateral"
+axis = [0, 0, -1]
+anchor = [0, 0, -1]
+min_deg = -10
+max_deg = 10
+basis = "envelope"
+cite = "upper cervical lateral share is small"
+note = "sign uncalibrated; symmetric"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 0.9411, 0.3381]
+anchor = [-0.0001, 0.9411, 0.3381]
+min_deg = -50
+max_deg = 50
+basis = "envelope"
+cite = "C1-C2 rotation ~50 deg per side (Physiopedia: 'C1-C2 accounts for 50% of cervical rotation'; cervical biomechanics reviews: 50 deg)"
+note = "sign uncalibrated; symmetric"
+
+[[joint]]
+name = "mixamorig:HeadTop_End"
+role = "marker"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Leaf marker above the skull; carries no flesh and no articulation."
+
+[[joint]]
+name = "mixamorig:LeftShoulder"
+role = "L clavicle"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Sternoclavicular link; short 3-DOF with a narrow range. Literature is thin and assumption-based; treat as envelope. Measured on the healthy Mixamo walk (sha 875f9ce1): elevation to 26, protraction to 26.4. Settle by MOCAP of shrug/reach on a captured subject, then split SC share from scapulothoracic."
+
+[[joint.axis]]
+name = "elevation"
+axis = [-0.9795, -0.2013, 0]
+anchor = [0, 0, 1]
+min_deg = -10
+max_deg = 45
+basis = "anatomical"
+cite = "Physiopedia Sternoclavicular Joint: elevation assumed 45 deg, depression 10 deg"
+note = "positive = shrug"
+
+[[joint.axis]]
+name = "protraction"
+axis = [-0.0042, 0.0205, 0.9998]
+anchor = [0, -1, 0]
+min_deg = -30
+max_deg = 30
+basis = "envelope"
+cite = "Kenhub: protraction-retraction arc 20-40 deg; medial-fulcrum share unresolved"
+note = "measured on the healthy Mixamo walk (sha 875f9ce1): 26.4 deg; positive = forward"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [0.9793, -0.0205, -0.2013]
+min_deg = -25
+max_deg = 25
+basis = "envelope"
+cite = "Kenhub: axial rotation 20-40 deg, passive with arm elevation; sign uncalibrated"
+note = "symmetric envelope because no calibration clip fixes the sign"
+
+[[joint]]
+name = "mixamorig:LeftArm"
+role = "L upperarm"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Glenohumeral joint; the clavicle is separate, so use the GH share, not the 180 deg whole-complex AAOS values. T-rest holds the arm horizontal, 90 deg from the anatomical zero (arm at the side): the ranges below are rest-relative and include that offset. Settle the GH/SC split with a shrug-reach capture."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0, -0.0001, 1]
+anchor = [0, -1, 0]
+min_deg = -60
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): extension 60, flexion 180"
+note = "rest-relative: -60 = 60 deg extension, +90 = arm overhead (anatomical 180)"
+
+[[joint.axis]]
+name = "abduction"
+axis = [-1, 0, 0]
+anchor = [0, 0, 1]
+min_deg = -120
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): adduction 30, abduction 180"
+note = "rest-relative: -120 = 30 deg adduction past the side, +90 = overhead"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [1, 0.0001, 0]
+min_deg = -90
+max_deg = 90
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): internal rotation 70, external rotation 90"
+note = "symmetric envelope: no calibration clip fixes the IR/ER sign on this rig"
+
+[[joint]]
+name = "mixamorig:LeftForeArm"
+role = "L forearm"
+type = "hinge"
+slack_deg = 6
+axis_basis = "measured"
+note = "Ulnohumeral hinge. The node also carries radioulnar roll (pronation/supination) in Mixamo clips, so the twist axis is listed deliberately. Flexion sign calibrated on the healthy Mixamo walk (sha 875f9ce1, flexion 24-66 deg observed)."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0, -0.0001, 1]
+anchor = [0, -1, 0]
+min_deg = 0
+max_deg = 150
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): elbow flexion 150, extension 0"
+note = "positive = flexion; up to 10 deg hyperextension exists in children/young adults (CDC ROM study) and stays out until a fixture needs it"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [1, 0.0001, 0]
+min_deg = -85
+max_deg = 85
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): pronation 80, supination 80-85"
+note = "radioulnar joint owns this anatomically; symmetric envelope, sign uncalibrated"
+
+[[joint]]
+name = "mixamorig:LeftHand"
+role = "L hand"
+type = "universal"
+slack_deg = 8
+axis_basis = "measured"
+note = "Wrist: two axes plus a small twist. Most forearm roll is radioulnar on the ForeArm node; the wrist's own twist is a small carpal share."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0, -0.0001, 1]
+anchor = [0, -1, 0]
+min_deg = -80
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): flexion 80, extension 70"
+note = "symmetric envelope; the 80/70 split needs a sign-calibrated clip"
+
+[[joint.axis]]
+name = "deviation"
+axis = [-1, 0, 0]
+anchor = [0, 0, 1]
+min_deg = -40
+max_deg = 40
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): radial 20, ulnar 30"
+note = "sign uncalibrated; measured on the healthy walk (sha 875f9ce1): 35.5 deg, which includes swing-twist cross-talk from flexion"
+
+[[joint.axis]]
+name = "twist"
+axis = [-0.2242, 0.9744, 0.0184]
+anchor = [0.9744, -0.0183, 0.2242]
+min_deg = -50
+max_deg = 50
+basis = "envelope"
+cite = "AAOS pronation/supination 80/85; this rig keys the roll on the Hand node"
+note = "measured on the healthy Mixamo walk (sha 875f9ce1): 46 deg; the carpal share itself is small and unresolved — settle by MOCAP of isolated wrist circles"
+
+[[joint]]
+name = "mixamorig:LeftUpLeg"
+role = "L thigh"
+type = "ball"
+slack_deg = 8
+axis_basis = "measured"
+note = "Hip: ball with per-axis ranges. Flexion sign calibrated on the healthy Mixamo walk (sha 875f9ce1, flexion 10-40 deg observed)."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, -0.006, -0.0001]
+anchor = [-1, 0, 0]
+min_deg = -20
+max_deg = 120
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): extension 20, flexion 120"
+note = "positive = flexion (leg forward)"
+
+[[joint.axis]]
+name = "abduction"
+axis = [0, -0.0127, 0.9999]
+anchor = [0, 0, 1]
+min_deg = -20
+max_deg = 45
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): adduction 20, abduction 40-45"
+note = "positive = outward"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [0.006, -0.9999, -0.0127]
+min_deg = -45
+max_deg = 45
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): internal 45, external 45"
+note = "symmetric by source; sign uncalibrated"
+
+[[joint]]
+name = "mixamorig:LeftLeg"
+role = "L calf"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Tibiofemoral hinge, one axis one sign. Flexion sign confirmed on the healthy Mixamo walk (sha 875f9ce1, flexion 16-68 deg observed); its slack admits the 11.3 deg off-axis the same reference walk carries."
+
+[[joint.axis]]
+name = "flexion"
+axis = [-1, -0.0058, -0.0003]
+anchor = [1, 0, 0]
+min_deg = -5
+max_deg = 135
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): flexion 135, extension 0"
+note = "-5 admits the 1-5 deg physiological hyperextension young adults carry (CDC ROM study, ages 2-19)"
+
+[[joint]]
+name = "mixamorig:LeftFoot"
+role = "L foot"
+type = "saddle"
+slack_deg = 8
+axis_basis = "measured"
+note = "Ankle: dorsi/plantar about the lateral axis, inversion/eversion about the foot's long axis, small transverse share. Dorsiflexion sign is the construction's (healthy walk shows -19..+20 deg, both directions present, as expected)."
+
+[[joint.axis]]
+name = "dorsiflexion"
+axis = [0.9987, -0.0238, 0.046]
+anchor = [-1, 0, 0]
+min_deg = -50
+max_deg = 20
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): plantarflexion 50, dorsiflexion 20"
+note = "positive = toes up; negative = plantar (push-off)"
+
+[[joint.axis]]
+name = "inversion"
+axis = [0, 1, 0]
+anchor = [0.0238, -0.4585, 0.8884]
+min_deg = -35
+max_deg = 35
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): inversion 35, eversion 15"
+note = "symmetric envelope: sign uncalibrated; the 35/15 split needs a clip with known eversion"
+
+[[joint.axis]]
+name = "twist"
+axis = [0.046, 0, -0.9989]
+anchor = [0, -0.8886, -0.4586]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value; transverse-tarsal share"
+note = "envelope; settle by MOCAP of isolated foot circles"
+
+[[joint]]
+name = "mixamorig:LeftToeBase"
+role = "L toe"
+type = "hinge"
+slack_deg = 8
+axis_basis = "measured"
+note = "MTP row in one joint (the palette has no per-ray toes). Extension sign calibrated on the healthy Mixamo walk (sha 875f9ce1, extension 0-55 deg at push-off). Envelope over five rays."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9997, 0.0142, -0.0186]
+anchor = [-1, 0, 0]
+min_deg = -45
+max_deg = 65
+basis = "envelope"
+cite = "AAOS (Hendriks SDC): toe MTP flexion 45; extension envelope 65 from gait push-off need, not an AAOS-listed value"
+note = "positive = extension (toes up, push-off); negative = curl"
+
+[[joint]]
+name = "mixamorig:LeftToe_End"
+role = "marker"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the last flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:LeftHandThumb1"
+role = "L digit0.0"
+type = "saddle"
+slack_deg = 35
+axis_basis = "anatomical"
+note = "Thumb CMC: saddle with opposition coupling the axes; the crease runs oblique to the knuckle row, so the axis is an anatomical prior, not a measurement. Split unresolved; settle by MOCAP of grasp/opposition."
+
+[[joint.axis]]
+name = "abduction"
+axis = [0.2236, 0.4471, 0.8661]
+anchor = [0, -1, 0]
+min_deg = -45
+max_deg = 45
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): CMC palmar abduction 60 (one direction)"
+note = "symmetric envelope: sign uncalibrated on a prior axis"
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.8115, -0.5777, 0.0879]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = -45
+max_deg = 45
+basis = "unresolved"
+cite = "no AAOS CMC flexion value"
+note = "prior axis direction; the reference walk's opposition reads off all three axes at once. Settle with a measured axis from a pinch/flex clip or a flesh survey"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [0.7746, -0.4471, 0.4472]
+min_deg = -40
+max_deg = 40
+basis = "envelope"
+cite = "no value"
+note = "opposition share; measured on the healthy walk (sha 875f9ce1): 38 deg"
+
+[[joint]]
+name = "mixamorig:LeftHandThumb2"
+role = "L digit0.1"
+type = "hinge"
+slack_deg = 30
+axis_basis = "anatomical"
+note = "Thumb MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.8115, -0.5777, 0.0879]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 50
+basis = "unresolved"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): thumb MCP flexion 50"
+note = "the AAOS range stands, but the axis direction is a prior: the reference walk's thumb motion reads off-axis against it, so the value is reported, not refused, until a pinch/flex clip measures the true axis"
+
+[[joint]]
+name = "mixamorig:LeftHandThumb3"
+role = "L digit0.2"
+type = "hinge"
+slack_deg = 30
+axis_basis = "anatomical"
+note = "Thumb IP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.8115, -0.5777, 0.0879]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 80
+basis = "unresolved"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): thumb IP flexion 80"
+note = "same prior-axis caveat as the thumb MCP"
+
+[[joint]]
+name = "mixamorig:LeftHandThumb4"
+role = "L digit0.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the thumb tip."
+
+[[joint]]
+name = "mixamorig:LeftHandIndex1"
+role = "L digit1.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Index MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [-0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:LeftHandIndex2"
+role = "L digit1.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Index PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandIndex3"
+role = "L digit1.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Index DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandIndex4"
+role = "L digit1.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:LeftHandMiddle1"
+role = "L digit2.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Middle MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [-0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:LeftHandMiddle2"
+role = "L digit2.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Middle PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandMiddle3"
+role = "L digit2.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Middle DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandMiddle4"
+role = "L digit2.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:LeftHandRing1"
+role = "L digit3.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Ring MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [-0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:LeftHandRing2"
+role = "L digit3.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Ring PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandRing3"
+role = "L digit3.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Ring DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandRing4"
+role = "L digit3.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:LeftHandPinky1"
+role = "L digit4.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Pinky MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9841, -0.1774, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [-0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:LeftHandPinky2"
+role = "L digit4.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Pinky PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9843, -0.1767, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandPinky3"
+role = "L digit4.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Pinky DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, -0.1771, -0.0007]
+anchor = [-0.1771, 0.0007, -0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:LeftHandPinky4"
+role = "L digit4.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:RightShoulder"
+role = "R clavicle"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Sternoclavicular link; short 3-DOF with a narrow range. Literature is thin and assumption-based; treat as envelope. Measured on the healthy Mixamo walk (sha 875f9ce1): elevation to 26, protraction to 26.4. Settle by MOCAP of shrug/reach on a captured subject, then split SC share from scapulothoracic."
+
+[[joint.axis]]
+name = "elevation"
+axis = [-0.9795, 0.2013, 0]
+anchor = [0, 0, -1]
+min_deg = -10
+max_deg = 45
+basis = "anatomical"
+cite = "Physiopedia Sternoclavicular Joint: elevation assumed 45 deg, depression 10 deg"
+note = "positive = shrug"
+
+[[joint.axis]]
+name = "protraction"
+axis = [-0.0042, -0.0207, -0.9998]
+anchor = [0, 1, 0.0001]
+min_deg = -30
+max_deg = 30
+basis = "envelope"
+cite = "Kenhub: protraction-retraction arc 20-40 deg; medial-fulcrum share unresolved"
+note = "measured on the healthy Mixamo walk (sha 875f9ce1): 26.4 deg; positive = forward"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [-0.9793, -0.0207, -0.2013]
+min_deg = -25
+max_deg = 25
+basis = "envelope"
+cite = "Kenhub: axial rotation 20-40 deg, passive with arm elevation; sign uncalibrated"
+note = "symmetric envelope because no calibration clip fixes the sign"
+
+[[joint]]
+name = "mixamorig:RightArm"
+role = "R upperarm"
+type = "ball"
+slack_deg = 10
+axis_basis = "measured"
+note = "Glenohumeral joint; the clavicle is separate, so use the GH share, not the 180 deg whole-complex AAOS values. T-rest holds the arm horizontal, 90 deg from the anatomical zero (arm at the side): the ranges below are rest-relative and include that offset. Settle the GH/SC split with a shrug-reach capture."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0, -0.0001, -1]
+anchor = [0, 1, 0]
+min_deg = -60
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): extension 60, flexion 180"
+note = "rest-relative: -60 = 60 deg extension, +90 = arm overhead (anatomical 180)"
+
+[[joint.axis]]
+name = "abduction"
+axis = [-1, 0, 0]
+anchor = [0, 0, -1]
+min_deg = -120
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): adduction 30, abduction 180"
+note = "rest-relative: -120 = 30 deg adduction past the side, +90 = overhead"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [-1, -0.0001, 0]
+min_deg = -90
+max_deg = 90
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): internal rotation 70, external rotation 90"
+note = "symmetric envelope: no calibration clip fixes the IR/ER sign on this rig"
+
+[[joint]]
+name = "mixamorig:RightForeArm"
+role = "R forearm"
+type = "hinge"
+slack_deg = 6
+axis_basis = "measured"
+note = "Ulnohumeral hinge. The node also carries radioulnar roll (pronation/supination) in Mixamo clips, so the twist axis is listed deliberately. Flexion sign calibrated on the healthy Mixamo walk (sha 875f9ce1, flexion 24-66 deg observed)."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0, -0.0001, -1]
+anchor = [0, 1, 0]
+min_deg = 0
+max_deg = 150
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): elbow flexion 150, extension 0"
+note = "positive = flexion; up to 10 deg hyperextension exists in children/young adults (CDC ROM study) and stays out until a fixture needs it"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [-1, -0.0001, 0]
+min_deg = -85
+max_deg = 85
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): pronation 80, supination 80-85"
+note = "radioulnar joint owns this anatomically; symmetric envelope, sign uncalibrated"
+
+[[joint]]
+name = "mixamorig:RightHand"
+role = "R hand"
+type = "universal"
+slack_deg = 8
+axis_basis = "measured"
+note = "Wrist: two axes plus a small twist. Most forearm roll is radioulnar on the ForeArm node; the wrist's own twist is a small carpal share."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0, -0.0001, -1]
+anchor = [0, 1, 0]
+min_deg = -80
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): flexion 80, extension 70"
+note = "symmetric envelope; the 80/70 split needs a sign-calibrated clip"
+
+[[joint.axis]]
+name = "deviation"
+axis = [-1, 0, 0]
+anchor = [0, 0, -1]
+min_deg = -40
+max_deg = 40
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): radial 20, ulnar 30"
+note = "sign uncalibrated; measured on the healthy walk (sha 875f9ce1): 35.5 deg, which includes swing-twist cross-talk from flexion"
+
+[[joint.axis]]
+name = "twist"
+axis = [0.2242, 0.9744, 0.0184]
+anchor = [-0.9744, -0.0185, 0.2242]
+min_deg = -50
+max_deg = 50
+basis = "envelope"
+cite = "AAOS pronation/supination 80/85; this rig keys the roll on the Hand node"
+note = "measured on the healthy Mixamo walk (sha 875f9ce1): 46 deg; the carpal share itself is small and unresolved — settle by MOCAP of isolated wrist circles"
+
+[[joint]]
+name = "mixamorig:RightUpLeg"
+role = "R thigh"
+type = "ball"
+slack_deg = 8
+axis_basis = "measured"
+note = "Hip: ball with per-axis ranges. Flexion sign calibrated on the healthy Mixamo walk (sha 875f9ce1, flexion 10-40 deg observed)."
+
+[[joint.axis]]
+name = "flexion"
+axis = [1, 0.006, 0.0001]
+anchor = [-1, 0, 0]
+min_deg = -20
+max_deg = 120
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): extension 20, flexion 120"
+note = "positive = flexion (leg forward)"
+
+[[joint.axis]]
+name = "abduction"
+axis = [0, 0.0127, -0.9999]
+anchor = [0, 0, -1]
+min_deg = -20
+max_deg = 45
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): adduction 20, abduction 40-45"
+note = "positive = outward"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [-0.006, -0.9999, -0.0127]
+min_deg = -45
+max_deg = 45
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): internal 45, external 45"
+note = "symmetric by source; sign uncalibrated"
+
+[[joint]]
+name = "mixamorig:RightLeg"
+role = "R calf"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Tibiofemoral hinge, one axis one sign. Flexion sign confirmed on the healthy Mixamo walk (sha 875f9ce1, flexion 16-68 deg observed); its slack admits the 11.3 deg off-axis the same reference walk carries."
+
+[[joint.axis]]
+name = "flexion"
+axis = [-1, 0.0058, 0.0003]
+anchor = [1, 0, 0]
+min_deg = -5
+max_deg = 135
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): flexion 135, extension 0"
+note = "-5 admits the 1-5 deg physiological hyperextension young adults carry (CDC ROM study, ages 2-19)"
+
+[[joint]]
+name = "mixamorig:RightFoot"
+role = "R foot"
+type = "saddle"
+slack_deg = 8
+axis_basis = "measured"
+note = "Ankle: dorsi/plantar about the lateral axis, inversion/eversion about the foot's long axis, small transverse share. Dorsiflexion sign is the construction's (healthy walk shows -19..+20 deg, both directions present, as expected)."
+
+[[joint.axis]]
+name = "dorsiflexion"
+axis = [0.9987, 0.0238, -0.046]
+anchor = [-1, 0, 0]
+min_deg = -50
+max_deg = 20
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): plantarflexion 50, dorsiflexion 20"
+note = "positive = toes up; negative = plantar (push-off)"
+
+[[joint.axis]]
+name = "inversion"
+axis = [0, 1, 0]
+anchor = [-0.0238, -0.4585, 0.8884]
+min_deg = -35
+max_deg = 35
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): inversion 35, eversion 15"
+note = "symmetric envelope: sign uncalibrated; the 35/15 split needs a clip with known eversion"
+
+[[joint.axis]]
+name = "twist"
+axis = [-0.046, 0, -0.9989]
+anchor = [0, -0.8886, -0.4586]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value; transverse-tarsal share"
+note = "envelope; settle by MOCAP of isolated foot circles"
+
+[[joint]]
+name = "mixamorig:RightToeBase"
+role = "R toe"
+type = "hinge"
+slack_deg = 8
+axis_basis = "measured"
+note = "MTP row in one joint (the palette has no per-ray toes). Extension sign calibrated on the healthy Mixamo walk (sha 875f9ce1, extension 0-55 deg at push-off). Envelope over five rays."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9997, -0.0142, 0.0177]
+anchor = [-1, 0, 0]
+min_deg = -45
+max_deg = 65
+basis = "envelope"
+cite = "AAOS (Hendriks SDC): toe MTP flexion 45; extension envelope 65 from gait push-off need, not an AAOS-listed value"
+note = "positive = extension (toes up, push-off); negative = curl"
+
+[[joint]]
+name = "mixamorig:RightToe_End"
+role = "marker"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the last flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:RightHandThumb1"
+role = "R digit0.0"
+type = "saddle"
+slack_deg = 35
+axis_basis = "anatomical"
+note = "Thumb CMC: saddle with opposition coupling the axes; the crease runs oblique to the knuckle row, so the axis is an anatomical prior, not a measurement. Split unresolved; settle by MOCAP of grasp/opposition."
+
+[[joint.axis]]
+name = "abduction"
+axis = [-0.2236, 0.4473, 0.866]
+anchor = [0, -1, 0]
+min_deg = -45
+max_deg = 45
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): CMC palmar abduction 60 (one direction)"
+note = "symmetric envelope: sign uncalibrated on a prior axis"
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.8115, 0.5777, -0.0879]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = -45
+max_deg = 45
+basis = "unresolved"
+cite = "no AAOS CMC flexion value"
+note = "prior axis direction; the reference walk's opposition reads off all three axes at once. Settle with a measured axis from a pinch/flex clip or a flesh survey"
+
+[[joint.axis]]
+name = "twist"
+axis = [0, 1, 0]
+anchor = [-0.7746, -0.4473, 0.4472]
+min_deg = -40
+max_deg = 40
+basis = "envelope"
+cite = "no value"
+note = "opposition share; measured on the healthy walk (sha 875f9ce1): 38 deg"
+
+[[joint]]
+name = "mixamorig:RightHandThumb2"
+role = "R digit0.1"
+type = "hinge"
+slack_deg = 30
+axis_basis = "anatomical"
+note = "Thumb MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.8115, 0.5777, -0.0879]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 50
+basis = "unresolved"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): thumb MCP flexion 50"
+note = "the AAOS range stands, but the axis direction is a prior: the reference walk's thumb motion reads off-axis against it, so the value is reported, not refused, until a pinch/flex clip measures the true axis"
+
+[[joint]]
+name = "mixamorig:RightHandThumb3"
+role = "R digit0.2"
+type = "hinge"
+slack_deg = 30
+axis_basis = "anatomical"
+note = "Thumb IP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.8115, 0.5777, -0.0879]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 80
+basis = "unresolved"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): thumb IP flexion 80"
+note = "same prior-axis caveat as the thumb MCP"
+
+[[joint]]
+name = "mixamorig:RightHandThumb4"
+role = "R digit0.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the thumb tip."
+
+[[joint]]
+name = "mixamorig:RightHandIndex1"
+role = "R digit1.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Index MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:RightHandIndex2"
+role = "R digit1.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Index PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandIndex3"
+role = "R digit1.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Index DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandIndex4"
+role = "R digit1.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:RightHandMiddle1"
+role = "R digit2.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Middle MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:RightHandMiddle2"
+role = "R digit2.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Middle PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandMiddle3"
+role = "R digit2.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Middle DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandMiddle4"
+role = "R digit2.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:RightHandRing1"
+role = "R digit3.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Ring MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:RightHandRing2"
+role = "R digit3.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Ring PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandRing3"
+role = "R digit3.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Ring DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandRing4"
+role = "R digit3.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."
+
+[[joint]]
+name = "mixamorig:RightHandPinky1"
+role = "R digit4.0"
+type = "saddle"
+slack_deg = 12
+axis_basis = "measured"
+note = "Pinky MCP: hinge about the knuckle-row crease plus splay at the MCP."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = -10
+max_deg = 80
+basis = "envelope"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger MCP flexion 80; -10 envelope for physiological hyperextension"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint.axis]]
+name = "splay"
+axis = [0.0008, 0, -1]
+anchor = [-0.0001, 1, 0.0008]
+min_deg = -15
+max_deg = 15
+basis = "envelope"
+cite = "no AAOS value for active splay"
+note = "MCP abduction/adduction envelope; settle by MOCAP of finger spread"
+
+[[joint]]
+name = "mixamorig:RightHandPinky2"
+role = "R digit4.1"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Pinky PIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 90
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger PIP flexion 90"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandPinky3"
+role = "R digit4.2"
+type = "hinge"
+slack_deg = 12
+axis_basis = "measured"
+note = "Pinky DIP: hinge about the knuckle-row crease."
+
+[[joint.axis]]
+name = "flexion"
+axis = [0.9842, 0.1771, 0.0007]
+anchor = [-0.1771, -0.0008, 0.9842]
+min_deg = 0
+max_deg = 65
+basis = "anatomical"
+cite = "AAOS normative ROM (compilation: Physiopedia 'Range of Motion Normative Values', Botman et al. supplement): AAOS: finger DIP flexion 65"
+note = "positive = curl; sign measured on the healthy walk for PIP/DIP segments"
+
+[[joint]]
+name = "mixamorig:RightHandPinky4"
+role = "R digit4.3"
+type = "fixed"
+slack_deg = 0
+axis_basis = "measured"
+note = "Skinning terminal past the DIP flesh; carries no articulation."

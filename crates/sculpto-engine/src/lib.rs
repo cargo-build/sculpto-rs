@@ -22,6 +22,7 @@ pub mod export_actor;
 pub mod export_glb;
 mod handlers;
 pub mod havok;
+pub mod joints;
 pub mod measures;
 pub mod obj;
 pub mod ops;
