@@ -215,7 +215,7 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
     // exists: the game carries the native weights and the pose together, and a
     // computed rotation has to invent that pairing.
     let plan = match &params.pose {
-        Some(path) => pose_plan(path, params, &resolved, &our_worlds)?,
+        Some(path) => pose_plan(&actor, path, params, &resolved, &our_worlds)?,
         None => PosePlan {
             targets: None,
             hand_targets: None,
@@ -775,6 +775,7 @@ struct PosePlan {
 /// within their own bars of rest. The report names every rejected candidate with
 /// its numbers, so a compromise is visible instead of hidden in a choice.
 fn pose_plan(
+    actor: &Actor,
     path: &PathBuf,
     params: &TPoseParams,
     resolved: &[Resolved],
@@ -839,14 +840,14 @@ fn pose_plan(
         };
         for side in sides.iter().copied() {
             let joint = role_node(
-                &pose,
+                actor,
                 BoneRole {
                     side,
                     part: joint_role,
                 },
             );
             let tip = role_node(
-                &pose,
+                actor,
                 BoneRole {
                     side,
                     part: tip_role,
@@ -1092,11 +1093,6 @@ impl SkyrimRest {
             .min_by_key(|(bone, name)| (u8::from(name.starts_with("CME ")), *bone))
             .map(|(bone, _)| bone)
     }
-
-    /// The bone index that carries a name.
-    fn bone(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|bone| bone == name)
-    }
 }
 
 /// One frame, compensated into our frame as directions and a hand frame.
@@ -1148,17 +1144,18 @@ fn measure_frame(
     // would silently mix two poses. Count them and let the caller report it.
     let mut unkeyed = Vec::new();
     for row in resolved {
-        if !clip_pose
-            .iter()
-            .enumerate()
-            .any(|(node, _)| pose.node_name(node) == Some(row.joint_name.as_str()))
+        if !skeleton
+            .bone_for(row.segment.role)
+            .is_some_and(|bone| skeleton.driven.contains(&skeleton.names[bone]))
         {
             unkeyed.push(row.joint_name.clone());
         }
-        let Some(joint) = skeleton.bone(&row.joint_name) else {
+        // By *role*, never by our bone's name: the body this bakes onto may carry
+        // Mixamo's names while the clip skeleton carries Skyrim's.
+        let Some(joint) = skeleton.bone_for(row.segment.role) else {
             return Ok(None);
         };
-        let Some(tip) = skeleton.bone(&row.tip_name) else {
+        let Some(tip) = skeleton.bone_for(row.segment.tip) else {
             return Ok(None);
         };
         let direction = (carried(tip) - carried(joint)).normalize_or_zero();
