@@ -657,14 +657,16 @@ fn instrument(
 
 /// A sampled part: its world-space vertices and its triangles, rebased so the
 /// triangle indices address `positions` directly.
-struct Selection {
+/// `pub(super)` fields: the shoulder seat casts rays through the same sampled
+/// surface instead of sampling the body a second time.
+pub(super) struct Selection {
     part: String,
-    positions: Vec<[f64; 3]>,
-    triangles: Vec<[usize; 3]>,
+    pub(super) positions: Vec<[f64; 3]>,
+    pub(super) triangles: Vec<[usize; 3]>,
 }
 
 impl Selection {
-    fn read(actor: &Actor, selector: &PartSelector) -> Result<Self, ActorError> {
+    pub(super) fn read(actor: &Actor, selector: &PartSelector) -> Result<Self, ActorError> {
         let nodes = geometry::select(&actor.document, &[selector.node_name.as_str()])?;
         let worlds = super::animation::compose_worlds(actor, &actor.transforms)?;
         let sample: Sample = geometry::sample(actor, &nodes, &worlds)?;
@@ -688,7 +690,7 @@ impl Selection {
     /// The cut, with the loop the caller names as the one that matters. `inside`
     /// receives the plane and returns the point whose loop is the answer — the
     /// joint for a body, `None` for a garment, whose every closed loop counts.
-    fn section_torso(
+    pub(super) fn section_torso(
         &self,
         frame: &Frame,
         level: &str,
@@ -728,7 +730,7 @@ impl Selection {
     }
 
     /// Every closed loop of the cut.
-    fn section_all(&self, frame: &Frame, level: &str, plane: f64) -> Section {
+    pub(super) fn section_all(&self, frame: &Frame, level: &str, plane: f64) -> Section {
         let cut = cut(self, frame, plane);
         let mut section = Section {
             part: self.part.clone(),
@@ -1012,18 +1014,21 @@ fn inside_ring(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
 }
 
 /// The actor's own frame.
+///
+/// `pub(super)` because the shoulder seat measures against the same axes: one
+/// owner for "which way is up" keeps the two verbs' sections comparable.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Frame {
-    up: DVec3,
-    lateral: DVec3,
-    anterior: DVec3,
-    anterior_source: &'static str,
+pub(super) struct Frame {
+    pub(super) up: DVec3,
+    pub(super) lateral: DVec3,
+    pub(super) anterior: DVec3,
+    pub(super) anterior_source: &'static str,
 }
 
 impl Frame {
     /// Up is glTF's Y; the anterior axis is the direction the feet point (ankle
     /// to ball), the only authored forward the palette carries.
-    fn of(actor: &Actor) -> Result<Self, ActorError> {
+    pub(super) fn of(actor: &Actor) -> Result<Self, ActorError> {
         let names = node_names(actor);
         let palette = Palette::read(&names)?;
         let worlds = super::animation::compose_worlds(actor, &actor.transforms)?;
@@ -1051,7 +1056,7 @@ impl Frame {
         })
     }
 
-    fn report(self) -> BodyFrame {
+    pub(super) fn report(self) -> BodyFrame {
         BodyFrame {
             up: self.up.to_array(),
             lateral: self.lateral.to_array(),
@@ -1166,7 +1171,7 @@ impl Palette {
 }
 
 /// The part of a sample a selector names.
-fn select_part<'a>(sample: &'a Sample, selector: &PartSelector) -> Option<&'a Part> {
+pub(super) fn select_part<'a>(sample: &'a Sample, selector: &PartSelector) -> Option<&'a Part> {
     sample.parts.iter().find(|part| {
         part.name == selector.node_name
             && selector

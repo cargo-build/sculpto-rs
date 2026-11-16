@@ -9,6 +9,7 @@ mod geometry;
 mod packing;
 mod pose;
 mod rig;
+mod shoulder;
 mod stress;
 mod torso;
 
@@ -20,6 +21,7 @@ pub use fit::{
 pub use gait::{GaitOutcome, GaitParameters, JointRange, gait, write_gait_clip};
 pub use packing::{ClothPacking, PackedCloth, pack_cloth};
 pub use pose::{Axis, JointPose, JointProbe, PoseOutcome, PosedJoint, probe, write_probe_clip};
+pub use shoulder::{SEAT_CHAIN, SeatBone, SeatJoint, SeatOutcome, SeatWall, shoulder_seat};
 pub use stress::{
     FrameRow, GarmentRow, PartAddress, StressError, StressPlan, StressPose, StressReport, stress,
 };
@@ -250,6 +252,11 @@ impl Actor {
         joints: &[&str],
     ) -> Result<RigSample, ActorError> {
         rig::sample(self, parts, pose, joints)
+    }
+
+    /// The node's parent, for verbs that report a joint's parent link. @req DECL0013
+    pub(super) fn parent_of(&self, node: usize) -> Option<usize> {
+        self.parents.get(node).copied().flatten()
     }
 
     fn buffer(&self, buffer: gltf::Buffer<'_>) -> Option<&[u8]> {

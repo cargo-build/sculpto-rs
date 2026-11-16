@@ -8,6 +8,7 @@ mod pack;
 mod pose;
 mod regression;
 mod rig;
+mod shoulder;
 mod stress;
 mod torso;
 
@@ -28,7 +29,9 @@ usage: sculpto actor havok (--archive CLIP.bsa --member PATH | --file CLIP.hkx) 
 usage: sculpto actor fit --input actor.glb --out fitted.glb [--report fitted.json] \
     [--lengths flesh|preserve] [--part NAME ...]
 usage: sculpto actor torso-fit --input actor.glb --body NAME[#i] [--layer NAME[#i] ...] \
-    [--out fitted.glb] [--report report.json]";
+    [--out fitted.glb] [--report report.json]
+usage: sculpto actor shoulder-seat --input actor.glb --body NAME[#i] \
+    [--layer NAME[#i] ...] [--report report.json]";
 
 #[derive(Debug)]
 struct Arguments<'arg> {
@@ -66,6 +69,12 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "torso-fit") {
         return torso::run(&args[1..]);
+    }
+    if args
+        .first()
+        .is_some_and(|command| command == "shoulder-seat")
+    {
+        return shoulder::run(&args[1..]);
     }
     if args
         .first()
