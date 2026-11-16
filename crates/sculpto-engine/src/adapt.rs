@@ -175,7 +175,7 @@ fn actor_rest_worlds(actor: &Actor) -> Result<Vec<DMat4>, CommandError> {
 /// The palette is the skin's joint array, and the rig is its skeleton: a bone's
 /// parent is its nearest palette ancestor, so a scaffolding node between two
 /// joints is folded into the local without changing any world transform.
-fn actor_rig(actor: &Actor) -> Result<(Rig, Vec<String>), CommandError> {
+pub fn actor_rig(actor: &Actor) -> Result<(Rig, Vec<String>), CommandError> {
     let joints = actor.skin_joints().map_err(actor_error)?;
     if joints.is_empty() {
         return Err(refused(
