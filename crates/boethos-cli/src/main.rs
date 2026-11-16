@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use boethos::Store;
 use boethos_catalogue::{
     Asset, Assets, BodyPartInput, Category, IndexOptions, RawPartInput, Sex, body_part_asset,
-    index_root, raw_part_asset, read_clips,
+    index_file, index_root, raw_part_asset, read_clips,
 };
 
 fn main() -> ExitCode {
@@ -82,9 +82,9 @@ struct Spec {
 fn spec(command: &str) -> Option<Spec> {
     Some(match command {
         "index" => Spec {
-            values: &["--root", "--source"],
+            values: &["--root", "--file", "--source"],
             switches: &["--no-archives", "--prune", "--json"],
-            repeat: &["--root"],
+            repeat: &["--root", "--file"],
             max_positionals: 0,
         },
         "list" => Spec {
@@ -154,9 +154,10 @@ fn spec(command: &str) -> Option<Spec> {
     })
 }
 
-const VALUE_FLAGS: [&str; 12] = [
+const VALUE_FLAGS: [&str; 13] = [
     "--db",
     "--root",
+    "--file",
     "--source",
     "--category",
     "--sex",
@@ -288,9 +289,11 @@ fn usage() -> &'static str {
     "usage: boethos [--db PATH] <command> [options]
 
 commands:
-  index --root DIR [--root DIR ...] [--source LABEL] [--no-archives] [--prune] [--json]
-        index files and archive members; --prune removes rows for files
-        that disappeared from the root
+  index --root DIR [--root DIR ...] [--file PATH ...] [--source LABEL]
+         [--no-archives] [--prune] [--json]
+        index files and archive members; --root walks a directory, --file
+        indexes one hand-picked file (requires --source), --prune removes
+        rows for files that disappeared from a root
   list [--category C] [--sex S] [--family F] [--source S] [--tag T]
        [--name TEXT] [--offset N] [--limit N] [--json]
         list indexed assets; --name is a case-insensitive substring
@@ -346,13 +349,23 @@ fn run(cli: &Cli) -> Result<(), String> {
 
 fn command_index(cli: &Cli) -> Result<(), String> {
     let roots = cli.values("--root");
-    if roots.is_empty() {
-        return Err("index requires at least one --root directory".to_string());
+    let files = cli.values("--file");
+    if roots.is_empty() && files.is_empty() {
+        return Err("index requires at least one --root directory or --file path".to_string());
     }
     for root in roots {
         if !Path::new(root).is_dir() {
             return Err(format!("{root}: not a directory"));
         }
+    }
+    for file in files {
+        if !Path::new(file).is_file() {
+            return Err(format!("{file}: not a file"));
+        }
+    }
+    let shared_source = cli.value("--source").map(str::to_string);
+    if !files.is_empty() && shared_source.is_none() {
+        return Err("index --file requires --source LABEL".to_string());
     }
     let options = IndexOptions {
         archive_entries: !cli.has("--no-archives"),
@@ -362,38 +375,26 @@ fn command_index(cli: &Cli) -> Result<(), String> {
     let mut report = boethos_catalogue::IndexReport::default();
     for root in roots {
         let root_path = Path::new(root);
-        let source = cli
-            .value("--source")
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                root_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(root)
-                    .to_string()
-            });
+        let source = shared_source.clone().unwrap_or_else(|| {
+            root_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(root)
+                .to_string()
+        });
         let root_report = index_root(&store, root_path, &source, &options);
-        report.files += root_report.files;
-        report.archives += root_report.archives;
-        report.members += root_report.members;
-        report
-            .members_per_archive
-            .extend(root_report.members_per_archive);
-        report.clips += root_report.clips;
-        report.inserted += root_report.inserted;
-        report.updated += root_report.updated;
-        report.unchanged += root_report.unchanged;
-        report.pruned += root_report.pruned;
-        report.symlinks += root_report.symlinks;
-        report.ignored_dirs += root_report.ignored_dirs;
-        report.special += root_report.special;
-        report.non_utf8 += root_report.non_utf8;
-        report.unsupported_archives += root_report.unsupported_archives;
-        report.errors.extend(root_report.errors);
+        merge_report(&mut report, root_report);
+    }
+    if let Some(source) = &shared_source {
+        for file in files {
+            let file_report = index_file(&store, Path::new(file), source, &options);
+            merge_report(&mut report, file_report);
+        }
     }
     if cli.has("--json") {
         let json = serde_json::json!({
             "roots": roots,
+            "paths": files,
             "files": report.files,
             "archives": report.archives,
             "members": report.members,
@@ -457,6 +458,24 @@ fn command_index(cli: &Cli) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn merge_report(report: &mut boethos_catalogue::IndexReport, part: boethos_catalogue::IndexReport) {
+    report.files += part.files;
+    report.archives += part.archives;
+    report.members += part.members;
+    report.members_per_archive.extend(part.members_per_archive);
+    report.clips += part.clips;
+    report.inserted += part.inserted;
+    report.updated += part.updated;
+    report.unchanged += part.unchanged;
+    report.pruned += part.pruned;
+    report.symlinks += part.symlinks;
+    report.ignored_dirs += part.ignored_dirs;
+    report.special += part.special;
+    report.non_utf8 += part.non_utf8;
+    report.unsupported_archives += part.unsupported_archives;
+    report.errors.extend(part.errors);
 }
 
 fn command_list(cli: &Cli) -> Result<(), String> {

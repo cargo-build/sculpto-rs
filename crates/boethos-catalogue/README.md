@@ -5,8 +5,9 @@ Asset, preset, face and hairstyle catalogue kinds for the
 
 The crate owns the `asset` record and a read-only indexer for supplied game
 assets. It hashes regular files, lists `.7z`/`.zip`/`.rar` archives through the
-host `7z`, lists Skyrim `.bsa` archives through the engine's own read-only BSA
-parser ([`bsa`], never host `7z`), and records only catalogue-relevant members:
+host `7z` (`.rar` falls back to `unrar lb`), lists Skyrim `.bsa` archives through
+the engine's own read-only BSA parser ([`bsa`], never host `7z`), and records
+only catalogue-relevant members:
 `FaceGeom` meshes, `SliderPresets`, `SliderSets`, `.jslot` presets, hair meshes
 and Havok `.hkx` clips as `skyrim-animation`. For `.glb` and `.gltf` files it
 also records one `clip` row per embedded `animations[]` entry with measured

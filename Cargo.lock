@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "boethos"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "redb",
  "serde",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "boethos-catalogue"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "boethos",
  "lz4_flex",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "boethos-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "boethos",
  "boethos-catalogue",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-bake"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "sculpto-core",
  "sculpto-nif",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-blender"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "schemars",
  "serde",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gltf",
  "sculpto-bake",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "boethos",
  "boethos-catalogue",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-engine"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "glam 0.34.3",
  "gltf",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-gltf"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "glam 0.34.3",
  "gltf",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-mesh"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "glam 0.34.3",
  "gltf",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "sculpto-nif"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "byroredux-core",
  "byroredux-nif",
@@ -779,7 +779,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "span-manifest"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "serde_json",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "tripo-split"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "sculpto-core",
  "sculpto-gltf",
