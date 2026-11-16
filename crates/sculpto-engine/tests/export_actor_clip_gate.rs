@@ -211,6 +211,7 @@ fn plan(name: &str, mapped: &[&str], rest_comparable: bool) -> ClipPlan {
         pose_error_median_degrees: 0.0,
         pose_error_max_degrees: 0.0,
         pose_error_outlier: String::new(),
+        lever_rules: Vec::new(),
         root_motion: RootMotion::Keep,
         root_motion_bone: None,
         source_root_bone: None,

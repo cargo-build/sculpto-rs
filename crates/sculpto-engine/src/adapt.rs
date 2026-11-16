@@ -638,6 +638,7 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
         "pose_error_median_degrees": plan.pose_error_median_degrees,
         "pose_error_max_degrees": plan.pose_error_max_degrees,
         "pose_error_outlier": plan.pose_error_outlier,
+        "lever_rules": plan.lever_rules,
         "rest_pose_comparable": plan.rest_pose_comparable,
         "max_rest_rotation_degrees": plan.max_rest_rotation_degrees,
         "max_rest_translation_residual": plan.max_rest_translation_residual,
@@ -709,9 +710,17 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
         .filter(|pair| matches!(pair.role.map(|role| role.part), Some(Part::Toe)))
         .map(|pair| pair.palette.clone())
         .collect();
-    let slide = match toes.is_empty() {
-        true => json!({"pass": false, "reason": "the palette carries no toe joint"}),
-        false => toe_slide(&written, &written_name, &palette, &toes, params.frames)?,
+    // With the root motion zeroed the clip carries no travel by construction, so a
+    // stance foot that is planted in the source must slide relative to the frozen
+    // origin. Measuring it would grade the preview policy, not the conversion.
+    let slide = match (root_motion, toes.is_empty()) {
+        (RootMotion::Zero, _) => json!({
+            "pass": true,
+            "gate": false,
+            "note": "root motion zeroed: the clip plays in place, so stance slide is not applicable",
+        }),
+        (_, true) => json!({"pass": false, "reason": "the palette carries no toe joint"}),
+        (_, false) => toe_slide(&written, &written_name, &palette, &toes, params.frames)?,
     };
     let mut stretch = edge_stretch(&written, &written_name, params.frames)?;
     // The gate is relative to the body's own baseline: the same joints at the same

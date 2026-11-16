@@ -916,3 +916,148 @@ fn the_spine_aims_at_its_successor_not_the_shoulder_that_sorts_first() {
          (aiming at the shoulder that sorts first gives ~30° on this fixture)"
     );
 }
+
+/// One palette bone's written local rotation over the clip: the angle between
+/// its first sample and its furthest sample, degrees.
+fn written_amplitude(plan: &sculpto_engine::export_glb::ClipPlan, slot: usize) -> f64 {
+    let values = plan.clip.channels.iter().find_map(|channel| match channel {
+        sculpto_gltf::ClipChannel::Rotation { bone, values } if *bone == slot => Some(values),
+        _ => None,
+    });
+    let Some(values) = values else { return 0.0 };
+    let first = DQuat::from_array(values[0].map(f64::from));
+    values.iter().fold(0.0_f64, |worst, value| {
+        let sample = DQuat::from_array(value.map(f64::from));
+        let angle = 2.0 * first.dot(sample).abs().clamp(-1.0, 1.0).acos().to_degrees();
+        worst.max(angle)
+    })
+}
+
+/// A clavicle channel: the source swings its shoulder `degrees` over the clip.
+fn clavicle_swing(degrees: f64) -> Channel {
+    Channel {
+        node: 7,
+        path: "rotation",
+        values: (0..8)
+            .map(|index| {
+                let angle = degrees.to_radians() * index as f64 / 7.0;
+                DQuat::from_rotation_z(angle).to_array().to_vec()
+            })
+            .collect(),
+    }
+}
+
+/// A source skeleton whose clavicle lever is `1 / ratio` of ours and points
+/// `tilt` degrees away from our own clavicle direction.
+fn clavicle_source(ratio: f64, tilt_degrees: f64) -> Vec<u8> {
+    let mut bones = humanoid(&MIXAMO);
+    let lever = 0.28 / ratio;
+    let tilt = tilt_degrees.to_radians();
+    bones[7].translation = [-lever * tilt.cos(), -lever * tilt.sin(), 0.0];
+    let mut clip = walk();
+    clip.push(clavicle_swing(30.0));
+    skeleton(&bones, 1.0, IDENTITY, &clip)
+}
+
+#[test]
+fn a_short_source_lever_transfers_the_swing_by_tip_travel_not_by_angle() {
+    // Mixamo's shape on the measured pair: our clavicle lever is 285.5 mm to its
+    // 109.9 mm (2.598x) and the two rest directions differ by 32.7 degrees, so an
+    // absolute aim re-seats our shoulder 126 mm off this body's seat. The rule
+    // must keep the seat and write the source's *tip travel*.
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let source = clavicle_source(2.6, 20.0);
+    let (_, plan, _) = plan(&target, &source, ClipSemantics::Pose);
+    let row = plan
+        .lever_rules
+        .iter()
+        .find(|row| row.bone.contains("Clavicle"))
+        .expect("the clavicle carries a lever row");
+    assert!(
+        (row.ratio - 2.6).abs() < 0.05,
+        "2.6x measured as {:.3} ({} {:.3} m against {:.3} m)",
+        row.ratio,
+        row.bone,
+        row.our_lever,
+        row.source_lever
+    );
+    assert!(
+        row.seat_error_mm > 25.0,
+        "the tilted rest direction is a re-seat: {:.1} mm",
+        row.seat_error_mm
+    );
+    assert_eq!(
+        row.branch, "seat",
+        "the lever rule must take the seat branch"
+    );
+    let written = written_amplitude(&plan, 6);
+    let expected = 30.0 / 2.6;
+    assert!(
+        (written - expected).abs() < 1.0,
+        "the clavicle writes {written:.2}° against the expected {expected:.2}° \
+         (the source's 30.0° attenuated by the lever ratio)"
+    );
+    let our_travel = row.our_lever * written.to_radians().sin();
+    let source_travel = row.source_lever * 30.0_f64.to_radians().sin();
+    assert!(
+        (our_travel - source_travel).abs() <= 0.10 * source_travel,
+        "tip travel {:.4} m against the source's {source_travel:.4} m",
+        our_travel
+    );
+}
+
+#[test]
+fn an_equal_lever_keeps_the_source_angle() {
+    // A pair whose clavicles agree in length and direction is untouched: the
+    // direction *is* the pose, and the rule must not attenuate it.
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let source = clavicle_source(1.0, 0.0);
+    let (_, plan, _) = plan(&target, &source, ClipSemantics::Pose);
+    let row = plan
+        .lever_rules
+        .iter()
+        .find(|row| row.bone.contains("Clavicle"))
+        .expect("the clavicle carries a lever row");
+    assert!((row.ratio - 1.0).abs() < 1e-6, "ratio {:.6}", row.ratio);
+    assert!(
+        row.seat_error_mm < 1e-6,
+        "an agreeing rest seat is no re-seat: {:.3} mm",
+        row.seat_error_mm
+    );
+    assert_eq!(row.branch, "aim", "an equal lever keeps the absolute aim");
+    let written = written_amplitude(&plan, 6);
+    assert!(
+        (written - 30.0).abs() < 0.5,
+        "the source's 30° reaches the palette, measured {written:.2}°"
+    );
+}
+
+#[test]
+fn a_joint_the_source_barely_moves_is_held_at_rest() {
+    // 1 degree of source articulation is noise, not a pose: over a 2.6x lever it
+    // would still be a visible tick, so the rule holds the joint at rest instead
+    // of transferring it.
+    let target = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &[]);
+    let mut bones = humanoid(&MIXAMO);
+    let lever = 0.28 / 2.6;
+    let tilt = 20.0_f64.to_radians();
+    bones[7].translation = [-lever * tilt.cos(), -lever * tilt.sin(), 0.0];
+    let mut clip = walk();
+    clip.push(clavicle_swing(1.0));
+    let source = skeleton(&bones, 1.0, IDENTITY, &clip);
+    let (_, plan, _) = plan(&target, &source, ClipSemantics::Pose);
+    let row = plan
+        .lever_rules
+        .iter()
+        .find(|row| row.bone.contains("Clavicle"))
+        .expect("the clavicle carries a lever row");
+    assert_eq!(
+        row.branch, "hold",
+        "a 1.0° source range is held, not aimed at"
+    );
+    assert!(
+        written_amplitude(&plan, 6) < 0.2,
+        "a held joint stays at rest, measured {:.3}°",
+        written_amplitude(&plan, 6)
+    );
+}

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use glam::{DMat3, DMat4, DQuat, DVec3};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -57,6 +57,26 @@ const CONSTANT_EPSILON: f64 = 1e-6;
 /// Largest weighted mass a re-derived bind may carry before the source itself
 /// is refused: a few stray influences are a local defect, a whole skin is not.
 const REPAIR_MASS_CAP: f64 = 0.02;
+/// Lever ratio above which an aimed joint's angle is no longer a transferable
+/// pose: the same rotation moves this rig's child more than the source's.
+///
+/// Measured on the real pair, the clavicle is `196.6 / 129.2 = 1.52` and the
+/// spine `308.6 / 150.5 = 2.05`; the arm (1.17) and leg (1.23) joints are below
+/// it, and their absolute direction *is* the pose.
+pub const LEVER_RATIO_THRESHOLD: f64 = 1.5;
+/// The smallest seat error, metres, an aimed joint may carry before the
+/// converter stops reproducing the source's absolute aim direction.
+///
+/// The seat error is `lever · sin(rest-direction difference)`: the distance the
+/// absolute aim moves this rig's child away from where this body's own rest puts
+/// it. Measured on Emily against the Mixamo walk: clavicle 126 mm, spine 16 mm,
+/// so the clavicle is a re-seat and the spine is a pose. The bar sits between
+/// them and on the same 25 mm the hand/hip crossing floor uses — under it the
+/// displacement is a couple of pixels on a 1.8 m figure.
+pub const LEVER_SEAT_ERROR_METRES: f64 = 0.025;
+/// A source direction range at or below this is not articulation: the joint is
+/// held at the rig's own rest instead of transferring noise, degrees.
+pub const LEVER_NEGLIGIBLE_DEGREES: f64 = 2.0;
 
 /// The command input.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
@@ -263,6 +283,10 @@ pub struct ClipPlan {
     pub pose_error_max_degrees: f64,
     /// Bone carrying the worst pose error.
     pub pose_error_outlier: String,
+    /// Every aimed joint's lever measurement and the branch the converter took,
+    /// sorted by bone. The converter's lever rule is only readable here: which
+    /// joint was re-seated, by how much, and which kept the source's angle.
+    pub lever_rules: Vec<LeverRule>,
     /// The root-motion policy applied.
     pub root_motion: RootMotion,
     /// Palette bone the travel is written on, when one was resolved.
@@ -2217,6 +2241,123 @@ pub fn plan_clip_with(
         .iter()
         .map(|track| slot_roles.get(track.slot).copied().flatten())
         .collect();
+
+    // The lever table: one row per aimed joint, and the branch the converter
+    // takes. The seat it protects is the rig's own rest direction to the aimed
+    // successor; the source's is read from the clip anchor (its first sample),
+    // which is the reference every other measured difference on this path uses.
+    let lever_rules: Vec<LeverRule> = {
+        let mut probe: Vec<Option<DMat4>> = vec![None; source_worlds.nodes()];
+        let aimable = |position: usize| {
+            track_roles[position].is_some_and(|role| {
+                matches!(
+                    role.part,
+                    crate::retarget::Part::Clavicle
+                        | crate::retarget::Part::UpperArm
+                        | crate::retarget::Part::Forearm
+                        | crate::retarget::Part::Hand
+                        | crate::retarget::Part::Thigh
+                        | crate::retarget::Part::Calf
+                        | crate::retarget::Part::Foot
+                        | crate::retarget::Part::Spine(_)
+                        | crate::retarget::Part::Neck
+                        | crate::retarget::Part::Head
+                )
+            })
+        };
+        let mut rows = Vec::new();
+        for (position, track) in tracks.iter().enumerate() {
+            if track.derived || !aimable(position) {
+                continue;
+            }
+            let Some((_, child)) = directions[position] else {
+                continue;
+            };
+            let Some(child_position) = tracks.iter().position(|other| other.node == child) else {
+                continue;
+            };
+            let ours = rest_world(rig, tracks[child_position].joint)
+                .w_axis
+                .truncate()
+                - rest_world(rig, track.joint).w_axis.truncate();
+            let theirs = rest_source_worlds[child_position].w_axis.truncate()
+                - rest_source_worlds[position].w_axis.truncate();
+            let our_lever = ours.length();
+            let source_lever = theirs.length();
+            if our_lever < 1e-6 || source_lever < 1e-6 {
+                continue;
+            }
+            // The source's anchored direction, and how far it swings over the
+            // clip: a joint the source does not move is held, never aimed at.
+            let anchor = theirs / source_lever;
+            let mut range = 0.0_f64;
+            for sample in 0..samples {
+                // The probe memoizes node worlds for *one* sample; carrying it
+                // across samples would measure sample 0 against itself.
+                probe.iter_mut().for_each(|slot| *slot = None);
+                let bone = source_worlds
+                    .world(track.node, sample, &mut probe)
+                    .w_axis
+                    .truncate();
+                let posed = source_worlds
+                    .world(child, sample, &mut probe)
+                    .w_axis
+                    .truncate();
+                let direction = (posed - bone).normalize_or_zero();
+                if direction.length_squared() > 0.5 {
+                    range = range.max(direction.dot(anchor).clamp(-1.0, 1.0).acos().to_degrees());
+                }
+            }
+            let ours = ours / our_lever;
+            let framed = (frame * anchor).normalize_or_zero();
+            let rest_angle = ours.dot(framed).clamp(-1.0, 1.0).acos();
+            let seat_error = our_lever * rest_angle.sin();
+            let ratio = our_lever / source_lever;
+            let hold = range <= LEVER_NEGLIGIBLE_DEGREES;
+            let seat =
+                !hold && ratio > LEVER_RATIO_THRESHOLD && seat_error > LEVER_SEAT_ERROR_METRES;
+            rows.push(LeverRule {
+                bone: track.name.clone(),
+                source_bone: actor
+                    .node_name(track.node)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("node {}", track.node)),
+                our_lever,
+                source_lever,
+                ratio,
+                rest_direction_degrees: rest_angle.to_degrees(),
+                seat_error_mm: seat_error * 1000.0,
+                source_range_degrees: range,
+                branch: match (hold, seat) {
+                    (true, _) => "hold",
+                    (false, true) => "seat",
+                    (false, false) => "aim",
+                },
+                scale: match seat {
+                    true => (1.0 / ratio).min(1.0),
+                    false => 1.0,
+                },
+            });
+        }
+        rows.sort_by(|left, right| left.bone.cmp(&right.bone));
+        rows
+    };
+    // The per-sample branches, by track position: `Some(scale)` is `seat`,
+    // `Some(0.0)` is `hold`, and `None` keeps the absolute aim.
+    let lever_branches: Vec<Option<f64>> = {
+        let mut branches = vec![None; tracks.len()];
+        for (position, track) in tracks.iter().enumerate() {
+            let Some(row) = lever_rules.iter().find(|row| row.bone == track.name) else {
+                continue;
+            };
+            branches[position] = match row.branch {
+                "seat" => Some(row.scale),
+                "hold" => Some(0.0),
+                _ => None,
+            };
+        }
+        branches
+    };
     let chains: Vec<Option<TwistChain>> = tracks
         .iter()
         .enumerate()
@@ -2367,14 +2508,38 @@ pub fn plan_clip_with(
                                     .map(f64::from),
                             )
                             .normalize_or_zero();
-                            let target = (frame_rotation
-                                * (source_worlds
-                                    .world(child, sample, &mut worlds)
-                                    .w_axis
-                                    .truncate()
-                                    - bone.w_axis.truncate()))
-                            .normalize_or_zero();
                             let rest_axis = rest_rotations[position] * ours;
+                            let source_direction = |worlds: &mut Vec<Option<DMat4>>| {
+                                (source_worlds.world(child, sample, worlds).w_axis.truncate()
+                                    - bone.w_axis.truncate())
+                                .normalize_or_zero()
+                            };
+                            let target = match lever_branches[position] {
+                                // The lever rule: this rig's child sits much
+                                // further from the joint than the source's, so
+                                // the source's *absolute* aim would re-seat it.
+                                // Transfer the direction change since the clip
+                                // anchor, scaled so the child travels the
+                                // source's distance, and keep our own seat.
+                                Some(scale) if scale > 0.0 => {
+                                    let anchor =
+                                        (rest_source_worlds[child_position].w_axis.truncate()
+                                            - rest_source_worlds[position].w_axis.truncate())
+                                        .normalize_or_zero();
+                                    let posed = source_direction(&mut worlds);
+                                    let deviation = DQuat::from_rotation_arc(anchor, posed);
+                                    let deviation =
+                                        frame_rotation * deviation * frame_rotation.inverse();
+                                    let deviation =
+                                        slerp_shortest(DQuat::IDENTITY, deviation, scale);
+                                    (deviation * rest_axis.normalize()).normalize_or_zero()
+                                }
+                                // A joint the source does not articulate is
+                                // held at this rig's rest, never aimed at noise.
+                                Some(_) => rest_axis.normalize_or_zero(),
+                                None => (frame_rotation * source_direction(&mut worlds))
+                                    .normalize_or_zero(),
+                            };
                             match ours.length_squared() > 0.5 && target.length_squared() > 0.5 {
                                 true => {
                                     DQuat::from_rotation_arc(rest_axis.normalize(), target)
@@ -2716,6 +2881,7 @@ pub fn plan_clip_with(
         pose_error_median_degrees: pose_error_median,
         pose_error_max_degrees: max_error,
         pose_error_outlier: error_outlier,
+        lever_rules,
         root_motion,
         root_motion_bone: root_track.map(|position| tracks[position].name.clone()),
         source_root_bone: source_root
@@ -2724,6 +2890,41 @@ pub fn plan_clip_with(
         root_motion_travel,
         root_travel: (frame * root_travel * unit).length(),
     })
+}
+
+/// One aimed joint's lever measurement, and what the converter did with it.
+///
+/// The rule it reports: a joint whose lever is much longer than the source's
+/// (`ratio > LEVER_RATIO_THRESHOLD`) and whose rest direction differs from the
+/// source's by enough to move the child off this body's own seat
+/// (`seat_error > LEVER_SEAT_ERROR_METRES`) may not reproduce the source's
+/// absolute aim direction. It transfers the source's *direction change since the
+/// clip anchor*, scaled by `source_lever / our_lever`, applied to this rig's rest
+/// direction: the child travels the source's distance instead of the angle, and
+/// the body's authored seat survives the conversion. Every other joint keeps the
+/// absolute aim, where the direction *is* the pose.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LeverRule {
+    /// Palette bone the row is about.
+    pub bone: String,
+    /// Source bone whose aimed successor defines the direction.
+    pub source_bone: String,
+    /// Distance from the joint to its aimed successor on this rig, metres.
+    pub our_lever: f64,
+    /// The same distance on the source skeleton, metres.
+    pub source_lever: f64,
+    /// `our_lever / source_lever`.
+    pub ratio: f64,
+    /// Angle between this rig's rest direction and the source's anchored one.
+    pub rest_direction_degrees: f64,
+    /// Distance the absolute aim would move the child off this rig's seat.
+    pub seat_error_mm: f64,
+    /// How far the source moves the aim direction over the clip, degrees.
+    pub source_range_degrees: f64,
+    /// `aim`, `seat` or `hold` — the branch the converter took.
+    pub branch: &'static str,
+    /// Angle factor applied to the source's direction change (`1.0` outside `seat`).
+    pub scale: f64,
 }
 
 /// One bone offset whose unit ratio is not the rig's shared one.

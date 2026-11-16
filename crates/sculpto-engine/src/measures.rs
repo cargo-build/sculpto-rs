@@ -338,6 +338,73 @@ pub(crate) fn actor_error(error: sculpto_mesh::actor::ActorError) -> CommandErro
     crate::export_glb::actor_error(error)
 }
 
+/// Where a shoulder joint sits relative to the top of the spine, over a clip.
+///
+/// The operator judges the girdle by its *level*, not by its swing (`0154`): a
+/// shoulder that moves the source's distance but sits 75 mm further out reads as
+/// a frame over the chest, while a shoulder that swings back and forth at the
+/// body's own radius is natural. Radius is the three-dimensional distance from
+/// the spine top; height is its component along the body's own up axis, which is
+/// read from the rest chain rather than assumed to be a world axis.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ShoulderLevel {
+    /// Palette bone the row measures.
+    pub bone: String,
+    /// Palette bone it is measured from.
+    pub spine: String,
+    /// Mean distance from the spine top, mm.
+    pub mean_radius_mm: f64,
+    /// Peak-to-peak radial excursion over the clip, mm.
+    pub radius_excursion_mm: f64,
+    /// Radial excursion as a fraction of the mean radius.
+    pub radius_excursion_fraction: f64,
+    /// Mean height above the spine top along the body's up axis, mm.
+    pub mean_height_mm: f64,
+    /// Peak-to-peak height excursion, mm.
+    pub height_excursion_mm: f64,
+    /// Frames sampled.
+    pub frames: usize,
+}
+
+/// The pure metric behind [`ShoulderLevel`]: offsets of the shoulder from the
+/// spine top, world metres, with `up` the body's own up direction.
+pub fn shoulder_level_from_offsets(
+    bone: &str,
+    spine: &str,
+    up: DVec3,
+    offsets: &[DVec3],
+) -> ShoulderLevel {
+    let up = up.normalize_or_zero();
+    let radii: Vec<f64> = offsets.iter().map(|offset| offset.length()).collect();
+    let heights: Vec<f64> = offsets.iter().map(|offset| offset.dot(up)).collect();
+    let mean = |values: &[f64]| match values.is_empty() {
+        true => 0.0,
+        false => values.iter().sum::<f64>() / values.len() as f64,
+    };
+    let spread = |values: &[f64]| match (
+        values.iter().copied().reduce(f64::min),
+        values.iter().copied().reduce(f64::max),
+    ) {
+        (Some(low), Some(high)) => high - low,
+        _ => 0.0,
+    };
+    let mean_radius = mean(&radii);
+    let radius_excursion = spread(&radii);
+    ShoulderLevel {
+        bone: bone.to_owned(),
+        spine: spine.to_owned(),
+        mean_radius_mm: mean_radius * 1000.0,
+        radius_excursion_mm: radius_excursion * 1000.0,
+        radius_excursion_fraction: match mean_radius > 1e-9 {
+            true => radius_excursion / mean_radius,
+            false => 0.0,
+        },
+        mean_height_mm: mean(&heights) * 1000.0,
+        height_excursion_mm: spread(&heights) * 1000.0,
+        frames: offsets.len(),
+    }
+}
+
 /// The palette in skin order: one name per skin joint, the names clips address.
 pub(crate) fn palette_names(actor: &Actor) -> Result<Vec<String>, CommandError> {
     let joints = actor.skin_joints().map_err(actor_error)?;

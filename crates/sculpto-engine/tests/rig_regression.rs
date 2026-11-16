@@ -18,10 +18,11 @@ use std::borrow::Cow;
 
 use glam::{DMat4, DQuat, DVec3};
 use gltf::binary::Glb;
+use sculpto_engine::measures::shoulder_level_from_offsets;
 use sculpto_engine::regression::{
     ClearanceFrame, RegressionActor, RegressionParams, chain_aligned, chain_local, clearance_gate,
-    clearance_metrics, clothing_gate, rest_frame_axes, rotation_range_deg, run_params, spine_gate,
-    spine_metrics, stretch_gate,
+    clearance_metrics, clothing_gate, rest_frame_axes, rotation_range_deg, run_params,
+    shoulder_level_gate, spine_gate, spine_metrics, stretch_gate,
 };
 use serde_json::{Value, json};
 
@@ -706,5 +707,86 @@ fn the_harness_names_the_rows_the_broken_transfer_breaks() {
         failed,
         vec!["synthetic/adapted:spine_lateral"],
         "the whole verdict: {report}"
+    );
+}
+
+/// The girdle row measures the shoulder's *level* against the spine top, and
+/// reports its swing without gating it: the reference's own shoulders move
+/// back and forth (`0154` measured 5.9 % of the radius), and the operator was
+/// explicit that the swing is natural.
+#[test]
+fn the_girdle_row_reads_a_swinging_shoulder_at_its_own_level() {
+    // Our rest offset on Emily: 181.6 mm lateral, 213.8 mm above Spine2.
+    let rest = DVec3::new(-0.1816, 0.0098, 0.2138);
+    // A swing of the shoulder about the clavicle root moves the lateral arm of
+    // the offset: +/-20 mm lateral is a 26 mm radial excursion here.
+    let frames: Vec<DVec3> = (0..9)
+        .map(|index| {
+            let swing = 0.020 * (index as f64 / 8.0 - 0.5) * 2.0;
+            rest + DVec3::new(swing, 0.0, 0.0)
+        })
+        .collect();
+    let level = shoulder_level_from_offsets("shoulder", "Spine2", DVec3::Z, &frames);
+    assert!(
+        (level.mean_radius_mm - 280.7).abs() < 1.0,
+        "the mean radius is the body's own level: {:.1} mm",
+        level.mean_radius_mm
+    );
+    assert!(
+        (level.mean_height_mm - 213.8).abs() < 1.0,
+        "the mean height is the body's own level: {:.1} mm",
+        level.mean_height_mm
+    );
+    assert!(
+        (level.radius_excursion_mm - 25.9).abs() < 1.0,
+        "the swing is reported, not hidden: {:.1} mm ({} frames)",
+        level.radius_excursion_mm,
+        level.frames
+    );
+    assert!(
+        level.radius_excursion_fraction < 0.10,
+        "26 mm on 280.7 is 9.2 %, not the 27 % defect: {:.3}",
+        level.radius_excursion_fraction
+    );
+}
+
+/// The gate must fail the measured lever defect and pass a shoulder that only
+/// swings: radius 420.5 mm against the body's 280.7, and the height arm on a
+/// shoulder carried too high.
+#[test]
+fn the_girdle_gate_fails_a_re_seated_shoulder_and_passes_a_swing() {
+    let rest = DVec3::new(-0.1816, 0.0098, 0.2138);
+    let still: Vec<DVec3> = std::iter::repeat_n(rest, 9).collect();
+    let own = shoulder_level_from_offsets("shoulder", "Spine2", DVec3::Z, &still);
+    let swinging: Vec<DVec3> = (0..9)
+        .map(|index| rest + DVec3::new(0.020 * (index as f64 / 8.0 - 0.5) * 2.0, 0.0, 0.0))
+        .collect();
+    let swing = shoulder_level_from_offsets("shoulder", "Spine2", DVec3::Z, &swinging);
+    let verdict = shoulder_level_gate(&own, &swing, "emily/adapted");
+    assert!(
+        verdict.pass,
+        "a shoulder at the body's level passes whatever its swing: {}",
+        verdict.detail
+    );
+    // The measured defect: mean radius 420.5 mm, height +225.4 mm.
+    let displaced: Vec<DVec3> =
+        std::iter::repeat_n(DVec3::new(-0.3497, 0.0436, 0.2254), 9).collect();
+    let re_seated = shoulder_level_from_offsets("shoulder", "Spine2", DVec3::Z, &displaced);
+    assert!(re_seated.mean_radius_mm > 400.0);
+    let verdict = shoulder_level_gate(&own, &re_seated, "emily/adapted");
+    assert!(!verdict.pass, "the re-seat must fail: {}", verdict.detail);
+    assert!(
+        verdict.detail.contains("mean radius") && verdict.detail.contains("bar"),
+        "the failing row names the measurement: {}",
+        verdict.detail
+    );
+    // And the height arm on its own: the same radius, 40 mm too high.
+    let high: Vec<DVec3> = std::iter::repeat_n(rest + DVec3::Z * 0.040, 9).collect();
+    let too_high = shoulder_level_from_offsets("shoulder", "Spine2", DVec3::Z, &high);
+    let verdict = shoulder_level_gate(&own, &too_high, "emily/adapted");
+    assert!(
+        !verdict.pass,
+        "40 mm too high must fail on its own: {}",
+        verdict.detail
     );
 }

@@ -46,8 +46,8 @@ use sculpto_mesh::actor::{Actor, Pose, StressPlan, stress};
 pub(crate) use crate::adapt::source_clip_name;
 use crate::export_actor::CLIP_ROLES;
 use crate::measures::{
-    RELATIVE_STRETCH, STANCE_MEDIAN_BAR, edge_stretch, measurable_parts, palette_names,
-    palette_reconstruction, toe_slide,
+    RELATIVE_STRETCH, STANCE_MEDIAN_BAR, ShoulderLevel, edge_stretch, measurable_parts,
+    palette_names, palette_reconstruction, shoulder_level_from_offsets, toe_slide,
 };
 use crate::retarget::{BoneRole, Part, Side, coverage_token, palette_role, role_of};
 use crate::{CommandError, ErrorKind, errors};
@@ -91,6 +91,21 @@ pub const CLEARANCE_MARGIN: f64 = 0.25;
 /// Admitted adapted stretch as a multiple of the own clip's stretch at the
 /// same witnesses: a body-owned tear (Mike's crotch) shows in both rows.
 pub const CLOTHING_RELATIVE: f64 = 1.10;
+/// Admitted adapted shoulder radius from the spine top, as a multiple of the
+/// own walk's — which for a procedural gait with no clavicle channel is the
+/// body's rest level.
+///
+/// The lever defect (`0154`) put the shoulder at 355.4 mm against the body's
+/// own 280.7 mm on the adapted walk (1.266×) while the source, measured from
+/// its own spine top, reads 207.6 mm with a 5.9 % radial excursion. A 10 % bar
+/// separates a converted walk from a re-seated shoulder by more than two
+/// times the defect, and leaves room for a genuinely different pelvis/spine
+/// proportion.
+pub const SHOULDER_RADIUS_RATIO: f64 = 1.10;
+/// Admitted adapted shoulder height above the spine top, mm from the own
+/// walk's. The same defect raised it 38.9 mm (252.7 against 213.8); 25 mm is
+/// smaller than the defect and larger than any measured conversion drift.
+pub const SHOULDER_HEIGHT_MM: f64 = 25.0;
 
 /// The chain roles whose absence makes a baseline unanimated: spine and neck.
 ///
@@ -794,6 +809,46 @@ pub fn clearance_gate(
     }
 }
 
+/// The girdle gate: the adapted shoulder's *level* against the own walk's,
+/// which for a procedural gait without a clavicle channel is the body's rest.
+///
+/// Swing is not gated: the reference's own shoulders move back and forth
+/// (`0154` measured 5.9 % of the radius from its own spine top), and the
+/// operator was explicit that the swing is natural. What must not move is the
+/// mean: the lever defect put the mean 74.7 mm further out than the body's own
+/// seat, which is the frame over the chest.
+pub fn shoulder_level_gate(
+    default: &ShoulderLevel,
+    adapted: &ShoulderLevel,
+    row: &str,
+) -> GateVerdict {
+    let ratio = adapted.mean_radius_mm / default.mean_radius_mm.max(f64::MIN_POSITIVE);
+    let height_delta = adapted.mean_height_mm - default.mean_height_mm;
+    GateVerdict {
+        gate: "shoulder_level",
+        row: row.to_owned(),
+        pass: ratio <= SHOULDER_RADIUS_RATIO && height_delta.abs() <= SHOULDER_HEIGHT_MM,
+        detail: format!(
+            "adapted {} mean radius {:.1} mm ({:.3}× own {:.1}, bar {:.2}×), mean height {:+.1} mm \
+             above {} (own {:+.1}, delta {:+.1}, bar ±{:.0}); radial excursion {:.1} mm ({:.1}% of \
+             radius), height excursion {:.1} mm",
+            adapted.bone,
+            adapted.mean_radius_mm,
+            ratio,
+            default.mean_radius_mm,
+            SHOULDER_RADIUS_RATIO,
+            adapted.mean_height_mm,
+            default.spine,
+            default.mean_height_mm,
+            height_delta,
+            SHOULDER_HEIGHT_MM,
+            adapted.radius_excursion_mm,
+            adapted.radius_excursion_fraction * 100.0,
+            adapted.height_excursion_mm,
+        ),
+    }
+}
+
 /// Edge stretch, relative: the adapted clip may not stretch the body more than
 /// `1.10 ×` the own clip's stretch at the same witnesses. The absolutes stay
 /// in the report; they are the body's property.
@@ -946,6 +1001,24 @@ fn resolve_joints(palette: &[String]) -> Result<ResolvedJoints, CommandError> {
         .cloned()
         .ok_or_else(|| errors::invalid("rig_regression_chain", "empty chain"))?;
     resolved.pelvis = pelvis;
+    resolved.spine_top = resolved
+        .chain
+        .get(3)
+        .cloned()
+        .ok_or_else(|| errors::invalid("rig_regression_chain", "the chain has no Spine2"))?;
+    let upper_arms: Vec<(&String, Side)> = palette
+        .iter()
+        .filter_map(|name| {
+            palette_role(name)
+                .filter(|role| matches!(role.part, Part::UpperArm))
+                .map(|role| (name, role.side))
+        })
+        .collect();
+    resolved.shoulder = upper_arms
+        .iter()
+        .find(|(_, side)| *side == Side::Left)
+        .or_else(|| upper_arms.first())
+        .map(|(name, _)| (*name).clone());
     Ok(resolved)
 }
 
@@ -955,6 +1028,13 @@ struct ResolvedJoints {
     pelvis: String,
     /// Pelvis → Neck, five joints on these palettes.
     chain: Vec<String>,
+    /// The top of the spine chain (`Spine2` on these palettes).
+    spine_top: String,
+    /// One shoulder the girdle row measures: the first `UpperArm` by side,
+    /// left preferred so the row is deterministic. Tool chains and test
+    /// fixtures without arms have none, and their girdle row is absent, not
+    /// vacuously passing.
+    shoulder: Option<String>,
     hands: Vec<String>,
     digits: Vec<String>,
     thighs: Vec<String>,
@@ -1096,6 +1176,9 @@ struct MotionRows {
     frame_joint: String,
     spine: SpineMetrics,
     clearance: ClearanceMetrics,
+    /// Shoulder level against the spine top: the girdle row, absent on a
+    /// palette that carries no arm.
+    shoulder: Option<ShoulderLevel>,
 }
 
 fn measure_motion(
@@ -1114,6 +1197,9 @@ fn measure_motion(
     ] {
         wanted.extend(list.iter().cloned());
     }
+    if let Some(shoulder) = &joints.shoulder {
+        wanted.push(shoulder.clone());
+    }
     wanted.sort_unstable();
     wanted.dedup();
     let (frame_joint, frame_world_rest, rest_positions) = rest_pose(actor, &joints.chain, palette)?;
@@ -1126,6 +1212,13 @@ fn measure_motion(
         .iter()
         .map(|point| chain_aligned(rest_axes, chain_local(frame_world_rest, *point)))
         .collect();
+    // The body's own up axis: the rest chain, pelvis to neck. Reading it from
+    // the body rather than from a world axis keeps the girdle row honest on a
+    // file whose world axes are the rig's convention (these palettes are Z-up).
+    let up = match (rest_positions.first(), rest_positions.last()) {
+        (Some(pelvis), Some(neck)) => (*neck - *pelvis).normalize_or_zero(),
+        _ => DVec3::Z,
+    };
     let mut sampled = wanted;
     sampled.push(frame_joint.clone());
     sampled.sort_unstable();
@@ -1133,6 +1226,7 @@ fn measure_motion(
     let tracks = joint_tracks(actor, clip, frames, &sampled, palette)?;
     let mut chain_frames = Vec::with_capacity(tracks.len());
     let mut clearance_frames = Vec::with_capacity(tracks.len());
+    let mut shoulder_offsets: Vec<DVec3> = Vec::with_capacity(tracks.len());
     for (time, worlds) in &tracks {
         let frame_world = worlds.get(&frame_joint).ok_or_else(|| {
             errors::invalid(
@@ -1224,11 +1318,29 @@ fn measure_motion(
             }
         }
         clearance_frames.push(frame);
+        if let Some(shoulder) = &joints.shoulder {
+            let shoulder_world = worlds.get(shoulder).ok_or_else(|| {
+                errors::invalid(
+                    "rig_regression_chain",
+                    format!("{shoulder:?} missing from a frame"),
+                )
+            })?;
+            let spine_world = worlds.get(&joints.spine_top).ok_or_else(|| {
+                errors::invalid(
+                    "rig_regression_chain",
+                    format!("{:?} missing from a frame", joints.spine_top),
+                )
+            })?;
+            shoulder_offsets.push(shoulder_world.w_axis.truncate() - spine_world.w_axis.truncate());
+        }
     }
     Ok(MotionRows {
         frame_joint,
         spine: spine_metrics(&rest_folded, &chain_frames),
         clearance: clearance_metrics(&clearance_frames),
+        shoulder: joints.shoulder.as_ref().map(|shoulder| {
+            shoulder_level_from_offsets(shoulder, &joints.spine_top, up, &shoulder_offsets)
+        }),
     })
 }
 
@@ -1491,6 +1603,15 @@ fn measure_actor(
         &adapted_row,
         default_drives_spine_chain,
     ));
+    if let (Some(default_shoulder), Some(adapted_shoulder)) =
+        (&default_motion.shoulder, &adapted_motion.shoulder)
+    {
+        gates.push(shoulder_level_gate(
+            default_shoulder,
+            adapted_shoulder,
+            &adapted_row,
+        ));
+    }
     gates.push(clearance_gate(
         &default_motion.clearance,
         &adapted_motion.clearance,
@@ -1584,6 +1705,7 @@ fn measure_actor(
             "clip": clip,
             "spine_frame_joint": rows.frame_joint,
             "spine": rows.spine,
+            "shoulder": rows.shoulder,
             "clearance": rows.clearance,
             "stance": stance,
             "edge_stretch": stretch,
