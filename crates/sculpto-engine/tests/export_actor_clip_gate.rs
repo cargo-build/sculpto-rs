@@ -217,6 +217,10 @@ fn plan(name: &str, mapped: &[&str], rest_comparable: bool) -> ClipPlan {
         source_root_bone: None,
         root_motion_travel: 0.0,
         root_travel: 0.0,
+        palette_fold_degrees: 0.0,
+        palette_fold_bone: String::new(),
+        palette_fold_slots: 0,
+        root_frame: None,
     }
 }
 

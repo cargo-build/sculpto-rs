@@ -13,18 +13,19 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use glam::{DMat4, DVec3};
+use glam::{DMat4, DQuat, DVec3};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use sculpto_core::rig::{Joint, LocalTransform, Rig, RigFrame};
 use sculpto_gltf::pack::{PackWriter, Track};
-use sculpto_mesh::actor::{Actor, Pose};
+use sculpto_mesh::actor::{Actor, Pose, SourceClip, SourceProperty, SourceValues};
 
 use crate::export_actor::{CLIP_ROLES, admit_clip};
 use crate::export_glb::{
-    ClipAnchor, ClipPlan, ClipSemantics, ClipTolerances, RootMotion, plan_clip_with, refused,
+    ClipAnchor, ClipPlan, ClipSemantics, ClipTolerances, PaletteFrames, RootFrame, RootMotion,
+    plan_clip_with, quaternion_angle, refused,
 };
 use crate::measures::{
     EDGE_STRETCH_CAP, RELATIVE_STRETCH, edge_stretch, measurable_parts, palette_reconstruction,
@@ -259,6 +260,170 @@ pub fn actor_rig(actor: &Actor) -> Result<(Rig, Vec<String>), CommandError> {
 fn actor_error(error: sculpto_mesh::actor::ActorError) -> CommandError {
     crate::export_glb::actor_error(error)
 }
+
+/// One node's posed world from a written clip, composed through the file's own
+/// parent chain: the frame a player applies a local in, read back from the
+/// artifact. A gate that composed the plan's own bookkeeping instead could not see
+/// the difference between the two frames, which is the defect class it exists for.
+fn written_node_world(
+    actor: &Actor,
+    clip: &SourceClip,
+    node: usize,
+    sample: usize,
+) -> Result<DMat4, CommandError> {
+    let mut overrides: BTreeMap<usize, (Option<DQuat>, Option<DVec3>)> = BTreeMap::new();
+    for channel in &clip.channels {
+        let entry = overrides.entry(channel.node).or_insert((None, None));
+        match (channel.property, &channel.values) {
+            (SourceProperty::Rotation, SourceValues::Rotation(values)) => {
+                entry.0 = values.get(sample).map(|value| DQuat::from_array(*value));
+            }
+            (SourceProperty::Translation, SourceValues::Vector(values)) => {
+                entry.1 = values.get(sample).map(|value| DVec3::from_array(*value));
+            }
+            _ => {}
+        }
+    }
+    fn resolve(
+        actor: &Actor,
+        node: usize,
+        overrides: &BTreeMap<usize, (Option<DQuat>, Option<DVec3>)>,
+        worlds: &mut Vec<Option<DMat4>>,
+    ) -> Result<DMat4, CommandError> {
+        if let Some(found) = worlds[node] {
+            return Ok(found);
+        }
+        let mut local =
+            DMat4::from_cols_array_2d(&actor.rest_local_matrix(node).map_err(actor_error)?);
+        if let Some((rotation, translation)) = overrides.get(&node) {
+            let (scale, rest_rotation, rest_translation) = local.to_scale_rotation_translation();
+            local = DMat4::from_scale_rotation_translation(
+                scale,
+                rotation.unwrap_or(rest_rotation),
+                translation.unwrap_or(rest_translation),
+            );
+        }
+        let world = match actor.node_parents()[node] {
+            Some(parent) => resolve(actor, parent, overrides, worlds)? * local,
+            None => local,
+        };
+        worlds[node] = Some(world);
+        Ok(world)
+    }
+    let mut worlds = vec![None; actor.node_parents().len()];
+    resolve(actor, node, &overrides, &mut worlds)
+}
+
+/// Whether the written artifact holds the root where the plan placed it.
+///
+/// The conversion writes locals; the player multiplies them by the file's own
+/// parent chain. A fold the plan dropped tips the whole body by that rotation
+/// while every limb still articulates, which a per-bone rest angle cannot see — so
+/// this compares the composed world with the intent, read from the written GLB.
+fn root_frame_gate(
+    written: &Actor,
+    clip: &SourceClip,
+    frame: &RootFrame,
+    joints: &[usize],
+) -> Result<Value, CommandError> {
+    let Some(&node) = joints.get(frame.slot) else {
+        return Ok(json!({
+            "gate": false,
+            "note": "the palette carries no joint at the root slot",
+        }));
+    };
+    let samples = frame.rotations.len();
+    if samples == 0 || clip.times.len() < 2 {
+        return Ok(json!({
+            "gate": false,
+            "note": "the plan carries no root frame to check",
+        }));
+    }
+    let mut world_error = 0.0_f64;
+    let mut rest_deviation_min = f64::INFINITY;
+    let mut rest_deviation_max = 0.0_f64;
+    let mut tilt_min = f64::INFINITY;
+    let mut tilt_max = 0.0_f64;
+    let mut height_min = f64::INFINITY;
+    let mut height_max = f64::NEG_INFINITY;
+    // The bone's own up axis, rest against posed: a body that has been laid on its
+    // side reads 90 here, while a walk's honest yaw about the vertical reads a few
+    // degrees. The full orientation is reported beside it, never gated: it is the
+    // clip's motion.
+    let rest_up = frame.rest_rotation * DVec3::Y;
+    for index in 0..samples {
+        let world = written_node_world(written, clip, node, index)?;
+        let (_, rotation, translation) = world.to_scale_rotation_translation();
+        world_error = world_error
+            .max(quaternion_angle(&(rotation * frame.rotations[index].inverse())).to_degrees());
+        let rest_deviation =
+            quaternion_angle(&(rotation * frame.rest_rotation.inverse())).to_degrees();
+        rest_deviation_min = rest_deviation_min.min(rest_deviation);
+        rest_deviation_max = rest_deviation_max.max(rest_deviation);
+        let tilt = (rotation * DVec3::Y)
+            .dot(rest_up)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+        tilt_min = tilt_min.min(tilt);
+        tilt_max = tilt_max.max(tilt);
+        height_min = height_min.min(translation.y);
+        height_max = height_max.max(translation.y);
+    }
+    // The body's travel is written on the bone that owns it, which is the pelvis
+    // itself on a Mixamo skeleton and a common ancestor on a palette that hangs
+    // the pelvis beside the spine.
+    let travel = frame
+        .travel_slot
+        .filter(|_| frame.deltas.len() == samples)
+        .and_then(|slot| joints.get(slot).copied());
+    let mut position_error = 0.0_f64;
+    let mut position_samples = 0;
+    if let Some(travel_node) = travel {
+        for index in 0..samples {
+            let world = written_node_world(written, clip, travel_node, index)?;
+            let (_, _, translation) = world.to_scale_rotation_translation();
+            position_error = position_error.max(
+                ((translation - frame.travel_rest_translation) - frame.deltas[index]).length(),
+            );
+            position_samples += 1;
+        }
+    }
+    Ok(json!({
+        "bone": frame.bone,
+        "samples": samples,
+        "world_error_degrees": world_error,
+        "world_bar_degrees": ROOT_FRAME_BAR_DEGREES,
+        "position_bone": frame.travel_bone,
+        "position_samples": position_samples,
+        "position_error": position_error,
+        "position_bar": ROOT_FRAME_BAR_POSITION,
+        "pass": world_error <= ROOT_FRAME_BAR_DEGREES
+            && (position_samples == 0 || position_error <= ROOT_FRAME_BAR_POSITION),
+        // Reported, not gated from here: how far the clip itself carries the root
+        // away from its rest frame. An authored walk measures near 10 degrees; a
+        // body on its side measures 90, which the world error above catches first.
+        "up_tilt_degrees": {
+            "min": tilt_min,
+            "max": tilt_max,
+        },
+        "rest_deviation_degrees": {
+            "min": rest_deviation_min,
+            "max": rest_deviation_max,
+        },
+        "root_height": {
+            "rest": frame.rest_translation.y,
+            "min": height_min,
+            "max": height_max,
+            "range": height_max - height_min,
+        },
+    }))
+}
+
+/// Admitted error of a written root frame against the plan's intent, degrees.
+const ROOT_FRAME_BAR_DEGREES: f64 = 1.0;
+/// Admitted root position error against the plan's intent, file units.
+const ROOT_FRAME_BAR_POSITION: f64 = 1e-3;
 
 /// The clip the source GLB carries, by name or by being the only one.
 pub(crate) fn source_clip_name(
@@ -554,6 +719,10 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
     };
     let semantics = semantics_of(params, frame_gap_degrees)?;
     let root_motion = root_motion_of(params)?;
+    // The frame the player will compose, measured from the actor the clip is
+    // written into: the rig folds the file's scaffolding out of a joint, and a
+    // written local is multiplied by the file's own parent chain.
+    let frames = PaletteFrames::of(&base)?;
     let anchor = ClipAnchor::of(&source, &source_clip)?;
     let tolerances = ClipTolerances::default();
     let plan = plan_clip_with(
@@ -564,6 +733,7 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
         &palette,
         &tolerances,
         Some(&correspondence),
+        Some(&frames),
         semantics,
         root_motion,
     )?;
@@ -647,6 +817,9 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
         "scale_outliers": plan.scale_outliers.len(),
         "root_travel": plan.root_travel,
         "root_motion_travel": plan.root_motion_travel,
+        "palette_fold_degrees": plan.palette_fold_degrees,
+        "palette_fold_bone": plan.palette_fold_bone,
+        "palette_fold_slots": plan.palette_fold_slots,
         "roles_covered": covered,
         "roles_missing": missing,
         "untouched_bones": rest_admission.untouched_bones.len(),
@@ -704,6 +877,18 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
     }
     let written = Actor::from_glb(&out_bytes).map_err(actor_error)?;
     let reconstruction = palette_reconstruction(&base, &written)?;
+    // The written clip's own frame, read back from the artifact: the player
+    // composes the file's node chain, not the plan's palette.
+    let root_frame = match &plan.root_frame {
+        Some(frame) => {
+            let written_clip = written.clip_shared(&written_name).map_err(actor_error)?;
+            root_frame_gate(&written, &written_clip, frame, &joints)?
+        }
+        None => json!({
+            "gate": false,
+            "note": "the plan resolved no root bone to write the body's travel on",
+        }),
+    };
     let toes: Vec<String> = correspondence
         .pairs
         .iter()
@@ -773,6 +958,7 @@ pub fn run(params: &AdaptParams) -> Result<Value, CommandError> {
                 "note": "the rest difference carried by a rest-anchored transfer; advisory",
             },
             "palette_reconstruction": reconstruction,
+            "root_frame": root_frame,
             "stance_foot": slide,
             "edge_stretch": stretch,
         },
@@ -788,7 +974,12 @@ pub fn verdict(report: &Value) -> String {
     let mut refused = Vec::new();
     // Only the entries that declare themselves a gate count: `pose_error` is an
     // advisory property of the two skeletons, not a gate (see the report note).
-    for key in ["palette_reconstruction", "stance_foot", "edge_stretch"] {
+    for key in [
+        "palette_reconstruction",
+        "root_frame",
+        "stance_foot",
+        "edge_stretch",
+    ] {
         let gate = &report["gates"][key];
         if gate["gate"].as_bool() == Some(false) {
             continue;
