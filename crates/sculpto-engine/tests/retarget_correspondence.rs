@@ -759,3 +759,160 @@ fn duplicated_roles_are_reported_with_the_rule_that_resolved_them() {
         .expect("a chosen bone");
     assert_eq!(chosen, "mixamorig:Hips", "the shortest claimed name wins");
 }
+
+/// A spine whose `Spine2` carries both shoulders *before* the neck in node order,
+/// the Mixamo layout (`LeftShoulder` 101 < `Neck` 104). `shoulder_deg` is the rest
+/// angle of the clavicle away from the vertical neck direction; the two bodies
+/// differ in it exactly as SSE (17.4°) and Mixamo (33.8°) do on the real fixtures.
+fn spine_shoulder_first(names: &[&'static str; 16], shoulder_deg: f64) -> Vec<Bone> {
+    let angle = shoulder_deg.to_radians();
+    let shoulder = |sign: f64| [sign * 0.10 * angle.sin(), 0.10 * angle.cos(), 0.0];
+    vec![
+        bone(names[0], None, [0.0, 1.0, 0.0]),
+        bone(names[1], Some(0), [0.0, 0.10, 0.0]),
+        bone(names[2], Some(1), [0.0, 0.10, 0.0]),
+        bone(names[3], Some(2), [0.0, 0.10, 0.0]),
+        bone(names[4], Some(3), shoulder(-1.0)),
+        bone(names[5], Some(3), shoulder(1.0)),
+        bone(names[6], Some(3), [0.0, 0.12, 0.0]),
+        bone(names[7], Some(6), [0.0, 0.08, 0.0]),
+        bone(names[8], Some(4), [-0.20, 0.0, 0.0]),
+        bone(names[9], Some(8), [-0.25, 0.0, 0.0]),
+        bone(names[10], Some(5), [0.20, 0.0, 0.0]),
+        bone(names[11], Some(10), [0.25, 0.0, 0.0]),
+        bone(names[12], Some(0), [-0.10, -0.10, 0.0]),
+        bone(names[13], Some(12), [0.0, -0.45, 0.0]),
+        bone(names[14], Some(0), [0.10, -0.10, 0.0]),
+        bone(names[15], Some(14), [0.0, -0.45, 0.0]),
+    ]
+}
+
+const MIXAMO_SPINE: [&str; 16] = [
+    "mixamorig:Hips",
+    "mixamorig:Spine",
+    "mixamorig:Spine1",
+    "mixamorig:Spine2",
+    "mixamorig:LeftShoulder",
+    "mixamorig:RightShoulder",
+    "mixamorig:Neck",
+    "mixamorig:Head",
+    "mixamorig:LeftArm",
+    "mixamorig:LeftForeArm",
+    "mixamorig:RightArm",
+    "mixamorig:RightForeArm",
+    "mixamorig:LeftUpLeg",
+    "mixamorig:LeftLeg",
+    "mixamorig:RightUpLeg",
+    "mixamorig:RightLeg",
+];
+
+const SSE_SPINE: [&str; 16] = [
+    "NPC Pelvis [Pelv]",
+    "NPC Spine [Spn0]",
+    "NPC Spine1 [Spn1]",
+    "NPC Spine2 [Spn2]",
+    "NPC L Clavicle [LClv]",
+    "NPC R Clavicle [RClv]",
+    "NPC Neck [Neck]",
+    "NPC Head [Head]",
+    "NPC L UpperArm [LUar]",
+    "NPC L Forearm [LLar]",
+    "NPC R UpperArm [RUar]",
+    "NPC R Forearm [RLar]",
+    "NPC L Thigh [LThg]",
+    "NPC L Calf [LClf]",
+    "NPC R Thigh [RThg]",
+    "NPC R Calf [RClf]",
+];
+
+#[test]
+fn the_spine_aims_at_its_successor_not_the_shoulder_that_sorts_first() {
+    // 0146: `direction_reference` took the first mapped child in node order, which
+    // under Mixamo's Spine2 is LeftShoulder, not Neck. The aim then matched the
+    // clavicle direction (0.001° on the written fixture) and dragged the neck
+    // 26.12° off the source's sagittal direction, because the two bodies' rest
+    // neck-vs-clavicle angles differ (17.41° ours, 33.78° source). Here the source
+    // holds its rest (identity spine channels) and the clavicle rest angles differ
+    // 40° vs 10°: aiming at the shoulder would tilt the written neck ~30° away
+    // from the source's vertical neck; aiming at the successor keeps it aligned.
+    let target = skeleton(&spine_shoulder_first(&SSE_SPINE, 10.0), 1.0, IDENTITY, &[]);
+    let held: Vec<Vec<f64>> = (0..8).map(|_| IDENTITY.to_vec()).collect();
+    let clip = vec![
+        Channel {
+            node: 1,
+            path: "translation",
+            values: (0..8)
+                .map(|index| vec![0.0, 1.0, 0.4 * index as f64 / 7.0])
+                .collect(),
+        },
+        Channel {
+            node: 1,
+            path: "rotation",
+            values: held.clone(),
+        },
+        Channel {
+            node: 2,
+            path: "rotation",
+            values: held.clone(),
+        },
+        Channel {
+            node: 3,
+            path: "rotation",
+            values: held.clone(),
+        },
+        Channel {
+            node: 4,
+            path: "rotation",
+            values: held.clone(),
+        },
+        Channel {
+            node: 5,
+            path: "rotation",
+            values: held.clone(),
+        },
+        Channel {
+            node: 6,
+            path: "rotation",
+            values: held.clone(),
+        },
+        Channel {
+            node: 7,
+            path: "rotation",
+            values: held,
+        },
+    ];
+    let source = skeleton(
+        &spine_shoulder_first(&MIXAMO_SPINE, 40.0),
+        1.0,
+        IDENTITY,
+        &clip,
+    );
+    let (correspondence, plan, _) = plan(&target, &source, ClipSemantics::Pose);
+    // The written world rotation of Spine2 is the composition of the written
+    // locals down the chain (the planner derives each local against its written
+    // parent, so FK composes them back exactly).
+    let local = |slot: usize| -> DQuat {
+        plan.clip
+            .channels
+            .iter()
+            .find_map(|channel| match channel {
+                sculpto_gltf::ClipChannel::Rotation { bone, values } if *bone == slot => {
+                    Some(DQuat::from_array(values[0].map(f64::from)))
+                }
+                _ => None,
+            })
+            .unwrap_or(DQuat::IDENTITY)
+    };
+    let spine2_world = local(0) * local(1) * local(2) * local(3);
+    // The neck rest offset is straight up in the palette; the source's own neck
+    // direction is straight up in its world, taken through the same fitted frame
+    // the aim uses.
+    let neck_direction = spine2_world * DVec3::Y;
+    let expected = correspondence.similarity.rotation * DVec3::Y;
+    let error = neck_direction.angle_between(expected).to_degrees();
+    assert!(
+        error < 3.0,
+        "Spine2 must carry the source's neck direction, measured {error:.2}° off \
+         (aiming at the shoulder that sorts first gives ~30° on this fixture)"
+    );
+}

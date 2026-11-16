@@ -1990,10 +1990,11 @@ pub fn plan_clip_with(
     // Bone directions carry the motion convention free: the source's two clips
     // disagree about bone roll by tens of degrees on the same bone, so a frame
     // delta would turn a twist into a limb swing. Each bone is aligned onto the
-    // source's own direction and keeps the rig rest's roll. A bone with several
-    // children (a pelvis with thighs, a hand with fingers) takes the child whose
-    // own rest direction is closest to the source's, so physics and attachment
-    // children are never mistaken for the anatomical successor.
+    // source's own direction and keeps the rig rest's roll. The direction child is
+    // the anatomical successor: for a spine/neck bone that is the next link up the
+    // chain (Spine2 -> Neck), never a shoulder that happens to sort first in node
+    // order; for other bones it is the first mapped child, so physics and
+    // attachment children are never mistaken for the successor.
     let rest_source_worlds: Vec<DMat4> = tracks
         .iter()
         .map(|track| match track.derived {
@@ -2001,12 +2002,32 @@ pub fn plan_clip_with(
             false => source_world(track.node),
         })
         .collect::<Result<_, CommandError>>()?;
+    // Source node -> anatomical role, so the direction child can be chosen by
+    // anatomy rather than node order. Only the correspondence carries roles; the
+    // legacy same-skeleton path has none and keeps the first-child rule.
+    let source_roles: BTreeMap<usize, crate::retarget::BoneRole> = correspondence
+        .map(|resolved| {
+            resolved
+                .pairs
+                .iter()
+                .filter_map(|pair| Some((pair.source?, pair.role?)))
+                .collect()
+        })
+        .unwrap_or_default();
     let directions: Vec<Option<(DVec3, usize)>> = tracks
         .iter()
         .enumerate()
         .map(|(index, track)| match track.derived {
             true => None,
-            false => direction_reference(rig, &tracks, index, &rest_source_worlds, frame, actor),
+            false => direction_reference(
+                rig,
+                &tracks,
+                index,
+                &rest_source_worlds,
+                frame,
+                actor,
+                &source_roles,
+            ),
         })
         .collect();
 
@@ -2821,7 +2842,13 @@ fn anchor_world(
 }
 
 /// The rig direction one mapped bone is aligned onto, and the source node that
-/// defines it: the first mapped child joint, so a leaf bone returns `None`.
+/// defines it: the anatomical successor child, so a leaf bone returns `None`.
+///
+/// For a spine/neck bone the successor is the next link up the axial chain
+/// (Spine2 -> Neck -> Head), chosen by role. Node order alone is wrong there:
+/// Mixamo sorts `LeftShoulder` before `Neck` under `Spine2`, and aiming at the
+/// shoulder dragged the neck 26° off the source's sagittal direction (0146).
+/// Every other bone keeps the first mapped child, which is its successor.
 fn direction_reference(
     rig: &Rig,
     tracks: &[Track],
@@ -2829,23 +2856,41 @@ fn direction_reference(
     anchor_worlds: &[DMat4],
     frame: DMat3,
     actor: &Actor,
+    source_roles: &BTreeMap<usize, crate::retarget::BoneRole>,
 ) -> Option<(DVec3, usize)> {
     let track = &tracks[index];
-    // The anatomical successor is the source graph's own first mapped child, so
-    // both sides measure the same bone; a rig child such as a physics helper is
-    // never substituted.
-    let child =
-        actor
-            .node_parents()
+    let axial = |node: usize| {
+        source_roles.get(&node).is_some_and(|role| {
+            matches!(
+                role.part,
+                crate::retarget::Part::Spine(_)
+                    | crate::retarget::Part::Neck
+                    | crate::retarget::Part::Head
+            )
+        })
+    };
+    // Mapped children of this source bone, in node order.
+    let children: Vec<(usize, usize)> = actor
+        .node_parents()
+        .iter()
+        .enumerate()
+        .filter_map(|(node, parent)| match parent {
+            Some(parent) if *parent == track.node => tracks
+                .iter()
+                .position(|other| other.node == node)
+                .map(|position| (position, node)),
+            _ => None,
+        })
+        .collect();
+    // An axial bone aims up the spine, not out to a shoulder that sorts first.
+    let child = match axial(track.node) {
+        true => children
             .iter()
-            .enumerate()
-            .find_map(|(node, parent)| match parent {
-                Some(parent) if *parent == track.node => tracks
-                    .iter()
-                    .position(|other| other.node == node)
-                    .map(|position| (position, node)),
-                _ => None,
-            })?;
+            .find(|(_, node)| axial(*node))
+            .copied()
+            .or_else(|| children.first().copied()),
+        false => children.first().copied(),
+    }?;
     let (position, _node) = child;
     let origin = rest_world(rig, track.joint).w_axis.truncate();
     let direction =

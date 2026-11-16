@@ -994,9 +994,11 @@ fn setup(
                 HelpOverlay,
             ))
             .with_children(|card| {
-                let (status_colour, status_line) = match config.status.as_str() {
-                    "ReadyToShowProgress" => (Color::srgb(0.18, 0.80, 0.44), "ReadyToShowProgress"),
-                    _ => (Color::srgb(0.95, 0.77, 0.20), "InProgress"),
+                let (status_colour, status_line) = match config.status.split(" · ").next() {
+                    Some("ReadyToShowProgress") => {
+                        (Color::srgb(0.18, 0.80, 0.44), config.status.as_str())
+                    }
+                    _ => (Color::srgb(0.95, 0.77, 0.20), config.status.as_str()),
                 };
                 card.spawn((
                     Text::new(status_line),
