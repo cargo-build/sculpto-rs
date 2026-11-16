@@ -219,6 +219,139 @@ impl MergedActor {
     }
 }
 
+/// The rotation between the joint frame a rig models and the node frame a
+/// glTF player composes, one entry per palette slot.
+///
+/// [`crate::adapt::actor_rig`] parents a joint on its nearest *palette* ancestor,
+/// so every file node between the two is folded into the joint's rest. A player
+/// composes the file's own chain instead: when one of the folded nodes carries a
+/// rest rotation, a local written in the rig's frame is off by exactly that
+/// rotation. Mixamo's `Armature` (+90° about X) above `mixamorig:Hips` (−90°
+/// about X) is the measured case — the two cancel in world, so the body is
+/// upright at rest and lands on its side the moment the local drops the −90°.
+/// The fold is measured from the actor the clip is written into, never assumed.
+#[derive(Clone, Debug, Default)]
+pub struct PaletteFrames {
+    /// Per palette slot, in palette order.
+    slots: Vec<SlotFrame>,
+}
+
+/// One palette slot's file-side parent frame.
+#[derive(Clone, Copy, Debug)]
+struct SlotFrame {
+    /// Rotation from the palette parent joint's world to the file parent node's world.
+    rotation: DQuat,
+    /// Uniform scale of the file parent node's world: the file's own unit factor
+    /// above the joint the rig models (Mixamo's centimetre `Armature` carries 0.01).
+    scale: f64,
+    /// World translation of the file parent node.
+    translation: DVec3,
+}
+
+impl Default for SlotFrame {
+    fn default() -> Self {
+        Self {
+            rotation: DQuat::IDENTITY,
+            scale: 1.0,
+            translation: DVec3::ZERO,
+        }
+    }
+}
+
+impl PaletteFrames {
+    /// Measure every palette slot's fold against the actor the clip is written into.
+    ///
+    /// # Errors
+    /// A joint or scaffolding node whose rest transform the file cannot compose.
+    pub fn of(actor: &Actor) -> Result<Self, CommandError> {
+        let joints = actor.skin_joints().map_err(actor_error)?;
+        let mut slots = Vec::with_capacity(joints.len());
+        for node in &joints {
+            let mut cursor = actor.node_parents()[*node];
+            let mut palette_parent = None;
+            while let Some(candidate) = cursor {
+                match joints.iter().position(|other| *other == candidate) {
+                    Some(found) => {
+                        palette_parent = Some(found);
+                        break;
+                    }
+                    None => cursor = actor.node_parents()[candidate],
+                }
+            }
+            let (file_rotation, file_scale, file_translation) = match actor.node_parents()[*node] {
+                Some(parent) => {
+                    let (scale, rotation, translation) =
+                        rest_world_of(actor, parent)?.to_scale_rotation_translation();
+                    (rotation, scale.x, translation)
+                }
+                None => (DQuat::IDENTITY, 1.0, DVec3::ZERO),
+            };
+            let joint_world = match palette_parent {
+                Some(parent) => rotation_of(rest_world_of(actor, joints[parent])?),
+                None => DQuat::IDENTITY,
+            };
+            slots.push(SlotFrame {
+                rotation: (joint_world.inverse() * file_rotation).normalize(),
+                scale: file_scale,
+                translation: file_translation,
+            });
+        }
+        Ok(Self { slots })
+    }
+
+    /// The measured fold of one palette slot.
+    fn fold(&self, slot: usize) -> DQuat {
+        self.slots
+            .get(slot)
+            .map(|frame| frame.rotation)
+            .unwrap_or(DQuat::IDENTITY)
+    }
+
+    /// The file parent node's uniform scale for one palette slot.
+    fn scale(&self, slot: usize) -> f64 {
+        self.slots.get(slot).map(|frame| frame.scale).unwrap_or(1.0)
+    }
+
+    /// The file parent node's world translation for one palette slot.
+    fn translation(&self, slot: usize) -> DVec3 {
+        self.slots
+            .get(slot)
+            .map(|frame| frame.translation)
+            .unwrap_or(DVec3::ZERO)
+    }
+}
+
+/// The frame a written clip must hold the body in, so a caller can prove the
+/// artifact stands where the conversion intended.
+///
+/// The conversion writes *locals*; a player multiplies them by the file's own
+/// parent chain. Those two only agree when the fold above is carried, so the gate
+/// compares the written file's composed world with this intent, not with the plan.
+#[derive(Debug, Clone)]
+pub struct RootFrame {
+    /// Palette bone the body hangs from.
+    pub bone: String,
+    /// Palette slot of that bone.
+    pub slot: usize,
+    /// The bone's rest world orientation.
+    pub rest_rotation: DQuat,
+    /// The bone's rest world position, file units.
+    pub rest_translation: DVec3,
+    /// World orientation the plan intends at every sample.
+    pub rotations: Vec<DQuat>,
+    /// The bone the body's travel is written on. The same bone as `bone` unless
+    /// the palette hangs the pelvis beside the spine off a common ancestor, in
+    /// which case the position belongs to that ancestor.
+    pub travel_bone: Option<String>,
+    /// Palette slot of the travel bone.
+    pub travel_slot: Option<usize>,
+    /// The travel bone's rest world position.
+    pub travel_rest_translation: DVec3,
+    /// World displacement from rest the plan intends at every sample, on the
+    /// travel bone.
+    pub deltas: Vec<DVec3>,
+}
+
 /// One clip converted onto the destination rig.
 #[derive(Debug)]
 pub struct ClipPlan {
@@ -297,6 +430,15 @@ pub struct ClipPlan {
     pub root_motion_travel: f64,
     /// Distance the pelvis travels over the clip, rig units.
     pub root_travel: f64,
+    /// Largest measured fold between a palette joint and the file node the local
+    /// is written into, degrees: `0` when the two frames agree.
+    pub palette_fold_degrees: f64,
+    /// Palette bone carrying the largest fold.
+    pub palette_fold_bone: String,
+    /// Palette slots whose fold is not the identity.
+    pub palette_fold_slots: usize,
+    /// The root's intended frame, for a gate measured on the written artifact.
+    pub root_frame: Option<RootFrame>,
 }
 
 /// Admitted clip rest differences.
@@ -1461,6 +1603,7 @@ pub fn plan_clip(
         palette,
         tolerances,
         None,
+        None,
         ClipSemantics::Motion,
         RootMotion::Keep,
     )
@@ -1470,7 +1613,11 @@ pub fn plan_clip(
 ///
 /// `correspondence` replaces name lookup with the resolved source-to-palette
 /// map, so a clip authored on another skeleton reaches the palette; a channel
-/// whose node drives nothing is counted, not refused. `semantics` chooses
+/// whose node drives nothing is counted, not refused. `frames` carries the
+/// measured difference between the palette the rig models and the file's own node
+/// chain, so a written local is anchored where the player will apply it; `None`
+/// assumes the two agree, which is true only for a file whose folded scaffolding
+/// carries no rest rotation. `semantics` chooses
 /// between a motion copy (the destination rest rotated by the clip's motion) and
 /// a pose copy (the clip's own world orientation, one fitted frame folded in),
 /// and the plan reports the error each one produced.
@@ -1487,6 +1634,7 @@ pub fn plan_clip_with(
     palette: &[String],
     tolerances: &ClipTolerances,
     correspondence: Option<&Correspondence>,
+    frames: Option<&PaletteFrames>,
     semantics: ClipSemantics,
     root_motion: RootMotion,
 ) -> Result<ClipPlan, CommandError> {
@@ -1768,6 +1916,45 @@ pub fn plan_clip_with(
         None => None,
     }
     .or_else(|| root_track.filter(|position| !tracks[*position].derived));
+    // The frame every written local is anchored in: the difference between the
+    // palette parent the rig models and the file node parent the player composes.
+    // Identity where the two agree, which is most bones; the measured 90° on
+    // Mixamo's root is what a missing fold tips the whole body by.
+    let folds: Vec<DQuat> = match frames {
+        Some(frames) => tracks.iter().map(|track| frames.fold(track.slot)).collect(),
+        None => vec![DQuat::IDENTITY; tracks.len()],
+    };
+    let frame_scales: Vec<f64> = match frames {
+        Some(frames) => tracks
+            .iter()
+            .map(|track| frames.scale(track.slot))
+            .collect(),
+        None => vec![1.0; tracks.len()],
+    };
+    let frame_translations: Vec<DVec3> = match frames {
+        Some(frames) => tracks
+            .iter()
+            .map(|track| frames.translation(track.slot))
+            .collect(),
+        None => vec![DVec3::ZERO; tracks.len()],
+    };
+    let (palette_fold_degrees, palette_fold_bone, palette_fold_slots) = {
+        let mut worst = (0.0_f64, String::new());
+        let mut folded = 0;
+        for (position, track) in tracks.iter().enumerate() {
+            if track.derived {
+                continue;
+            }
+            let degrees = quaternion_angle(&folds[position]).to_degrees();
+            if degrees > 0.5 {
+                folded += 1;
+            }
+            if degrees > worst.0 {
+                worst = (degrees, track.name.clone());
+            }
+        }
+        (worst.0, worst.1, folded)
+    };
     // The reference pose this clip's motion is measured from: the clip set's
     // first sample, never the exported node rest.
     let source_local = |node: usize| -> Result<sculpto_mesh::actor::LocalRest, CommandError> {
@@ -2057,10 +2244,14 @@ pub fn plan_clip_with(
 
     // Per-sample conversion.
     let samples = source.times.len();
-    let source_worlds = SourceWorlds::new(actor, &tracks, samples)?;
+    let source_worlds = SourceWorlds::new(actor, source, &tracks, samples)?;
     let rest_rotations: Vec<DQuat> = tracks
         .iter()
-        .map(|track| DQuat::from_mat4(&rest_world(rig, track.joint)))
+        // `rotation_of` divides the scale out: a rig whose root carries the
+        // file's conversion factor (Mixamo's centimetre armature, 0.01) has a
+        // scaled rest world, and a quaternion read straight off it is not a
+        // rotation at all.
+        .map(|track| rotation_of(rest_world(rig, track.joint)))
         .collect();
     let rest_source_rotations: Vec<DQuat> = tracks
         .iter()
@@ -2428,6 +2619,12 @@ pub fn plan_clip_with(
     let mut direction_errors: Vec<f64> = Vec::with_capacity(samples);
     let mut written_position: Vec<DVec3> = vec![DVec3::ZERO; tracks.len()];
     let mut root_positions: Vec<DVec3> = Vec::with_capacity(samples);
+    // The bone whose frame the artifact has to hold: the pelvis the body hangs
+    // from, falling back to the joint the travel is written on.
+    let root_frame_position = source_root.or(root_track);
+    let mut root_frame_rotations: Vec<DQuat> = Vec::with_capacity(samples);
+    let mut root_frame_frames: Vec<DQuat> = Vec::new();
+    let mut root_frame_deltas: Vec<DVec3> = Vec::new();
 
     let mut worlds: Vec<Option<DMat4>> = vec![None; source_worlds.nodes()];
     for sample in 0..samples {
@@ -2586,6 +2783,9 @@ pub fn plan_clip_with(
             errors.push(error);
             written_position[position] = bone.w_axis.truncate();
         }
+        if let Some(position) = root_frame_position {
+            root_frame_rotations.push(written[position]);
+        }
         // The twist chain runs parent -> twist1 -> twist2 -> child; each twist
         // takes `depth / length` of the parent-to-child world deviation, so the
         // band between two bones is monotone instead of snapping at one joint.
@@ -2593,8 +2793,8 @@ pub fn plan_clip_with(
             let Some(chain) = chain else { continue };
             let anchor_world = written[chain.anchor];
             let tip_world = written[chain.tip];
-            let rest_anchor = DQuat::from_mat4(&rest_world(rig, tracks[chain.anchor].joint));
-            let rest_tip = DQuat::from_mat4(&rest_world(rig, tracks[chain.tip].joint));
+            let rest_anchor = rotation_of(rest_world(rig, tracks[chain.anchor].joint));
+            let rest_tip = rotation_of(rest_world(rig, tracks[chain.tip].joint));
             let from = anchor_world * rest_anchor.inverse();
             let to = tip_world * rest_tip.inverse();
             // Only the *twist about the bone's own axis* is distributed. Handing the
@@ -2622,17 +2822,7 @@ pub fn plan_clip_with(
             if track.rotation.is_none() {
                 continue;
             }
-            let parent_world = match closure[position] {
-                Some((anchor, offset)) => written[anchor] * offset,
-                None => match rig
-                    .joint(track.joint)
-                    .expect("a mapped bone is a rig joint")
-                    .parent
-                {
-                    Some(parent) => rotation_of(rest_world(rig, parent)),
-                    None => DQuat::IDENTITY,
-                },
-            };
+            let parent_world = parent_frame(position, &tracks, &closure, &folds, rig, &written);
             let local = parent_world.inverse() * written[position];
             rotation_values[position].push(local.normalize().to_array());
         }
@@ -2649,24 +2839,22 @@ pub fn plan_clip_with(
             let travel = written_position[source_position] - reference.w_axis.truncate();
             root_positions.push(travel);
             let track = &tracks[root];
-            let rest = rig
-                .joint(track.joint)
-                .expect("a mapped bone is a rig joint")
-                .rest;
-            let rig_parent = match rig
-                .joint(track.joint)
-                .expect("a mapped bone is a rig joint")
-                .parent
-            {
-                Some(parent) => rotation_of(rest_world(rig, parent)),
-                None => DQuat::IDENTITY,
+            // The pelvis is placed in *world* and mapped back through the frame the
+            // player composes: rotation, the file parent's own unit factor and its
+            // origin. Writing a world figure as if it were a local is the same fold
+            // defect the rotations had — on Mixamo's centimetre root it put the
+            // pelvis on the ground a hundredth of the way up, and a metre forward.
+            let frame_of_root = parent_frame(root, &tracks, &closure, &folds, rig, &written);
+            let delta_world = match root_motion {
+                RootMotion::Zero => DVec3::ZERO,
+                _ => frame * travel * unit,
             };
-            let mut local_delta = rig_parent.inverse() * (frame * travel * unit);
-            if root_motion == RootMotion::Zero {
-                local_delta = DVec3::ZERO;
-            }
-            let value = DVec3::from_array(rest.translation.map(f64::from)) + local_delta;
+            let world = rest_world(rig, track.joint).w_axis.truncate();
+            let value = frame_of_root.inverse() * (world + delta_world - frame_translations[root])
+                / frame_scales[root];
             translation_values[root].push(value.to_array());
+            root_frame_frames.push(frame_of_root);
+            root_frame_deltas.push(delta_world);
         }
         for (position, track) in tracks.iter().enumerate() {
             // The travel of the source's own root bone is consumed by the
@@ -2701,7 +2889,7 @@ pub fn plan_clip_with(
                 .expect("a mapped bone is a rig joint")
                 .parent
             {
-                Some(parent) => DQuat::from_mat4(&rest_world(rig, parent)),
+                Some(parent) => rotation_of(rest_world(rig, parent)),
                 None => DQuat::IDENTITY,
             };
             let world_delta = source_parent * delta;
@@ -2762,6 +2950,15 @@ pub fn plan_clip_with(
             let time = times.get(index).copied().unwrap_or(0.0) as f64;
             let fraction = (time - start) / span;
             *value = (DVec3::from_array(*value) - ramp * fraction).to_array();
+            // The ramp leaves the pelvis in the frame the player composes, so the
+            // intended world displacement follows it; a gate comparing the two
+            // would otherwise charge the split policy as a frame error.
+            if let (Some(frame_of_root), Some(delta)) = (
+                root_frame_frames.get(index),
+                root_frame_deltas.get_mut(index),
+            ) {
+                *delta -= *frame_of_root * (ramp * fraction);
+            }
         }
     }
 
@@ -2889,6 +3086,22 @@ pub fn plan_clip_with(
             .map(|position| tracks[position].name.clone()),
         root_motion_travel,
         root_travel: (frame * root_travel * unit).length(),
+        palette_fold_degrees,
+        palette_fold_bone,
+        palette_fold_slots,
+        root_frame: root_frame_position.map(|position| RootFrame {
+            bone: tracks[position].name.clone(),
+            slot: tracks[position].slot,
+            rest_rotation: rest_rotations[position],
+            rest_translation: rest_world(rig, tracks[position].joint).w_axis.truncate(),
+            rotations: root_frame_rotations,
+            travel_bone: root_track.map(|position| tracks[position].name.clone()),
+            travel_slot: root_track.map(|position| tracks[position].slot),
+            travel_rest_translation: root_track
+                .map(|position| rest_world(rig, tracks[position].joint).w_axis.truncate())
+                .unwrap_or(DVec3::ZERO),
+            deltas: root_frame_deltas,
+        }),
     })
 }
 
@@ -3291,7 +3504,71 @@ fn local_matrix(local: sculpto_mesh::actor::LocalRest) -> DMat4 {
     )
 }
 
+/// The world a written local is multiplied by: the palette ancestor's posed world
+/// with the file's own fold on top.
+///
+/// This is the frame a glTF player composes, which is the only frame a local may
+/// be expressed in. `closure` names the ancestor the rig models and folds the
+/// untracked palette joints between; `folds` adds the file's scaffolding, which
+/// the rig took out.
+fn parent_frame(
+    position: usize,
+    tracks: &[Track],
+    closure: &[Option<(usize, DQuat)>],
+    folds: &[DQuat],
+    rig: &Rig,
+    written: &[DQuat],
+) -> DQuat {
+    let base = match closure[position] {
+        Some((anchor, offset)) => written[anchor] * offset,
+        None => match rig
+            .joint(tracks[position].joint)
+            .and_then(|definition| definition.parent)
+        {
+            Some(parent) => rotation_of(rest_world(rig, parent)),
+            None => DQuat::IDENTITY,
+        },
+    };
+    (base * folds[position]).normalize()
+}
+
 /// Source node worlds for every sample, with the clip's channels applied.
+/// One untracked node's authored channels: rotation, translation, scale.
+type AnimatedNode<'clip> = (
+    Option<&'clip Vec<[f64; 4]>>,
+    Option<&'clip Vec<[f64; 3]>>,
+    Option<&'clip Vec<[f64; 3]>>,
+);
+
+/// One untracked but animated node's local matrix at one sample.
+fn animated_local(
+    actor: &Actor,
+    node: usize,
+    channels: &AnimatedNode<'_>,
+    sample: usize,
+) -> Result<DMat4, CommandError> {
+    let (scale, rotation, translation) =
+        DMat4::from_cols_array_2d(&actor.rest_local_matrix(node).map_err(actor_error)?)
+            .to_scale_rotation_translation();
+    let pick_rotation = channels
+        .0
+        .and_then(|values| values.get(sample))
+        .map_or(rotation, |value| DQuat::from_array(*value));
+    let pick_translation = channels
+        .1
+        .and_then(|values| values.get(sample))
+        .map_or(translation, |value| DVec3::from_array(*value));
+    let pick_scale = channels
+        .2
+        .and_then(|values| values.get(sample))
+        .map_or(scale, |value| DVec3::from_array(*value));
+    Ok(DMat4::from_scale_rotation_translation(
+        pick_scale,
+        pick_rotation,
+        pick_translation,
+    ))
+}
+
 struct SourceWorlds {
     parents: Vec<Option<usize>>,
     /// One local matrix per sample for every node the mapped bones reach.
@@ -3299,8 +3576,34 @@ struct SourceWorlds {
 }
 
 impl SourceWorlds {
-    fn new(actor: &Actor, tracks: &[Track], samples: usize) -> Result<Self, CommandError> {
+    /// Locals for every node the mapped bones reach.
+    ///
+    /// A node between a mapped bone and its root may carry its own channel
+    /// without driving a palette bone of its own — a native clip's travel lives
+    /// on `NPC COM`, which no palette bone answers — so the chain is read from
+    /// the clip's channels, not only from the tracks. Folding such a node into
+    /// its rest froze the body's travel at a constant offset.
+    fn new(
+        actor: &Actor,
+        source: &SourceClip,
+        tracks: &[Track],
+        samples: usize,
+    ) -> Result<Self, CommandError> {
         let parents: Vec<Option<usize>> = actor.node_parents().to_vec();
+        let mut animated: BTreeMap<usize, AnimatedNode<'_>> = BTreeMap::new();
+        for channel in &source.channels {
+            let entry = animated.entry(channel.node).or_default();
+            match (channel.property, &channel.values) {
+                (SourceProperty::Rotation, SourceValues::Rotation(values)) => {
+                    entry.0 = Some(values)
+                }
+                (SourceProperty::Translation, SourceValues::Vector(values)) => {
+                    entry.1 = Some(values)
+                }
+                (SourceProperty::Scale, SourceValues::Vector(values)) => entry.2 = Some(values),
+                _ => {}
+            }
+        }
         let mut locals: BTreeMap<usize, Vec<DMat4>> = BTreeMap::new();
         for track in tracks.iter().filter(|track| !track.derived) {
             let mut node = Some(track.node);
@@ -3309,11 +3612,14 @@ impl SourceWorlds {
                     break;
                 }
                 let entry = tracks.iter().find(|other| other.node == current);
-                let values: Vec<DMat4> = match entry {
-                    Some(entry) => (0..samples)
+                let values: Vec<DMat4> = match (entry, animated.get(&current)) {
+                    (Some(entry), _) => (0..samples)
                         .map(|sample| local_at(actor, entry, sample))
                         .collect::<Result<_, CommandError>>()?,
-                    None => vec![DMat4::from_cols_array_2d(
+                    (None, Some(channels)) => (0..samples)
+                        .map(|sample| animated_local(actor, current, channels, sample))
+                        .collect::<Result<_, CommandError>>()?,
+                    (None, None) => vec![DMat4::from_cols_array_2d(
                         &actor.rest_local_matrix(current).map_err(actor_error)?,
                     )],
                 };
@@ -3450,7 +3756,7 @@ fn rotation_of(matrix: DMat4) -> DQuat {
 }
 
 /// Rotation angle of one quaternion, radians in `[0, π]`.
-fn quaternion_angle(value: &DQuat) -> f64 {
+pub(crate) fn quaternion_angle(value: &DQuat) -> f64 {
     2.0 * value.w.abs().clamp(-1.0, 1.0).acos()
 }
 

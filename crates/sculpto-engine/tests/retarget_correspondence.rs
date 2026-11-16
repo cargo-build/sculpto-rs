@@ -15,7 +15,7 @@ use gltf::binary::Glb;
 use sculpto_core::rig::{Joint, LocalTransform, Rig, RigFrame};
 use sculpto_engine::export_actor::admit_clip;
 use sculpto_engine::export_glb::{
-    ClipAnchor, ClipSemantics, ClipTolerances, RootMotion, plan_clip_with,
+    ClipAnchor, ClipSemantics, ClipTolerances, PaletteFrames, RootMotion, plan_clip_with,
 };
 use sculpto_engine::retarget::{
     Correspondence, Method, Part, Side, correspondence_report, role_of,
@@ -448,11 +448,48 @@ fn plan(
         &palette,
         &ClipTolerances::default(),
         Some(&correspondence),
+        None,
         semantics,
         RootMotion::Keep,
     )
     .expect("the clip plans");
     (correspondence, plan, palette)
+}
+
+/// Plan the same clip with the target file's own frames measured, which is what
+/// `actor adapt` does before it writes.
+fn plan_framed(
+    target: &[u8],
+    source: &[u8],
+    semantics: ClipSemantics,
+    root_motion: RootMotion,
+) -> (
+    sculpto_engine::export_glb::ClipPlan,
+    PaletteFrames,
+    Vec<String>,
+) {
+    let actor = Actor::from_glb(target).expect("target decodes");
+    let (rig, palette) = actor_rig(&actor);
+    let frames = PaletteFrames::of(&actor).expect("the file's frames measure");
+    let source_actor = Actor::from_glb(source).expect("source decodes");
+    let correspondence =
+        Correspondence::build(&source_actor, &rig, &palette).expect("a correspondence");
+    let clip = source_actor.clip("walk").expect("the source clip");
+    let anchor = ClipAnchor::of(&source_actor, &clip).expect("an anchor");
+    let plan = plan_clip_with(
+        &clip,
+        &source_actor,
+        &anchor,
+        &rig,
+        &palette,
+        &ClipTolerances::default(),
+        Some(&correspondence),
+        Some(&frames),
+        semantics,
+        root_motion,
+    )
+    .expect("the clip plans");
+    (plan, frames, palette)
 }
 
 #[test]
@@ -1059,5 +1096,110 @@ fn a_joint_the_source_barely_moves_is_held_at_rest() {
         written_amplitude(&plan, 6) < 0.2,
         "a held joint stays at rest, measured {:.3}°",
         written_amplitude(&plan, 6)
+    );
+}
+
+/// One slot's written rotation samples.
+fn written_rotations(plan: &sculpto_engine::export_glb::ClipPlan, slot: usize) -> Vec<DQuat> {
+    plan.clip
+        .channels
+        .iter()
+        .find_map(|channel| match channel {
+            sculpto_gltf::ClipChannel::Rotation { bone, values } if *bone == slot => Some(
+                values
+                    .iter()
+                    .map(|value| DQuat::from_array(value.map(f64::from)))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The angle between two unit quaternions, degrees.
+fn between(first: DQuat, second: DQuat) -> f64 {
+    2.0 * first.dot(second).abs().clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// A target exported through a centimetre FBX pipeline: the armature node carries
+/// the Z-up turn and the 0.01 unit factor, and the pelvis node carries the
+/// opposite turn, so the body is upright in *world* and a quarter turn out in the
+/// pelvis node's own *local*.
+fn turned_target() -> Vec<Bone> {
+    let mut bones = humanoid(&MIXAMO);
+    for bone in &mut bones {
+        bone.translation = bone.translation.map(|value| value * 100.0);
+    }
+    bones[0].rotation = DQuat::from_rotation_x(-std::f64::consts::FRAC_PI_2).to_array();
+    bones
+}
+
+/// The written local must be anchored in the file parent's frame, not the palette
+/// parent's. The rig folds the armature turn out of the pelvis; a player puts it
+/// back, so a local written without the fold tips the whole body by 90° while
+/// every limb still articulates (0159).
+#[test]
+fn the_written_root_local_is_anchored_at_the_files_own_parent_frame() {
+    let armature = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2).to_array();
+    let target = skeleton(&turned_target(), 0.01, armature, &[]);
+    // The pelvis carries its own bend as well as its travel: the frame the player
+    // composes is only readable on a bone that has a rotation channel.
+    let mut clip = walk();
+    clip.push(Channel {
+        node: 1,
+        path: "rotation",
+        values: (0..8)
+            .map(|index| {
+                let angle = 2.0_f64.to_radians() * index as f64 / 7.0;
+                DQuat::from_rotation_z(angle).to_array().to_vec()
+            })
+            .collect(),
+    });
+    let source = skeleton(&humanoid(&SSE), 1.0, IDENTITY, &clip);
+    let (framed, _frames, _palette) =
+        plan_framed(&target, &source, ClipSemantics::Pose, RootMotion::Zero);
+
+    // The fold is measured, not assumed: 90° between the palette joint and the
+    // file parent node.
+    assert!(
+        (framed.palette_fold_degrees - 90.0).abs() < 1.0,
+        "the armature turn is measured, got {:.2}° on {:?}",
+        framed.palette_fold_degrees,
+        framed.palette_fold_bone
+    );
+    assert_eq!(
+        framed.palette_fold_slots, 1,
+        "only the pelvis sits under a fold"
+    );
+
+    // The pelvis carries no rotation in this clip, so the frame the player will
+    // compose must stay at rest through every sample.
+    let fold = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
+    let rest = DQuat::IDENTITY;
+    let worst = written_rotations(&framed, 0)
+        .into_iter()
+        .fold(0.0_f64, |worst, local| {
+            worst.max(between(fold * local, rest))
+        });
+    assert!(
+        worst <= 5.0,
+        "the composed root frame must stay at rest, measured {worst:.2}°"
+    );
+
+    // The witness: the same clip planned without the file's frames composes to a
+    // quarter turn, which is the defect this test exists for.
+    let (_, unframed, _) = plan(
+        &target,
+        &skeleton(&humanoid(&SSE), 1.0, IDENTITY, &clip),
+        ClipSemantics::Pose,
+    );
+    let tilt = written_rotations(&unframed, 0)
+        .into_iter()
+        .fold(0.0_f64, |worst, local| {
+            worst.max(between(fold * local, rest))
+        });
+    assert!(
+        (tilt - 90.0).abs() < 5.0,
+        "an unanchored local must tilt the body 90°, measured {tilt:.2}°"
     );
 }
