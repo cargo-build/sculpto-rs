@@ -1,3 +1,0 @@
-# Enables the unstable `codegen-backend` profile key (nightly only).
-[unstable]
-codegen-backend = true

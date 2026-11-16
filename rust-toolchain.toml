@@ -1,5 +1,0 @@
-# Alpha policy (operator, 2026-11-17): development builds, Cranelift codegen.
-# See the wrapper root `rust-toolchain.toml` for the reason.
-[toolchain]
-channel = "nightly"
-components = ["rustfmt", "clippy", "rust-src"]

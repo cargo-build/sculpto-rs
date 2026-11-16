@@ -22,10 +22,10 @@ fn authored(name: &str) -> Option<serde_json::Value> {
     }
     Some(
         run(&SkinParams {
+            expect_input_sha: None,
             actor,
             out: None,
             report: None,
-            expect_input_sha: None,
         })
         .expect("the seated actor authors a skin"),
     )
@@ -124,6 +124,7 @@ fn a_ghost_twin_carries_no_weight_on_the_t_rest_bodies() {
             continue;
         }
         let report = run(&SkinParams {
+            expect_input_sha: None,
             actor,
             out: None,
             report: None,

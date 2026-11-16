@@ -199,7 +199,7 @@ fn measure_document(document: &Value) -> Result<ClipDocument, String> {
             .iter()
             .filter(|node| joints.iter().any(|joint| joint == *node))
             .count();
-        let palette_coverage = (!joints.is_empty()).then(|| covered as f64 / joints.len() as f64);
+        let palette_coverage = (!joints.is_empty()).then_some(covered as f64 / joints.len() as f64);
         let (keyframes, duration_seconds) = sampler_span(animation, accessors);
         clips.push(ClipInfo {
             name,
