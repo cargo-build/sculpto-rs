@@ -1168,24 +1168,32 @@ pub fn correspondence_report(correspondence: &Correspondence) -> serde_json::Val
 /// so on a `mixamorig:*` palette it reports zero coverage for a complete clip.
 /// A role is a function, and the correspondence resolved it by function, so the
 /// coverage is counted here.
+/// The standard role token a palette or source part answers, `None` for parts
+/// no clip role names.
+pub fn coverage_token(part: Part) -> Option<&'static str> {
+    match part {
+        Part::Pelvis | Part::Thigh => Some("hips"),
+        Part::Spine(_) => Some("spine"),
+        Part::Calf => Some("knees"),
+        Part::Foot => Some("ankles"),
+        Part::Toe => Some("toes"),
+        Part::Clavicle | Part::UpperArm => Some("shoulders"),
+        Part::Forearm => Some("elbows"),
+        Part::Hand => Some("hands"),
+        Part::Neck => Some("neck"),
+        Part::Head => Some("head"),
+        Part::Twist { .. } => Some("twists"),
+        _ => None,
+    }
+}
+
 pub fn role_coverage(correspondence: &Correspondence) -> RoleCoverage {
     let mut covered: BTreeSet<&'static str> = BTreeSet::new();
     let mut present: BTreeSet<&'static str> = BTreeSet::new();
     for pair in &correspondence.pairs {
         let Some(role) = pair.role else { continue };
-        let token = match role.part {
-            Part::Pelvis | Part::Thigh => "hips",
-            Part::Spine(_) => "spine",
-            Part::Calf => "knees",
-            Part::Foot => "ankles",
-            Part::Toe => "toes",
-            Part::Clavicle | Part::UpperArm => "shoulders",
-            Part::Forearm => "elbows",
-            Part::Hand => "hands",
-            Part::Neck => "neck",
-            Part::Head => "head",
-            Part::Twist { .. } => "twists",
-            _ => continue,
+        let Some(token) = coverage_token(role.part) else {
+            continue;
         };
         present.insert(token);
         // A derived twist is written by the plan even though no source bone drives

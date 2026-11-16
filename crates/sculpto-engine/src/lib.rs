@@ -20,9 +20,11 @@ pub mod errors;
 pub mod export_actor;
 pub mod export_glb;
 mod handlers;
+mod measures;
 pub mod obj;
 pub mod ops;
 mod parts;
+pub mod regression;
 pub mod retarget;
 pub mod rules;
 mod seal;
@@ -103,6 +105,8 @@ pub enum CommandId {
     GltfClampTexcoord,
     /// Write the metres-scale review GLB: body plus palette-ranked layers.
     ViewerExport,
+    /// Measure the four-way default-vs-adapted rig regression and fail loudly.
+    RigRegression,
 }
 
 impl CommandId {
@@ -142,6 +146,7 @@ impl CommandId {
             CommandId::GltfResetWeights => "gltf.reset_weights",
             CommandId::GltfClampTexcoord => "gltf.clamp_texcoord",
             CommandId::ViewerExport => "viewer.export",
+            CommandId::RigRegression => "rig.regression",
         }
     }
 
@@ -549,6 +554,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: viewer::schema,
         handler: viewer::export,
+    },
+    Spec {
+        id: CommandId::RigRegression,
+        summary: "Measure the default-vs-adapted rig regression per declared actor (spine straightness, hand-to-hip clearance, stance, rest reconstruction, role coverage, edge stretch, clothing stress) and fail loudly by naming the rows that regressed; the verdict is the difference between an actor's own walk and the converted clip.",
+        mutates: true,
+        stub: false,
+        schema: regression::schema,
+        handler: regression::run,
     },
 ];
 

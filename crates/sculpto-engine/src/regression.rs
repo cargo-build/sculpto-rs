@@ -1,0 +1,1469 @@
+//! `rig.regression`: the four-way default-vs-adapted rig gate.
+//!
+//! The operator judged the four side-by-side viewer windows (Emily and Mike,
+//! each with its own walk and with the adapted Mixamo walk) a good regression
+//! test; the windows were ad hoc, so this verb replaces them with numbers. For
+//! every declared actor it measures a default artifact (the actor's own walk)
+//! and an adapted artifact (a converted clip) with the same instruments the
+//! `0134` conversion gate runs, then decides on the *difference*: a
+//! body-owned defect shows in both rows and cannot masquerade as a
+//! conversion regression.
+//!
+//! Rows, all measured per artifact and clip:
+//!
+//! - **spine straightness** — per-segment lateral and sagittal tilt of the
+//!   `Pelvis/Spine/Spine1/Spine2/Neck` chain, resolved by role rather than by
+//!   name, and the peak cumulative lateral deviation of the chain top in mm.
+//!   Positions live in the pelvis's yaw-only frame, so the walk's normal
+//!   carriage folds out and only the spine's own bending stays.
+//! - **hand-to-hip clearance** — the smallest distance from a hand or finger
+//!   joint to the pelvis point or a hip/thigh segment, with the frame.
+//! - **stance median and max** — the `0134` toe-slide form.
+//! - **rest reconstruction** — the default artifact's rest must be the
+//!   adapted artifact's rest, joint for joint.
+//! - **role coverage** — the roles each clip drives, read from the file's own
+//!   channels; the conversion may not lose a role the own clip drives.
+//! - **edge stretch** — the rest-length classes; the gate is the relative one.
+//! - **clothing stress** — the per-frame dressed clearance on the adapted
+//!   artifact: the adapted clip against the actor's own anchor clip on the
+//!   same mesh, plus declared context clips.
+//!
+//! A regression is a non-zero exit and a named row, not a note.
+//!
+//! @req BODY-01
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use glam::{DMat4, DVec3};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use sculpto_mesh::actor::{Actor, Pose, StressPlan, stress};
+
+use crate::export_actor::CLIP_ROLES;
+use crate::measures::{
+    RELATIVE_STRETCH, STANCE_MEDIAN_BAR, edge_stretch, measurable_parts, palette_names,
+    palette_reconstruction, toe_slide,
+};
+use crate::retarget::{BoneRole, Part, Side, coverage_token, palette_role};
+use crate::{CommandError, ErrorKind, errors};
+
+/// Lateral mm the adapted chain may drift beyond `1.10 ×` the own walk's drift.
+///
+/// The rest chain measures exactly 0.0 mm on both actors, and the default walk
+/// drives no spine bone, so the default rows sit at a fraction of a millimetre;
+/// the floor exists so the gate cannot be absorbed by a perfect default and
+/// so a healthy walking sway passes.
+pub const SPINE_DEVIATION_FLOOR_MM: f64 = 5.0;
+/// Lateral degrees per segment the adapted chain may exceed `1.10 ×` default by.
+pub const SPINE_TILT_FLOOR_DEG: f64 = 2.0;
+/// mm of clearance the adapted walk may lose against the own walk before the
+/// row is a regression, on top of the proportional margin.
+pub const CLEARANCE_FLOOR_MM: f64 = 1.0;
+/// The proportional share of the own walk's clearance the conversion may spend.
+pub const CLEARANCE_MARGIN: f64 = 0.25;
+/// Admitted adapted stretch as a multiple of the own clip's stretch at the
+/// same witnesses: a body-owned tear (Mike's crotch) shows in both rows.
+pub const CLOTHING_RELATIVE: f64 = 1.10;
+
+/// The command input.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegressionParams {
+    /// One entry per actor: the default artifact, the adapted artifact and the
+    /// clips each carries.
+    pub actors: Vec<RegressionActor>,
+    /// Clip frames the motion measures sample, endpoints included.
+    #[serde(default = "default_frames")]
+    pub frames: usize,
+    /// Accepted graded visible clothing depth, GLB units (metres).
+    #[serde(default = "default_tolerance")]
+    pub tolerance: f64,
+    /// Also write the report JSON here.
+    #[serde(default)]
+    pub report: Option<PathBuf>,
+}
+
+/// One actor under regression.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegressionActor {
+    /// Actor name the rows and failures carry.
+    pub name: String,
+    /// Artifact carrying the actor's own walk.
+    pub default: PathBuf,
+    /// Artifact carrying the adapted (converted) clip.
+    pub adapted: PathBuf,
+    /// The own-walk clip the default metrics measure.
+    pub default_clip: String,
+    /// The converted clip the adapted metrics measure.
+    pub adapted_clip: String,
+    /// The own-walk clip the clothing anchor row measures on the adapted
+    /// artifact; defaults to `default_clip`.
+    #[serde(default)]
+    pub stress_anchor_clip: Option<String>,
+    /// Extra context clips measured on the adapted artifact, report-only.
+    #[serde(default)]
+    pub stress_clips: Vec<String>,
+    /// Body part address for the clothing rows (`Name` or `Name#i`).
+    pub body: String,
+    /// Garment part addresses graded against the body every frame.
+    #[serde(default)]
+    pub garments: Vec<String>,
+}
+
+fn default_frames() -> usize {
+    16
+}
+
+fn default_tolerance() -> f64 {
+    0.0021
+}
+
+/// The command input schema.
+pub(crate) fn schema() -> Value {
+    json!(schemars::schema_for!(RegressionParams))
+}
+
+// ---------------------------------------------------------------------------
+// typed metric cores; the JSON shapes mirror these
+// ---------------------------------------------------------------------------
+
+/// One spine segment's peak tilt over a clip.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SegmentTilt {
+    /// `parent→child` chain names.
+    pub segment: String,
+    /// Peak angle between the posed and rest segment, sideways, degrees.
+    pub peak_lateral_deg: f64,
+    /// Peak angle fore/aft, degrees.
+    pub peak_sagittal_deg: f64,
+}
+/// Spine straightness of one clip: the defect the adapted walk carries today.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SpineMetrics {
+    /// Per-segment peaks, pelvis to neck.
+    pub segments: Vec<SegmentTilt>,
+    /// Peak lateral offset of the chain top from its rest position, mm — the
+    /// cumulative lateral deviation.
+    pub peak_lateral_deviation_mm: f64,
+    /// Clip time of that peak, seconds.
+    pub deviation_time: f64,
+    /// The chain joint carrying the worst own lateral offset.
+    pub worst_deviation_joint: String,
+    /// Peak own lateral offset of that joint, mm.
+    pub worst_deviation_mm: f64,
+    /// Peak lateral tilt over the spine segments, degrees; the connector into
+    /// the spine is reported per segment but never gates or peaks here.
+    pub peak_lateral_tilt_deg: f64,
+    /// Peak sagittal tilt over the spine segments, degrees.
+    pub peak_sagittal_tilt_deg: f64,
+    /// Frames sampled.
+    pub frames: usize,
+}
+
+/// The narrowest hand-to-hip pass of one clip, with its witness.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ClearanceMetrics {
+    /// Smallest joint-to-target distance over the clip, mm.
+    pub min_mm: f64,
+    /// Clip time of the minimum, seconds.
+    pub time: f64,
+    /// Frame index of the minimum, endpoints included.
+    pub frame: usize,
+    /// The hand or finger joint that reached it.
+    pub joint: String,
+    /// The pelvis/thigh target it approached.
+    pub target: String,
+    /// Frames sampled.
+    pub frames: usize,
+}
+
+/// The roles one clip drives, read from the file's own channels.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CoverageMetrics {
+    /// Standard roles the clip drives, [`CLIP_ROLES`] order.
+    pub driven_roles: Vec<&'static str>,
+    /// Standard roles the palette carries bones for.
+    pub palette_roles: Vec<&'static str>,
+    /// Palette roles the clip leaves at rest.
+    pub undriven_roles: Vec<&'static str>,
+    /// Distinct bones the clip drives.
+    pub driven_bones: usize,
+}
+
+/// One typed gate verdict; the report carries these verbatim.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GateVerdict {
+    /// Stable gate name the failure row carries.
+    pub gate: &'static str,
+    /// Row the verdict is about, e.g. `emily/adapted`.
+    pub row: String,
+    /// Whether the gate passes.
+    pub pass: bool,
+    /// The measurement behind the verdict, with both numbers.
+    pub detail: String,
+}
+
+// ---------------------------------------------------------------------------
+// pure metric math
+// ---------------------------------------------------------------------------
+
+/// Point in the chain frame joint's local space, metres.
+///
+/// The chain is measured where the clip writes its spine rotations: the spine
+/// root's parent joint's local frame. On today's palettes that parent is the
+/// `COM` mirror; after the pelvis re-parent it is the pelvis — either way the
+/// body's carriage (yaw, pitch, roll, bob) moves the frame and the chain with
+/// it and folds out, so only the spine's own bending stays. A chain rigid to
+/// its parent measures zero under any motion of the parent.
+pub fn chain_local(frame: DMat4, point: DVec3) -> DVec3 {
+    frame.inverse().transform_point3(point)
+}
+
+fn projected_angle_deg(first: [f64; 2], second: [f64; 2]) -> f64 {
+    let length = first.iter().map(|v| v * v).sum::<f64>().sqrt()
+        * second.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if length < 1e-12 {
+        return 0.0;
+    }
+    let dot = (first[0] * second[0] + first[1] * second[1]) / length;
+    dot.clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// Spine straightness from the chain's folded positions.
+///
+/// `rest` and every frame's chain carry the five joints in one order,
+/// pelvis first, already yaw-folded and pelvis-relative.
+pub fn spine_metrics(rest: &[DVec3], frames: &[(f64, Vec<DVec3>)]) -> SpineMetrics {
+    let names = ["Pelvis", "Spine", "Spine1", "Spine2", "Neck"];
+    let rest_mm: Vec<[f64; 3]> = rest
+        .iter()
+        .map(|p| [p.x * 1000.0, p.y * 1000.0, p.z * 1000.0])
+        .collect();
+    let mut segments: Vec<SegmentTilt> = (0..rest.len().saturating_sub(1))
+        .map(|index| SegmentTilt {
+            segment: format!("{}→{}", names[index], names[index + 1]),
+            peak_lateral_deg: 0.0,
+            peak_sagittal_deg: 0.0,
+        })
+        .collect();
+    let mut peak_lateral_tilt = 0.0_f64;
+    let mut peak_sagittal_tilt = 0.0_f64;
+    let mut peak_deviation = 0.0_f64;
+    let mut deviation_time = 0.0_f64;
+    let mut worst_joint = String::new();
+    let mut worst_joint_mm = 0.0_f64;
+    for (time, chain) in frames {
+        let posed_mm: Vec<[f64; 3]> = chain
+            .iter()
+            .map(|p| [p.x * 1000.0, p.y * 1000.0, p.z * 1000.0])
+            .collect();
+        for index in 1..posed_mm.len() {
+            let delta = [
+                posed_mm[index][0] - rest_mm[index][0],
+                posed_mm[index][1] - rest_mm[index][1],
+                posed_mm[index][2] - rest_mm[index][2],
+            ];
+            if delta[0].abs() > worst_joint_mm {
+                worst_joint_mm = delta[0].abs();
+                worst_joint = names[index].to_owned();
+            }
+            let is_top = index == posed_mm.len() - 1;
+            if is_top && delta[0].abs() > peak_deviation {
+                peak_deviation = delta[0].abs();
+                deviation_time = *time;
+            }
+            if let Some(segment) = segments.get_mut(index - 1) {
+                let rest_segment = [
+                    rest_mm[index][0] - rest_mm[index - 1][0],
+                    rest_mm[index][1] - rest_mm[index - 1][1],
+                ];
+                let posed_segment = [
+                    posed_mm[index][0] - posed_mm[index - 1][0],
+                    posed_mm[index][1] - posed_mm[index - 1][1],
+                ];
+                let lateral = projected_angle_deg(posed_segment, rest_segment);
+                segment.peak_lateral_deg = segment.peak_lateral_deg.max(lateral);
+                // Segment 0 is the connector into the spine (Pelvis→Spine); on
+                // a palette where the spine hangs beside the pelvis it carries
+                // the pelvis's own carriage, so the gate and the reported
+                // peaks read the spine segments only, while the connector
+                // stays listed below.
+                if index > 1 {
+                    peak_lateral_tilt = peak_lateral_tilt.max(lateral);
+                }
+                let rest_sagittal = [
+                    rest_mm[index][2] - rest_mm[index - 1][2],
+                    rest_mm[index][1] - rest_mm[index - 1][1],
+                ];
+                let posed_sagittal = [
+                    posed_mm[index][2] - posed_mm[index - 1][2],
+                    posed_mm[index][1] - posed_mm[index - 1][1],
+                ];
+                let sagittal = projected_angle_deg(posed_sagittal, rest_sagittal);
+                segment.peak_sagittal_deg = segment.peak_sagittal_deg.max(sagittal);
+                if index > 1 {
+                    peak_sagittal_tilt = peak_sagittal_tilt.max(sagittal);
+                }
+            }
+        }
+    }
+    SpineMetrics {
+        segments,
+        peak_lateral_deviation_mm: peak_deviation,
+        deviation_time,
+        worst_deviation_joint: if worst_joint.is_empty() {
+            "Neck".to_owned()
+        } else {
+            worst_joint
+        },
+        worst_deviation_mm: worst_joint_mm,
+        peak_lateral_tilt_deg: peak_lateral_tilt,
+        peak_sagittal_tilt_deg: peak_sagittal_tilt,
+        frames: frames.len(),
+    }
+}
+
+/// Distance from a point to a segment, metres; a point target is `a == b`.
+pub fn point_segment_distance(point: DVec3, a: DVec3, b: DVec3) -> f64 {
+    let edge = b - a;
+    let span = edge.length_squared();
+    if span < 1e-18 {
+        return point.distance(a);
+    }
+    let t = ((point - a).dot(edge) / span).clamp(0.0, 1.0);
+    point.distance(a + edge * t)
+}
+
+/// One clearance frame: hand/finger joints against pelvis/thigh targets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClearanceFrame {
+    /// Clip time, seconds.
+    pub time: f64,
+    /// `(joint name, world position)` for every hand and finger joint.
+    pub joints: Vec<(String, DVec3)>,
+    /// `(target name, segment start, segment end)`; a point target repeats the
+    /// position.
+    pub targets: Vec<(String, DVec3, DVec3)>,
+}
+
+/// Hand-to-hip clearance over a clip: the smallest pass and its witness.
+pub fn clearance_metrics(frames: &[ClearanceFrame]) -> ClearanceMetrics {
+    let mut best: Option<ClearanceMetrics> = None;
+    for (index, frame) in frames.iter().enumerate() {
+        for (joint, point) in &frame.joints {
+            for (target, a, b) in &frame.targets {
+                let distance = point_segment_distance(*point, *a, *b) * 1000.0;
+                let better = match &best {
+                    None => true,
+                    Some(current) => distance < current.min_mm,
+                };
+                if better {
+                    best = Some(ClearanceMetrics {
+                        min_mm: distance,
+                        time: frame.time,
+                        frame: index,
+                        joint: joint.clone(),
+                        target: target.clone(),
+                        frames: frames.len(),
+                    });
+                }
+            }
+        }
+    }
+    best.unwrap_or(ClearanceMetrics {
+        min_mm: f64::INFINITY,
+        time: 0.0,
+        frame: 0,
+        joint: String::new(),
+        target: String::new(),
+        frames: frames.len(),
+    })
+}
+
+/// The standard roles one set of palette bone names answers.
+fn palette_role_tokens(names: &[String]) -> Vec<&'static str> {
+    let mut tokens: Vec<&'static str> = names
+        .iter()
+        .filter_map(|name| palette_role(name))
+        .filter_map(|role| coverage_token(role.part))
+        .collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    CLIP_ROLES
+        .iter()
+        .filter(|role| tokens.contains(role))
+        .copied()
+        .collect()
+}
+
+/// The roles one clip drives, read from the artifact's own channels — not from
+/// a conversion plan, so the same measure answers a written file and a
+/// hand-authored clip.
+///
+/// # Errors
+/// A missing or ambiguous clip.
+pub fn clip_role_coverage(
+    actor: &Actor,
+    clip: &str,
+    palette: &[String],
+) -> Result<CoverageMetrics, CommandError> {
+    let source = actor
+        .clip_shared(clip)
+        .map_err(crate::measures::actor_error)?;
+    let mut driven: BTreeMap<&'static str, ()> = BTreeMap::new();
+    let mut bones: BTreeMap<String, ()> = BTreeMap::new();
+    for channel in &source.channels {
+        // Scale carries no pose.
+        if matches!(
+            channel.property,
+            sculpto_mesh::actor::SourceProperty::Translation
+                | sculpto_mesh::actor::SourceProperty::Rotation
+        ) && let Some(name) = &channel.node_name
+        {
+            bones.insert(name.clone(), ());
+            if let Some(role) = palette_role(name)
+                && let Some(token) = coverage_token(role.part)
+            {
+                driven.insert(token, ());
+            }
+        }
+    }
+    let palette_roles = palette_role_tokens(palette);
+    let undriven: Vec<&'static str> = palette_roles
+        .iter()
+        .filter(|role| !driven.contains_key(**role))
+        .copied()
+        .collect();
+    Ok(CoverageMetrics {
+        driven_roles: CLIP_ROLES
+            .iter()
+            .filter(|role| driven.contains_key(**role))
+            .copied()
+            .collect(),
+        palette_roles,
+        undriven_roles: undriven,
+        driven_bones: bones.len(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// gates
+// ---------------------------------------------------------------------------
+
+/// Spine straightness: the adapted chain may not bend beyond a floor plus the
+/// own walk's share. The floor is what makes a straight default mean anything.
+pub fn spine_gate(default: &SpineMetrics, adapted: &SpineMetrics, row: &str) -> GateVerdict {
+    let deviation_bound = (SPINE_DEVIATION_FLOOR_MM).max(1.10 * default.peak_lateral_deviation_mm);
+    let tilt_bound = SPINE_TILT_FLOOR_DEG.max(1.10 * default.peak_lateral_tilt_deg);
+    let pass = adapted.peak_lateral_deviation_mm <= deviation_bound
+        && adapted.peak_lateral_tilt_deg <= tilt_bound;
+    GateVerdict {
+        gate: "spine_lateral",
+        row: row.to_owned(),
+        pass,
+        detail: format!(
+            "peak lateral deviation {:.1} mm (bound {:.1}, default {:.1}), peak lateral tilt \
+             {:.2}° (bound {:.2}, default {:.2}), sagittal {:.2}° (reported, not gated)",
+            adapted.peak_lateral_deviation_mm,
+            deviation_bound,
+            default.peak_lateral_deviation_mm,
+            adapted.peak_lateral_tilt_deg,
+            tilt_bound,
+            default.peak_lateral_tilt_deg,
+            adapted.peak_sagittal_tilt_deg,
+        ),
+    }
+}
+
+/// Hand-to-hip clearance: the adapted walk may not close the corridor the own
+/// walk keeps open, beyond a floor plus a proportional margin. When the own
+/// clip already crosses, the gate is vacuous and says so.
+pub fn clearance_gate(
+    default: &ClearanceMetrics,
+    adapted: &ClearanceMetrics,
+    row: &str,
+) -> GateVerdict {
+    let bound = default.min_mm - (CLEARANCE_FLOOR_MM).max(CLEARANCE_MARGIN * default.min_mm);
+    let vacuous = default.min_mm <= 0.0 || !default.min_mm.is_finite();
+    let pass = vacuous || adapted.min_mm >= bound;
+    GateVerdict {
+        gate: "clearance",
+        row: row.to_owned(),
+        pass,
+        detail: format!(
+            "min {:.2} mm at t={:.3} ({}↔{}, frame {}) against default {:.2} mm (bound {:.2}){}",
+            adapted.min_mm,
+            adapted.time,
+            adapted.joint,
+            adapted.target,
+            adapted.frame,
+            default.min_mm,
+            bound,
+            match vacuous {
+                true => "; the own clip already crosses, the gate is vacuous here",
+                false => "",
+            },
+        ),
+    }
+}
+
+/// Edge stretch, relative: the adapted clip may not stretch the body more than
+/// `1.10 ×` the own clip's stretch at the same witnesses. The absolutes stay
+/// in the report; they are the body's property.
+pub fn stretch_gate(default_five_mm: f64, adapted_five_mm: f64, row: &str) -> GateVerdict {
+    let bound = RELATIVE_STRETCH * default_five_mm;
+    let pass = if default_five_mm <= 0.0 {
+        adapted_five_mm <= 0.0
+    } else {
+        adapted_five_mm <= bound
+    };
+    GateVerdict {
+        gate: "edge_stretch_relative",
+        row: row.to_owned(),
+        pass,
+        detail: format!(
+            "adapted {:.2}x at ≥5 mm (bound {:.2}x, default {:.2}x){}",
+            adapted_five_mm,
+            bound,
+            default_five_mm,
+            match default_five_mm <= 0.0 {
+                true => "; the own clip stretches nothing, so any conversion stretch fails here",
+                false => "",
+            },
+        ),
+    }
+}
+
+/// Clothing stress: when the own anchor clip passes the tolerance on the same
+/// mesh, the adapted clip must too (an absolute regression); when the anchor
+/// already fails, the verdict is the relative delta, never the absolute number.
+/// Depths and the tolerance arrive in the same units (mm).
+pub fn clothing_gate(
+    tolerance_mm: f64,
+    anchor_depth_mm: f64,
+    adapted_depth_mm: f64,
+    anchor_clip: &str,
+    row: &str,
+) -> GateVerdict {
+    let anchor_pass = anchor_depth_mm <= tolerance_mm;
+    let bound = match anchor_pass {
+        true => tolerance_mm,
+        false => CLOTHING_RELATIVE * anchor_depth_mm,
+    };
+    GateVerdict {
+        gate: "clothing_stress",
+        row: row.to_owned(),
+        pass: adapted_depth_mm <= bound,
+        detail: format!(
+            "adapted {:.3} mm against anchor {anchor_clip:?} {:.3} mm ({}), bound {:.3} mm",
+            adapted_depth_mm,
+            anchor_depth_mm,
+            match anchor_pass {
+                true => "passing, so the adapted row must pass the tolerance too",
+                false => "already failing, delta is the verdict",
+            },
+            bound,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sampling plumbing
+// ---------------------------------------------------------------------------
+
+/// One chain role the spine row needs.
+struct ChainRole {
+    side: Side,
+    matches: fn(&Part) -> bool,
+    label: &'static str,
+}
+
+/// The chain roles the spine row needs, in chain order.
+const CHAIN_ORDER: [ChainRole; 5] = [
+    ChainRole {
+        side: Side::Centre,
+        matches: |part| matches!(part, Part::Pelvis),
+        label: "Pelvis",
+    },
+    ChainRole {
+        side: Side::Centre,
+        matches: |part| matches!(part, Part::Spine(0)),
+        label: "Spine",
+    },
+    ChainRole {
+        side: Side::Centre,
+        matches: |part| matches!(part, Part::Spine(1)),
+        label: "Spine1",
+    },
+    ChainRole {
+        side: Side::Centre,
+        matches: |part| matches!(part, Part::Spine(2)),
+        label: "Spine2",
+    },
+    ChainRole {
+        side: Side::Centre,
+        matches: |part| matches!(part, Part::Neck),
+        label: "Neck",
+    },
+];
+
+/// Resolve the spine chain, hand/finger joints and hip/thigh targets on one
+/// palette, by role. Refuses with the missing role named.
+fn resolve_joints(palette: &[String]) -> Result<ResolvedJoints, CommandError> {
+    let mut resolved = ResolvedJoints::default();
+    for role in CHAIN_ORDER {
+        let name = palette
+            .iter()
+            .find(|name| {
+                palette_role(name)
+                    .is_some_and(|found| found.side == role.side && (role.matches)(&found.part))
+            })
+            .ok_or_else(|| {
+                errors::invalid(
+                    "rig_regression_chain",
+                    format!(
+                        "the palette carries no {} joint, so the spine row has no chain",
+                        role.label
+                    ),
+                )
+            })?;
+        resolved.chain.push(name.clone());
+    }
+    for (name, role) in palette
+        .iter()
+        .filter_map(|name| palette_role(name).map(|role| (name, role)))
+    {
+        match role.part {
+            Part::Hand => resolved.hands.push(name.clone()),
+            Part::Digit { .. } => resolved.digits.push(name.clone()),
+            Part::Thigh => resolved.thighs.push(name.clone()),
+            Part::Calf => resolved.calves.push(name.clone()),
+            _ => {}
+        }
+    }
+    if resolved.hands.is_empty() {
+        return Err(errors::invalid(
+            "rig_regression_chain",
+            "the palette carries no hand joint, so the clearance row has no hand",
+        ));
+    }
+    if resolved.thighs.len() < 2 || resolved.calves.len() < 2 {
+        return Err(errors::invalid(
+            "rig_regression_chain",
+            "the palette carries no thigh/calf pair, so the clearance row has no hip target",
+        ));
+    }
+    let pelvis = resolved
+        .chain
+        .first()
+        .cloned()
+        .ok_or_else(|| errors::invalid("rig_regression_chain", "empty chain"))?;
+    resolved.pelvis = pelvis;
+    Ok(resolved)
+}
+
+/// The palette joints the motion rows sample, by role.
+#[derive(Default, Debug, Clone)]
+struct ResolvedJoints {
+    pelvis: String,
+    /// Pelvis → Neck, five joints on these palettes.
+    chain: Vec<String>,
+    hands: Vec<String>,
+    digits: Vec<String>,
+    thighs: Vec<String>,
+    calves: Vec<String>,
+}
+
+/// World matrices of the wanted joints at evenly spaced clip times.
+///
+/// The whole palette is requested per frame — a retained rig keeps the joints a
+/// requested bone's vertices bind to — so a joint outside the wanted list is
+/// still retained when the skin needs it.
+type JointTracks = Vec<(f64, BTreeMap<String, DMat4>)>;
+
+fn joint_tracks(
+    actor: &Actor,
+    clip: &str,
+    frames: usize,
+    wanted: &[String],
+    palette: &[String],
+) -> Result<JointTracks, CommandError> {
+    let parts = measurable_parts(actor);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let (start, end) = actor
+        .clip_span(clip)
+        .map_err(crate::measures::actor_error)?;
+    let count = frames.max(2);
+    let mut tracks = Vec::with_capacity(count);
+    for index in 0..count {
+        let time = start + (end - start) * index as f64 / (count - 1) as f64;
+        let sample = actor
+            .rig_sample(
+                &parts,
+                Pose::Clip { name: clip, time },
+                &palette.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .map_err(crate::measures::actor_error)?;
+        let mut worlds = BTreeMap::new();
+        for name in wanted {
+            let node = sample
+                .rig
+                .iter()
+                .find(|node| node.name.as_deref() == Some(name.as_str()))
+                .ok_or_else(|| {
+                    errors::invalid(
+                        "rig_regression_chain",
+                        format!("the rig sample does not carry joint {name:?}"),
+                    )
+                })?;
+            worlds.insert(name.clone(), DMat4::from_cols_array_2d(&node.world));
+        }
+        tracks.push((time, worlds));
+    }
+    Ok(tracks)
+}
+
+/// Rest state of the chain: the frame joint (the spine root's parent, so the
+/// chain is measured where its rotations land) and the chain's rest world
+/// positions.
+fn rest_pose(
+    actor: &Actor,
+    chain: &[String],
+    palette: &[String],
+) -> Result<(String, DMat4, Vec<DVec3>), CommandError> {
+    let parts = measurable_parts(actor);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let sample = actor
+        .rig_sample(
+            &parts,
+            Pose::Rest,
+            &palette.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .map_err(crate::measures::actor_error)?;
+    let spine = chain
+        .get(1)
+        .ok_or_else(|| errors::invalid("rig_regression_chain", "the chain has no spine root"))?;
+    let spine_position = sample
+        .rig
+        .iter()
+        .position(|node| node.name.as_deref() == Some(spine.as_str()))
+        .ok_or_else(|| {
+            errors::invalid(
+                "rig_regression_chain",
+                format!("the rest rig does not carry joint {spine:?}"),
+            )
+        })?;
+    // `RigNode.parent` is the retained rig's own index: the nearest retained
+    // ancestor, which with the whole palette requested is the joint the spine
+    // hangs from in the file.
+    let parent_position = sample.rig[spine_position].parent.ok_or_else(|| {
+        errors::invalid(
+            "rig_regression_chain",
+            format!(
+                "joint {spine:?} has no retained parent, so there is no frame to measure it in"
+            ),
+        )
+    })?;
+    let frame_node = sample.rig.get(parent_position).ok_or_else(|| {
+        errors::invalid(
+            "rig_regression_chain",
+            format!(
+                "joint {spine:?}'s rig parent index {parent_position} is outside the retained rig"
+            ),
+        )
+    })?;
+    let frame_name = frame_node.name.clone().ok_or_else(|| {
+        errors::invalid(
+            "rig_regression_chain",
+            format!(
+                "joint {spine:?}'s parent node {} is unnamed",
+                frame_node.node
+            ),
+        )
+    })?;
+    let mut positions = Vec::with_capacity(chain.len());
+    for name in chain {
+        let node = sample
+            .rig
+            .iter()
+            .find(|node| node.name.as_deref() == Some(name.as_str()))
+            .ok_or_else(|| {
+                errors::invalid(
+                    "rig_regression_chain",
+                    format!("the rest rig does not carry joint {name:?}"),
+                )
+            })?;
+        positions.push(DMat4::from_cols_array_2d(&node.world).w_axis.truncate());
+    }
+    Ok((
+        frame_name,
+        DMat4::from_cols_array_2d(&frame_node.world),
+        positions,
+    ))
+}
+
+/// One motion measurement on one artifact and clip: spine chain plus
+/// hand-to-hip clearance from one shared joint pass.
+struct MotionRows {
+    /// The joint whose local frame the chain was measured in.
+    frame_joint: String,
+    spine: SpineMetrics,
+    clearance: ClearanceMetrics,
+}
+
+fn measure_motion(
+    actor: &Actor,
+    clip: &str,
+    frames: usize,
+    joints: &ResolvedJoints,
+    palette: &[String],
+) -> Result<MotionRows, CommandError> {
+    let mut wanted: Vec<String> = joints.chain.clone();
+    for list in [
+        &joints.hands,
+        &joints.digits,
+        &joints.thighs,
+        &joints.calves,
+    ] {
+        wanted.extend(list.iter().cloned());
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    let (frame_joint, frame_world_rest, rest_positions) = rest_pose(actor, &joints.chain, palette)?;
+    let rest_folded: Vec<DVec3> = rest_positions
+        .iter()
+        .map(|point| chain_local(frame_world_rest, *point))
+        .collect();
+    let mut sampled = wanted;
+    sampled.push(frame_joint.clone());
+    sampled.sort_unstable();
+    sampled.dedup();
+    let tracks = joint_tracks(actor, clip, frames, &sampled, palette)?;
+    let mut chain_frames = Vec::with_capacity(tracks.len());
+    let mut clearance_frames = Vec::with_capacity(tracks.len());
+    for (time, worlds) in &tracks {
+        let frame_world = worlds.get(&frame_joint).ok_or_else(|| {
+            errors::invalid(
+                "rig_regression_chain",
+                format!("frame joint {frame_joint:?} missing from a frame"),
+            )
+        })?;
+        let chain: Vec<DVec3> = joints
+            .chain
+            .iter()
+            .map(|name| {
+                worlds
+                    .get(name)
+                    .map(|world| world.w_axis.truncate())
+                    .ok_or_else(|| {
+                        errors::invalid(
+                            "rig_regression_chain",
+                            format!("{name:?} missing from a frame"),
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        chain_frames.push((
+            *time,
+            chain
+                .iter()
+                .map(|p| chain_local(*frame_world, *p))
+                .collect(),
+        ));
+        let pelvis_world = worlds.get(&joints.pelvis).ok_or_else(|| {
+            errors::invalid(
+                "rig_regression_chain",
+                format!("{:?} missing from a frame", joints.pelvis),
+            )
+        })?;
+        let mut frame = ClearanceFrame {
+            time: *time,
+            joints: Vec::new(),
+            targets: Vec::new(),
+        };
+        for list in [&joints.hands, &joints.digits] {
+            for name in list.iter() {
+                if let Some(world) = worlds.get(name) {
+                    frame.joints.push((name.clone(), world.w_axis.truncate()));
+                }
+            }
+        }
+        let pelvis_point = pelvis_world.w_axis.truncate();
+        frame
+            .targets
+            .push(("pelvis".to_owned(), pelvis_point, pelvis_point));
+        let thighs: Vec<DVec3> = joints
+            .thighs
+            .iter()
+            .map(|name| {
+                worlds
+                    .get(name)
+                    .map(|world| world.w_axis.truncate())
+                    .ok_or_else(|| {
+                        errors::invalid(
+                            "rig_regression_chain",
+                            format!("{name:?} missing from a frame"),
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let calves: Vec<DVec3> = joints
+            .calves
+            .iter()
+            .map(|name| {
+                worlds
+                    .get(name)
+                    .map(|world| world.w_axis.truncate())
+                    .ok_or_else(|| {
+                        errors::invalid(
+                            "rig_regression_chain",
+                            format!("{name:?} missing from a frame"),
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let sides = ["L", "R"];
+        for (index, side) in sides.iter().enumerate() {
+            if let (Some(thigh), Some(calf)) = (thighs.get(index), calves.get(index)) {
+                frame
+                    .targets
+                    .push((format!("{side} hip"), pelvis_point, *thigh));
+                frame.targets.push((format!("{side} thigh"), *thigh, *calf));
+            }
+        }
+        clearance_frames.push(frame);
+    }
+    Ok(MotionRows {
+        frame_joint,
+        spine: spine_metrics(&rest_folded, &chain_frames),
+        clearance: clearance_metrics(&clearance_frames),
+    })
+}
+
+/// One clothing stress row: the worst frame of one clip on one artifact.
+#[derive(Clone, Debug)]
+struct StressRow {
+    clip: String,
+    worst_mm: f64,
+    worst_part: String,
+    frame: usize,
+    time: Option<f64>,
+    within_tolerance: bool,
+}
+
+fn stress_row(
+    actor: &Actor,
+    clip: &str,
+    frames: usize,
+    tolerance: f64,
+    body: &str,
+    garments: &[String],
+) -> Result<StressRow, CommandError> {
+    let plan = StressPlan {
+        body,
+        garments: garments.iter().map(String::as_str).collect(),
+        clip: Some(clip),
+        frames,
+        tolerance: tolerance as f32,
+    };
+    let report = stress(actor, &plan).map_err(|error| {
+        errors::invalid("rig_regression_stress", format!("clip {clip:?}: {error}"))
+    })?;
+    let mut worst: Option<(f32, String, usize, Option<f64>)> = None;
+    for row in &report.frames {
+        for garment in &row.garments {
+            let better = match &worst {
+                None => true,
+                Some((depth, _, _, _)) => garment.visible_max > *depth,
+            };
+            if better {
+                worst = Some((
+                    garment.visible_max,
+                    garment.part.clone(),
+                    row.index,
+                    row.time_seconds,
+                ));
+            }
+        }
+    }
+    let (depth, part, frame, time) = worst.ok_or_else(|| {
+        errors::invalid(
+            "rig_regression_stress",
+            format!("clip {clip:?}: the stress harness returned no rows"),
+        )
+    })?;
+    Ok(StressRow {
+        clip: clip.to_owned(),
+        worst_mm: depth as f64 * 1000.0,
+        worst_part: part,
+        frame,
+        time,
+        within_tolerance: depth as f64 <= tolerance,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// the verb
+// ---------------------------------------------------------------------------
+
+/// One actor's full measurement, default and adapted, with its gates.
+struct ActorReport {
+    value: Value,
+    gates: Vec<GateVerdict>,
+}
+
+fn measure_actor(
+    params: &RegressionActor,
+    frames: usize,
+    tolerance: f64,
+) -> Result<ActorReport, CommandError> {
+    let default_bytes =
+        std::fs::read(&params.default).map_err(|error| errors::io(&params.default, error))?;
+    let adapted_bytes =
+        std::fs::read(&params.adapted).map_err(|error| errors::io(&params.adapted, error))?;
+    let default_actor =
+        Actor::from_glb(&default_bytes).map_err(|error| actor_read(&params.default, error))?;
+    let adapted_actor =
+        Actor::from_glb(&adapted_bytes).map_err(|error| actor_read(&params.adapted, error))?;
+    let default_palette = palette_names(&default_actor)?;
+    let adapted_palette = palette_names(&adapted_actor)?;
+    let default_joints = resolve_joints(&default_palette)?;
+    let adapted_joints = resolve_joints(&adapted_palette)?;
+
+    // Motion rows: the own walk on the default artifact, the converted clip on
+    // the adapted artifact.
+    let default_motion = measure_motion(
+        &default_actor,
+        &params.default_clip,
+        frames,
+        &default_joints,
+        &default_palette,
+    )?;
+    let adapted_motion = measure_motion(
+        &adapted_actor,
+        &params.adapted_clip,
+        frames,
+        &adapted_joints,
+        &adapted_palette,
+    )?;
+
+    // Stance on both sides; the toes come from the palette's own roles.
+    let toes_of = |palette: &[String]| -> Result<Vec<String>, CommandError> {
+        let toes: Vec<String> = palette
+            .iter()
+            .filter(|name| {
+                palette_role(name).is_some_and(|role: BoneRole| matches!(role.part, Part::Toe))
+            })
+            .cloned()
+            .collect();
+        if toes.is_empty() {
+            return Err(errors::invalid(
+                "rig_regression_chain",
+                "the palette carries no toe joint, so the stance row has no foot",
+            ));
+        }
+        Ok(toes)
+    };
+    let default_toes = toes_of(&default_palette)?;
+    let adapted_toes = toes_of(&adapted_palette)?;
+    let default_stance = toe_slide(
+        &default_actor,
+        &params.default_clip,
+        &default_palette,
+        &default_toes,
+        frames,
+    )?;
+    let adapted_stance = toe_slide(
+        &adapted_actor,
+        &params.adapted_clip,
+        &adapted_palette,
+        &adapted_toes,
+        frames,
+    )?;
+
+    // Stretch on both sides.
+    let default_stretch = edge_stretch(&default_actor, &params.default_clip, frames)?;
+    let adapted_stretch = edge_stretch(&adapted_actor, &params.adapted_clip, frames)?;
+
+    // Coverage on both sides.
+    let default_coverage =
+        clip_role_coverage(&default_actor, &params.default_clip, &default_palette)?;
+    let adapted_coverage =
+        clip_role_coverage(&adapted_actor, &params.adapted_clip, &adapted_palette)?;
+
+    // Rest reconstruction: the adapted artifact's rest must be the default's.
+    let reconstruction = palette_reconstruction(&default_actor, &adapted_actor)?;
+
+    // Clothing rows live on the adapted artifact: adapt preserves the mesh, so
+    // the own anchor and the converted clip grade on byte-identical geometry.
+    let anchor_clip = params
+        .stress_anchor_clip
+        .clone()
+        .unwrap_or_else(|| params.default_clip.clone());
+    let mut clothing_rows = Vec::new();
+    let mut adapted_clothing: Option<StressRow> = None;
+    let mut anchor_clothing: Option<StressRow> = None;
+    if !params.garments.is_empty() {
+        for clip in [&params.adapted_clip, &anchor_clip] {
+            if clothing_rows
+                .iter()
+                .any(|row: &StressRow| row.clip == *clip)
+            {
+                continue;
+            }
+            let row = stress_row(
+                &adapted_actor,
+                clip,
+                frames,
+                tolerance,
+                &params.body,
+                &params.garments,
+            )?;
+            if *clip == params.adapted_clip {
+                adapted_clothing = Some(row.clone());
+            }
+            if *clip == anchor_clip {
+                anchor_clothing = Some(row.clone());
+            }
+            clothing_rows.push(row);
+        }
+        for clip in &params.stress_clips {
+            if clothing_rows
+                .iter()
+                .any(|row: &StressRow| row.clip == *clip)
+            {
+                continue;
+            }
+            clothing_rows.push(stress_row(
+                &adapted_actor,
+                clip,
+                frames,
+                tolerance,
+                &params.body,
+                &params.garments,
+            )?);
+        }
+    }
+
+    // Gates: the difference decides, so a body-owned defect shows in both rows.
+    let adapted_row = format!("{}/adapted", params.name);
+    let mut gates = Vec::new();
+    gates.push(spine_gate(
+        &default_motion.spine,
+        &adapted_motion.spine,
+        &adapted_row,
+    ));
+    gates.push(clearance_gate(
+        &default_motion.clearance,
+        &adapted_motion.clearance,
+        &adapted_row,
+    ));
+    gates.push(GateVerdict {
+        gate: "stance_median",
+        row: adapted_row.clone(),
+        pass: adapted_stance["pass"].as_bool() == Some(true),
+        detail: format!(
+            "adapted median {:.3} m/s (max {:.3}) against bar {STANCE_MEDIAN_BAR:.3}; default \
+             median {:.3} (max {:.3})",
+            adapted_stance["worst_median_speed"].as_f64().unwrap_or(0.0),
+            adapted_stance["max_horizontal_speed"]
+                .as_f64()
+                .unwrap_or(0.0),
+            default_stance["worst_median_speed"].as_f64().unwrap_or(0.0),
+            default_stance["max_horizontal_speed"]
+                .as_f64()
+                .unwrap_or(0.0),
+        ),
+    });
+    gates.push(GateVerdict {
+        gate: "rest_reconstruction",
+        row: params.name.clone(),
+        pass: reconstruction["pass"].as_bool() == Some(true),
+        detail: format!(
+            "max joint rest delta {:.2e} over extent {:.3} (bound 1e-5·extent), names identical: {}",
+            reconstruction["max_rest_delta"].as_f64().unwrap_or(0.0),
+            reconstruction["extent"].as_f64().unwrap_or(0.0),
+            reconstruction["names_identical"].as_bool().unwrap_or(false),
+        ),
+    });
+    {
+        let lost: Vec<&str> = default_coverage
+            .driven_roles
+            .iter()
+            .filter(|role| !adapted_coverage.driven_roles.contains(role))
+            .copied()
+            .collect();
+        gates.push(GateVerdict {
+            gate: "role_coverage",
+            row: adapted_row.clone(),
+            pass: lost.is_empty(),
+            detail: format!(
+                "adapted drives {} roles ({}) against default {} ({}); lost: {}",
+                adapted_coverage.driven_roles.len(),
+                adapted_coverage.driven_roles.join(", "),
+                default_coverage.driven_roles.len(),
+                default_coverage.driven_roles.join(", "),
+                match lost.is_empty() {
+                    true => "none".to_owned(),
+                    false => lost.join(", "),
+                },
+            ),
+        });
+    }
+    gates.push(stretch_gate(
+        default_stretch["max_ratio_edges_at_least_5mm"]
+            .as_f64()
+            .unwrap_or(0.0),
+        adapted_stretch["max_ratio_edges_at_least_5mm"]
+            .as_f64()
+            .unwrap_or(0.0),
+        &adapted_row,
+    ));
+    if let (Some(anchor), Some(adapted)) = (&anchor_clothing, &adapted_clothing) {
+        gates.push(clothing_gate(
+            tolerance * 1000.0,
+            anchor.worst_mm,
+            adapted.worst_mm,
+            &anchor.clip,
+            &adapted_row,
+        ));
+    }
+
+    let motion_value = |side: &str,
+                        clip: &str,
+                        rows: &MotionRows,
+                        stance: &Value,
+                        stretch: &Value,
+                        coverage: &CoverageMetrics| {
+        let name = &params.name;
+        json!({
+            "row": format!("{name}/{side}"),
+            "artifact": match side {
+                "default" => params.default.to_string_lossy(),
+                _ => params.adapted.to_string_lossy(),
+            },
+            "clip": clip,
+            "spine_frame_joint": rows.frame_joint,
+            "spine": rows.spine,
+            "clearance": rows.clearance,
+            "stance": stance,
+            "edge_stretch": stretch,
+            "coverage": coverage,
+        })
+    };
+    let value = json!({
+        "name": params.name,
+        "default": motion_value(
+            "default",
+            &params.default_clip,
+            &default_motion,
+            &default_stance,
+            &default_stretch,
+            &default_coverage,
+        ),
+        "adapted": motion_value(
+            "adapted",
+            &params.adapted_clip,
+            &adapted_motion,
+            &adapted_stance,
+            &adapted_stretch,
+            &adapted_coverage,
+        ),
+        "clothing": {
+            "artifact": params.adapted.to_string_lossy(),
+            "anchor_clip": anchor_clip,
+            "tolerance_mm": tolerance * 1000.0,
+            "rows": clothing_rows.iter().map(|row| json!({
+                "clip": row.clip,
+                "worst_visible_mm": row.worst_mm,
+                "worst_part": row.worst_part,
+                "frame": row.frame,
+                "time": row.time,
+                "within_tolerance": row.within_tolerance,
+            })).collect::<Vec<_>>(),
+        },
+        "rest_reconstruction": reconstruction,
+        "gates": gates,
+    });
+    Ok(ActorReport { value, gates })
+}
+
+fn actor_read(path: &Path, error: sculpto_mesh::actor::ActorError) -> CommandError {
+    CommandError::new(
+        ErrorKind::InvalidRequest,
+        "rig_regression_glb_invalid",
+        format!("{}: {error}", path.display()),
+    )
+}
+
+/// Run the regression over every declared actor.
+///
+/// # Errors
+/// Unreadable artifacts, a palette without the roles the rows need, a missing
+/// clip and a stress plan the harness refuses.
+pub fn run(input: &Value) -> Result<Value, CommandError> {
+    let params: RegressionParams = serde_json::from_value(input.clone()).map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidParams,
+            "rig_regression_input",
+            error.to_string(),
+        )
+    })?;
+    run_params(&params)
+}
+
+/// The typed entry, shared by the registry and the argv surface.
+///
+/// # Errors
+/// As [`run`].
+pub fn run_params(params: &RegressionParams) -> Result<Value, CommandError> {
+    if params.actors.is_empty() {
+        return Err(errors::invalid("actors", "at least one actor is required"));
+    }
+    if !params.tolerance.is_finite() || params.tolerance < 0.0 {
+        return Err(errors::invalid(
+            "tolerance",
+            format!("{} is not a finite non-negative depth", params.tolerance),
+        ));
+    }
+    let mut actors = Vec::with_capacity(params.actors.len());
+    let mut gates = Vec::new();
+    for actor in &params.actors {
+        let report = measure_actor(actor, params.frames, params.tolerance)?;
+        gates.extend(report.gates.iter().cloned());
+        actors.push(report.value);
+    }
+    let mut failed: Vec<String> = gates
+        .iter()
+        .filter(|gate| !gate.pass)
+        .map(|gate| format!("{}:{}", gate.row, gate.gate))
+        .collect();
+    failed.sort();
+    failed.dedup();
+    let report = json!({
+        "frames": params.frames,
+        "tolerance_mm": params.tolerance * 1000.0,
+        "bars": {
+            "spine_deviation_floor_mm": SPINE_DEVIATION_FLOOR_MM,
+            "spine_tilt_floor_deg": SPINE_TILT_FLOOR_DEG,
+            "clearance_floor_mm": CLEARANCE_FLOOR_MM,
+            "clearance_margin": CLEARANCE_MARGIN,
+            "stance_median_bar_mps": STANCE_MEDIAN_BAR,
+            "stretch_relative_bar": RELATIVE_STRETCH,
+            "clothing_relative_bar": CLOTHING_RELATIVE,
+        },
+        "actors": actors,
+        "gates": gates,
+        "failed_rows": failed,
+        "pass": failed.is_empty(),
+    });
+    if let Some(path) = &params.report {
+        write_report(path, &report)?;
+    }
+    Ok(report)
+}
+
+/// The one-line-per-row table the argv surface prints.
+pub fn table_lines(report: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for actor in report["actors"].as_array().unwrap_or(&Vec::new()) {
+        for side in ["default", "adapted"] {
+            let row = &actor[side];
+            let spine = &row["spine"];
+            let clearance = &row["clearance"];
+            let stance = &row["stance"];
+            let stretch = &row["edge_stretch"];
+            lines.push(format!(
+                "{} {} clip={:?} | spine lat {:.2}° sag {:.2}° dev {:.1} mm | clearance {:.2} mm \
+                 @t={:.3} ({}↔{}) | stance med {:.3} max {:.3} m/s | stretch ≥5 mm {:.2}x | roles {}",
+                actor["name"].as_str().unwrap_or("?"),
+                side,
+                row["clip"].as_str().unwrap_or("?"),
+                spine["peak_lateral_tilt_deg"].as_f64().unwrap_or(0.0),
+                spine["peak_sagittal_tilt_deg"].as_f64().unwrap_or(0.0),
+                spine["peak_lateral_deviation_mm"].as_f64().unwrap_or(0.0),
+                clearance["min_mm"].as_f64().unwrap_or(0.0),
+                clearance["time"].as_f64().unwrap_or(0.0),
+                clearance["joint"].as_str().unwrap_or("?"),
+                clearance["target"].as_str().unwrap_or("?"),
+                stance["worst_median_speed"].as_f64().unwrap_or(0.0),
+                stance["max_horizontal_speed"].as_f64().unwrap_or(0.0),
+                stretch["max_ratio_edges_at_least_5mm"]
+                    .as_f64()
+                    .unwrap_or(0.0),
+                row["coverage"]["driven_roles"]
+                    .as_array()
+                    .map(|roles| roles.len())
+                    .unwrap_or(0),
+            ));
+        }
+        let clothing = &actor["clothing"];
+        let rows: Vec<String> = clothing["rows"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|row| {
+                format!(
+                    "{:?} {:.3} mm on {:?} (f{}){}",
+                    row["clip"].as_str().unwrap_or("?"),
+                    row["worst_visible_mm"].as_f64().unwrap_or(0.0),
+                    row["worst_part"].as_str().unwrap_or("?"),
+                    row["frame"].as_u64().unwrap_or(0),
+                    match row["within_tolerance"].as_bool() {
+                        Some(true) => " pass",
+                        Some(false) => " FAIL",
+                        None => "",
+                    },
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "{} clothing on adapted artifact (tolerance {:.1} mm): {}",
+            actor["name"].as_str().unwrap_or("?"),
+            clothing["tolerance_mm"].as_f64().unwrap_or(0.0),
+            rows.join(" | "),
+        ));
+    }
+    for gate in report["gates"].as_array().unwrap_or(&Vec::new()) {
+        if gate["pass"].as_bool() == Some(false) {
+            lines.push(format!(
+                "FAIL {}:{} — {}",
+                gate["row"].as_str().unwrap_or("?"),
+                gate["gate"].as_str().unwrap_or("?"),
+                gate["detail"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    lines.push(match report["failed_rows"].as_array() {
+        Some(rows) if rows.is_empty() => "rig regression: PASS".to_owned(),
+        Some(rows) => format!(
+            "rig regression: FAIL ({}): {}",
+            rows.len(),
+            rows.iter()
+                .filter_map(|row| row.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        None => "rig regression: report has no verdict".to_owned(),
+    });
+    lines
+}
+
+fn write_report(path: &Path, report: &Value) -> Result<(), CommandError> {
+    let text = serde_json::to_string_pretty(report).map_err(|error| {
+        CommandError::new(
+            ErrorKind::InvalidRequest,
+            "rig_regression_report",
+            format!("cannot serialize the report: {error}"),
+        )
+    })?;
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| errors::io(parent, error))?;
+    }
+    std::fs::write(path, format!("{text}\n")).map_err(|error| errors::io(path, error))
+}

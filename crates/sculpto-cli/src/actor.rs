@@ -5,6 +5,7 @@ mod fit;
 mod gait;
 mod pack;
 mod pose;
+mod regression;
 mod rig;
 mod stress;
 mod torso;
@@ -59,6 +60,12 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|command| command == "torso-fit") {
         return torso::run(&args[1..]);
+    }
+    if args
+        .first()
+        .is_some_and(|command| command == "rig-regression")
+    {
+        return regression::run(&args[1..]);
     }
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,

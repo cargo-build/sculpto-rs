@@ -39,6 +39,9 @@ commands:
   actor pose [options]  probe named joints at explicit angles; posed GLB + report
   actor gait [options]  generate a symmetric walk cycle from parameters; GLB + report
   actor adapt [options] adapt a clip authored on ANY skeleton onto the actor's palette
+  actor rig-regression --config FILE [--report FILE]
+                        the four-way default-vs-adapted gate: spine, clearance, stance,
+                        rest, coverage, stretch, clothing; exit 1 names the regressed rows
   inspect <path>        parse a document or a `.osd`/`.bsd` morph data file
   bake [options]        resolve a preset, apply it to a body NIF, write an OBJ
   batch [options]       bake every matching set in a project to OBJ files
