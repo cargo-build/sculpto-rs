@@ -104,6 +104,48 @@ several cameras on consecutive ticks, `SCULPTO_VIEWER_DIR` receives
 `pose<tick>_<view>.png`. One view per tick, so views of a pose differ by
 ~1/60 s of animation.
 
+## Live reload (`--watch <dir> --stage <name>`)
+
+Agents write `<dir>/<stage>.glb` plus `<dir>/<stage>.json` every few minutes;
+the viewer polls the file and swaps it in place, so the operator watches the
+work happen instead of reading about it:
+
+```sh
+nix develop -c ./target/debug/cloth-viewer --interactive \
+  --watch /tmp/opencode/live --stage weights-0164
+```
+
+`--watch` without a value uses `/tmp/opencode/live` (`SCULPTO_VIEWER_WATCH` /
+`SCULPTO_VIEWER_STAGE` are the env forms). One well-known file per stage: the
+sidecar carries `{"status", "sha256", "note"}` and only its one-line `note` is
+displayed — the sha in the card is always this viewer's own hash of the bytes
+it actually staged, never the sidecar's claim. A missing sidecar says
+`no sidecar`; an unparsable one says `sidecar unparsable`.
+
+Every `0.5 s` the viewer `stat`s the file (polling keeps the crate
+dependency-free — no file-watcher, no feature flag). An mtime or size change
+is copied to a fresh `live-<n>.glb` inside the asset root (write + rename, so
+a reader never sees a half copy) and loaded as a new asset; when it loads, the
+new scene root spawns and the previous one despawns. The camera, orbit, zoom,
+light rig, lit/flat, bones level, turntable pose and pause/speed all live in
+resources that outlive the swap; the clip graph is rebuilt from the new file,
+so `0`/`1` keep their meaning and playback restarts at 0. A corrupt or
+half-written GLB fails its load: the previous scene stays, the card says
+`load failed — kept previous`, and the next change retries. The title and the
+card's live line carry the status first (`diagnostic · live <stage>
+<sha256[:8]> · <note>`), matching the niri focus rules at every swap.
+
+`--watch` cannot combine with `--report` (that path exits through a fixed
+headless route) or `--glb` (the watched file names the asset itself), and it
+shows exactly one figure (`--units` is forced to 1). Staged copies and their
+`.gitignore` live under the asset root (`BEVY_ASSET_ROOT`, else
+`CARGO_MANIFEST_DIR`, else the executable's directory + `assets/`) and are
+removed as generations advance. `SCULPTO_VIEWER_WATCH_EXIT_SECS=<n>` exits a
+headless `--watch` run after n seconds — the smoke knob behind the task's
+headless proof, never needed for a real window. An idle poll is one `stat`
+(measured 0.4 µs, twice a second); a change costs one read, one SHA-256 of
+the bytes (21 ms for 4 MiB) and one write, off the hot path.
+
 ## Review lighting
 
 Lighting is runtime PBR, not baked into the exported GLB (`viewer export` writes

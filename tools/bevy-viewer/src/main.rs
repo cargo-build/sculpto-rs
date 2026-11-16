@@ -282,6 +282,263 @@ fn has_actor_extra() -> bool {
         .is_some_and(|index| index >= 2)
 }
 
+// --- Live reload (`--watch <dir> --stage <name>`) -------------------------
+// Agents write `<dir>/<stage>.glb` plus `<dir>/<stage>.json` every few
+// minutes; the viewer polls the file and swaps it in place so the operator
+// watches the work happen. The filesystem half below is plain std so the
+// poll, staging and sidecar logic is testable headless; the Bevy half
+// (`watch_tick` / `watch_card`) swaps the scene root when the staged world
+// has loaded.
+
+/// How often to `stat` the watched file. Polling keeps the standalone viewer
+/// dependency-free — no file-watcher crate and no platform feature flag —
+/// and an unchanged poll is one metadata read, not a file read.
+const POLL_INTERVAL_SECS: f64 = 0.5;
+
+/// Watch directory used when `--watch` is given without a value.
+const DEFAULT_WATCH_DIR: &str = "/tmp/opencode/live";
+
+/// Minimal SHA-256 (FIPS 180-4) for the live card's content fingerprint —
+/// the hash of the bytes the viewer actually staged, not a sidecar claim.
+/// Hand-rolled so the standalone viewer stays dependency-free; pinned by the
+/// standard vectors in the tests and cross-checked against `sha256sum` in
+/// the task evidence.
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = bytes.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (index, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[index] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
+            state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
+        );
+        for (i, k) in K.iter().enumerate() {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(*k)
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, round) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(round);
+        }
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+/// The `<stage>.json` sidecar an agent writes next to the GLB: status label,
+/// sha and a one-line note. Only the note is displayed; the sha in the card
+/// is always this viewer's own hash of the staged bytes, never the sidecar's.
+enum SidecarNote {
+    Missing,
+    Unparsable,
+    Empty,
+    Note(String),
+}
+
+impl SidecarNote {
+    fn display(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Missing => "no sidecar".into(),
+            Self::Unparsable => "sidecar unparsable".into(),
+            Self::Empty => "no sidecar note".into(),
+            Self::Note(note) => std::borrow::Cow::Borrowed(note),
+        }
+    }
+}
+
+fn read_sidecar_note(path: &std::path::Path) -> SidecarNote {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return SidecarNote::Missing;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return SidecarNote::Unparsable;
+    };
+    match value.get("note").and_then(|note| note.as_str()) {
+        Some(note) if !note.trim().is_empty() => SidecarNote::Note(note.trim().to_string()),
+        _ => SidecarNote::Empty,
+    }
+}
+
+/// The watched stage file and its staged copies. The asset server caches by
+/// path, so a changed file is copied to a fresh `live-<n>.glb` in the asset
+/// root before loading — the same path would never reload.
+struct WatchFiles {
+    dir: std::path::PathBuf,
+    stage: String,
+    staging_dir: std::path::PathBuf,
+    seq: u64,
+    /// (mtime, len) of the watched file already staged or attempted, so a
+    /// failed load is not retried until the file changes again.
+    seen: Option<(std::time::SystemTime, u64)>,
+}
+
+/// One staged generation: the asset-relative copy name, the sha of the bytes
+/// actually copied, and the sidecar note read beside the watched file.
+struct StagedFile {
+    seq: u64,
+    asset_name: String,
+    sha8: String,
+    note: SidecarNote,
+}
+
+impl WatchFiles {
+    fn watched_path(&self) -> std::path::PathBuf {
+        self.dir.join(format!("{}.glb", self.stage))
+    }
+
+    fn sidecar_path(&self) -> std::path::PathBuf {
+        self.dir.join(format!("{}.json", self.stage))
+    }
+
+    fn staged_path(&self, seq: u64) -> std::path::PathBuf {
+        self.staging_dir.join(format!("live-{seq}.glb"))
+    }
+
+    /// One poll: `stat` the watched file; nothing to do unless mtime or size
+    /// changed. A change is read fully, copied to `live-<seq>.glb` (write to
+    /// a temp name, then rename — a reader never sees a half copy) and
+    /// hashed. A torn write usually fails later at GLB parse, where the
+    /// previous scene is kept; the next change retries.
+    fn poll(&mut self) -> Option<StagedFile> {
+        let path = self.watched_path();
+        let metadata = std::fs::metadata(&path).ok()?;
+        let mtime = metadata.modified().ok()?;
+        let key = (mtime, metadata.len());
+        if self.seen.as_ref() == Some(&key) {
+            return None;
+        }
+        self.seen = Some(key);
+        let bytes = std::fs::read(&path).ok()?;
+        let seq = self.seq;
+        let staged = self.staged_path(seq);
+        let tmp = self.staging_dir.join(format!(".live-{seq}.tmp"));
+        std::fs::write(&tmp, &bytes).ok()?;
+        std::fs::rename(&tmp, &staged).ok()?;
+        self.seq += 1;
+        Some(StagedFile {
+            seq,
+            asset_name: format!("live-{seq}.glb"),
+            sha8: sha256_hex(&bytes)[..8].to_string(),
+            note: read_sidecar_note(&self.sidecar_path()),
+        })
+    }
+
+    /// Drop a staged copy whose generation is no longer needed: a failed
+    /// load, or the replaced generation after a successful swap.
+    fn remove_staged(&self, seq: u64) {
+        let _ = std::fs::remove_file(self.staged_path(seq));
+    }
+}
+
+/// A load in flight.
+struct PendingScene {
+    seq: u64,
+    asset_name: String,
+    world: Handle<bevy::world_serialization::WorldAsset>,
+    sha8: String,
+    note: SidecarNote,
+}
+
+/// Live reload state; present only when `--watch` is given, so every system
+/// is a no-op without it.
+#[derive(Resource)]
+struct WatchState {
+    files: WatchFiles,
+    pending: Option<PendingScene>,
+    /// Scene root on screen; despawned on the next successful swap.
+    current_root: Option<Entity>,
+    /// Staged sequence number of the generation on screen; its copy is
+    /// removed when the next generation swaps in.
+    current_seq: Option<u64>,
+    /// Spawn transform for a reloaded figure: setup's home and source scale,
+    /// so a swapped-in body lands exactly where the first one stood.
+    home: Vec3,
+    scale: f32,
+    /// Seconds since startup — the poll clock and the smoke-run exit timer.
+    elapsed: f64,
+    next_poll: f64,
+    /// `SCULPTO_VIEWER_WATCH_EXIT_SECS`: headless smoke runs only.
+    exit_after: Option<f64>,
+    /// The generation on screen: its sha and sidecar note.
+    sha8: String,
+    note: String,
+    /// The last attempt failed to load — keep the old scene and say so.
+    failed: bool,
+    /// A stage file existed at startup, so setup spawned it directly.
+    ready: bool,
+    /// Cached card/title line, so Text is written only on change.
+    last_line: String,
+}
+
+impl WatchState {
+    /// The truth line: status first (the niri focus rules match
+    /// `^diagnostic · ` titles), then stage, the sha of what is on screen
+    /// and the sidecar note.
+    fn line(&self, status: &str) -> String {
+        if self.failed {
+            return format!(
+                "{} · live {} {} · load failed — kept previous",
+                status, self.files.stage, self.sha8
+            );
+        }
+        live_line(status, &self.files.stage, &self.sha8, &self.note)
+    }
+}
+
+fn live_line(status: &str, stage: &str, sha8: &str, note: &str) -> String {
+    let sha8 = if sha8.is_empty() { "—" } else { sha8 };
+    format!("{status} · live {stage} {sha8} · {note}")
+}
+
+/// Marks the live-status line in the controls card.
+#[derive(Component)]
+struct WatchLine;
+
 struct CliOptions {
     report: bool,
     headless: bool,
@@ -291,6 +548,10 @@ struct CliOptions {
     units: usize,
     bench: bool,
     uncapped: bool,
+    /// `--watch <dir>`: live-reload the actor from `<dir>/<stage>.glb`.
+    watch: Option<std::path::PathBuf>,
+    /// `--stage <name>`: the stage file name to watch (required with --watch).
+    stage: Option<String>,
 }
 
 fn parse_args() -> CliOptions {
@@ -306,6 +567,10 @@ fn parse_args() -> CliOptions {
         units: env_usize("SCULPTO_VIEWER_UNITS", 1),
         bench: std::env::var("SCULPTO_VIEWER_BENCH").is_ok(),
         uncapped: std::env::var("SCULPTO_VIEWER_UNCAPPED").is_ok(),
+        watch: std::env::var("SCULPTO_VIEWER_WATCH")
+            .ok()
+            .map(std::path::PathBuf::from),
+        stage: std::env::var("SCULPTO_VIEWER_STAGE").ok(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -315,6 +580,20 @@ fn parse_args() -> CliOptions {
             "--interactive" => options.interactive = true,
             "--bench" => options.bench = true,
             "--uncapped" => options.uncapped = true,
+            // A bare `--watch` uses the default staging directory; a following
+            // flag is not swallowed as a directory value.
+            "--watch" => {
+                let value = args.next().filter(|value| !value.starts_with('-'));
+                options.watch = Some(value.map_or_else(
+                    || std::path::PathBuf::from(DEFAULT_WATCH_DIR),
+                    std::path::PathBuf::from,
+                ));
+            }
+            "--stage" => {
+                if let Some(val) = args.next() {
+                    options.stage = Some(val);
+                }
+            }
             "--glb" => {
                 if let Some(val) = args.next() {
                     options.glb_path = Some(val);
@@ -356,8 +635,8 @@ fn glb_animation_count(path: &std::path::Path) -> Option<usize> {
 }
 
 fn main() {
-    let options = parse_args();
-    let (asset_dir, asset_file) = if let Some(ref glb) = options.glb_path {
+    let mut options = parse_args();
+    let (asset_dir, mut asset_file) = if let Some(ref glb) = options.glb_path {
         let p = std::path::Path::new(glb);
         let abs = if p.is_absolute() {
             p.to_path_buf()
@@ -388,6 +667,120 @@ fn main() {
     } else {
         std::time::Duration::from_secs_f64(1.0 / 60.0)
     };
+
+    // Live reload: `--watch <dir> --stage <name>` shows `<dir>/<stage>.glb`
+    // and re-loads it whenever the file changes, with the stage, sha and
+    // sidecar note in the title and card. The watched file names the asset
+    // itself, so --glb/--asset and --report are refused together with it.
+    if options.report && options.watch.is_some() {
+        eprintln!("viewer: --watch is a live window mode and cannot run with --report");
+        std::process::exit(2);
+    }
+    let watch_state = if let Some(ref dir) = options.watch {
+        if options.glb_path.is_some() {
+            eprintln!(
+                "viewer: --watch names the asset itself; do not combine it with --glb/--asset"
+            );
+            std::process::exit(2);
+        }
+        let stage = match options.stage.clone() {
+            Some(stage) => stage,
+            None => {
+                eprintln!("viewer: --watch needs --stage <name> (agents write <dir>/<stage>.glb)");
+                std::process::exit(2);
+            }
+        };
+        if stage.is_empty() || stage.contains('/') || stage.contains('\\') || stage.contains("..") {
+            eprintln!("viewer: --stage must be a plain file name, got {stage:?}");
+            std::process::exit(2);
+        }
+        if std::fs::create_dir_all(dir).is_err() {
+            eprintln!(
+                "viewer: watch directory {} cannot be created",
+                dir.display()
+            );
+            std::process::exit(2);
+        }
+        // Bevy's file asset source resolves a relative `file_path` against
+        // BEVY_ASSET_ROOT, then CARGO_MANIFEST_DIR, then the executable's
+        // directory (bevy_asset's `get_base_path`) — stage into that same
+        // root, or `asset_server.load("live-N.glb")` looks somewhere else.
+        let staging_root = if let Ok(root) = std::env::var("BEVY_ASSET_ROOT") {
+            std::path::PathBuf::from(root)
+        } else if let Ok(root) = std::env::var("CARGO_MANIFEST_DIR") {
+            std::path::PathBuf::from(root)
+        } else {
+            match std::env::current_exe() {
+                Ok(exe) => match exe.parent() {
+                    Some(dir) => dir.to_path_buf(),
+                    None => {
+                        eprintln!("viewer: cannot resolve the executable's directory");
+                        std::process::exit(2);
+                    }
+                },
+                Err(error) => {
+                    eprintln!("viewer: cannot resolve the asset root: {error}");
+                    std::process::exit(2);
+                }
+            }
+        };
+        let staging_dir = staging_root.join(&asset_dir);
+        if std::fs::create_dir_all(&staging_dir).is_err() {
+            eprintln!(
+                "viewer: staging directory {} cannot be created",
+                staging_dir.display()
+            );
+            std::process::exit(2);
+        }
+        // The staged copies are process-local artifacts, never sources.
+        let _ = std::fs::write(staging_dir.join(".gitignore"), "*\n");
+        let mut state = WatchState {
+            files: WatchFiles {
+                dir: dir.clone(),
+                stage: stage.clone(),
+                staging_dir,
+                seq: 0,
+                seen: None,
+            },
+            pending: None,
+            current_root: None,
+            current_seq: None,
+            home: Vec3::ZERO,
+            scale: env_f32("SCULPTO_VIEWER_SCALE", 1.0),
+            elapsed: 0.0,
+            next_poll: POLL_INTERVAL_SECS,
+            exit_after: std::env::var("SCULPTO_VIEWER_WATCH_EXIT_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            sha8: String::new(),
+            note: String::new(),
+            failed: false,
+            ready: false,
+            last_line: String::new(),
+        };
+        if let Some(staged) = state.files.poll() {
+            eprintln!(
+                "viewer: live start {} sha {} sidecar {}",
+                staged.asset_name,
+                staged.sha8,
+                staged.note.display()
+            );
+            asset_file = staged.asset_name;
+            state.sha8 = staged.sha8;
+            state.note = staged.note.display().to_string();
+            state.ready = true;
+            state.current_seq = Some(0);
+        } else {
+            state.note = format!("waiting for {stage}.glb");
+        }
+        Some(state)
+    } else {
+        None
+    };
+    if options.watch.is_some() && options.units != 1 {
+        eprintln!("viewer: --watch shows one stage file; units forced to 1");
+        options.units = 1;
+    }
 
     // A clip index the file does not carry is a caller error, not a broken clip.
     // Say it in the status line and fall back to the last clip that exists.
@@ -425,6 +818,12 @@ fn main() {
     };
 
     let mut app = App::new();
+    // The live line carries the truth (status, stage, sha, sidecar note) and
+    // stays status-first, so the niri focus rules keep matching the title.
+    let headline = match watch_state.as_ref() {
+        Some(watch) => watch.line(&config.status),
+        None => config.status.clone(),
+    };
     if options.interactive {
         app.add_plugins(
             DefaultPlugins
@@ -432,7 +831,7 @@ fn main() {
                     primary_window: Some(Window {
                         title: format!(
                             "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, Space pause, Ctrl+,/. speed, H help",
-                            config.status
+                            headline
                         ),
                         resolution: (1280, 900).into(),
                         ..default()
@@ -457,6 +856,9 @@ fn main() {
             );
     }
 
+    if let Some(state) = watch_state {
+        app.insert_resource(state);
+    }
     app.insert_resource(FlatFlipped::default())
         .insert_resource(ClipSelection(
             std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
@@ -555,6 +957,8 @@ fn main() {
                 toggle_help,
             ),
         )
+        // Separate call: the tuple above is already at Bevy's arity limit.
+        .add_systems(Update, (watch_tick, watch_card))
         .add_systems(Update, (control_playback, apply_playback))
         .add_systems(Update, tag_in_place_roots)
         // After the animation pass, before transform propagation, so the held
@@ -699,6 +1103,7 @@ fn apply_playback(playback: Res<Playback>, mut players: Query<&mut AnimationPlay
 
 /// Alpha the actor materials while the overlay is on and restore them after.
 /// glTF materials stream in after startup, so the "on" branch runs every frame.
+#[allow(clippy::type_complexity)]
 fn apply_skeleton_mode(
     skel: Res<SkelMode>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -732,6 +1137,7 @@ fn apply_skeleton_mode(
 
 /// Build the overlay once, then move it to the live joint positions every frame:
 /// a sphere per joint and a cylinder from each joint to its parent bone.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn draw_skeleton(
     mut commands: Commands,
     skel: Res<SkelMode>,
@@ -893,6 +1299,7 @@ fn draw_skeleton(
 /// default rig shows only the key, and `3` shows the fill/rim pair as well.
 /// The ground is interactive-only and hides in flat so the silhouette stays
 /// against the black backdrop.
+#[allow(clippy::type_complexity, clippy::if_same_then_else)]
 fn apply_review_visibility(
     flat: Res<FlatMode>,
     rig: Res<RigMode>,
@@ -966,6 +1373,48 @@ struct PlayerGraph {
     cloth: Option<AnimationNodeIndex>,
 }
 
+/// The actor idle/walk clips (plus the optional extra and cloth clips) as one
+/// graph. Shared by startup and every live swap, so a reloaded file plays its
+/// own clips under the same `0`/`1` keys the operator already set.
+fn build_player_graph(
+    asset_server: &AssetServer,
+    graphs: &mut Assets<AnimationGraph>,
+    asset_file: &str,
+) -> PlayerGraph {
+    let actor_idle = asset_server.load(format!("{asset_file}#Animation0"));
+    let actor_walk = asset_server.load(format!("{asset_file}#Animation1"));
+    let (mut graph, actor_idle_node) = AnimationGraph::from_clip(actor_idle);
+    let actor_walk_node = graph.add_clip(actor_walk, 1.0, graph.root);
+    // A separate cloth clip exists only when the file carries one and the
+    // caller names it. Defaulting it to `Animation0` played the actor's own
+    // idle clip a second time at full weight, blending two clips on the same
+    // skeleton — the figure trembled and the walk was diluted by half.
+    let mut nodes = vec![actor_idle_node, actor_walk_node];
+    // `SCULPTO_VIEWER_ACTOR_ANIMATION=N` with N ≥ 2 adds the named actor clip
+    // (for example an adapted Havok spike) as node 2. `select_clip` reaches it
+    // with the `2` key; cloth keeps its own slot behind it.
+    if has_actor_extra() {
+        let extra_index = std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2);
+        let extra_clip = asset_server.load(format!("{asset_file}#Animation{extra_index}"));
+        nodes.push(graph.add_clip(extra_clip, 1.0, graph.root));
+    }
+    let cloth = std::env::var("SCULPTO_VIEWER_CLOTH_ANIMATION")
+        .ok()
+        .map(|index| {
+            let cloth_clip = asset_server.load(format!("{asset_file}#Animation{index}"));
+            graph.add_clip(cloth_clip, 1.0, graph.root)
+        });
+    PlayerGraph {
+        handle: graphs.add(graph),
+        nodes,
+        cloth,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -975,7 +1424,11 @@ fn setup(
     mut graphs: ResMut<Assets<AnimationGraph>>,
     units: Res<Units>,
     config: Res<ViewerConfig>,
+    mut watch: Option<ResMut<WatchState>>,
 ) {
+    // A live watch with no file yet spawns nothing until the first poll
+    // stages one; everything else behaves exactly as before.
+    let watch_ready = watch.as_ref().is_none_or(|watch| watch.ready);
     let mut target_handle = None;
     if !config.interactive {
         let mut image = Image::new(
@@ -1074,61 +1527,41 @@ fn setup(
         ));
     }
 
-    let gltf_handle: Handle<bevy::gltf::Gltf> = asset_server.load(config.asset_file.clone());
-    commands.insert_resource(GltfRoot(gltf_handle));
-
-    if !config.report_mode {
-        let actor_idle = asset_server.load(format!("{}#Animation0", config.asset_file));
-        let actor_walk = asset_server.load(format!("{}#Animation1", config.asset_file));
-        let (mut graph, actor_idle_node) = AnimationGraph::from_clip(actor_idle);
-        let actor_walk_node = graph.add_clip(actor_walk, 1.0, graph.root);
-        // A separate cloth clip exists only when the file carries one and the
-        // caller names it. Defaulting it to `Animation0` played the actor's own
-        // idle clip a second time at full weight, blending two clips on the same
-        // skeleton — the figure trembled and the walk was diluted by half.
-        let mut nodes = vec![actor_idle_node, actor_walk_node];
-        // `SCULPTO_VIEWER_ACTOR_ANIMATION=N` with N ≥ 2 adds the named actor clip
-        // (for example an adapted Havok spike) as node 2. `select_clip` reaches it
-        // with the `2` key; cloth keeps its own slot behind it.
-        if has_actor_extra() {
-            let extra_index = std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(2);
-            let extra_clip =
-                asset_server.load(format!("{}#Animation{extra_index}", config.asset_file));
-            nodes.push(graph.add_clip(extra_clip, 1.0, graph.root));
-        }
-        if let Ok(index) = std::env::var("SCULPTO_VIEWER_CLOTH_ANIMATION") {
-            let cloth_clip = asset_server.load(format!("{}#Animation{index}", config.asset_file));
-            let cloth_node = graph.add_clip(cloth_clip, 1.0, graph.root);
-            commands.insert_resource(PlayerGraph {
-                handle: graphs.add(graph),
-                nodes,
-                cloth: Some(cloth_node),
-            });
-        } else {
-            commands.insert_resource(PlayerGraph {
-                handle: graphs.add(graph),
-                nodes,
-                cloth: None,
-            });
-        }
+    // GltfRoot feeds the report path only, and watch mode refuses --report;
+    // skipping it here also lets generation 0 unload after its last swap.
+    if watch.is_none() {
+        let gltf_handle: Handle<bevy::gltf::Gltf> = asset_server.load(config.asset_file.clone());
+        commands.insert_resource(GltfRoot(gltf_handle));
     }
 
-    let scene = asset_server.load(format!("{}#Scene0", config.asset_file));
-    for index in 0..count {
-        let column = index % columns;
-        let row = index / columns;
-        let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
-        let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
-        let home = Vec3::new(x, 0.0, z);
-        commands.spawn((
-            bevy::world_serialization::WorldAssetRoot(scene.clone()),
-            Transform::from_translation(home).with_scale(Vec3::splat(scene_scale)),
-            ModelHome(home),
-            ReviewModel,
+    if !config.report_mode && watch_ready {
+        commands.insert_resource(build_player_graph(
+            &asset_server,
+            &mut graphs,
+            &config.asset_file,
         ));
+    }
+
+    if watch_ready {
+        let scene = asset_server.load(format!("{}#Scene0", config.asset_file));
+        for index in 0..count {
+            let column = index % columns;
+            let row = index / columns;
+            let x = (column as f32 - (columns as f32 - 1.0) * 0.5) * spacing;
+            let z = (row as f32 - (rows as f32 - 1.0) * 0.5) * spacing;
+            let home = Vec3::new(x, 0.0, z);
+            let root = commands
+                .spawn((
+                    bevy::world_serialization::WorldAssetRoot(scene.clone()),
+                    Transform::from_translation(home).with_scale(Vec3::splat(scene_scale)),
+                    ModelHome(home),
+                    ReviewModel,
+                ))
+                .id();
+            if let Some(watch) = watch.as_mut() {
+                watch.current_root = Some(root);
+            }
+        }
     }
     if config.interactive {
         commands
@@ -1183,6 +1616,19 @@ fn setup(
                             ..default()
                         },
                         TextColor(Color::WHITE),
+                    ));
+                }
+                if let Some(watch) = watch.as_mut() {
+                    let line = watch.line(&config.status);
+                    watch.last_line = line.clone();
+                    card.spawn((
+                        Text::new(line),
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(13.0),
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                        WatchLine,
                     ));
                 }
             });
@@ -1267,6 +1713,7 @@ impl OrbitCamera {
 /// a 100-unit Fox both open at a readable distance. The model itself is never
 /// rescaled; `SCULPTO_VIEWER_SCALE` still controls source-unit conversion.
 /// Interactive only, so headless captures keep their fixed review camera.
+#[allow(clippy::type_complexity)]
 fn fit_camera_to_scene(
     config: Res<ViewerConfig>,
     mut fitted: Local<bool>,
@@ -1612,13 +2059,15 @@ fn capture_once(
     config: Res<ViewerConfig>,
     target: Option<Res<Target>>,
     bench: Res<Bench>,
+    watch: Option<Res<WatchState>>,
     mut frames: Local<u32>,
     mut captured: Local<bool>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if bench.0 || config.report_mode || config.debug_scene || config.interactive {
+    if bench.0 || config.report_mode || config.debug_scene || config.interactive || watch.is_some()
+    {
         return;
     }
     let Some(target) = target else {
@@ -1829,6 +2278,131 @@ fn benchmark(
         rss
     );
     exit.write(AppExit::Success);
+}
+
+/// The live reload state machine. Poll on a fixed cadence; stage a changed
+/// file; when the staged world finishes loading, swap it in — spawn the new
+/// root, despawn the old one, rebuild the clip graph from the new file — so
+/// the camera, orbit, zoom, light rig, bones level and playback state all
+/// survive untouched. A failed load (a half-written GLB) keeps the previous
+/// scene alive and reports `load failed` until the next change.
+fn watch_tick(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut watch: Option<ResMut<WatchState>>,
+    asset_server: Res<AssetServer>,
+    worlds: Res<Assets<bevy::world_serialization::WorldAsset>>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(watch) = watch.as_mut() else {
+        return;
+    };
+    watch.elapsed += time.delta_secs_f64();
+    if let Some(limit) = watch.exit_after {
+        if watch.elapsed >= limit {
+            info!("viewer: live smoke limit {limit}s reached, exiting");
+            exit.write(AppExit::Success);
+            return;
+        }
+    }
+    if watch.elapsed < watch.next_poll {
+        return;
+    }
+    watch.next_poll = watch.elapsed + POLL_INTERVAL_SECS;
+
+    if let Some(staged) = watch.files.poll() {
+        let world = asset_server.load(format!("{}#Scene0", staged.asset_name));
+        info!(
+            "viewer: live staged {} sha {} sidecar {}",
+            staged.asset_name,
+            staged.sha8,
+            staged.note.display()
+        );
+        watch.pending = Some(PendingScene {
+            seq: staged.seq,
+            asset_name: staged.asset_name,
+            world,
+            sha8: staged.sha8,
+            note: staged.note,
+        });
+    }
+
+    let ready = watch
+        .pending
+        .as_ref()
+        .is_some_and(|pending| worlds.get(&pending.world).is_some());
+    let failed = watch
+        .pending
+        .as_ref()
+        .is_some_and(|pending| asset_server.load_state(&pending.world).is_failed());
+    if ready {
+        let pending = watch.pending.take().expect("checked ready above");
+        let home = watch.home;
+        let scale = watch.scale;
+        let new_root = commands
+            .spawn((
+                bevy::world_serialization::WorldAssetRoot(pending.world.clone()),
+                Transform::from_translation(home).with_scale(Vec3::splat(scale)),
+                ModelHome(home),
+                ReviewModel,
+            ))
+            .id();
+        if let Some(old) = watch.current_root {
+            commands.entity(old).despawn();
+        }
+        watch.current_root = Some(new_root);
+        commands.insert_resource(build_player_graph(
+            &asset_server,
+            &mut graphs,
+            &pending.asset_name,
+        ));
+        watch.sha8 = pending.sha8.clone();
+        watch.note = pending.note.display().to_string();
+        watch.failed = false;
+        // Free the replaced generation: its staged copy is gone from disk and
+        // its asset unloads once nothing holds a strong handle any more.
+        if let Some(old_seq) = watch.current_seq.replace(pending.seq) {
+            watch.files.remove_staged(old_seq);
+        }
+        info!(
+            "viewer: live swap to {} sha {} — camera, orbit, lights, bones and playback state kept",
+            pending.asset_name, pending.sha8
+        );
+    } else if failed {
+        let pending = watch.pending.take().expect("checked failed above");
+        watch.files.remove_staged(pending.seq);
+        watch.failed = true;
+        eprintln!(
+            "viewer: live load failed for {} — keeping the previous scene",
+            pending.asset_name
+        );
+    }
+}
+
+/// Reflect the live line in the controls card and the window title. Status
+/// first, so the niri focus rules keep matching `^diagnostic · ` titles even
+/// while the sha and note change under it.
+fn watch_card(
+    config: Res<ViewerConfig>,
+    mut watch: Option<ResMut<WatchState>>,
+    mut lines: Query<&mut Text, With<WatchLine>>,
+    mut windows: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
+) {
+    let Some(watch) = watch.as_mut() else {
+        return;
+    };
+    let line = watch.line(&config.status);
+    if watch.last_line == line {
+        return;
+    }
+    for mut text in &mut lines {
+        text.0 = line.clone();
+    }
+    if let Ok(mut window) = windows.single_mut() {
+        window.title = format!("{line} — Sculpto live review");
+    }
+    watch.last_line = line;
 }
 
 #[cfg(test)]
@@ -2076,5 +2650,165 @@ mod tests {
         assert!(orbit.min_distance > 0.0);
         orbit.reset();
         assert_eq!(orbit.distance, 400.0, "R restores the fitted frame");
+    }
+
+    fn temp_watch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sculpto-viewer-watch-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp watch dir");
+        dir
+    }
+
+    fn watch_files(dir: &std::path::Path) -> WatchFiles {
+        WatchFiles {
+            dir: dir.to_path_buf(),
+            stage: "actor".to_string(),
+            staging_dir: dir.join("staging"),
+            seq: 0,
+            seen: None,
+        }
+    }
+
+    #[test]
+    fn sha256_matches_the_standard_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn poll_stages_a_change_once_per_write() {
+        let dir = temp_watch_dir("poll");
+        let mut files = watch_files(&dir);
+        std::fs::create_dir_all(&files.staging_dir).expect("staging dir");
+
+        assert!(
+            files.poll().is_none(),
+            "nothing to stage before the file exists"
+        );
+
+        std::fs::write(dir.join("actor.glb"), b"first").expect("write");
+        let staged = files.poll().expect("first write stages");
+        assert_eq!(staged.asset_name, "live-0.glb");
+        assert_eq!(staged.seq, 0);
+        assert_eq!(
+            std::fs::read(files.staged_path(0)).expect("staged copy"),
+            b"first"
+        );
+        assert!(files.poll().is_none(), "an unchanged file must not restage");
+
+        std::fs::write(dir.join("actor.glb"), b"second-version").expect("write");
+        let staged = files.poll().expect("a changed file stages again");
+        assert_eq!(staged.asset_name, "live-1.glb");
+        assert_eq!(
+            std::fs::read(files.staged_path(1)).expect("staged copy"),
+            b"second-version"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_notes_are_truthful() {
+        let dir = temp_watch_dir("sidecar");
+        let mut files = watch_files(&dir);
+        std::fs::create_dir_all(&files.staging_dir).expect("staging dir");
+        std::fs::write(dir.join("actor.glb"), b"body").expect("write");
+
+        let staged = files.poll().expect("staged");
+        assert!(
+            matches!(staged.note, SidecarNote::Missing),
+            "no sidecar file yet"
+        );
+
+        std::fs::write(
+            dir.join("actor.json"),
+            r#"{"status":"InProgress","sha256":"deadbeef","note":"authored M1 on eb318020"}"#,
+        )
+        .expect("sidecar");
+        std::fs::write(dir.join("actor.glb"), b"body-v2").expect("write");
+        let staged = files.poll().expect("staged");
+        assert_eq!(staged.note.display(), "authored M1 on eb318020");
+
+        std::fs::write(dir.join("actor.json"), "not json at all {").expect("sidecar");
+        std::fs::write(dir.join("actor.glb"), b"body-v3").expect("write");
+        let staged = files.poll().expect("staged");
+        assert_eq!(staged.note.display(), "sidecar unparsable");
+
+        std::fs::write(dir.join("actor.json"), r#"{"status":"InProgress"}"#).expect("sidecar");
+        std::fs::write(dir.join("actor.glb"), b"body-v4").expect("write");
+        let staged = files.poll().expect("staged");
+        assert_eq!(staged.note.display(), "no sidecar note");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_line_keeps_status_first_for_niri() {
+        let line = live_line(
+            "diagnostic",
+            "weights-0164",
+            "4c585296",
+            "authored M1 on eb318020",
+        );
+        assert!(
+            line.starts_with("diagnostic · "),
+            "niri focus rules match this prefix: {line}"
+        );
+        assert!(line.contains("weights-0164"));
+        assert!(line.contains("4c585296"));
+        assert!(line.contains("authored M1 on eb318020"));
+        assert_eq!(
+            live_line("diagnostic", "s", "", "note"),
+            "diagnostic · live s — · note",
+            "no sha yet shows an em dash, never an invented value"
+        );
+    }
+
+    #[test]
+    fn poll_cost_is_invisible() {
+        // The idle path is one `stat` per poll; the change path adds one read,
+        // one hash and one write. Measure both so the report quotes numbers.
+        let dir = temp_watch_dir("cost");
+        let path = dir.join("actor.glb");
+        std::fs::write(&path, vec![0u8; 4 * 1024 * 1024]).expect("4 MiB body");
+
+        let start = std::time::Instant::now();
+        for _ in 0..2000 {
+            let metadata = std::fs::metadata(&path).expect("stat");
+            let _ = (metadata.modified().expect("mtime"), metadata.len());
+        }
+        let per_stat_us = start.elapsed().as_secs_f64() * 1e6 / 2000.0;
+
+        let bytes = std::fs::read(&path).expect("read");
+        let start = std::time::Instant::now();
+        let hash = sha256_hex(&bytes);
+        let hash_ms = start.elapsed().as_secs_f64() * 1e3;
+
+        println!(
+            "poll cost: stat {per_stat_us:.1} µs, sha256 of 4 MiB {hash_ms:.1} ms ({head})",
+            head = &hash[..8]
+        );
+        assert!(
+            per_stat_us < 100.0,
+            "two stat polls per second must stay far below 0.5 ms of work"
+        );
+        assert!(
+            hash_ms < 500.0,
+            "the one-off change hash must not approach a frame budget"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
