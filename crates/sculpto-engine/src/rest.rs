@@ -716,6 +716,8 @@ struct PoseCandidate {
     targets: Vec<DVec3>,
     /// Per side: hand axis, palm-plane normal, thumb direction, carried likewise.
     hand_targets: Vec<(DVec3, DVec3, DVec3)>,
+    /// Bones the clip never keys, whose pose therefore mixes our rest in.
+    unkeyed: Vec<String>,
 }
 
 impl PoseCandidate {
@@ -953,6 +955,7 @@ fn pose_plan(
         "note": "the chosen frame turns only the arm chain; the torso and legs keep this body's \
                  authored rest by construction, and the clip's own leg figures are advisory \
                  because its translation channels do not share our units",
+        "unkeyed_bones": chosen.unkeyed,
         "compromise": match chosen.admits() {
             true => Value::Null,
             false => json!(chosen.refusal()),
@@ -975,8 +978,6 @@ struct SkyrimRest {
     rest: Vec<(DVec3, DQuat)>,
     names: Vec<String>,
     driven: BTreeSet<String>,
-    /// The decode's Havok-to-metre factor, which the report also carries.
-    scale: f64,
 }
 
 impl SkyrimRest {
@@ -986,6 +987,17 @@ impl SkyrimRest {
         let report: Value = serde_json::from_str(&text).map_err(|error| {
             errors::invalid("tpose_pose", format!("{}: {error}", path.display()))
         })?;
+        let units = report["skeleton_rest_units"].as_str().unwrap_or("havok");
+        if units != "metres" {
+            return Err(refused(
+                "tpose_pose",
+                format!(
+                    "{} declares skeleton_rest in {units:?}; a compensated composition needs \
+                     metres, so regenerate it with the current actor havok",
+                    path.display()
+                ),
+            ));
+        }
         let rows = report["skeleton_rest"].as_array().ok_or_else(|| {
             refused(
                 "tpose_pose",
@@ -1036,14 +1048,12 @@ impl SkyrimRest {
                     .collect()
             })
             .unwrap_or_default();
-        let scale = report["scale"].as_f64().unwrap_or(1.0);
         Ok(Self {
             name,
             parents,
             rest,
             names,
             driven,
-            scale,
         })
     }
 
@@ -1125,15 +1135,26 @@ fn measure_frame(
     let (pivots, _) = skeleton.compose(&locals);
     let frame_change = frame_change_rotation();
     let carried = |index: usize| -> DVec3 {
-        // Pivots are in the clip's units in its own frame; the carry brings them
-        // into ours, scale included, so a direction is comparable to our bones.
-        frame_change * pivots[index] * skeleton.scale
+        // Pivots are metres in the clip's own frame — the report declares that
+        // unit and the clip's channels already carry it — so only the carry into
+        // our axes remains.
+        frame_change * pivots[index]
     };
 
     // Target directions: the game's own bone, carried into our frame.
     let mut targets = Vec::with_capacity(resolved.len());
     let mut arms = 0.0_f64;
+    // A bone the clip does *not* key keeps our rest inside the pose, so the aim
+    // would silently mix two poses. Count them and let the caller report it.
+    let mut unkeyed = Vec::new();
     for row in resolved {
+        if !clip_pose
+            .iter()
+            .enumerate()
+            .any(|(node, _)| pose.node_name(node) == Some(row.joint_name.as_str()))
+        {
+            unkeyed.push(row.joint_name.clone());
+        }
         let Some(joint) = skeleton.bone(&row.joint_name) else {
             return Ok(None);
         };
@@ -1212,6 +1233,7 @@ fn measure_frame(
         legs,
         targets,
         hand_targets,
+        unkeyed,
     }))
 }
 

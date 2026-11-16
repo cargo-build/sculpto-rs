@@ -156,13 +156,19 @@ pub struct RigSkeleton {
 /// result is the `0159` class of error — a 90° gap that looks like a broken clip
 /// and is really two different bases. Name, parent, translation and rotation are
 /// enough to compose both sides.
-fn skeleton_rest(skeleton: &RigSkeleton) -> Vec<Value> {
+fn skeleton_rest(skeleton: &RigSkeleton, scale: f64) -> Vec<Value> {
     skeleton
         .bones
         .iter()
         .enumerate()
         .map(|(bone, name)| {
             let (translation, rotation) = skeleton.rest[bone];
+            // Metres, not Havok units: a consumer that composes this table with a
+            // clip whose translations were already written in metres would
+            // otherwise build pivots out of two different units — a rest of 22.8
+            // next to a clip translation of 0.319 — and every direction measured
+            // through a mixed chain comes out wrong.
+            let translation = translation.map(|value| value * scale);
             json!({
                 "bone": bone,
                 "name": name,
@@ -210,7 +216,8 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
                 "bones": skeleton.bones.len(),
                 "bone_names": skeleton.bones,
             },
-            "skeleton_rest": skeleton_rest(&skeleton),
+            "skeleton_rest": skeleton_rest(&skeleton, params.scale),
+            "skeleton_rest_units": "metres",
             "scale": params.scale,
         });
         if let Some(path) = params.report.as_deref() {
@@ -270,11 +277,46 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
     };
     // The same name rule the correspondence layer uses, so this report cannot
     // disagree with `actor adapt` about who maps to whom.
-    let slot_of_name: HashMap<String, usize> = palette
-        .iter()
-        .enumerate()
-        .map(|(slot, name)| (crate::retarget::compact(name), slot))
-        .collect();
+    // One identity per name, decided rather than overwritten: the BodySlide
+    // palette carries the `CME` ghost family beside its `NPC` bones at the same
+    // rest, and a plain map insert would let whichever slot came **last** win the
+    // clip. That is how Mike's arm tracks bound to `CME L UpperArm` while the verb
+    // aimed the `NPC` bone, and the pose silently kept our rest on the arm it was
+    // supposed to drive. The rule is the correspondence layer's: prefer `NPC` over
+    // a `CME` duplicate, then the shorter name, then the earlier slot.
+    let mut slot_of_name: HashMap<String, usize> = HashMap::new();
+    let mut palette_identity: Vec<Value> = Vec::new();
+    for (slot, name) in palette.iter().enumerate() {
+        let key = crate::retarget::compact(name);
+        match slot_of_name.get(&key).copied() {
+            None => {
+                slot_of_name.insert(key, slot);
+            }
+            Some(current) => {
+                let ghost = |slot: usize| u8::from(palette[slot].starts_with("CME "));
+                let better = (ghost(slot), palette[slot].len(), slot)
+                    < (ghost(current), palette[current].len(), current);
+                if better {
+                    palette_identity.push(json!({
+                        "name": key,
+                        "chosen": palette[slot],
+                        "refused": palette[current],
+                        "rule": "prefers the `NPC` family over a ghost `CME` duplicate, then the \
+                                 shorter name, then the earlier slot",
+                    }));
+                    slot_of_name.insert(key, slot);
+                } else {
+                    palette_identity.push(json!({
+                        "name": key,
+                        "chosen": palette[current],
+                        "refused": palette[slot],
+                        "rule": "prefers the `NPC` family over a ghost `CME` duplicate, then the \
+                                 shorter name, then the earlier slot",
+                    }));
+                }
+            }
+        }
+    }
 
     let mut unbound_tracks: Vec<Value> = Vec::new();
     let mut palette_slots: Vec<Option<usize>> = Vec::with_capacity(clip.tracks.len());
@@ -339,7 +381,8 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
             "name": skeleton.name,
             "bones": skeleton.bones.len(),
         },
-        "skeleton_rest": skeleton_rest(&skeleton),
+        "skeleton_rest": skeleton_rest(&skeleton, params.scale),
+        "skeleton_rest_units": "metres",
         "blend_hint": clip.blend_hint,
         "root_motion_samples": clip.root_motion.len(),
         "annotations": clip.annotation_tracks.iter()
@@ -349,6 +392,7 @@ pub fn run(params: &HavokParams) -> Result<Value, CommandError> {
         "track_bindings": rows,
         "unbound_tracks": unbound_tracks,
         "palette_bones": palette.len(),
+        "palette_identity": palette_identity,
         "undriven_palette": undriven_palette,
         "scale": params.scale,
     });
