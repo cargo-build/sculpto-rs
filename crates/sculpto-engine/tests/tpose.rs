@@ -106,6 +106,7 @@ fn a_pose_body() -> Rig {
     let mut joints = vec![
         joint("NPC Pelvis [Pelv]", None, [0.0, 1.0, 0.0]),
         joint("NPC Spine2 [Spn2]", Some(0), [0.0, 0.45, 0.0]),
+        joint("NPC Head [Head]", Some(1), [0.0, 0.28, 0.0]),
     ];
     for (suffix, side) in [("L", -1.0_f32), ("R", 1.0)] {
         let clavicle = joints.len() as u32;
@@ -170,6 +171,7 @@ fn t_pose_reference() -> Rig {
     let mut joints = vec![
         joint("mixamorig:Hips", None, [0.0, 1.0, 0.0]),
         joint("mixamorig:Spine2", Some(0), [0.0, 0.45, 0.0]),
+        joint("mixamorig:Head", Some(1), [0.0, 0.28, 0.0]),
     ];
     for (suffix, side) in [("Left", 1.0_f32), ("Right", -1.0)] {
         let shoulder = joints.len() as u32;
@@ -490,6 +492,100 @@ fn the_arm_chain_is_re_aimed_onto_the_reference_t_pose() {
     // The bone vector is the forearm's own authored offset: 0.02, −0.24, 0.
     let authored = (0.02_f64 * 0.02 + 0.24 * 0.24).sqrt();
     assert!((length("NPC L UpperArm [LUar]", "NPC L Forearm [LLar]") - authored).abs() < 1e-6);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// An A-posed body whose spine leans `degrees` sideways from the vertical.
+///
+/// Emily's measured lean is forward (`Hips → Head = (−0.000, +1.000, +0.030)`,
+/// `1.723°` from vertical). The sideways shape is what makes the rule visible: a
+/// lateral arm is no longer perpendicular to the tilted axis once the tilt has a
+/// lateral component, so the world horizontal and the body's own T stop agreeing.
+fn leaning_body(degrees: f32) -> Rig {
+    let lean = 0.73 * degrees.to_radians().tan();
+    let joints = a_pose_body()
+        .joints()
+        .iter()
+        .map(|joint| {
+            let mut joint = joint.clone();
+            if joint.name.as_deref() == Some("NPC Head [Head]") {
+                joint.rest.translation = [lean, 0.28, 0.0];
+            }
+            joint
+        })
+        .collect();
+    Rig::new(joints, RigFrame::YUp).expect("a leaning body forms a rig")
+}
+
+#[test]
+fn the_arms_are_squared_to_the_body_spine_not_to_the_world() {
+    let lean = 1.72_f32;
+    let body = leaning_body(lean);
+    let reference = y_along_bones(&t_pose_reference());
+    let (actor_path, reference_path) = write_pair("leaning", &body, &reference);
+    let out_path = temp_path("leaning-out");
+
+    let report = run(&TPoseParams {
+        actor: actor_path,
+        reference: reference_path,
+        out: Some(out_path.clone()),
+        report: None,
+        pose: None,
+        pose_clip: None,
+        pose_time: None,
+        pose_scan: false,
+        pose_rest: None,
+        straighten_arms: false,
+    })
+    .expect("the bake succeeds");
+
+    // The axis the bake states is the body's own, and the shoulder line is
+    // squared to it: aiming at the world horizontal would leave this arm `1.72°`
+    // off perpendicular, which is the defect this bar exists to catch.
+    let tilt = report["spine"]["tilt_from_vertical_deg"]
+        .as_f64()
+        .expect("a measured spine tilt");
+    assert!((tilt - f64::from(lean)).abs() < 0.01, "spine tilt {tilt}°");
+    assert_eq!(report["gates"]["arm_perpendicular"]["pass"], true);
+    let perpendicular = report["gates"]["arm_perpendicular"]["max_deviation_deg"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        perpendicular < 1e-6,
+        "off perpendicular by {perpendicular}°"
+    );
+    // The arms follow the lean instead of being flattened onto the world: the
+    // world-horizontal figure is the lean itself, and inside its own bar.
+    assert_eq!(report["gates"]["arm_horizontal"]["pass"], true);
+    let horizontal = report["gates"]["arm_horizontal"]["max_below_horizontal_deg"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (horizontal - f64::from(lean)).abs() < 0.05,
+        "arms {horizontal}° below horizontal, where the lean is {tilt}°"
+    );
+
+    // The artifact's own numbers, taken from its own Hips → Head axis.
+    let out_bytes = std::fs::read(&out_path).expect("read output");
+    let out = Actor::from_glb(&out_bytes).expect("output actor");
+    let (baked_rig, _) = actor_rig(&out).expect("baked rig");
+    let pivot = |joint: &str| {
+        let id = baked_rig.joint_by_name(joint).expect("joint");
+        DMat4::from_cols_array_2d(&baked_rig.rest_world(id).unwrap())
+            .transform_point3(glam::DVec3::ZERO)
+    };
+    let axis = (pivot("NPC Head [Head]") - pivot("NPC Pelvis [Pelv]")).normalize();
+    for (upper, child) in [
+        ("NPC L UpperArm [LUar]", "NPC L Forearm [LLar]"),
+        ("NPC R UpperArm [RUar]", "NPC R Forearm [RLar]"),
+    ] {
+        let arm = (pivot(child) - pivot(upper)).normalize();
+        let off = 90.0 - axis.angle_between(arm).to_degrees();
+        assert!(
+            off.abs() < 1e-5,
+            "{upper} sits {off}° off the spine's perpendicular"
+        );
+    }
     let _ = std::fs::remove_file(&out_path);
 }
 

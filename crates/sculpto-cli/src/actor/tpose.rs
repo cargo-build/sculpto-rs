@@ -94,19 +94,20 @@ fn job(params: &TPoseParams) -> Result<(), String> {
     if let Some(aims) = report["aims"].as_array() {
         for aim in aims {
             println!(
-                "  {:16} {:<28} turned {:7.3}°  residual {:0.6}°  below horizontal {:+.3}°",
+                "  {:16} {:<28} turned {:7.3}°  residual {:0.6}°  below horizontal {:+.3}°  off perpendicular {:+.3}°",
                 aim["role"].as_str().unwrap_or("?"),
                 aim["bone"].as_str().unwrap_or("?"),
                 aim["turn_degrees"].as_f64().unwrap_or(0.0),
                 aim["residual_degrees"].as_f64().unwrap_or(0.0),
                 aim["below_horizontal_after_deg"].as_f64().unwrap_or(0.0),
+                aim["off_perpendicular_after_deg"].as_f64().unwrap_or(0.0),
             );
         }
     }
     if let Some(rows) = report["straighten"]["rotations"].as_array() {
         for row in rows {
             println!(
-                "  straightened {:9} {:14} {:<28} {:7.3}°  {:5.3}° -> {:0.6}°  residual {:0.6}°",
+                "  straightened {:9} {:14} {:<28} {:7.3}°  {:5.3}° -> {:0.6}°  residual {:0.6}°  off perpendicular {:+.3}°",
                 row["side"].as_str().unwrap_or("?"),
                 row["joint"].as_str().unwrap_or("?"),
                 row["bone"].as_str().unwrap_or("?"),
@@ -114,6 +115,7 @@ fn job(params: &TPoseParams) -> Result<(), String> {
                 row["angle_before_deg"].as_f64().unwrap_or(0.0),
                 row["angle_after_deg"].as_f64().unwrap_or(0.0),
                 row["residual_to_target_deg"].as_f64().unwrap_or(0.0),
+                row["off_perpendicular_after_deg"].as_f64().unwrap_or(0.0),
             );
         }
     }
