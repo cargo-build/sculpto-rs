@@ -1,7 +1,10 @@
-//! Read-only archive member listing through the host `7z` tool.
+//! Read-only archive member listing.
 //!
-//! The catalogue never extracts payloads: it records member identity so a face
-//! or preset inside a supplied archive is discoverable without unpacking it.
+//! The catalogue never extracts payloads into the catalogue: it records
+//! member identity so a face or preset inside a supplied archive is
+//! discoverable without unpacking it. Host `7z` lists 7z/zip/rar containers;
+//! Skyrim `.bsa` archives go to the engine's own BSA parser, because host
+//! `7z` misparses the container as gzip.
 
 use std::path::Path;
 use std::process::Command;
@@ -17,6 +20,42 @@ pub struct ArchiveEntry {
     pub crc: Option<String>,
     /// Directory marker.
     pub is_directory: bool,
+}
+
+/// List members of one supported archive, dispatched by extension.
+///
+/// `.bsa` goes to the in-engine BSA parser ([`list_bsa`]) and is never handed
+/// to `7z`; every other extension goes to the host `7z` route. An archive the
+/// chosen reader refuses is a named error, not an empty list.
+pub fn archive_members(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match extension.as_str() {
+        "bsa" => list_bsa(path),
+        _ => list_archive(path),
+    }
+}
+
+/// List a Skyrim BSA's members through the engine's read-only index.
+///
+/// Member paths are the engine's normalized keys (`\`→`/`, ASCII lowercase),
+/// sorted; sizes come from the index where they are readable. BSA records
+/// carry a name hash, not a CRC, so `crc` is always `None`.
+pub fn list_bsa(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
+    let index =
+        crate::bsa::index_bsa(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(index
+        .members()
+        .map(|key| ArchiveEntry {
+            path: key.to_string(),
+            size: index.member_size(key),
+            crc: None,
+            is_directory: false,
+        })
+        .collect())
 }
 
 /// List an archive through the host `7z` binary.
@@ -85,7 +124,73 @@ pub fn parse_listing(text: &str) -> Vec<ArchiveEntry> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_listing;
+    use super::*;
+    use crate::bsa::tests::{Build, Spec, build_bsa};
+
+    fn write_bsa(label: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "boethos-catalogue-{label}-{}.bsa",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).expect("fixture archive writes");
+        path
+    }
+
+    #[test]
+    fn bsa_dispatch_reads_the_engine_parser_and_never_7z() {
+        // `BSA\0` bytes are no container host `7z` can open (it misparses a
+        // BSA as gzip and fails), so an `Ok` with exactly these members can
+        // only come from the engine's BSA index reader.
+        let specs = [
+            Spec {
+                folder: "meshes\\actors\\character\\animations",
+                name: "2hm_attackpowerforward.hkx",
+                data: b"havok-spline-clip",
+            },
+            Spec {
+                folder: "meshes\\actors\\character\\animations",
+                name: "mt_walkidle.hkx",
+                data: b"havok-behavior",
+            },
+            Spec {
+                folder: "textures\\clutter",
+                name: "rope.dds",
+                data: b"DDS ",
+            },
+        ];
+        let path = write_bsa("dispatch", &build_bsa(&specs, Build::default()));
+        let entries = archive_members(&path).expect("engine parser lists the BSA");
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "meshes/actors/character/animations/2hm_attackpowerforward.hkx",
+                "meshes/actors/character/animations/mt_walkidle.hkx",
+                "textures/clutter/rope.dds",
+            ],
+            "normalized keys, sorted"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.crc.is_none() && !entry.is_directory)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_bsa_is_a_named_refusal() {
+        let path =
+            std::env::temp_dir().join(format!("absent-catalogue-{}.bsa", std::process::id()));
+        let error = archive_members(&path).expect_err("a missing archive refuses");
+        assert!(error.to_string().contains("No such file"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&path.to_string_lossy().to_string()),
+            "the refusal names the archive: {error}"
+        );
+    }
 
     #[test]
     fn parses_members_and_skips_the_archive_header() {

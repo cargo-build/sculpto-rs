@@ -6,7 +6,7 @@ use std::io::Write as _;
 
 /// How the synthetic builder marks members and archive defaults.
 #[derive(Default, Clone, Copy)]
-struct Build {
+pub(crate) struct Build {
     /// Set the archive's default-compressed flag (`0x4`).
     archive_compressed: bool,
     /// Set the per-member compression bits (`member XOR archive default`).
@@ -18,10 +18,13 @@ struct Build {
 }
 
 /// One member specification.
-struct Spec<'a> {
-    folder: &'a str,
-    name: &'a str,
-    data: &'a [u8],
+pub(crate) struct Spec<'a> {
+    /// Member folder, backslash separators allowed.
+    pub(crate) folder: &'a str,
+    /// Member file name.
+    pub(crate) name: &'a str,
+    /// Uncompressed payload bytes.
+    pub(crate) data: &'a [u8],
 }
 
 /// Compress `data` into the LZ4 frame format real SSE members use.
@@ -54,8 +57,9 @@ fn stored_payload(spec: &Spec<'_>, build: &Build) -> Vec<u8> {
 ///
 /// Layout follows the reference reader: header, folder records, then per
 /// folder its length-prefixed name and file records, then the NUL-terminated
-/// file-name block, then the member data blocks.
-fn build_bsa(specs: &[Spec<'_>], build: Build) -> Vec<u8> {
+/// file-name block, then the member data blocks. Shared with the catalogue
+/// index/dispatch tests so the synthetic format has one owner.
+pub(crate) fn build_bsa(specs: &[Spec<'_>], build: Build) -> Vec<u8> {
     let mut archive_flags = 0x0000_0003;
     if build.archive_compressed {
         archive_flags |= FLAG_COMPRESSED;
@@ -164,7 +168,7 @@ fn build_bsa(specs: &[Spec<'_>], build: Build) -> Vec<u8> {
 }
 
 /// Write one archive to a fresh, uniquely named temp file.
-fn write_temp(label: &str, bytes: &[u8]) -> PathBuf {
+pub(crate) fn write_temp(label: &str, bytes: &[u8]) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(

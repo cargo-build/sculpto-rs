@@ -10,5 +10,4 @@ license.workspace = true
 boethos = { path = "../boethos" }
 boethos-catalogue = { path = "../boethos-catalogue" }
 glam.workspace = true
-lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
 roxmltree.workspace = true

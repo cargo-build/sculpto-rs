@@ -316,8 +316,8 @@ database:
   else $HOME/.local/state/boethos/assets.redb
 
 categories:
-  body body-part outfit hair face animation clip preset face_preset project
-  texture mesh image archive other
+  body body-part outfit hair face animation skyrim-animation clip preset
+  face_preset project texture mesh image archive other
 
 sex:
   female male unknown
@@ -376,6 +376,9 @@ fn command_index(cli: &Cli) -> Result<(), String> {
         report.files += root_report.files;
         report.archives += root_report.archives;
         report.members += root_report.members;
+        report
+            .members_per_archive
+            .extend(root_report.members_per_archive);
         report.clips += root_report.clips;
         report.inserted += root_report.inserted;
         report.updated += root_report.updated;
@@ -394,6 +397,7 @@ fn command_index(cli: &Cli) -> Result<(), String> {
             "files": report.files,
             "archives": report.archives,
             "members": report.members,
+            "members_per_archive": report.members_per_archive,
             "clips": report.clips,
             "inserted": report.inserted,
             "updated": report.updated,
@@ -423,6 +427,9 @@ fn command_index(cli: &Cli) -> Result<(), String> {
             report.pruned,
             report.errors.len()
         );
+        for (archive, members) in &report.members_per_archive {
+            println!("archive: {archive}: {members} members");
+        }
         if report.symlinks
             + report.ignored_dirs
             + report.special

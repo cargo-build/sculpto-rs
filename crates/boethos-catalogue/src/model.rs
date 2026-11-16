@@ -22,6 +22,9 @@ pub enum Category {
     Face,
     /// Motion clip or behavior.
     Animation,
+    /// Skyrim Havok clip or behavior graph (`.hkx`).
+    #[serde(rename = "skyrim-animation")]
+    SkyrimAnimation,
     /// One animation embedded in an actor `glb`/`gltf`.
     Clip,
     /// BodySlide preset XML.
@@ -52,6 +55,7 @@ impl Category {
             Self::Hair => "hair",
             Self::Face => "face",
             Self::Animation => "animation",
+            Self::SkyrimAnimation => "skyrim-animation",
             Self::Clip => "clip",
             Self::Preset => "preset",
             Self::FacePreset => "face_preset",
@@ -73,6 +77,7 @@ impl Category {
             "hair" => Self::Hair,
             "face" => Self::Face,
             "animation" => Self::Animation,
+            "skyrim-animation" => Self::SkyrimAnimation,
             "clip" => Self::Clip,
             "preset" => Self::Preset,
             "face_preset" => Self::FacePreset,

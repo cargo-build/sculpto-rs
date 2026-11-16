@@ -1,5 +1,9 @@
 //! Read-only Skyrim BSA indexing and loose-first texture resolution.
 //!
+//! This is the engine's single BSA format owner: both texture resolution and
+//! the catalogue's member listing read through it, and nothing dispatches a
+//! `.bsa` container to host `7z`, which misparses it as gzip.
+//!
 //! The format facts are reimplemented from the BSD-licensed NifTools FSEngine
 //! reader (`lib/FSEngine/FSBSA.{h,cpp}` of the local BodySlide checkout):
 //! 36-byte header, 24-byte SSE folder records, 16-byte file records, the
@@ -550,4 +554,4 @@ pub fn resolve_texture(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -40,6 +40,7 @@ name = "boethos-catalogue"
 version = "0.3.0"
 dependencies = [
  "boethos",
+ "lz4_flex",
  "serde",
  "serde_json",
  "sha2",
@@ -632,7 +633,6 @@ dependencies = [
  "boethos",
  "boethos-catalogue",
  "glam 0.34.3",
- "lz4_flex",
  "roxmltree",
 ]
 

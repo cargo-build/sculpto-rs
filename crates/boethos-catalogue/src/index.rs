@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use boethos::{Put, Store};
 use sha2::{Digest, Sha256};
 
-use crate::archive::list_archive;
+use crate::archive::archive_members;
 use crate::model::{Asset, Assets, Category, Sex, Status};
 
-const ARCHIVE_EXTENSIONS: [&str; 3] = ["7z", "zip", "rar"];
+const ARCHIVE_EXTENSIONS: [&str; 4] = ["7z", "zip", "rar", "bsa"];
 const IGNORED_DIRS: [&str; 5] = [".git", ".jj", "__pycache__", "node_modules", "target"];
 const UNSUPPORTED_ARCHIVES: [&str; 5] = ["gz", "tar", "tgz", "xz", "bz2"];
 
@@ -99,6 +99,9 @@ pub struct IndexReport {
     pub archives: usize,
     /// Archive members selected for the catalogue.
     pub members: usize,
+    /// Selected-member count per archive path, in visit order. A refused
+    /// archive records 0 so a silent miss stays visible next to its error.
+    pub members_per_archive: Vec<(String, usize)>,
     /// Animation clips embedded in indexed `glb`/`gltf` files.
     pub clips: usize,
     /// New identities.
@@ -342,13 +345,15 @@ fn index_archive(
     if !options.archive_entries {
         return;
     }
-    let entries = match list_archive(path) {
+    let entries = match archive_members(path) {
         Ok(entries) => entries,
         Err(error) => {
             report.errors.push(error);
+            report.members_per_archive.push((path_text.clone(), 0));
             return;
         }
     };
+    let mut selected = 0usize;
     for entry in entries {
         if entry.is_directory {
             continue;
@@ -396,8 +401,12 @@ fn index_archive(
             status: Status::Raw,
         };
         report.members += 1;
+        selected += 1;
         write(store, &asset, seen, report);
     }
+    report
+        .members_per_archive
+        .push((path_text.clone(), selected));
 }
 
 fn write(store: &Store, asset: &Asset, seen: &mut HashSet<String>, report: &mut IndexReport) {
@@ -501,7 +510,10 @@ fn classify(path: &Path, extension: &str) -> Category {
     if matches!(extension, "glb" | "gltf" | "obj" | "fbx" | "tri") {
         return Category::Mesh;
     }
-    if matches!(extension, "hkx") || text.contains("/animations/") {
+    if extension == "hkx" {
+        return Category::SkyrimAnimation;
+    }
+    if text.contains("/animations/") {
         return Category::Animation;
     }
     if matches!(extension, "png" | "jpg" | "jpeg" | "webp") {
@@ -513,6 +525,11 @@ fn classify(path: &Path, extension: &str) -> Category {
 fn member_category(path: &str, archive_name: &str) -> Option<Category> {
     let text = path.to_lowercase();
     let file = text.rsplit('/').next().unwrap_or("");
+    // Havok clips and behavior graphs: the extension owns this mapping, so a
+    // `.hkx` member is never dropped as unclassified.
+    if text.ends_with(".hkx") {
+        return Some(Category::SkyrimAnimation);
+    }
     if text.contains("underwear")
         && ["body", "hands", "feet", "head", "tail", "ears", "mouth"]
             .iter()
@@ -748,6 +765,142 @@ fn read_readme_hashes(root: &Path) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bsa::tests::{Build, Spec, build_bsa};
+
+    #[test]
+    fn hkx_members_land_in_the_skyrim_animation_category() {
+        assert_eq!(
+            member_category(
+                "meshes/actors/character/animations/2hm_attackpowerforward.hkx",
+                "Skyrim - Animations.bsa"
+            ),
+            Some(Category::SkyrimAnimation)
+        );
+        assert_eq!(
+            member_category("behaviors/0_master.hkx", "Skyrim - Animations.bsa"),
+            Some(Category::SkyrimAnimation)
+        );
+        assert_eq!(
+            member_category(
+                "meshes/animationsetdata/2hm_attackpowerforward.txt",
+                "Skyrim - Animations.bsa"
+            ),
+            None,
+            "non-Havok members keep their existing routing"
+        );
+        assert_eq!(
+            classify(Path::new("meshes/animations/idle.hkx"), "hkx"),
+            Category::SkyrimAnimation,
+            "the extension table owns loose `.hkx` too"
+        );
+        assert_eq!(
+            Category::parse("skyrim-animation"),
+            Some(Category::SkyrimAnimation)
+        );
+        assert_eq!(Category::SkyrimAnimation.as_str(), "skyrim-animation");
+    }
+
+    #[test]
+    fn a_bsa_root_yields_member_rows_counts_and_named_refusals() {
+        let root =
+            std::env::temp_dir().join(format!("boethos-catalogue-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("test root");
+
+        let specs = [
+            Spec {
+                folder: "meshes\\actors\\character\\animations",
+                name: "2hm_attackpowerforward.hkx",
+                data: b"havok-spline-clip",
+            },
+            Spec {
+                folder: "meshes\\actors\\character\\_1stperson\\animations",
+                name: "mt_walkidle.hkx",
+                data: b"havok-first-person",
+            },
+            Spec {
+                folder: "textures\\clutter",
+                name: "rope.dds",
+                data: b"DDS ",
+            },
+        ];
+        let animations = root.join("Skyrim - Animations.bsa");
+        fs::write(&animations, build_bsa(&specs, Build::default())).expect("synthetic BSA");
+        fs::write(root.join("loose behavior.hkx"), b"loose havok").expect("loose member");
+        let broken = root.join("encrypted.bsa");
+        fs::write(&broken, b"ENCRYPTED-PAYLOAD-BY-TEST-0000000000001").expect("broken fixture");
+
+        let store_path = std::env::temp_dir().join(format!(
+            "boethos-catalogue-store-{}.redb",
+            std::process::id()
+        ));
+        let store = boethos::Store::open(&store_path).expect("test store");
+        let report = index_root(&store, &root, "test-root", &IndexOptions::default());
+
+        // Per-archive member counts make a silent miss visible: the refused
+        // archive records 0 beside its named error.
+        assert_eq!(report.archives, 2, "both .bsa files are archive candidates");
+        assert_eq!(report.members, 2, "only the `.hkx` members are selected");
+        assert_eq!(
+            report.members_per_archive,
+            vec![
+                (animations.to_string_lossy().into_owned(), 2),
+                (broken.to_string_lossy().into_owned(), 0),
+            ]
+        );
+        let refusal = report
+            .errors
+            .iter()
+            .find(|error| error.contains("encrypted.bsa"))
+            .expect("the broken archive is a named refusal");
+        assert!(refusal.contains("not a BSA"), "{refusal}");
+
+        let rows: Vec<Asset> = store
+            .iter_kind::<Assets>()
+            .expect("rows read")
+            .into_iter()
+            .map(|(_, asset)| asset)
+            .collect();
+        let skyrim_rows: Vec<&Asset> = rows
+            .iter()
+            .filter(|asset| asset.category == Category::SkyrimAnimation)
+            .collect();
+        assert_eq!(
+            skyrim_rows.len(),
+            3,
+            "two BSA members plus the loose `.hkx`"
+        );
+        let power_attack = skyrim_rows
+            .iter()
+            .find(|asset| {
+                asset.entry.as_deref()
+                    == Some("meshes/actors/character/animations/2hm_attackpowerforward.hkx")
+            })
+            .expect("the named clip is indexed");
+        assert_eq!(
+            power_attack.path,
+            format!(
+                "{}::meshes/actors/character/animations/2hm_attackpowerforward.hkx",
+                animations.display()
+            )
+        );
+        assert_eq!(
+            power_attack.archive.as_deref(),
+            Some(animations.to_string_lossy().as_ref())
+        );
+        assert_eq!(power_attack.format, "hkx");
+
+        let archive_rows: Vec<&Asset> = rows
+            .iter()
+            .filter(|asset| asset.category == Category::Archive)
+            .collect();
+        assert_eq!(archive_rows.len(), 2);
+        assert!(archive_rows.iter().all(|asset| asset.format == "bsa"));
+
+        drop(store);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&store_path);
+    }
 
     #[test]
     fn classifies_hair_members_without_chair_false_positive() {

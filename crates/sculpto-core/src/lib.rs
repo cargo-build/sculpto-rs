@@ -18,7 +18,7 @@
 //! writes, no hidden global state, so results are reproducible and testable.
 
 pub mod appearance;
-pub mod bsa;
+pub use boethos_catalogue::bsa;
 pub mod document;
 pub mod error;
 pub mod mesh;

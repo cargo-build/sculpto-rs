@@ -6,13 +6,15 @@
 
 mod archive;
 mod body_part;
+pub mod bsa;
 mod clip;
 mod index;
 mod model;
 mod raw_part;
 
-pub use archive::{ArchiveEntry, list_archive};
+pub use archive::{ArchiveEntry, archive_members, list_archive, list_bsa};
 pub use body_part::{BodyPartInput, body_part_asset};
+pub use bsa::{BsaError, BsaIndex, TextureSource, index_bsa, resolve_texture};
 pub use clip::{ClipDocument, ClipInfo, clip_asset, read_clips};
 pub use index::{IndexOptions, IndexReport, index_root};
 pub use model::{Asset, Assets, Category, ClipDetails, Sex, Status};
