@@ -13,7 +13,10 @@
 //! The reference is measured, not assumed: the arm directions come from the
 //! skeleton's own rest, and the verb refuses a reference whose own arms are not
 //! within [`T_POSE_TOLERANCE_DEG`] of the horizontal, because that is the only
-//! thing this verb claims to bake.
+//! thing this verb claims to bake. The targets are then squared to the **actor's
+//! own spine**, not left on the world horizontal: a torso that leans `1.72°`
+//! carries its shoulder line with it, and aiming at the world instead leaves the
+//! T `1.65°` off square to the body it was aimed on.
 //!
 //! Garments already on the actor keep the same skin and the same weights, so
 //! they rotate with the flesh they are bound to; an unrigged garment fitted
@@ -98,6 +101,16 @@ pub const STRAIGHTEN_TOLERANCE_DEG: f64 = 0.5;
 /// pair below this is recorded as already straight instead of being turned about
 /// float noise.
 pub const STRAIGHTEN_EPS_DEG: f64 = 1e-6;
+
+/// How close the shoulder line must sit to perpendicular to the body's spine.
+///
+/// This is the T's real definition: the arms leave the shoulders square to the
+/// **torso**, not to the world. A body whose spine leans `1.72°` carries its
+/// shoulder line with it, so aiming at the world horizontal leaves the arms
+/// `1.65°` off perpendicular — an aimed T that is not square to the body it was
+/// aimed on. The world-horizontal figure is reported beside this one instead of
+/// being the target.
+pub const SPINE_PERPENDICULARITY_TOLERANCE_DEG: f64 = 0.5;
 
 /// The command input.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
@@ -224,6 +237,10 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
     let correspondence = Correspondence::build(&actor, &reference_rig, &reference_palette)?;
     let bodies = Bodies::measure(&our_rig, &our_palette, &reference_rig, &reference_palette)?;
     let our_worlds = crate::adapt::actor_rest_worlds(&actor)?;
+    // The axis the arms are squared to: measured once, before any target is
+    // chosen, and reported with the bake so the aim can be checked against the
+    // body it was aimed on.
+    let spine = spine_axis(&our_rig, &our_palette, "actor")?;
     let (resolved, hands) = resolve_chains(
         &actor,
         &correspondence,
@@ -266,6 +283,12 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
         }
         retarget_turns(&mut resolved, &mut hands)?;
     }
+    // The target is now the world's T; the body's own T is square to its spine,
+    // so every side's targets are turned rigidly onto that plane and the turns
+    // are solved again for the moved targets. The straightening step then moves
+    // the chain about the hinge this aim produced, not about a stale one.
+    align_targets_to_spine(&mut resolved, &mut hands, &spine);
+    retarget_turns(&mut resolved, &mut hands)?;
 
     let pool = read_pool(&actor, mesh_node, &mesh_name, &our_palette)?;
     let mass = weight_mass(&pool.rows, our_palette.len());
@@ -424,6 +447,7 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
                 resolved: &resolved,
                 authored: &our_worlds,
                 actor: &actor,
+                spine: &spine,
                 baseline_deformation: &baseline_deformation,
                 deformation: &deformation,
             })?;
@@ -441,6 +465,7 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
         &validation,
         &measurement,
         &bodies,
+        &spine,
     );
     gate_rows
         .as_object_mut()
@@ -451,7 +476,7 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
         );
     let report = json!({
         "ok": true,
-        "verdict": verdict_text(&resolved, &measurement.max_vertex, &deformation),
+        "verdict": verdict_text(&resolved, &measurement.max_vertex, &deformation, &spine),
         "input": {
             "actor": params.actor.to_string_lossy(),
             "sha256_16": sha16(&actor_bytes),
@@ -467,6 +492,12 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
             "reference_forward": bodies.reference_forward.to_array(),
             "yaw_deg": bodies.yaw_degrees(),
             "rule": "each body's own rest frame; the two actors do not share a forward axis",
+        },
+        "spine": {
+            "axis": spine.axis.to_array(),
+            "tilt_from_vertical_deg": spine.tilt_deg,
+            "bar_perpendicular_deg": SPINE_PERPENDICULARITY_TOLERANCE_DEG,
+            "rule": "measured pelvis -> head on the actor's own rest; the arms aim square to this axis, not at the world horizontal, and the bake turns no bone outside the arm chain, so the written file carries the same axis",
         },
         "reference": {
             "skeleton": params.reference.to_string_lossy(),
@@ -493,6 +524,8 @@ pub fn run(params: &TPoseParams) -> Result<Value, CommandError> {
             "turns_applied": aimed.turns_applied,
             "below_horizontal_before_deg": below_horizontal(DVec3::from_array(aimed.direction_before)),
             "below_horizontal_after_deg": below_horizontal(DVec3::from_array(aimed.direction_after)),
+            "off_perpendicular_before_deg": spine.off_perpendicular(DVec3::from_array(aimed.direction_before)),
+            "off_perpendicular_after_deg": spine.off_perpendicular(DVec3::from_array(aimed.direction_after)),
             "pivot_before": aimed.pivot_before,
             "pivot_after": aimed.pivot_after,
             "pivot_shift_m": distance(aimed.pivot_before, aimed.pivot_after),
@@ -546,6 +579,7 @@ fn gates(
     validation: &Validation,
     measurement: &RestMeasurement,
     bodies: &Bodies,
+    spine: &Spine,
 ) -> Value {
     let arm_max = bake
         .aims
@@ -557,6 +591,32 @@ fn gates(
             after.angle_between(target).to_degrees()
         })
         .fold(0.0_f64, f64::max);
+    // The T's own bar: the shoulder line square to the body's spine, and the
+    // world-horizontal figure beside it as the number the operator reads. Only
+    // the upper arms are graded here — a pose's elbow bend legitimately leaves
+    // the forearm off the plane until the straightening step removes it.
+    let shoulder_line: Vec<(f64, f64)> = resolved
+        .iter()
+        .filter(|row| row.segment.role.part == Part::UpperArm)
+        .filter_map(|row| {
+            bake.aims
+                .iter()
+                .find(|aimed| aimed.joint == row.joint && aimed.child == row.tip)
+                .map(|aimed| {
+                    let direction = DVec3::from_array(aimed.direction_after);
+                    (
+                        spine.off_perpendicular(direction),
+                        below_horizontal(direction),
+                    )
+                })
+        })
+        .collect();
+    let off_perpendicular = shoulder_line
+        .iter()
+        .fold(0.0_f64, |max: f64, (value, _)| max.max(value.abs()));
+    let horizontal = shoulder_line
+        .iter()
+        .fold(0.0_f64, |max: f64, (_, value)| max.max(value.abs()));
     let band = |name: &str| {
         deformation
             .bands
@@ -575,6 +635,18 @@ fn gates(
             "bar_deg": T_POSE_TOLERANCE_DEG,
             "max_deviation_deg": arm_max,
             "pass": arm_max <= T_POSE_TOLERANCE_DEG,
+        },
+        "arm_perpendicular": {
+            "bar_deg": SPINE_PERPENDICULARITY_TOLERANCE_DEG,
+            "max_deviation_deg": off_perpendicular,
+            "bones": "upper arms — the shoulder line a T is named for",
+            "pass": off_perpendicular <= SPINE_PERPENDICULARITY_TOLERANCE_DEG,
+        },
+        "arm_horizontal": {
+            "bar_deg": T_POSE_TOLERANCE_DEG,
+            "max_below_horizontal_deg": horizontal,
+            "note": "reported, not targeted: a leaning spine carries its shoulder line with it, so this figure is the spine's lean where the arm has a vertical component",
+            "pass": horizontal <= T_POSE_TOLERANCE_DEG,
         },
         "edge_stretch": {
             "bar_max_ratio": 2.0,
@@ -1009,6 +1081,8 @@ struct StraightenInputs<'a> {
     /// The authored worlds, for the hinge expressed in a bone's own frame.
     authored: &'a [DMat4],
     actor: &'a Actor,
+    /// The axis the arms were squared to, so the ledger can state both angles.
+    spine: &'a Spine,
     baseline_deformation: &'a Deformation,
     deformation: &'a Deformation,
 }
@@ -1019,6 +1093,8 @@ struct StraightenVerdict {
     elbow_max_deg: f64,
     wrist_max_deg: f64,
     upper_arm_max_deg: f64,
+    /// The written chain's own angle off the plane perpendicular to the spine.
+    off_perpendicular_deg: f64,
     non_arm_max_deg: f64,
     not_worse: bool,
     applied_max_deg: f64,
@@ -1096,6 +1172,8 @@ fn straighten_report(
             "direction_after": after.to_array(),
             "angle_before_deg": angle(parent_before, before),
             "angle_after_deg": angle(parent_after, after),
+            "off_perpendicular_before_deg": input.spine.off_perpendicular(before),
+            "off_perpendicular_after_deg": input.spine.off_perpendicular(after),
             "turn_degrees": angle(before, after),
             "target": row.reference_direction.to_array(),
             "residual_to_target_deg": angle(after, row.reference_direction),
@@ -1139,6 +1217,8 @@ fn straighten_report(
             },
             "below_horizontal_before_deg": upper_before.map(below_horizontal),
             "below_horizontal_after_deg": upper_after.map(below_horizontal),
+            "off_perpendicular_before_deg": upper_before.map(|d| input.spine.off_perpendicular(d)),
+            "off_perpendicular_after_deg": upper_after.map(|d| input.spine.off_perpendicular(d)),
             "elbow_after_deg": elbow_deg,
             "wrist_after_deg": wrist_deg,
         }));
@@ -1147,6 +1227,23 @@ fn straighten_report(
         .iter()
         .map(|row| row["delta_deg"].as_f64().unwrap_or(180.0))
         .fold(0.0_f64, f64::max);
+
+    // The step is what makes the whole arm a T, so every written direction is
+    // graded against the spine, not only the shoulder line the aim set.
+    let mut off_perpendicular_deg = 0.0_f64;
+    for side in [Side::Left, Side::Right] {
+        for part in [Part::UpperArm, Part::Forearm, Part::Hand] {
+            let direction = measured(input.straightened, BoneRole { side, part })
+                .ok_or_else(|| {
+                    refused(
+                        "tpose_straighten",
+                        format!("the written rest carries no {side:?} {part:?} direction"),
+                    )
+                })?;
+            off_perpendicular_deg =
+                off_perpendicular_deg.max(input.spine.off_perpendicular(direction).abs());
+        }
+    }
 
     // The palm rides the chain: how far it moved is the visible cost of the step,
     // and stating it keeps a rotated hand from passing as an untouched one.
@@ -1204,6 +1301,8 @@ fn straighten_report(
         "elbow_max_deg": elbow_max_deg,
         "wrist_max_deg": wrist_max_deg,
         "upper_arm_max_delta_deg": upper_arm_max_deg,
+        "bar_perpendicular_deg": SPINE_PERPENDICULARITY_TOLERANCE_DEG,
+        "chain_off_perpendicular_deg": off_perpendicular_deg,
         "outside_arm_subtree": {
             "nodes": deltas.outside_nodes,
             "max_rotation_deg": deltas.outside_deg,
@@ -1231,6 +1330,7 @@ fn straighten_report(
         elbow_max_deg,
         wrist_max_deg,
         upper_arm_max_deg,
+        off_perpendicular_deg,
         non_arm_max_deg: deltas.outside_deg,
         not_worse,
         applied_max_deg,
@@ -1324,6 +1424,8 @@ fn straighten_gate(verdict: Option<&StraightenVerdict>) -> Value {
         "wrist_max_deg": verdict.wrist_max_deg,
         "bar_upper_arm_deg": T_POSE_TOLERANCE_DEG,
         "upper_arm_max_delta_deg": verdict.upper_arm_max_deg,
+        "bar_perpendicular_deg": SPINE_PERPENDICULARITY_TOLERANCE_DEG,
+        "chain_off_perpendicular_deg": verdict.off_perpendicular_deg,
         "outside_arm_max_rotation_deg": verdict.non_arm_max_deg,
         "edge_stretch_not_worse": verdict.not_worse,
         // "Exactly 0.00°" is compared exactly: the two bakes compose the same
@@ -1332,6 +1434,7 @@ fn straighten_gate(verdict: Option<&StraightenVerdict>) -> Value {
         "pass": verdict.elbow_max_deg <= STRAIGHTEN_TOLERANCE_DEG
             && verdict.wrist_max_deg <= STRAIGHTEN_TOLERANCE_DEG
             && verdict.upper_arm_max_deg <= T_POSE_TOLERANCE_DEG
+            && verdict.off_perpendicular_deg <= SPINE_PERPENDICULARITY_TOLERANCE_DEG
             && verdict.non_arm_max_deg == 0.0
             && verdict.not_worse,
     })
@@ -1880,11 +1983,17 @@ fn role_node(actor: &Actor, role: BoneRole) -> Option<usize> {
 }
 
 /// One line a caller can print: what changed, how cleanly, and what it cost.
-fn verdict_text(resolved: &[Resolved], rest_error: &f64, deformation: &Deformation) -> String {
+fn verdict_text(
+    resolved: &[Resolved],
+    rest_error: &f64,
+    deformation: &Deformation,
+    spine: &Spine,
+) -> String {
     format!(
-        "actor tpose: {} arm bones re-aimed onto the reference rest, rest reconstruction {:.2e} m, \
-         edge stretch max {:.3}x (p99 {:.3}x), max vertex displacement {:.3} m",
+        "actor tpose: {} arm bones re-aimed square to a spine leaning {:.3}° from vertical, rest \
+         reconstruction {:.2e} m, edge stretch max {:.3}x (p99 {:.3}x), max vertex displacement {:.3} m",
         resolved.len(),
+        spine.tilt_deg,
         rest_error,
         deformation.max_ratio,
         deformation.p99_ratio,
@@ -2329,6 +2438,103 @@ fn forward_axis(rig: &Rig, palette: &[String], who: &str) -> Result<DVec3, Comma
             "tpose_frame",
             format!("the {who}'s feet point nowhere horizontally, so its frame is undefined"),
         )),
+    }
+}
+
+/// The body's own spine axis, measured from its pelvis to its head.
+///
+/// The T belongs to the body, not to the world: the arms leave the shoulders
+/// square to this axis, so a torso that leans carries its shoulder line with it.
+/// The axis is read from pivots the rig already has, and the bake turns arm bones
+/// only — which is why the same axis describes the written file as the input.
+struct Spine {
+    /// Unit axis, pelvis toward head, in the actor's frame.
+    axis: DVec3,
+    /// How far the axis leans from the world vertical, degrees.
+    tilt_deg: f64,
+}
+
+impl Spine {
+    /// Degrees a direction sits off the plane perpendicular to this spine.
+    ///
+    /// Signed toward the head: positive means the direction leans with the
+    /// spine's own tilt, negative against it. The magnitude is what the gate
+    /// grades, exactly as `below_horizontal` is graded by its own bar.
+    fn off_perpendicular(&self, direction: DVec3) -> f64 {
+        90.0 - self.axis.angle_between(direction).to_degrees()
+    }
+}
+
+/// Measure the actor's spine axis, or refuse a body that cannot carry one.
+fn spine_axis(rig: &Rig, palette: &[String], who: &str) -> Result<Spine, CommandError> {
+    let slot = |part: Part| {
+        reference_slot(
+            palette,
+            BoneRole {
+                side: Side::Centre,
+                part,
+            },
+        )
+    };
+    let missing = |role: &str| {
+        refused(
+            "tpose_frame",
+            format!("the {who} carries no {role}, so its spine axis is undefined"),
+        )
+    };
+    let pelvis = slot(Part::Pelvis).ok_or_else(|| missing("pelvis"))?;
+    let head = slot(Part::Head).ok_or_else(|| missing("head"))?;
+    let axis = (pivot(rig, head)? - pivot(rig, pelvis)?).normalize_or_zero();
+    if axis == DVec3::ZERO {
+        return Err(refused(
+            "tpose_frame",
+            format!("the {who}'s pelvis and head coincide, so its spine axis is undefined"),
+        ));
+    }
+    Ok(Spine {
+        axis,
+        tilt_deg: axis.angle_between(DVec3::Y).to_degrees(),
+    })
+}
+
+/// Carry the aim targets from the world horizontal onto the body's own T.
+///
+/// The reference rest and the shipped pose both state their shoulder line against
+/// the world, and the difference from the body's T is the spine's lean. Each side
+/// is turned **rigidly** by the rotation that lands its upper arm on the plane
+/// perpendicular to the spine: a per-bone projection would flatten the elbow bend
+/// the pose carries (the forearm sits `10.7°` off that plane), and the hand's palm
+/// normal points nearly along the spine, so only a rigid turn keeps the frame the
+/// roll is graded against.
+fn align_targets_to_spine(resolved: &mut [Resolved], hands: &mut [HandFrame], spine: &Spine) {
+    for side in [Side::Left, Side::Right] {
+        let Some(row) = resolved
+            .iter_mut()
+            .find(|row| row.segment.role == BoneRole {
+                side,
+                part: Part::UpperArm,
+            })
+        else {
+            continue;
+        };
+        let target = row.reference_direction;
+        let square =
+            (target - spine.axis * target.dot(spine.axis)).normalize_or_zero();
+        if square == DVec3::ZERO || target.normalize_or_zero() == DVec3::ZERO {
+            continue;
+        }
+        let turn = DQuat::from_rotation_arc(target.normalize(), square);
+        for row in resolved
+            .iter_mut()
+            .filter(|row| row.segment.role.side == side)
+        {
+            row.reference_direction = (turn * row.reference_direction).normalize();
+        }
+        for hand in hands.iter_mut().filter(|hand| hand.side == side) {
+            hand.target_axis = (turn * hand.target_axis).normalize();
+            hand.target_normal = (turn * hand.target_normal).normalize();
+            hand.target_thumb = (turn * hand.target_thumb).normalize();
+        }
     }
 }
 
