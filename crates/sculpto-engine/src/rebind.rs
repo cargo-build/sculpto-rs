@@ -138,14 +138,179 @@ fn flesh_probe(
     (signed_mm, best_k, outward <= 0.0)
 }
 
+/// A leg branch's socket, and the hub position it implies.
+struct HubLeg {
+    /// The thigh bone this branch belongs to.
+    bone: String,
+    /// The flesh socket (the femoral head landmark).
+    socket: DVec3,
+    /// Socket offset from the midline along the body's right axis, millimetres.
+    socket_lateral_mm: f64,
+    /// Lateral component of Mixamo's branch direction, unitless.
+    mixamo_lateral: f64,
+    /// Branch length that reaches the socket, millimetres.
+    length_mm: f64,
+    /// Mixamo's branch angle below horizontal, degrees.
+    below_horizontal_deg: f64,
+    /// The hub this socket alone implies.
+    candidate: DVec3,
+}
+
+/// The anatomical hips hub: where Mixamo's root sits, derived from the leg sockets.
+struct HipsHub {
+    /// The seated root position.
+    position: DVec3,
+    /// Per-side branch geometry, for the report.
+    legs: Vec<HubLeg>,
+    /// Left/right candidate disagreement, millimetres (symmetry check).
+    disagreement_mm: f64,
+    /// Hub height above the mean socket, millimetres.
+    rise_mm: f64,
+    /// Mean branch angle below horizontal, degrees.
+    below_horizontal_deg: f64,
+    /// Whether a leg branch resolved; when false the flesh anchor is kept.
+    derived: bool,
+    /// Midpoint of the two sockets: the point on the symmetry plane the hub is derived from.
+    mid_socket: DVec3,
+}
+
+/// Derive the hips hub from the flesh sockets and Mixamo's own branch direction.
+///
+/// Mixamo's root sits above the femoral heads — its `Hips→UpLeg` branch drops ~66.6 mm at
+/// 36.1° below horizontal — while the flesh medial axis anchors the root at the pelvis
+/// inscribed centre, which lands level with the sockets. Taking that flesh vector therefore
+/// collapses the branch into a pure lateral bar. The sockets are the trusted landmarks (the
+/// femoral heads, measured 1.4 mm from Mixamo's own lateral socket), so the seat holds them
+/// and derives the hub instead: on the symmetry plane, back along Mixamo's body-frame branch
+/// direction by exactly the distance that puts the socket at its flesh lateral offset,
+/// `hub = socket − d · (lateral / d_lateral)`. Both sides must agree; their difference is
+/// reported, never averaged away silently. No native joint is read.
+#[allow(clippy::too_many_arguments)]
+fn hips_hub(
+    landmark_pos: &BTreeMap<JointId, DVec3>,
+    root: usize,
+    parent: &[Option<usize>],
+    chain: &[Chain],
+    palette: &[String],
+    pos: &[DVec3],
+    frame_rotation: DMat3,
+    right: DVec3,
+    hip_anchor: DVec3,
+) -> HipsHub {
+    // The lateral offset is measured from the **socket pair's midpoint**, which is the point
+    // on the body's symmetry plane: measuring from the pelvis anchor instead gives each side
+    // a different offset (the anchor is not on that plane in a real body) and the derived hub
+    // then drifts off it.
+    let mut sockets: Vec<(usize, String, DVec3, DVec3)> = Vec::new();
+    for (j, name) in palette.iter().enumerate() {
+        if parent[j] != Some(root) || chain[j] != Chain::Leg {
+            continue;
+        }
+        let Some(&socket) = landmark_pos.get(&JointId::new(j as u32)) else {
+            continue;
+        };
+        let mix_bone = frame_rotation * (pos[j] - pos[root]);
+        let mix_length = mix_bone.length();
+        if mix_length < 1e-9 {
+            continue;
+        }
+        sockets.push((j, name.clone(), socket, mix_bone / mix_length));
+    }
+    if sockets.is_empty() {
+        return HipsHub {
+            position: hip_anchor,
+            legs: Vec::new(),
+            disagreement_mm: 0.0,
+            rise_mm: 0.0,
+            below_horizontal_deg: 0.0,
+            derived: false,
+            mid_socket: hip_anchor,
+        };
+    }
+    let mid = sockets.iter().fold(DVec3::ZERO, |acc, s| acc + s.2) / sockets.len() as f64;
+    let mut legs = Vec::new();
+    for (_, name, socket, dir) in sockets {
+        let lateral = (socket - mid).dot(right);
+        let mixamo_lateral = dir.dot(right);
+        // The branch must travel outward from the midline to reach its own socket.
+        if mixamo_lateral.abs() < 1e-6 || lateral * mixamo_lateral <= 0.0 {
+            continue;
+        }
+        let length = lateral / mixamo_lateral;
+        legs.push(HubLeg {
+            bone: name,
+            socket,
+            socket_lateral_mm: lateral * 1000.0,
+            mixamo_lateral,
+            length_mm: length * 1000.0,
+            below_horizontal_deg: (-dir.y).asin().to_degrees(),
+            candidate: socket - dir * length,
+        });
+    }
+    if legs.is_empty() {
+        return HipsHub {
+            position: hip_anchor,
+            legs,
+            disagreement_mm: 0.0,
+            rise_mm: 0.0,
+            below_horizontal_deg: 0.0,
+            derived: false,
+            mid_socket: mid,
+        };
+    }
+    let derived = true;
+    let position = legs
+        .iter()
+        .fold(DVec3::ZERO, |acc, leg| acc + leg.candidate)
+        / legs.len() as f64;
+    let disagreement_mm = match (legs.first(), legs.get(1)) {
+        (Some(a), Some(b)) => a.candidate.distance(b.candidate) * 1000.0,
+        _ => 0.0,
+    };
+    let rise_mm = {
+        let mean_socket =
+            legs.iter().fold(DVec3::ZERO, |acc, leg| acc + leg.socket) / legs.len() as f64;
+        (position.y - mean_socket.y) * 1000.0
+    };
+    let below_horizontal_deg =
+        legs.iter().map(|leg| leg.below_horizontal_deg).sum::<f64>() / legs.len() as f64;
+    HipsHub {
+        position,
+        legs,
+        disagreement_mm,
+        rise_mm,
+        below_horizontal_deg,
+        derived,
+        mid_socket: mid,
+    }
+}
+
+/// Whether Mixamo's body-frame direction seats this bone, instead of the flesh direction.
+///
+/// The flesh direction is the body's own rest posture, and it is the truth wherever the body
+/// holds a limb in that posture: the A-pose arms (M2 is not warped to the T yet), this
+/// stance's legs and the digits. The torso column and the foot's toe are different: there the
+/// medial axis measures a torso sheet, or the junction between two masses, and that direction
+/// is not a bone's. The pelvis anchor itself is derived from both sockets in [`hips_hub`].
+fn mixamo_direction(role: Option<Part>) -> bool {
+    matches!(
+        role,
+        Some(Part::Spine(_) | Part::Neck | Part::Head | Part::Toe)
+    )
+}
+
 /// Seat the target skeleton on the flesh medial axis at Mixamo's chain fractions.
 ///
 /// Mixamo's names, hierarchy and rest directions are kept; the flesh supplies the
 /// hip anchor (pelvis inscribed centre), the branch-to-branch chain extents and the
 /// body frame, all measured on the medial axis. `flesh_pos` carries those flesh-derived
-/// landmark positions; each bone vector is the spacing between them, so the chain spans
-/// the flesh's own length (shoulder→elbow→wrist, hip→knee→ankle, pelvis→skull). The
-/// native palette (`native_pos`) is used **only** to report the delta a native seat
+/// landmark positions; each bone takes its **length** from the spacing between them, so the
+/// chain spans the flesh's own length (shoulder→elbow→wrist, hip→knee→ankle, pelvis→skull).
+/// The **direction** comes from Mixamo's body frame for the torso column and the toe, where
+/// the medial axis measures a sheet or a junction rather than a bone ([`mixamo_direction`]);
+/// the limbs the body holds in its own rest posture keep the flesh direction. The root is the
+/// derived hips hub ([`hips_hub`]), above the leg sockets, and the socket stays at the femoral
+/// head. The native palette (`native_pos`) is used **only** to report the delta a native seat
 /// would have copied (`native_delta_mm`) and how many native seats sit outside the flesh
 /// (`native_outside_flesh_count`) — it never measures, anchors or places a vertex. The
 /// result is Mixamo's skeleton proportioned to this body's flesh, not native placement
@@ -229,14 +394,19 @@ fn seat_rig(
         let right = (right - up * right.dot(up)).normalize_or_zero();
         DMat3::from_cols(right, up, right.cross(up))
     };
-    let frame_rotation = match (
+    let (frame_rotation, body_right) = match (
         body_vec("mixamorig:LeftShoulder", "mixamorig:RightShoulder"),
         body_vec("mixamorig:Hips", "mixamorig:Head"),
         mix_vec("mixamorig:LeftShoulder", "mixamorig:RightShoulder"),
         mix_vec("mixamorig:Hips", "mixamorig:Head"),
     ) {
-        (Some(br), Some(bu), Some(mr), Some(mu)) => basis(br, bu) * basis(mr, mu).inverse(),
-        _ => DMat3::IDENTITY,
+        (Some(br), Some(bu), Some(mr), Some(mu)) => {
+            // The body's own right axis (the symmetry plane's normal): the hips hub must
+            // sit on that plane, not wherever a socket happens to land.
+            let body = basis(br, bu);
+            (body * basis(mr, mu).inverse(), body.x_axis)
+        }
+        _ => (DMat3::IDENTITY, DVec3::X),
     };
     let frame_quat = DQuat::from_mat3(&frame_rotation);
 
@@ -308,17 +478,45 @@ fn seat_rig(
         }
     }
 
-    // Escalation: a uniform chain factor cannot put every joint inside when the
-    // flesh's per-bone proportions differ from Mixamo's (clavicle 196 vs 129 mm,
-    // forearm 225 vs 276 mm). Where that happens, adapt per bone: each bone keeps
-    // Mixamo's body-frame direction but takes its length from the flesh landmark
-    // spacing. The per-bone factor and the joint-angle error it introduces are
-    // declared per joint below; no joint is nudged to a native position.
+    // The anatomical root: Mixamo's root sits above the leg sockets, while the flesh medial
+    // axis anchors it at the pelvis inscribed centre, level with them. The sockets are the
+    // trusted landmarks (the femoral heads), so the seat holds them and derives the hub from
+    // Mixamo's own branch angle. See [`hips_hub`].
+    let hub = hips_hub(
+        &landmark_pos,
+        root,
+        &parent,
+        &chain,
+        target_palette,
+        &pos,
+        frame_rotation,
+        body_right,
+        hip_anchor,
+    );
+
+    // Length and direction of every bone. The flesh supplies the **length** (the spacing
+    // between the two flesh landmarks); the torso column and the foot's toe take Mixamo's
+    // body-frame **direction**, because the medial axis measures a sheet or a junction there,
+    // not a bone. Every limb the body holds in its own rest posture — the A-pose arms, this
+    // stance's legs, the digits — keeps the flesh direction: that posture is what the weights
+    // are authored in, and M2 is not warped to the T yet (SkeletonFoundation revision 2). The
+    // drift the flesh direction would have introduced stays in the report, as the measurement
+    // that justifies the rule.
     let mut bone_vec = vec![DVec3::ZERO; n];
     let mut bone_factor = vec![1.0_f64; n];
     let mut angle_error = vec![0.0_f64; n];
-    for j in 0..n {
-        let Some(p) = parent[j] else { continue };
+    let mut seat_deviation = vec![0.0_f64; n];
+    let mut direction_source = vec!["mixamo_body_frame_chain_scale"; n];
+    let mut seated_pos = vec![DVec3::ZERO; n];
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| std::iter::successors(parent[i], |&p| parent[p]).count());
+    for j in order {
+        let Some(p) = parent[j] else {
+            // The root is the hips hub, on the symmetry plane above the leg sockets.
+            seated_pos[j] = hub.position;
+            direction_source[j] = "hips_hub";
+            continue;
+        };
         let mix_bone = frame_rotation * (pos[j] - pos[p]);
         let mix_length = mix_bone.length();
         let dir = mix_bone.normalize_or_zero();
@@ -326,7 +524,7 @@ fn seat_rig(
             .get(&JointId::new(j as u32))
             .copied()
             .zip(landmark_pos.get(&JointId::new(p as u32)).copied());
-        let (vec, factor, angle) = match mapped {
+        let (target, angle, deviation, source) = match mapped {
             Some((nj, np)) => {
                 let flesh_bone = nj - np;
                 let flesh_length = flesh_bone.length();
@@ -336,43 +534,55 @@ fn seat_rig(
                     .clamp(-1.0, 1.0)
                     .acos()
                     .to_degrees();
-                let factor = if mix_length > 1e-9 {
-                    flesh_length / mix_length
+                // A chain's proximal anchor is a flesh landmark POSITION, so a chain whose
+                // parent moved (the arm on the re-aimed column, the leg on the raised hub, a
+                // digit on the hand) cannot inherit that offset: it starts where the flesh says
+                // and its own bones keep the flesh spacing. The clavicle is an arm-chain root by
+                // the same argument even though the proportion table files it with the torso for
+                // its scale: its lateral end is the armpit branch the flesh measures.
+                let anchored = chain[p] != chain[j]
+                    || matches!(
+                        role_of(&target_palette[j]).map(|role| role.part),
+                        Some(Part::Clavicle)
+                    );
+                if anchored {
+                    (nj, angle, angle, "flesh_landmark_position")
+                } else if mixamo_direction(role_of(&target_palette[j]).map(|role| role.part)) {
+                    (
+                        seated_pos[p] + dir * flesh_length,
+                        angle,
+                        0.0,
+                        "mixamo_body_frame",
+                    )
                 } else {
-                    1.0
-                };
-                (flesh_bone, factor, angle)
+                    (
+                        seated_pos[p] + flesh_bone,
+                        angle,
+                        angle,
+                        "flesh_landmark_spacing",
+                    )
+                }
             }
             None => {
                 let k = chain_idx(chain[j]);
-                (dir * scale[k] * mix_length, scale[k], 0.0)
+                (
+                    seated_pos[p] + dir * scale[k] * mix_length,
+                    0.0,
+                    0.0,
+                    "mixamo_body_frame_chain_scale",
+                )
             }
         };
-        bone_vec[j] = vec;
-        bone_factor[j] = factor;
+        seated_pos[j] = target;
+        bone_vec[j] = target - seated_pos[p];
+        bone_factor[j] = if mix_length > 1e-9 {
+            bone_vec[j].length() / mix_length
+        } else {
+            1.0
+        };
         angle_error[j] = angle;
-    }
-    let mut seated_pos = vec![DVec3::ZERO; n];
-    let mut done = vec![false; n];
-    seated_pos[root] = hip_anchor;
-    done[root] = true;
-    fn place(
-        j: usize,
-        parent: &[Option<usize>],
-        bone_vec: &[DVec3],
-        seated_pos: &mut [DVec3],
-        done: &mut [bool],
-    ) {
-        if done[j] {
-            return;
-        }
-        let p = parent[j].expect("non-root joint has a parent");
-        place(p, parent, bone_vec, seated_pos, done);
-        seated_pos[j] = seated_pos[p] + bone_vec[j];
-        done[j] = true;
-    }
-    for j in 0..n {
-        place(j, &parent, &bone_vec, &mut seated_pos, &mut done);
+        seat_deviation[j] = deviation;
+        direction_source[j] = source;
     }
 
     let mut joints = Vec::with_capacity(n);
@@ -404,6 +614,14 @@ fn seat_rig(
             "chain_scale": scale[chain_idx(chain[j])],
             "bone_factor": bone_factor[j],
             "joint_angle_error_degrees": angle_error[j],
+            "seat_direction": direction_source[j],
+            "seat_angle_from_mixamo_degrees": seat_deviation[j],
+            "bone_length_mm": bone_vec[j].length() * 1000.0,
+            "seated_position_mm": [
+                seated_pos[j].x * 1000.0,
+                seated_pos[j].y * 1000.0,
+                seated_pos[j].z * 1000.0,
+            ],
             "flesh_distance_mm": signed_mm,
             "inside": inside,
             "native_delta_mm": native_delta,
@@ -449,11 +667,41 @@ fn seat_rig(
             }))
         })
         .collect();
+    let hub_rows: Vec<Value> = hub
+        .legs
+        .iter()
+        .map(|leg| {
+            json!({
+                "bone": leg.bone,
+                "socket_mm": [leg.socket.x * 1000.0, leg.socket.y * 1000.0, leg.socket.z * 1000.0],
+                "socket_lateral_mm": leg.socket_lateral_mm,
+                "mixamo_branch_lateral": leg.mixamo_lateral,
+                "branch_length_mm": leg.length_mm,
+                "branch_below_horizontal_deg": leg.below_horizontal_deg,
+                "candidate_hub_mm": [leg.candidate.x * 1000.0, leg.candidate.y * 1000.0, leg.candidate.z * 1000.0],
+            })
+        })
+        .collect();
     let report = json!({
-        "method": "per-chain Mixamo structure seated at the caller's flesh landmarks: per-bone vectors from landmark spacing, uniform chain-scale fallback for unmapped joints, anatomical girdle root",
+        "method": "per-chain Mixamo structure seated at the caller's flesh landmarks: Mixamo body-frame direction with the flesh landmark length for the torso column and the toe, the flesh direction for the limbs the body holds in its own rest posture; the root is the hips hub derived from the flesh sockets at Mixamo's branch angle, uniform chain-scale fallback for unmapped joints",
         "bones": n,
         "frame_yaw_degrees": yaw_degrees,
         "shoulder_girdle": girdle,
+        "hips_hub": {
+            "derived_from": "flesh leg sockets + Mixamo body-frame branch direction; keeps the socket at the femoral head and raises the hub above it",
+            "flesh_hip_anchor_mm": [hip_anchor.x * 1000.0, hip_anchor.y * 1000.0, hip_anchor.z * 1000.0],
+            "seated_hub_mm": [hub.position.x * 1000.0, hub.position.y * 1000.0, hub.position.z * 1000.0],
+            "rise_above_socket_mm": hub.rise_mm,
+            "branch_below_horizontal_deg": hub.below_horizontal_deg,
+            "left_right_disagreement_mm": hub.disagreement_mm,
+            // Lateral offsets: from the socket pair's midpoint (the plane the hub is placed on,
+            // so this is the placement residual) and from the flesh hip anchor (which is not on
+            // the body's symmetry plane — the two differ by the anchor's own offset).
+            "offset_from_socket_midpoint_mm": (hub.position - hub.mid_socket).dot(body_right) * 1000.0,
+            "offset_from_flesh_hip_anchor_mm": (hub.position - hip_anchor).dot(body_right) * 1000.0,
+            "derived": hub.derived,
+            "legs": hub_rows,
+        },
         "chain_scale": { "spine": scale[0], "arm": scale[1], "leg": scale[2], "finger": scale[3] },
         "chain_length_mm": {
             "spine": { "mixamo": mix_len[0]*1000.0, "flesh": flesh_len[0]*1000.0 },
@@ -1095,18 +1343,29 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             }
         }
         seat_report["skeleton_authority"] = json!({
-            "method": "Mixamo graph + arc-fraction placement on the flesh medial axis (hip anchor = pelvis inscribed centre; chain extents branch-to-branch; digits/toes/head-top by Mixamo direction at flesh height scale); containment by +X ray parity / point-triangle distance at the gate tolerance; the medial field supplies inscribed radii; no native joint places, anchors or measures — native_pos is delta/census only; no snap back to the axis",
+            "method": "Mixamo graph + arc-fraction placement on the flesh medial axis (hip anchor = pelvis inscribed centre, root = hips hub derived from the leg sockets at Mixamo's branch angle; chain extents branch-to-branch; digits/toes/head-top by Mixamo direction at flesh height scale); containment by +X ray parity / point-triangle distance at the gate tolerance; the medial field supplies inscribed radii; no native joint places, anchors or measures — native_pos is delta/census only; no snap back to the axis",
             "similarity": {
                 "height_scale": height_scale,
                 "body_height_mm": (body_y_max - body_y_min) * 1000.0,
                 "mixamo_height_mm": (mix_y_max - mix_y_min) * 1000.0,
                 "rotation_source": "body symmetry plane + shoulder-branch axis + hip->head up (see frame_yaw_degrees), measured from flesh",
-                "translation_source": "hip anchor = pelvis inscribed centre on the medial axis (flesh landmark, not a native seat)",
+                "translation_source": "root = hips hub derived from the leg sockets at Mixamo's branch angle (see seat.hips_hub); the pelvis inscribed centre is its flesh anchor",
                 "hip_anchor_mm": [hip_anchor.x * 1000.0, hip_anchor.y * 1000.0, hip_anchor.z * 1000.0],
                 "hip_anchor_medial_radius_mm": fc.hip_anchor.map(|(_, r)| r * 1000.0),
                 "symmetry_plane_x_mm": fc.cx * 1000.0,
             },
             "chain_table": chain_table,
+            "hip_sockets": {
+                "rule": "the leg's proximal centre at the crotch carried up one thigh radius, mirrored onto the midline: the pelvis medial skeleton is a sheet, so its junctions sit in the upper thigh, not at the hip (measured 116 mm below the crotch on Emily)",
+                "left": fc.femoral_head_left.map(|(crotch, radius)| json!({
+                    "crotch_mm": [crotch.x * 1000.0, crotch.y * 1000.0, crotch.z * 1000.0],
+                    "crotch_inscribed_radius_mm": radius * 1000.0,
+                })),
+                "right": fc.femoral_head_right.map(|(crotch, radius)| json!({
+                    "crotch_mm": [crotch.x * 1000.0, crotch.y * 1000.0, crotch.z * 1000.0],
+                    "crotch_inscribed_radius_mm": radius * 1000.0,
+                })),
+            },
             "containment_tolerance_mm": tolerance_mm,
             "outside_flesh": outside,
             "refusals": refusals,

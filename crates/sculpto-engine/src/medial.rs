@@ -791,10 +791,15 @@ pub struct FleshCentrelines {
     pub shoulder_left: Option<(DVec3, f64)>,
     /// Right shoulder branch.
     pub shoulder_right: Option<(DVec3, f64)>,
-    /// Left hip branch (where the leg leaves the pelvis).
+    /// Left hip branch (where the leg leaves the pelvis), at the femoral head.
     pub hip_left: Option<(DVec3, f64)>,
-    /// Right hip branch.
+    /// Right hip branch, at the femoral head.
     pub hip_right: Option<(DVec3, f64)>,
+    /// Left femoral-head measurement: the crotch anchor and its inscribed radius, before the
+    /// pair is mirrored.
+    pub femoral_head_left: Option<(DVec3, f64)>,
+    /// Right femoral-head measurement, same shape.
+    pub femoral_head_right: Option<(DVec3, f64)>,
 }
 
 impl FleshCentrelines {
@@ -1207,8 +1212,7 @@ pub fn flesh_centrelines(field: &MedialField) -> FleshCentrelines {
     let toe_base_right = distal_junction(&junctions, &leg_right, 0.06);
     let shoulder_left = proximal_branch(&junctions, &arm_left, cx);
     let shoulder_right = proximal_branch(&junctions, &arm_right, cx);
-    let hip_left = proximal_branch(&junctions, &leg_left, cx);
-    let hip_right = proximal_branch(&junctions, &leg_right, cx);
+    let heads = femoral_heads(&leg_left, &leg_right, cx, hip_anchor);
 
     FleshCentrelines {
         spine,
@@ -1229,9 +1233,88 @@ pub fn flesh_centrelines(field: &MedialField) -> FleshCentrelines {
         toe_base_right,
         shoulder_left,
         shoulder_right,
-        hip_left,
-        hip_right,
+        hip_left: heads.left,
+        hip_right: heads.right,
+        femoral_head_left: heads.left_measured,
+        femoral_head_right: heads.right_measured,
     }
+}
+
+/// The femoral heads: the crotch anchor carried up one thigh radius, mirrored onto the
+/// body's midline.
+///
+/// A standing body's hip joints are level and symmetric. The pelvis's medial skeleton is a
+/// *sheet*, so its junctions sit in the upper thigh and pick a point 116 mm below the crotch
+/// (measured on Emily: `y` 814.2 / 790.2 against a 1846 mm body) — a thigh junction, not a
+/// hip — and the leg track itself stops there too, so neither supplies the level. The level
+/// is the crotch anchor carried up one thigh radius; the lateral offset and the depth come
+/// from the thigh's proximal centre. The pair is mirrored about the midline: a
+/// one-sided error would otherwise be inherited by the hip branch. No native joint is read.
+fn femoral_heads(
+    left: &[(DVec3, f64)],
+    right: &[(DVec3, f64)],
+    cx: f64,
+    hip_anchor: Option<(DVec3, f64)>,
+) -> FemoralHeads {
+    // The crotch anchor for one leg: the track is hip -> foot, so its first point is the
+    // proximal end and its inscribed radius is the thigh's there.
+    let raw = |track: &[(DVec3, f64)]| -> Option<(DVec3, f64)> {
+        let (anchor, radius) = *track.first()?;
+        if radius <= 0.0 {
+            return None;
+        }
+        Some((anchor, radius))
+    };
+    let left_raw = raw(left);
+    let right_raw = raw(right);
+    if left_raw.is_none() && right_raw.is_none() {
+        return FemoralHeads::default();
+    }
+    // The level: the crotch carried up one thigh radius — the hip ball sits at the top of the
+    // thigh's proximal inscribed sphere. The leg track stops 116 mm below the crotch on this
+    // body, so the level keeps that known residual and the caller reports it.
+    let level = match (left_raw, right_raw) {
+        (Some((l, rl)), Some((r, rr))) => (l.y + rl + (r.y + rr)) * 0.5,
+        (Some((l, rl)), None) => l.y + rl,
+        (None, Some((r, rr))) => r.y + rr,
+        (None, None) => hip_anchor.map(|(p, _)| p.y).unwrap_or(0.0),
+    };
+    // One lateral offset, one depth: the mean of the two crotch anchors about the midline.
+    let lateral = match (left_raw, right_raw) {
+        (Some((l, _)), Some((r, _))) => ((cx - l.x).abs() + (r.x - cx).abs()) * 0.5,
+        (Some((l, _)), None) => (cx - l.x).abs(),
+        (None, Some((r, _))) => (r.x - cx).abs(),
+        (None, None) => 0.0,
+    };
+    let depth = match (left_raw, right_raw) {
+        (Some((l, _)), Some((r, _))) => (l.z + r.z) * 0.5,
+        (Some((l, _)), None) => l.z,
+        (None, Some((r, _))) => r.z,
+        (None, None) => hip_anchor.map(|(p, _)| p.z).unwrap_or(0.0),
+    };
+    let radius_of = |m: Option<(DVec3, f64)>| m.map(|(_, radius)| radius).unwrap_or(0.0);
+    let left_socket = DVec3::new(cx - lateral, level, depth);
+    let right_socket = DVec3::new(cx + lateral, level, depth);
+    FemoralHeads {
+        left: left_raw.map(|_| (left_socket, radius_of(left_raw))),
+        right: right_raw.map(|_| (right_socket, radius_of(right_raw))),
+        left_measured: left_raw,
+        right_measured: right_raw,
+    }
+}
+
+/// Both femoral heads: the socket the seat uses per side, and the crotch measurement it was
+/// derived from (for the report).
+#[derive(Default)]
+struct FemoralHeads {
+    /// Left socket and its crotch inscribed radius.
+    left: Option<(DVec3, f64)>,
+    /// Right socket and its crotch inscribed radius.
+    right: Option<(DVec3, f64)>,
+    /// Left crotch anchor and its inscribed radius.
+    left_measured: Option<(DVec3, f64)>,
+    /// Right crotch anchor and its inscribed radius.
+    right_measured: Option<(DVec3, f64)>,
 }
 
 /// Flesh digit centrelines: the medial-skeleton graph paths from an anchor junction
