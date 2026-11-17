@@ -886,6 +886,208 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             native_pos.insert(joint, source_worlds[source_joints[slot]].w_axis.truncate());
         }
     }
+    let humanoid = crate::humanoid::supports(&target_palette);
+    let (seated_rig, seat_report) = match humanoid {
+        true => {
+            let body_triangles: Vec<[u32; 3]> = pool.triangles.iter().zip(&pool.partitions)
+                .filter(|(_, partition)| partition.0 == 0)
+                .map(|(triangle, _)| *triangle).collect();
+            crate::humanoid::place(&pool.vertices, &body_triangles, &skeleton, &target_rig, &target_palette)?
+        }
+        false => generic_seat(&pool, &target_rig, &target_palette, &native_pos)?,
+    };
+
+    // Resolve every source joint: direct, folded to its nearest mapped ancestor,
+    // or unsupported. A weighted bone with no mapped ancestor is a refusal.
+    let mut mass = vec![0.0_f64; source_palette.len()];
+    for row in &pool.rows {
+        for &(slot, weight) in row {
+            mass[usize::from(slot)] += f64::from(weight);
+        }
+    }
+    let total_mass: f64 = mass.iter().sum();
+    let mut destinations = Vec::with_capacity(source_palette.len());
+    let mut folds: Vec<FoldRow> = Vec::new();
+    for (slot, name) in source_palette.iter().enumerate() {
+        let joint = JointId::new(slot as u32);
+        if let Some(target) = direct[slot] {
+            destinations.push(Destination::Direct(target));
+            continue;
+        }
+        let ancestor = nearest_mapped_ancestor(&source_rig, joint, &direct);
+        match ancestor {
+            Some(target) => {
+                destinations.push(Destination::Collapsed(target));
+                if mass[slot] > 0.0 {
+                    folds.push(FoldRow {
+                        name: name.clone(),
+                        group: fold_group(name),
+                        mass: mass[slot],
+                        target: target_palette[target.index()].clone(),
+                    });
+                }
+            }
+            None if mass[slot] > 0.0 => {
+                return Err(refused(
+                    "rebind_fold",
+                    format!(
+                        "source bone {name:?} carries weight mass {:.4} but no mapped ancestor; \
+                         the target skeleton cannot carry it",
+                        mass[slot]
+                    ),
+                ));
+            }
+            None => destinations.push(Destination::Unsupported),
+        }
+    }
+
+    // The source rest, proved in world Y-up with an identity basis.
+    let positions: Vec<[f32; 3]> = pool
+        .vertices
+        .iter()
+        .map(|point| point.map(|value| value as f32))
+        .collect();
+    let source_skin = Skin {
+        bones: source_palette.clone(),
+        bind_inverse: (0..source_palette.len())
+            .map(|slot| {
+                f32_of(
+                    DMat4::from_cols_array_2d(
+                        &source_rig
+                            .rest_world(JointId::new(slot as u32))
+                            .expect("source palette joint resolves"),
+                    )
+                    .inverse(),
+                )
+            })
+            .collect(),
+        influences: pool_weights(&pool.rows, source_palette.len())?,
+    };
+    let source_root = source_rig.roots()[0];
+    let source_binding = RestBinding::prove_with_basis(
+        &source_rig,
+        RigFrame::YUp,
+        &[SkinRestSource {
+            shape: 0,
+            root: source_root,
+            positions: &positions,
+            skin: &source_skin,
+            global_to_skin: identity_f32(),
+        }],
+        identity_f64(),
+    )
+    .map_err(rest_error)?;
+
+    let map = BoneMap::resolved(&source_binding, &seated_rig, &destinations)
+        .map_err(|error| errors::invalid("rebind_map", error.to_string()))?;
+
+    // The seat carrier: the mesh rigidly bound to the seated root. It proves the
+    // seated rig carries the geometry at rest and supplies the kernel its target
+    // root and basis; the transferred output is proved again below.
+    let seat_root = seated_rig.roots()[0];
+    let seat_skin = rigid_root_skin(&seated_rig, seat_root, positions.len())?;
+    let seat_binding = RestBinding::prove_with_basis(
+        &seated_rig,
+        RigFrame::YUp,
+        &[SkinRestSource {
+            shape: 0,
+            root: seat_root,
+            positions: &positions,
+            skin: &seat_skin,
+            global_to_skin: identity_f32(),
+        }],
+        identity_f64(),
+    )
+    .map_err(rest_error)?;
+
+    let remapped = remap_skin(
+        &source_binding,
+        &map,
+        &seat_binding,
+        &RemapSettings {
+            source_shape: 0,
+            target_shape: 0,
+            locked_source_joints: Vec::new(),
+        },
+    )
+    .map_err(|error| errors::invalid("rebind_transfer", error.to_string()))?;
+
+    // The palette is the skeleton's, not the weight census's: keep every target
+    // bone so a clip authored on the full skeleton drives it without a conversion
+    // layer. Unreached tips carry zero weight.
+    let skin = complete_palette(&remapped.skin, &seated_rig, &target_palette)?;
+    let validation = validate_skin(&skin, positions.len())?;
+    if humanoid {
+        crate::humanoid::validate_marker_weights(&target_palette,&validation.per_bone)?;
+    }
+
+    let normals = smooth_normals(&positions, &pool.triangles);
+    let asset = MeshAsset {
+        name: mesh_name.to_owned(),
+        positions: positions.clone(),
+        normals,
+        triangles: pool.triangles.clone(),
+        triangle_partitions: pool.partitions.clone(),
+        skin: Some(skin.clone()),
+        ..Default::default()
+    };
+    let final_binding = RestBinding::prove_with_basis(
+        &seated_rig,
+        RigFrame::YUp,
+        &[SkinRestSource {
+            shape: 0,
+            root: seat_root,
+            positions: &asset.positions,
+            skin: &skin,
+            global_to_skin: identity_f32(),
+        }],
+        identity_f64(),
+    )
+    .map_err(rest_error)?;
+    let measurement = final_binding.skins()[0].measurement();
+    let materials = part_materials(&actor, mesh_node)?;
+    let bytes = write_partitioned_rigged_glb(&asset, &final_binding, 0, &[], &materials)
+        .map_err(glb_error)?;
+    if let Some(path) = &params.out {
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|error| errors::io(parent, error))?;
+        }
+        std::fs::write(path, &bytes).map_err(|error| errors::io(path, error))?;
+    }
+
+    let report = build_report(ReportInputs {
+        params,
+        actor_bytes: &actor_bytes,
+        skeleton_bytes: &skeleton_bytes,
+        correspondence: &correspondence,
+        seat_report,
+        source_palette: &source_palette,
+        target_palette: &target_palette,
+        folds: &folds,
+        total_mass,
+        mass: &mass,
+        direct: &direct,
+        validation: &validation,
+        measurement,
+        remap_discarded: remapped.report.discarded.len(),
+        pool: &pool,
+        materials: &materials,
+        bytes: &bytes,
+        positions: &positions,
+    });
+    if let Some(path) = &params.report {
+        write_report(path, &report)?;
+    }
+    Ok(report)
+}
+
+/// Retain generic transfer semantics for palettes outside the humanoid contract.
+fn generic_seat(
+    pool: &Pool,
+    target_rig: &Rig,
+    target_palette: &[String],
+    native_pos: &BTreeMap<JointId, DVec3>,
+) -> Result<(Rig, Value), CommandError> {
     // Skeleton-authority placement (operator): Mixamo's graph and chain fractions are
     // the authority; the flesh medial axis supplies the hip anchor, the chain extents
     // and the frame. No native joint places, anchors or measures a vertex — native_pos
@@ -905,7 +1107,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             Ok(DVec3::new(m[3][0], m[3][1], m[3][2]))
         })
         .collect::<Result<_, CommandError>>()?;
-    let fractions = crate::medial::chain_fractions(&target_palette, &target_rest);
+    let fractions = crate::medial::chain_fractions(target_palette, &target_rest);
     let index_of = |name: &str| target_palette.iter().position(|p| p == name);
 
     // Flesh placement axes, branch-to-branch, measured on the medial axis: spine pelvis
@@ -1037,7 +1239,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             record_flesh_joint(
                 &mut flesh_pos,
                 &mut joint_meta,
-                &native_pos,
+                native_pos,
                 &field,
                 *j,
                 *p,
@@ -1085,7 +1287,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
                 &fractions,
                 &mut flesh_pos,
                 &mut joint_meta,
-                &native_pos,
+                native_pos,
                 &field,
                 "flesh_digit_axis",
             );
@@ -1114,7 +1316,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
                 &fractions,
                 &mut flesh_pos,
                 &mut joint_meta,
-                &native_pos,
+                native_pos,
                 &field,
                 "flesh_digit_axis",
             );
@@ -1129,7 +1331,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
             &fractions,
             &mut flesh_pos,
             &mut joint_meta,
-            &native_pos,
+            native_pos,
             &field,
             "flesh_digit_axis",
         );
@@ -1159,7 +1361,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
         record_flesh_joint(
             &mut flesh_pos,
             &mut joint_meta,
-            &native_pos,
+            native_pos,
             &field,
             j,
             p,
@@ -1216,10 +1418,10 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
         .collect();
     let mesh_normals = smooth_normals(&positions_f32, &pool.triangles);
     let (seated_rig, mut seat_report) = seat_rig(
-        &target_rig,
-        &target_palette,
+        target_rig,
+        target_palette,
         &flesh_pos,
-        &native_pos,
+        native_pos,
         &pool.vertices,
         &mesh_normals,
     )?;
@@ -1390,185 +1592,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
         });
     }
 
-    // Resolve every source joint: direct, folded to its nearest mapped ancestor,
-    // or unsupported. A weighted bone with no mapped ancestor is a refusal.
-    let mut mass = vec![0.0_f64; source_palette.len()];
-    for row in &pool.rows {
-        for &(slot, weight) in row {
-            mass[usize::from(slot)] += f64::from(weight);
-        }
-    }
-    let total_mass: f64 = mass.iter().sum();
-    let mut destinations = Vec::with_capacity(source_palette.len());
-    let mut folds: Vec<FoldRow> = Vec::new();
-    for (slot, name) in source_palette.iter().enumerate() {
-        let joint = JointId::new(slot as u32);
-        if let Some(target) = direct[slot] {
-            destinations.push(Destination::Direct(target));
-            continue;
-        }
-        let ancestor = nearest_mapped_ancestor(&source_rig, joint, &direct);
-        match ancestor {
-            Some(target) => {
-                destinations.push(Destination::Collapsed(target));
-                if mass[slot] > 0.0 {
-                    folds.push(FoldRow {
-                        name: name.clone(),
-                        group: fold_group(name),
-                        mass: mass[slot],
-                        target: target_palette[target.index()].clone(),
-                    });
-                }
-            }
-            None if mass[slot] > 0.0 => {
-                return Err(refused(
-                    "rebind_fold",
-                    format!(
-                        "source bone {name:?} carries weight mass {:.4} but no mapped ancestor; \
-                         the target skeleton cannot carry it",
-                        mass[slot]
-                    ),
-                ));
-            }
-            None => destinations.push(Destination::Unsupported),
-        }
-    }
-
-    // The source rest, proved in world Y-up with an identity basis.
-    let positions: Vec<[f32; 3]> = pool
-        .vertices
-        .iter()
-        .map(|point| point.map(|value| value as f32))
-        .collect();
-    let source_skin = Skin {
-        bones: source_palette.clone(),
-        bind_inverse: (0..source_palette.len())
-            .map(|slot| {
-                f32_of(
-                    DMat4::from_cols_array_2d(
-                        &source_rig
-                            .rest_world(JointId::new(slot as u32))
-                            .expect("source palette joint resolves"),
-                    )
-                    .inverse(),
-                )
-            })
-            .collect(),
-        influences: pool_weights(&pool.rows, source_palette.len())?,
-    };
-    let source_root = source_rig.roots()[0];
-    let source_binding = RestBinding::prove_with_basis(
-        &source_rig,
-        RigFrame::YUp,
-        &[SkinRestSource {
-            shape: 0,
-            root: source_root,
-            positions: &positions,
-            skin: &source_skin,
-            global_to_skin: identity_f32(),
-        }],
-        identity_f64(),
-    )
-    .map_err(rest_error)?;
-
-    let map = BoneMap::resolved(&source_binding, &seated_rig, &destinations)
-        .map_err(|error| errors::invalid("rebind_map", error.to_string()))?;
-
-    // The seat carrier: the mesh rigidly bound to the seated root. It proves the
-    // seated rig carries the geometry at rest and supplies the kernel its target
-    // root and basis; the transferred output is proved again below.
-    let seat_root = seated_rig.roots()[0];
-    let seat_skin = rigid_root_skin(&seated_rig, seat_root, positions.len())?;
-    let seat_binding = RestBinding::prove_with_basis(
-        &seated_rig,
-        RigFrame::YUp,
-        &[SkinRestSource {
-            shape: 0,
-            root: seat_root,
-            positions: &positions,
-            skin: &seat_skin,
-            global_to_skin: identity_f32(),
-        }],
-        identity_f64(),
-    )
-    .map_err(rest_error)?;
-
-    let remapped = remap_skin(
-        &source_binding,
-        &map,
-        &seat_binding,
-        &RemapSettings {
-            source_shape: 0,
-            target_shape: 0,
-            locked_source_joints: Vec::new(),
-        },
-    )
-    .map_err(|error| errors::invalid("rebind_transfer", error.to_string()))?;
-
-    // The palette is the skeleton's, not the weight census's: keep every target
-    // bone so a clip authored on the full skeleton drives it without a conversion
-    // layer. Unreached tips carry zero weight.
-    let skin = complete_palette(&remapped.skin, &seated_rig, &target_palette)?;
-    let validation = validate_skin(&skin, positions.len())?;
-
-    let normals = smooth_normals(&positions, &pool.triangles);
-    let asset = MeshAsset {
-        name: mesh_name.to_owned(),
-        positions: positions.clone(),
-        normals,
-        triangles: pool.triangles.clone(),
-        triangle_partitions: pool.partitions.clone(),
-        skin: Some(skin.clone()),
-        ..Default::default()
-    };
-    let final_binding = RestBinding::prove_with_basis(
-        &seated_rig,
-        RigFrame::YUp,
-        &[SkinRestSource {
-            shape: 0,
-            root: seat_root,
-            positions: &asset.positions,
-            skin: &skin,
-            global_to_skin: identity_f32(),
-        }],
-        identity_f64(),
-    )
-    .map_err(rest_error)?;
-    let measurement = final_binding.skins()[0].measurement();
-    let materials = part_materials(&actor, mesh_node)?;
-    let bytes = write_partitioned_rigged_glb(&asset, &final_binding, 0, &[], &materials)
-        .map_err(glb_error)?;
-    if let Some(path) = &params.out {
-        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|error| errors::io(parent, error))?;
-        }
-        std::fs::write(path, &bytes).map_err(|error| errors::io(path, error))?;
-    }
-
-    let report = build_report(ReportInputs {
-        params,
-        actor_bytes: &actor_bytes,
-        skeleton_bytes: &skeleton_bytes,
-        correspondence: &correspondence,
-        seat_report,
-        source_palette: &source_palette,
-        target_palette: &target_palette,
-        folds: &folds,
-        total_mass,
-        mass: &mass,
-        direct: &direct,
-        validation: &validation,
-        measurement,
-        remap_discarded: remapped.report.discarded.len(),
-        pool: &pool,
-        materials: &materials,
-        bytes: &bytes,
-        positions: &positions,
-    });
-    if let Some(path) = &params.report {
-        write_report(path, &report)?;
-    }
-    Ok(report)
+    Ok((seated_rig, seat_report))
 }
 
 fn identity_f64() -> [[f64; 4]; 4] {

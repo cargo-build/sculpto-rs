@@ -22,6 +22,7 @@ pub mod export_actor;
 pub mod export_glb;
 mod handlers;
 pub mod havok;
+mod humanoid;
 pub mod joints;
 pub mod measures;
 pub mod medial;

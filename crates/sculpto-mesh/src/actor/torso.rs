@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 
 use super::fit::{build_frames, node_names, parse_name, skin_base, skin_matrices};
 use super::{Actor, ActorError, FittedFrame, Part, Sample, geometry, invalid};
@@ -292,6 +292,55 @@ impl Section {
             frame.lateral * centre[0] + frame.anterior * centre[1] + frame.up * self.plane
         })
     }
+}
+
+/// Cut explicit Y-up geometry without consulting a rig or its weights. @req DECL0013
+/// Open chains remain explicit; an unresolved section has no selected area.
+///
+/// # Errors
+/// Empty/nonfinite geometry, an invalid triangle index or a nonfinite cut height.
+pub fn horizontal_sections(
+    positions: &[[f64; 3]],
+    triangles: &[[u32; 3]],
+    heights: &[f64],
+) -> Result<Vec<Section>, ActorError> {
+    if positions.is_empty() || triangles.is_empty() {
+        return Err(invalid("surface sections", "geometry is empty"));
+    }
+    if positions.iter().flatten().any(|value| !value.is_finite())
+        || heights.iter().any(|value| !value.is_finite())
+    {
+        return Err(invalid("surface sections", "geometry or cut height is not finite"));
+    }
+    let triangles = triangles
+        .iter()
+        .enumerate()
+        .map(|(index, triangle)| {
+            let converted = triangle.map(|vertex| vertex as usize);
+            match converted.iter().any(|vertex| *vertex >= positions.len()) {
+                true => Err(invalid(
+                    "surface sections",
+                    format!("triangle {index} leaves the {}-vertex surface", positions.len()),
+                )),
+                false => Ok(converted),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let surface = Selection {
+        part: "surface".to_owned(),
+        positions: positions.to_vec(),
+        triangles,
+    };
+    let frame = Frame {
+        up: DVec3::Y,
+        lateral: DVec3::X,
+        anterior: DVec3::Z,
+        anterior_source: "geometry",
+    };
+    Ok(heights
+        .iter()
+        .map(|height| surface.section_all(&frame, "surface", *height))
+        .collect())
 }
 
 /// One limb probe: the instrument's calibration on flesh that is near a cylinder.
@@ -839,7 +888,8 @@ fn cut(selection: &Selection, frame: &Frame, plane: f64) -> Cut {
         .map(|point| DVec3::from_array(*point))
         .collect();
     let mut segments: Vec<Segment> = Vec::new();
-    let mut counts: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    let mut cut_points = CutPoints::default();
     for triangle in &selection.triangles {
         let [first, second, third] = [triangle[0], triangle[1], triangle[2]];
         let (Some(a), Some(b), Some(c)) =
@@ -867,8 +917,11 @@ fn cut(selection: &Selection, frame: &Frame, plane: f64) -> Cut {
         if (q1 - q0).cross(normal).dot(frame.up) < 0.0 {
             std::mem::swap(&mut q0, &mut q1);
         }
-        let start_key = key(q0, frame);
-        let end_key = key(q1, frame);
+        let start_key = cut_points.identity(q0, frame);
+        let end_key = cut_points.identity(q1, frame);
+        if start_key == end_key {
+            continue;
+        }
         for value in [start_key, end_key] {
             *counts.entry(value).or_insert(0) += 1;
         }
@@ -892,23 +945,43 @@ fn cut(selection: &Selection, frame: &Frame, plane: f64) -> Cut {
 /// One oriented cut segment.
 #[derive(Clone, Copy, Debug)]
 struct Segment {
-    start: (i64, i64),
-    end: (i64, i64),
+    start: usize,
+    end: usize,
     start_point: DVec3,
     end_point: DVec3,
 }
 
-/// A cut point's identity: the 1 µm cell it falls in.
-fn key(point: DVec3, frame: &Frame) -> (i64, i64) {
-    (
-        (point.dot(frame.lateral) / POINT_KEY).round() as i64,
-        (point.dot(frame.anterior) / POINT_KEY).round() as i64,
-    )
+/// Adjacent hash cells must agree when a shared edge straddles their boundary. @req DECL0013
+#[derive(Default)]
+struct CutPoints {
+    bins: HashMap<(i64, i64), Vec<usize>>,
+    points: Vec<DVec2>,
+}
+
+impl CutPoints {
+    fn identity(&mut self, point: DVec3, frame: &Frame) -> usize {
+        let point = DVec2::new(point.dot(frame.lateral), point.dot(frame.anterior));
+        let cell = ((point.x / POINT_KEY).floor() as i64, (point.y / POINT_KEY).floor() as i64);
+        let existing = (-1..=1).flat_map(|x| (-1..=1).map(move |y| (x, y)))
+            .filter_map(|(x, y)| self.bins.get(&(cell.0 + x, cell.1 + y)))
+            .flatten().copied()
+            .filter(|index| self.points[*index].distance(point) <= POINT_KEY)
+            .min();
+        match existing {
+            Some(index) => index,
+            None => {
+                let index = self.points.len();
+                self.points.push(point);
+                self.bins.entry(cell).or_default().push(index);
+                index
+            }
+        }
+    }
 }
 
 /// Walk the segments into rings through their shared edges.
 fn link(segments: &[Segment], frame: &Frame) -> (Vec<SectionLoop>, usize) {
-    let mut at_point: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut at_point: HashMap<usize, Vec<usize>> = HashMap::new();
     for (index, segment) in segments.iter().enumerate() {
         at_point.entry(segment.start).or_default().push(index);
         at_point.entry(segment.end).or_default().push(index);
@@ -966,12 +1039,12 @@ fn measure_loop(segments: &[Segment], chain: &[usize], closed: bool, frame: &Fra
     let mut ring: Vec<[f64; 2]> = Vec::with_capacity(chain.len());
     let mut area = 0.0;
     let mut sum = [0.0_f64; 2];
-    let mut cursor = segments[chain[0]].start_point;
+    let mut cursor = segments[chain[0]].start;
     for index in chain {
         let segment = segments[*index];
-        let (from, to) = match segment.start_point.distance(cursor) < 1e-9 {
-            true => (segment.start_point, segment.end_point),
-            false => (segment.end_point, segment.start_point),
+        let (from, to, end) = match segment.start == cursor {
+            true => (segment.start_point, segment.end_point, segment.end),
+            false => (segment.end_point, segment.start_point, segment.start),
         };
         let (u0, v0) = (from.dot(frame.lateral), from.dot(frame.anterior));
         let (u1, v1) = (to.dot(frame.lateral), to.dot(frame.anterior));
@@ -980,7 +1053,7 @@ fn measure_loop(segments: &[Segment], chain: &[usize], closed: bool, frame: &Fra
         area += term;
         sum[0] += (u0 + u1) * term;
         sum[1] += (v0 + v1) * term;
-        cursor = to;
+        cursor = end;
     }
     area *= 0.5;
     let centroid = match area.abs() > 1e-12 {

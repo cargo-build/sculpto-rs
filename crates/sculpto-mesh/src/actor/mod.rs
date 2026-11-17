@@ -29,7 +29,7 @@ pub use stress::{
 };
 pub use torso::{
     AnatomyLevel, BodyFrame, Decision, LATERAL_TOLERANCE, LimbProbe, PartSelector, Section,
-    SectionLoop, TORSO_CHAIN, TorsoBone, TorsoJoint, TorsoOutcome, torso_fit,
+    SectionLoop, TORSO_CHAIN, TorsoBone, TorsoJoint, TorsoOutcome, horizontal_sections, torso_fit,
 };
 
 use std::fmt;

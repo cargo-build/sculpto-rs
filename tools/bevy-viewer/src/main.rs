@@ -1,6 +1,9 @@
 //! Headless Bevy proof: load the accepted actor GLB and the baked cloth GLB
 //! (morph animation), render an offscreen frame, save it as PNG, exit.
 //! Also provides `--headless --report --glb <path>` count reporting for consumer acceptance.
+//! `--control <socket>` publishes the agent control socket (see `control.rs`).
+mod control;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::mesh::morph::{MorphWeights, MAX_MORPH_WEIGHTS};
@@ -69,6 +72,9 @@ struct ViewerConfig {
     /// Operator-facing status of the result on screen: `ReadyToShowProgress`
     /// when it is finished and verified, `InProgress` while it is not.
     status: String,
+    /// Control socket path when `--control` is given, so the card and the
+    /// agent name the same address.
+    control: Option<String>,
 }
 
 /// Runtime lit/flat state; `SCULPTO_VIEWER_FLAT` seeds it and `L` flips it.
@@ -103,6 +109,15 @@ struct RigMode {
 /// Materials flattened by the flat mode, so switching back restores them.
 #[derive(Resource, Default)]
 struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
+
+/// Opacity for **every** actor material while the skeleton overlay is on — body,
+/// bra and panty alike. The operator's default is 65 % (2026-11-17, was 16 %),
+/// so the figure stays readable as flesh with the bones visible through it.
+///
+/// The value is one number for one figure: parts are distinguished by their
+/// own compositing, not by different alpha. `state.materials` reports what each
+/// material actually carries.
+const ACTOR_OPACITY: f32 = 0.65;
 
 /// `B` cycles the skeleton overlay: off -> primary chain -> every driven joint.
 /// Enabled at start by `SCULPTO_VIEWER_SKELETON=1` so a headless capture can
@@ -213,6 +228,11 @@ struct ClipSelection(usize);
 struct InPlaceRoot {
     translation: Vec3,
 }
+
+/// The control socket as a Bevy resource. The socket module stays free of
+/// Bevy so its protocol tests run without an app; this is the one adapter.
+#[derive(Resource)]
+struct ControlHandle(control::ControlServer);
 
 /// `SCULPTO_VIEWER_IN_PLACE=0` restores world displacement for a deliberate check.
 #[derive(Resource, Clone, Copy)]
@@ -370,6 +390,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
+/// The 8-character display form of a digest. The card and the title show the
+/// short form; the control socket reports the whole hash.
+fn sha_short(sha: &str) -> &str {
+    match sha.char_indices().nth(8) {
+        Some((index, _)) => &sha[..index],
+        None => sha,
+    }
+}
+
 /// The `<stage>.json` sidecar an agent writes next to the GLB: status label,
 /// sha and a one-line note. Only the note is displayed; the sha in the card
 /// is always this viewer's own hash of the staged bytes, never the sidecar's.
@@ -422,7 +451,7 @@ struct WatchFiles {
 struct StagedFile {
     seq: u64,
     asset_name: String,
-    sha8: String,
+    sha: String,
     note: SidecarNote,
 }
 
@@ -463,7 +492,7 @@ impl WatchFiles {
         Some(StagedFile {
             seq,
             asset_name: format!("live-{seq}.glb"),
-            sha8: sha256_hex(&bytes)[..8].to_string(),
+            sha: sha256_hex(&bytes),
             note: read_sidecar_note(&self.sidecar_path()),
         })
     }
@@ -480,7 +509,7 @@ struct PendingScene {
     seq: u64,
     asset_name: String,
     world: Handle<bevy::world_serialization::WorldAsset>,
-    sha8: String,
+    sha: String,
     note: SidecarNote,
 }
 
@@ -504,8 +533,8 @@ struct WatchState {
     next_poll: f64,
     /// `SCULPTO_VIEWER_WATCH_EXIT_SECS`: headless smoke runs only.
     exit_after: Option<f64>,
-    /// The generation on screen: its sha and sidecar note.
-    sha8: String,
+    /// The generation on screen: its full sha and sidecar note.
+    sha: String,
     note: String,
     /// The last attempt failed to load — keep the old scene and say so.
     failed: bool,
@@ -523,10 +552,12 @@ impl WatchState {
         if self.failed {
             return format!(
                 "{} · live {} {} · load failed — kept previous",
-                status, self.files.stage, self.sha8
+                status,
+                self.files.stage,
+                sha_short(&self.sha)
             );
         }
-        live_line(status, &self.files.stage, &self.sha8, &self.note)
+        live_line(status, &self.files.stage, sha_short(&self.sha), &self.note)
     }
 }
 
@@ -552,6 +583,37 @@ struct CliOptions {
     watch: Option<std::path::PathBuf>,
     /// `--stage <name>`: the stage file name to watch (required with --watch).
     stage: Option<String>,
+    /// `--control <socket>`: publish the agent control socket at this path.
+    control: Option<std::path::PathBuf>,
+}
+
+/// The asset the viewer is showing: identity for the control socket.
+///
+/// `sha256` is the hash of the file's bytes at load time — or, in watch mode,
+/// of the generation on screen — so an agent can prove which artifact it reads
+/// instead of trusting a path.
+#[derive(Resource)]
+struct AssetProfile {
+    path: std::path::PathBuf,
+    file: String,
+    sha256: String,
+    /// A scene mesh from this file is on screen. A spawned scene root alone is
+    /// not evidence: the root exists before its scene parses.
+    loaded: bool,
+    /// A newer watch generation is staged and still loading, so the digest
+    /// above describes the generation on screen, not the one arriving.
+    pending: bool,
+    /// The newest staged file did not parse; the previous scene is still shown.
+    failed: bool,
+    /// Staged generation index on screen, so a reload of identical bytes still
+    /// moves the reported file name to the copy actually loaded.
+    seq: Option<u64>,
+    /// Scene mesh entities counted while waiting for `loaded`.
+    meshes: usize,
+    scale: f32,
+    /// Animation clips the file on screen actually carries. The player graph
+    /// always holds idle/walk nodes, so its length is not this number.
+    clips: Option<usize>,
 }
 
 fn parse_args() -> CliOptions {
@@ -571,6 +633,9 @@ fn parse_args() -> CliOptions {
             .ok()
             .map(std::path::PathBuf::from),
         stage: std::env::var("SCULPTO_VIEWER_STAGE").ok(),
+        control: std::env::var("SCULPTO_VIEWER_CONTROL")
+            .ok()
+            .map(std::path::PathBuf::from),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -592,6 +657,11 @@ fn parse_args() -> CliOptions {
             "--stage" => {
                 if let Some(val) = args.next() {
                     options.stage = Some(val);
+                }
+            }
+            "--control" => {
+                if let Some(val) = args.next().filter(|value| !value.starts_with('-')) {
+                    options.control = Some(std::path::PathBuf::from(val));
                 }
             }
             "--glb" => {
@@ -621,7 +691,12 @@ fn parse_args() -> CliOptions {
 /// the figure in its rest pose, which reads as "the clip is broken" rather than
 /// "the index is wrong". Reporting the real count keeps the preview honest.
 fn glb_animation_count(path: &std::path::Path) -> Option<usize> {
-    let bytes = std::fs::read(path).ok()?;
+    glb_animation_count_bytes(&std::fs::read(path).ok()?)
+}
+
+/// The animation count of already-read GLB bytes, so a startup hash and a
+/// clip count cost one file read, not two.
+fn glb_animation_count_bytes(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 20 || &bytes[0..4] != b"glTF" {
         return None;
     }
@@ -631,7 +706,13 @@ fn glb_animation_count(path: &std::path::Path) -> Option<usize> {
         return None;
     }
     let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + chunk_len]).ok()?;
-    Some(json.get("animations")?.as_array()?.len())
+    // A GLB without an `animations` array carries zero clips; reporting `null`
+    // there would read as "unknown" to an agent.
+    Some(
+        json.get("animations")
+            .and_then(|animations| animations.as_array())
+            .map_or(0, |animations| animations.len()),
+    )
 }
 
 fn main() {
@@ -752,7 +833,7 @@ fn main() {
             exit_after: std::env::var("SCULPTO_VIEWER_WATCH_EXIT_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
-            sha8: String::new(),
+            sha: String::new(),
             note: String::new(),
             failed: false,
             ready: false,
@@ -762,11 +843,11 @@ fn main() {
             eprintln!(
                 "viewer: live start {} sha {} sidecar {}",
                 staged.asset_name,
-                staged.sha8,
+                sha_short(&staged.sha),
                 staged.note.display()
             );
             asset_file = staged.asset_name;
-            state.sha8 = staged.sha8;
+            state.sha = staged.sha;
             state.note = staged.note.display().to_string();
             state.ready = true;
             state.current_seq = Some(0);
@@ -800,6 +881,74 @@ fn main() {
         _ => String::new(),
     };
 
+    // The control socket drives a live window or a headless capture; `--report`
+    // prints its counts and exits before a socket could answer once.
+    if options.control.is_some() && options.report {
+        eprintln!("viewer: --control needs a running viewer; it cannot combine with --report");
+        std::process::exit(2);
+    }
+    // A missing asset used to render a black frame that looked like a result.
+    // Say it at startup instead; `--watch` legitimately waits for its first file.
+    if options.watch.is_none() && !asset_path.exists() {
+        eprintln!(
+            "viewer: asset not found: {} (pass --glb <path> or set SCULPTO_VIEWER_ASSET)",
+            asset_path.display()
+        );
+        std::process::exit(2);
+    }
+    // Identity of what is on screen. Watch mode already hashed the staged
+    // generation it loaded; the single-asset modes hash the file once here.
+    let (digest_path, digest, clips) = match watch_state.as_ref() {
+        Some(watch) if !watch.sha.is_empty() => {
+            let path = watch.files.staging_dir.join(
+                watch
+                    .current_seq
+                    .map_or_else(|| asset_file.clone(), |seq| format!("live-{seq}.glb")),
+            );
+            let clips = glb_animation_count(&path);
+            (path, watch.sha.clone(), clips)
+        }
+        _ => match std::fs::read(&asset_path) {
+            Ok(bytes) => (
+                asset_path.clone(),
+                sha256_hex(&bytes),
+                glb_animation_count_bytes(&bytes),
+            ),
+            Err(_) => (asset_path.clone(), String::new(), None),
+        },
+    };
+    let asset_profile = AssetProfile {
+        path: digest_path,
+        file: asset_file.clone(),
+        sha256: digest,
+        loaded: false,
+        pending: false,
+        failed: false,
+        seq: None,
+        meshes: 0,
+        scale: env_f32("SCULPTO_VIEWER_SCALE", 1.0),
+        clips,
+    };
+    let control_server = match options.control.as_deref() {
+        Some(path) => match control::start(path) {
+            Ok(server) => {
+                eprintln!("viewer: control socket {}", server.path.display());
+                Some(server)
+            }
+            Err(error) => {
+                eprintln!(
+                    "viewer: control socket {} cannot be created: {error}",
+                    path.display()
+                );
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let control_path = control_server
+        .as_ref()
+        .map(|server| server.path.display().to_string());
+
     let config = ViewerConfig {
         report_mode: options.report,
         debug_scene: options.debug_scene,
@@ -811,6 +960,7 @@ fn main() {
             std::env::var("SCULPTO_VIEWER_STATUS").unwrap_or_else(|_| "InProgress".to_string()),
             clip_note
         ),
+        control: control_path,
     };
     let asset_plugin = AssetPlugin {
         file_path: asset_dir,
@@ -859,7 +1009,12 @@ fn main() {
     if let Some(state) = watch_state {
         app.insert_resource(state);
     }
-    app.insert_resource(FlatFlipped::default())
+    if let Some(server) = control_server {
+        app.insert_resource(ControlHandle(server));
+    }
+    app.insert_resource(asset_profile)
+        .insert_resource(ActorMaterials::default())
+        .insert_resource(FlatFlipped::default())
         .insert_resource(ClipSelection(
             std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
                 .ok()
@@ -931,6 +1086,7 @@ fn main() {
             ),
             ..default()
         })
+        .init_resource::<SkelJointsInfo>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -959,6 +1115,19 @@ fn main() {
         )
         // Separate call: the tuple above is already at Bevy's arity limit.
         .add_systems(Update, (watch_tick, watch_card))
+        .add_systems(Update, hover_joint_name)
+        .add_systems(Update, track_asset_loaded)
+        .add_systems(Update, collect_actor_materials.after(apply_skeleton_mode))
+        // The socket reads joints after the overlay refreshed them and writes
+        // the camera, the clip and the playback the frame's own systems read.
+        .add_systems(
+            Update,
+            (control_service,)
+                .after(draw_skeleton)
+                .before(control_playback)
+                .before(apply_playback)
+                .before(orbit_controls),
+        )
         .add_systems(Update, (control_playback, apply_playback))
         .add_systems(Update, tag_in_place_roots)
         // After the animation pass, before transform propagation, so the held
@@ -1051,6 +1220,14 @@ fn toggle_rig(
 #[derive(Component)]
 struct SkelJoint;
 
+/// Active overlay joint names + world positions, refreshed each frame for hover picking.
+#[derive(Resource, Default)]
+struct SkelJointsInfo(Vec<(String, Vec3)>);
+
+/// UI label showing the hovered joint's name.
+#[derive(Component)]
+struct HoverLabel;
+
 #[derive(Component)]
 struct SkelBone;
 
@@ -1120,7 +1297,9 @@ fn apply_skeleton_mode(
                 continue;
             }
             if let Some(mut material) = materials.get_mut(id) {
-                material.base_color = material.base_color.with_alpha(0.16);
+                // 65 % opacity is the operator's default (2026-11-17): the body
+                // reads as a body while the bones still show through it.
+                material.base_color = material.base_color.with_alpha(ACTOR_OPACITY);
                 material.alpha_mode = AlphaMode::Blend;
                 restore.0.push(id);
             }
@@ -1144,6 +1323,7 @@ fn draw_skeleton(
     mut pool: ResMut<SkelPool>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut info: ResMut<SkelJointsInfo>,
     nodes: Query<(Entity, &Name, &GlobalTransform, Option<&ChildOf>)>,
     skins: Query<&SkinnedMesh>,
     mut overlay: Query<(&mut Transform, &mut Visibility), Or<(With<SkelJoint>, With<SkelBone>)>>,
@@ -1242,7 +1422,16 @@ fn draw_skeleton(
             bones.push((entity, transform.translation(), parent.map(|p| p.parent())));
         }
     }
+    let name_of: std::collections::HashMap<Entity, String> = nodes
+        .iter()
+        .map(|(e, n, _, _)| (e, n.as_str().to_string()))
+        .collect();
+    info.0 = bones
+        .iter()
+        .filter_map(|(e, p, _)| name_of.get(e).map(|n| (n.clone(), *p)))
+        .collect();
     if !skel.on() {
+        info.0.clear();
         for entity in pool.joints.iter().chain(pool.bones.iter()) {
             if let Ok((_, mut visibility)) = overlay.get_mut(*entity) {
                 *visibility = Visibility::Hidden;
@@ -1484,9 +1673,11 @@ fn setup(
     ));
     if let Some(handle) = target_handle {
         camera.insert(bevy::camera::RenderTarget::Image(handle.into()));
-    } else {
-        commands.insert_resource(OrbitCamera::looking_at(camera_eye, camera_target));
     }
+    // Both modes carry the orbit state: the interactive window drives it with
+    // the mouse, the headless capture leaves it at the fixed review view, and
+    // the control socket can move either one through the same resource.
+    commands.insert_resource(OrbitCamera::looking_at(camera_eye, camera_target));
     // One key light by default: the shading and the cast shadow are computed
     // at runtime, so turning the figure under it changes both. `3` adds the
     // fill/rim pair when the far side is too dark to read.
@@ -1607,7 +1798,7 @@ fn setup(
                     } else {
                         "0 idle · 1 walk · Space pause · Ctrl+, slower · Ctrl+. faster"
                     },
-                    "R reset · L lit/flat · 3 rig · B bones (chain/all) · H help",
+                    "R reset · L lit/flat · 3 rig · B bones · H help · hover node = name",
                 ] {
                     card.spawn((
                         Text::new(line),
@@ -1631,7 +1822,93 @@ fn setup(
                         WatchLine,
                     ));
                 }
+                if let Some(control) = config.control.as_deref() {
+                    card.spawn((
+                        Text::new(format!("control: {control}")),
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(12.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.55, 0.85, 1.0)),
+                    ));
+                }
             });
+        commands
+            .spawn(Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                justify_content: JustifyContent::Center,
+                ..default()
+            })
+            .with_children(|row| {
+                row.spawn((
+                    Text::new(""),
+                    TextFont {
+                        font_size: bevy::text::FontSize::Px(22.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.82, 0.15)),
+                    HoverLabel,
+                    Visibility::Hidden,
+                ));
+            });
+    }
+}
+
+/// Hover the cursor over a yellow joint to read its name (top-center label).
+/// Picks the joint whose world position lies closest to the cursor ray within a
+/// small radius, so the operator can identify nodes while placing them.
+fn hover_joint_name(
+    config: Res<ViewerConfig>,
+    skel: Res<SkelMode>,
+    info: Res<SkelJointsInfo>,
+    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    windows: Query<&Window>,
+    mut labels: Query<(&mut Text, &mut Visibility), With<HoverLabel>>,
+) {
+    let Ok((mut text, mut vis)) = labels.single_mut() else {
+        return;
+    };
+    if !config.interactive || !skel.on() || info.0.is_empty() {
+        *vis = Visibility::Hidden;
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    let Ok((camera, cam_tf)) = cameras.single() else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    let dir = ray.direction.normalize();
+    let mut best: Option<(f32, &str)> = None;
+    for (name, pos) in &info.0 {
+        let d = *pos - ray.origin;
+        let along = d.dot(dir);
+        if along <= 0.0 {
+            continue;
+        }
+        let perp = (d - dir * along).length();
+        if perp < 0.012 && best.is_none_or(|(b, _)| perp < b) {
+            best = Some((perp, name.as_str()));
+        }
+    }
+    if let Some((_, name)) = best {
+        text.0 = name.to_string();
+        *vis = Visibility::Inherited;
+    } else {
+        *vis = Visibility::Hidden;
     }
 }
 
@@ -2026,13 +2303,7 @@ fn select_clip(
     }
     selection.0 = wanted;
     let Some(graph) = graph else { return };
-    for mut player in &mut players {
-        player.stop_all();
-        player.play(graph.nodes[wanted]).repeat();
-        if let Some(cloth) = graph.cloth {
-            player.play(cloth).repeat();
-        }
-    }
+    start_actor_clip(&graph, wanted, &mut players);
 }
 
 /// Camera positions for the review views; the glTF actor faces +Z, so the
@@ -2054,6 +2325,14 @@ fn parse_series(spec: &str) -> Option<(u32, u32, u32)> {
     (count > 0 && stride > 0).then_some((start, count, stride))
 }
 
+/// The one-shot capture and its frame-301 exit.
+///
+/// A `--control` session is a live session: its caller decides when it ends,
+/// and the automatic capture would both overwrite `SCULPTO_VIEWER_PNG` and take
+/// the process down after roughly five seconds — measured against a live
+/// control session that lost its third capture request. Control mode is
+/// therefore exempt, exactly like the interactive window and `--watch`; the
+/// one-shot and series behaviour stays for every run without it.
 #[allow(clippy::too_many_arguments)]
 fn capture_once(
     config: Res<ViewerConfig>,
@@ -2066,7 +2345,12 @@ fn capture_once(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if bench.0 || config.report_mode || config.debug_scene || config.interactive || watch.is_some()
+    if bench.0
+        || config.report_mode
+        || config.debug_scene
+        || config.interactive
+        || config.control.is_some()
+        || watch.is_some()
     {
         return;
     }
@@ -2128,6 +2412,411 @@ fn capture_once(
             "SCULPTO_VIEWER_PNG",
             "/tmp/sculpto-classify/cloth/bevy_combined_240.png",
         )));
+}
+
+/// Per-material evidence for the control socket: what each drawn actor material
+/// carries after the overlay pass has run.
+#[derive(Resource, Default)]
+struct ActorMaterials(Vec<control::MaterialEntry>);
+
+/// Read every actor material back from the assets once per frame. Cheap (a
+/// handful of entities) and honest: it reports the values the renderer uses,
+/// including `unlit` in flat mode, instead of restating the setting.
+#[allow(clippy::type_complexity)] // the four name/material components are the evidence
+fn collect_actor_materials(
+    actors: Query<
+        (
+            Option<&Name>,
+            Option<&bevy::gltf::GltfMeshName>,
+            Option<&bevy::gltf::GltfMaterialName>,
+            &MeshMaterial3d<StandardMaterial>,
+        ),
+        (
+            With<Mesh3d>,
+            Without<ReviewGround>,
+            Without<SkelJoint>,
+            Without<SkelBone>,
+        ),
+    >,
+    materials: Res<Assets<StandardMaterial>>,
+    mut out: ResMut<ActorMaterials>,
+) {
+    let entries: Vec<control::MaterialEntry> = actors
+        .iter()
+        .filter_map(|(name, mesh_name, material_name, handle)| {
+            let material = materials.get(handle.id())?;
+            let srgba = material.base_color.to_srgba();
+            Some(control::MaterialEntry {
+                mesh: name
+                    .map(|name| name.as_str().to_string())
+                    .or_else(|| mesh_name.map(|name| name.0.clone()))
+                    .unwrap_or_else(|| "<unnamed mesh>".to_string()),
+                material: material_name
+                    .map(|name| name.0.clone())
+                    .unwrap_or_else(|| "<unnamed material>".to_string()),
+                asset: materials.iter().position(|(id, _)| id == handle.id()),
+                alpha: material.base_color.alpha(),
+                blend: format!("{:?}", material.alpha_mode),
+                color: [srgba.red, srgba.green, srgba.blue],
+                unlit: material.unlit,
+            })
+        })
+        .collect();
+    out.0 = entries;
+}
+
+/// A drawn scene mesh: not the overlay pool, not the review ground. Those exist
+/// without any asset, so counting them would fake readiness.
+type SceneMeshFilter = (
+    With<Mesh3d>,
+    Without<SkelJoint>,
+    Without<SkelBone>,
+    Without<ReviewGround>,
+);
+
+/// Reflect the asset on screen into the profile the control socket reports.
+/// Watch mode stages a new copy per generation, so a changed digest also
+/// refreshes the file name, the path and the clip count the same frame.
+///
+/// `loaded` is scene readiness, not intent: a spawned scene root exists before
+/// its scene parses, and a pending watch generation is not on screen yet.
+fn track_asset_loaded(
+    asset_server: Res<AssetServer>,
+    gltf: Option<Res<GltfRoot>>,
+    watch: Option<Res<WatchState>>,
+    meshes: Query<(), SceneMeshFilter>,
+    mut profile: ResMut<AssetProfile>,
+) {
+    // A scene mesh is the one signal that something parsed and reached the
+    // renderer; the overlay pool and the review ground are excluded because
+    // they exist without any loaded asset.
+    let scene_meshes = meshes.iter().count();
+    let (parsed, pending, failed) = match watch.as_ref() {
+        Some(watch) => {
+            // The generation index moves on every swap, including one whose bytes
+            // are identical; the identity work only repeats for a new digest.
+            if watch.current_seq != profile.seq {
+                profile.seq = watch.current_seq;
+                profile.file = watch
+                    .current_seq
+                    .map_or_else(|| profile.file.clone(), |seq| format!("live-{seq}.glb"));
+                profile.path = watch.files.staging_dir.join(&profile.file);
+                if watch.sha != profile.sha256 && !watch.sha.is_empty() {
+                    profile.sha256 = watch.sha.clone();
+                    profile.clips = glb_animation_count(&profile.path);
+                }
+            }
+            // `current_seq` names the generation on screen and survives a failed
+            // swap, so a rejected file does not erase the identity of what is
+            // still displayed.
+            (
+                watch.current_seq.is_some(),
+                watch.pending.is_some(),
+                watch.failed,
+            )
+        }
+        None => {
+            let state = gltf.as_ref().map(|gltf| asset_server.load_state(&gltf.0));
+            (
+                state.as_ref().is_some_and(|state| state.is_loaded()),
+                false,
+                state.as_ref().is_some_and(|state| state.is_failed()),
+            )
+        }
+    };
+    profile.pending = pending;
+    profile.failed = failed;
+    profile.meshes = scene_meshes;
+    // `loaded` describes the generation the digest names, so a pending load
+    // keeps it false until that generation is the one on screen.
+    profile.loaded = parsed && !pending && scene_meshes > 0;
+}
+
+/// Orbit angles for the named views. `left`/`right` are the figure's own sides:
+/// the actor faces +Z, so its left is +X and the camera for `left` sits there.
+fn view_angles(name: &str) -> (f32, f32) {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+    match name {
+        "front" => (0.0, 0.12),
+        "back" => (PI, 0.12),
+        "left" => (FRAC_PI_2, 0.12),
+        "right" => (-FRAC_PI_2, 0.12),
+        "quarter" => (FRAC_PI_4, 0.12),
+        "top" => (0.0, 1.25),
+        "below" => (0.0, -0.65),
+        _ => (0.0, 0.12),
+    }
+}
+
+/// Move the camera to the orbit state. In the interactive window
+/// `orbit_controls` writes the same values from the same resource, so the two
+/// paths cannot disagree; the headless capture camera is otherwise untouched,
+/// which keeps a plain capture on its fixed review view.
+fn place_camera(
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    cameras: &mut Query<&mut Transform, With<Camera3d>>,
+) {
+    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, yaw, pitch, 0.0);
+    if let Ok(mut camera) = cameras.single_mut() {
+        camera.translation = target + rotation * Vec3::Z * distance;
+        camera.look_at(target, Vec3::Y);
+    }
+}
+
+/// Start the chosen actor clip on every player while the cloth clip keeps
+/// running. Shared by the keyboard path and the control socket.
+fn start_actor_clip(graph: &PlayerGraph, index: usize, players: &mut Query<&mut AnimationPlayer>) {
+    let Some(node) = graph.nodes.get(index).copied() else {
+        return;
+    };
+    for mut player in players.iter_mut() {
+        player.stop_all();
+        player.play(node).repeat();
+        if let Some(cloth) = graph.cloth {
+            player.play(cloth).repeat();
+        }
+    }
+}
+
+/// The agent control socket: drain the queued requests and answer each one in
+/// this frame. The socket thread only moves JSON strings; every mutation and
+/// every read of ECS state happens here, on the schedule that owns it.
+#[allow(clippy::too_many_arguments)]
+fn control_service(
+    mut commands: Commands,
+    server: Option<Res<ControlHandle>>,
+    config: Res<ViewerConfig>,
+    profile: Res<AssetProfile>,
+    target: Option<Res<Target>>,
+    orbit: Option<ResMut<OrbitCamera>>,
+    mut selection: ResMut<ClipSelection>,
+    mut playback: ResMut<Playback>,
+    mut skel: ResMut<SkelMode>,
+    info: Res<SkelJointsInfo>,
+    actor_materials: Res<ActorMaterials>,
+    graph: Option<Res<PlayerGraph>>,
+    mut players: Query<&mut AnimationPlayer>,
+    mut cameras: Query<&mut Transform, With<Camera3d>>,
+) {
+    let Some(server) = server else {
+        return;
+    };
+    let Ok(requests) = server.0.requests.lock() else {
+        return;
+    };
+    let mut orbit = orbit;
+    // The graph always carries idle/walk nodes, so its length is not the file's
+    // clip count: a file with no animations must refuse `clip` instead of
+    // playing a phantom handle.
+    let clip_count = profile.clips;
+    while let Ok(request) = requests.try_recv() {
+        let joints: Vec<(String, [f32; 3])> = info
+            .0
+            .iter()
+            .map(|(name, position)| (name.clone(), [position.x, position.y, position.z]))
+            .collect();
+        let response = match request.command {
+            control::Command::Help => control::help_json(),
+            control::Command::State => {
+                let snapshot = control::Snapshot {
+                    asset_file: profile.file.clone(),
+                    asset_path: profile.path.display().to_string(),
+                    sha256: profile.sha256.clone(),
+                    loaded: profile.loaded,
+                    pending: profile.pending,
+                    failed: profile.failed,
+                    meshes: profile.meshes,
+                    scale: profile.scale,
+                    status: config.status.clone(),
+                    clip_index: selection.0,
+                    clip_count,
+                    paused: playback.paused,
+                    speed: playback.speed,
+                    skeleton: skel.level,
+                    camera_mode: if orbit.is_some() { "orbit" } else { "fixed" },
+                    camera_target: orbit
+                        .as_ref()
+                        .map_or([0.0; 3], |orbit| orbit.target.to_array()),
+                    camera_yaw: orbit.as_ref().map_or(0.0, |orbit| orbit.yaw),
+                    camera_pitch: orbit.as_ref().map_or(0.0, |orbit| orbit.pitch),
+                    camera_distance: orbit.as_ref().map_or(0.0, |orbit| orbit.distance),
+                    camera_position: cameras
+                        .iter()
+                        .next()
+                        .map_or([0.0; 3], |transform| transform.translation.to_array()),
+                    joints: joints.clone(),
+                    materials: actor_materials.0.clone(),
+                };
+                snapshot.to_json()
+            }
+            control::Command::Joint { name } => match control::find_joint(&joints, &name) {
+                Ok((found, position)) => control::ok_json(serde_json::json!({
+                    "joint": { "name": found, "position": position },
+                })),
+                Err(error) => control::error_json(&error),
+            },
+            control::Command::View {
+                name,
+                yaw,
+                pitch,
+                distance,
+                target,
+            } => {
+                let mut message = None;
+                if let Some(name) = target.as_deref() {
+                    match control::find_joint(&joints, name) {
+                        Ok((_, position)) => {
+                            if let Some(orbit) = orbit.as_mut() {
+                                orbit.target = Vec3::from(*position);
+                            }
+                        }
+                        Err(error) => message = Some(error),
+                    }
+                }
+                match (message, orbit.as_mut()) {
+                    (Some(error), _) => control::error_json(&error),
+                    (None, None) => {
+                        control::error_json("no orbit camera in this mode; camera left unchanged")
+                    }
+                    (None, Some(orbit)) => {
+                        if let Some(name) = name.as_deref() {
+                            let (view_yaw, view_pitch) = view_angles(name);
+                            orbit.yaw = view_yaw;
+                            orbit.pitch = view_pitch;
+                        }
+                        if let Some(yaw) = yaw {
+                            orbit.yaw = yaw;
+                        }
+                        if let Some(pitch) = pitch {
+                            orbit.pitch = pitch;
+                        }
+                        if let Some(distance) = distance {
+                            orbit.distance = distance;
+                        }
+                        place_camera(
+                            orbit.target,
+                            orbit.yaw,
+                            orbit.pitch,
+                            orbit.distance,
+                            &mut cameras,
+                        );
+                        control::ok_json(serde_json::json!({
+                            "camera": {
+                                "target": orbit.target.to_array(),
+                                "yaw": orbit.yaw,
+                                "pitch": orbit.pitch,
+                                "distance": orbit.distance,
+                            },
+                        }))
+                    }
+                }
+            }
+            control::Command::Target { joint, point } => {
+                let resolved = match (joint.as_deref(), point) {
+                    (Some(name), _) => control::find_joint(&joints, name)
+                        .map(|(_, position)| Vec3::from(*position)),
+                    (None, Some(point)) => Ok(Vec3::from(point)),
+                    (None, None) => Err("target needs \"joint\" or \"point\"".to_string()),
+                };
+                match (resolved, orbit.as_mut()) {
+                    (Err(error), _) => control::error_json(&error),
+                    (Ok(_), None) => control::error_json("no orbit camera in this mode"),
+                    (Ok(target), Some(orbit)) => {
+                        orbit.target = target;
+                        place_camera(
+                            orbit.target,
+                            orbit.yaw,
+                            orbit.pitch,
+                            orbit.distance,
+                            &mut cameras,
+                        );
+                        control::ok_json(serde_json::json!({
+                            "camera": { "target": target.to_array(), "distance": orbit.distance },
+                        }))
+                    }
+                }
+            }
+            control::Command::Clip { index } => match (clip_count, graph.as_ref()) {
+                (None, _) | (Some(0), _) => {
+                    control::error_json("no animation clips are loaded; the file carries none")
+                }
+                (Some(count), None) => control::error_json(&format!(
+                    "clip {index} cannot be selected without a player graph (file has {count})"
+                )),
+                (Some(_), Some(_))
+                    if index >= graph.as_ref().map_or(0, |graph| graph.nodes.len()) =>
+                {
+                    control::error_json(&format!(
+                        "clip {index} has no player node; the viewer holds {} actor clips",
+                        graph.as_ref().map_or(0, |graph| graph.nodes.len())
+                    ))
+                }
+                (Some(count), Some(_)) if index >= count => control::error_json(&format!(
+                    "clip {index} out of range; the file carries {count} (0..{})",
+                    count - 1
+                )),
+                (Some(_), Some(graph)) => {
+                    selection.0 = index;
+                    start_actor_clip(graph, index, &mut players);
+                    control::ok_json(serde_json::json!({ "clip": index }))
+                }
+            },
+            control::Command::Playback { paused, speed } => {
+                if let Some(paused) = paused {
+                    playback.paused = paused;
+                }
+                if let Some(speed) = speed {
+                    playback.speed = speed;
+                }
+                control::ok_json(serde_json::json!({
+                    "paused": playback.paused,
+                    "speed": playback.speed,
+                }))
+            }
+            control::Command::Skeleton { level } => {
+                skel.level = level;
+                control::ok_json(serde_json::json!({
+                    "skeleton": skel.level,
+                    "note": "the overlay rebuilds on the next frame",
+                }))
+            }
+            control::Command::Capture { path } => {
+                let request_sent = match (config.interactive, target.as_ref()) {
+                    (true, _) => {
+                        commands
+                            .spawn(Screenshot::primary_window())
+                            .observe(save_to_disk(path.clone()));
+                        true
+                    }
+                    (false, Some(target)) => {
+                        commands
+                            .spawn(Screenshot::image(target.0.clone()))
+                            .observe(save_to_disk(path.clone()));
+                        true
+                    }
+                    (false, None) => false,
+                };
+                if request_sent {
+                    control::ok_json(serde_json::json!({
+                        "capture": path,
+                        "note": "queued; the PNG is written after the next rendered frame",
+                    }))
+                } else {
+                    control::error_json("no render target to capture in this mode")
+                }
+            }
+            control::Command::Quit => {
+                // The socket thread leaves the process after it has written
+                // this answer (`control::serve_connection`), skipping the
+                // driver teardown that segfaults on this host.
+                control::ok_json(serde_json::json!({ "quitting": true }))
+            }
+        };
+        let _ = request.reply.send(response);
+    }
 }
 
 /// One-shot scene dump (SCULPTO_VIEWER_DEBUG_SCENE=1): every mesh entity
@@ -2316,14 +3005,14 @@ fn watch_tick(
         info!(
             "viewer: live staged {} sha {} sidecar {}",
             staged.asset_name,
-            staged.sha8,
+            sha_short(&staged.sha),
             staged.note.display()
         );
         watch.pending = Some(PendingScene {
             seq: staged.seq,
             asset_name: staged.asset_name,
             world,
-            sha8: staged.sha8,
+            sha: staged.sha,
             note: staged.note,
         });
     }
@@ -2357,7 +3046,7 @@ fn watch_tick(
             &mut graphs,
             &pending.asset_name,
         ));
-        watch.sha8 = pending.sha8.clone();
+        watch.sha = pending.sha.clone();
         watch.note = pending.note.display().to_string();
         watch.failed = false;
         // Free the replaced generation: its staged copy is gone from disk and
@@ -2367,7 +3056,8 @@ fn watch_tick(
         }
         info!(
             "viewer: live swap to {} sha {} — camera, orbit, lights, bones and playback state kept",
-            pending.asset_name, pending.sha8
+            pending.asset_name,
+            sha_short(&pending.sha)
         );
     } else if failed {
         let pending = watch.pending.take().expect("checked failed above");
@@ -2417,6 +3107,7 @@ mod tests {
             flat,
             asset_file: String::new(),
             status: "InProgress".to_string(),
+            control: None,
         }
     }
 
