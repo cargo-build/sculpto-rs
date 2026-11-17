@@ -5,11 +5,15 @@
 //! and the skin change. The transfer is the neutral remap kernel
 //! ([`remap_skin`]) through an explicitly checked [`BoneMap::resolved`] table:
 //! the correspondence layer ([`crate::retarget`]) resolves each target bone onto
-//! a source bone, the target hierarchy is seated at the source's rest, and every
+//! a source bone, the geometry owner seats the target hierarchy, and every
 //! source weight the target cannot name folds to its nearest mapped source
 //! ancestor. The fold is reported per family (breast, twist, helpers) with its
 //! raw weight mass, so the soft tissue a pure target rig trades away is named
 //! before a render shows it, not after.
+//!
+//! The full Mixamo path derives pivots from body sections and template priors,
+//! without source-rig placement seeds. Smaller palettes retain the generic seat.
+//! A named outside-flesh Toe_End exception requires zero encoded endpoint weight.
 //!
 //! Everything is measured in world glTF Y-up metres with an identity basis and
 //! global-to-skin: the source rest is proved, the seat is proved, and the
