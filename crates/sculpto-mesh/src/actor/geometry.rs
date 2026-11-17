@@ -60,6 +60,15 @@ pub(super) fn sample(
     selected: &[usize],
     worlds: &[DMat4],
 ) -> Result<Sample, ActorError> {
+    sample_with_morphs(actor, selected, worlds, None)
+}
+
+pub(super) fn sample_with_morphs(
+    actor: &Actor,
+    selected: &[usize],
+    worlds: &[DMat4],
+    morphs: Option<&super::animation::MorphWeights>,
+) -> Result<Sample, ActorError> {
     let mut sample = Sample {
         vertices: Vec::new(),
         triangles: Vec::new(),
@@ -87,6 +96,25 @@ pub(super) fn sample(
             Some(skin) => Some(joint_matrices(actor, skin, worlds)?),
             None => None,
         };
+        let weights = morphs.map(|animated| {
+            animated
+                .get(&index)
+                .cloned()
+                .or_else(|| {
+                    node.weights()
+                        .or_else(|| mesh.weights())
+                        .map(|values| values.iter().copied().map(f64::from).collect())
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        0.0;
+                        mesh.primitives()
+                            .next()
+                            .map(|p| p.morph_targets().len())
+                            .unwrap_or(0)
+                    ]
+                })
+        });
         mesh.primitives().try_for_each(|primitive| {
             let context = format!(
                 "part {name:?} node {index} mesh {} primitive {}",
@@ -100,6 +128,7 @@ pub(super) fn sample(
                 &primitive,
                 joints.as_deref(),
                 worlds[index],
+                weights.as_deref(),
                 &context,
             )?;
             let triangles = primitive_triangles(actor, &primitive, vertices.len(), &context)?;
@@ -320,13 +349,14 @@ fn primitive_vertices(
     primitive: &gltf::Primitive<'_>,
     joints: Option<&[DMat4]>,
     world: DMat4,
+    morph_weights: Option<&[f64]>,
     context: &str,
 ) -> Result<Vec<[f64; 3]>, ActorError> {
     match primitive.mode() {
         Mode::Triangles => {}
         mode => return Err(unsupported(context, format!("primitive mode {mode:?}"))),
     }
-    if primitive.morph_targets().len() > 0 {
+    if primitive.morph_targets().len() > 0 && morph_weights.is_none() {
         return Err(unsupported(context, "morph geometry"));
     }
     let positions = primitive
@@ -337,11 +367,33 @@ fn primitive_vertices(
         return Err(invalid(context, "normalized floating-point POSITION"));
     }
     let reader = primitive.reader(|buffer| actor.buffer(buffer));
-    let points: Vec<_> = reader
+    let mut points: Vec<_> = reader
         .read_positions()
         .ok_or_else(|| invalid(context, "unreadable POSITION"))?
         .map(|point| DVec3::from_array(point.map(f64::from)).extend(1.0))
         .collect();
+    if let Some(weights) = morph_weights {
+        if weights.len() != primitive.morph_targets().len()
+            || weights.iter().any(|w| !w.is_finite())
+        {
+            return Err(invalid(context, "invalid morph defaults or track width"));
+        }
+        for (target, &weight) in primitive.morph_targets().zip(weights) {
+            let Some(delta) = target.positions() else {
+                continue;
+            };
+            decode::accessor(&delta, Dimensions::Vec3, &[DataType::F32], context)?;
+            if delta.count() != points.len() || delta.normalized() {
+                return Err(invalid(context, "invalid POSITION morph target"));
+            }
+            let values =
+                gltf::accessor::Iter::<[f32; 3]>::new(delta, |buffer| actor.buffer(buffer))
+                    .ok_or_else(|| invalid(context, "unreadable POSITION morph target"))?;
+            for (point, offset) in points.iter_mut().zip(values) {
+                *point += DVec3::from_array(offset.map(f64::from)).extend(0.0) * weight;
+            }
+        }
+    }
     let transformed: Vec<_> = match joints {
         Some(matrices) => {
             let rows = skin_rows(actor, primitive, matrices.len(), points.len(), context)?;

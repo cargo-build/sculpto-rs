@@ -5,6 +5,7 @@ mod fit;
 mod gait;
 mod havok;
 mod joints;
+mod knee_fold;
 mod pack;
 mod pose;
 mod rebind;
@@ -51,6 +52,9 @@ struct Arguments<'arg> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|command| command == "knee-fold") {
+        return knee_fold::run(&args[1..]);
+    }
     if args.first().is_some_and(|command| command == "pack-cloth") {
         return pack::run(&args[1..]);
     }

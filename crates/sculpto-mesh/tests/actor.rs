@@ -12,6 +12,37 @@ fn near(actual: [f64; 3], expected: [f64; 3]) {
 }
 
 #[test]
+fn corrective_positions_apply_before_the_skin_and_track_weights_override_defaults() {
+    let mut f = Fixture::triangle();
+    f.skin();
+    f.json["nodes"][1]["scale"] = json!([2., 1., 1.]);
+    let target = f.floats(&[1., 0., 0., 0., 0., 0., 0., 0., 0.], "VEC3", 3);
+    f.json["accessors"][target]["min"] = json!([0., 0., 0.]);
+    f.json["accessors"][target]["max"] = json!([1., 0., 0.]);
+    f.json["meshes"][0]["primitives"][0]["targets"] = json!([{"POSITION":target}]);
+    f.json["meshes"][0]["weights"] = json!([0.75]);
+    f.json["nodes"][2]["weights"] = json!([0.25]);
+    let times = f.floats(&[0., 1.], "SCALAR", 2);
+    let values = f.floats(&[0., 1.], "SCALAR", 2);
+    f.json["animations"] = json!([{"name":"Bend","channels":[{"sampler":0,"target":{"node":2,"path":"weights"}}],
+        "samplers":[{"input":times,"output":values,"interpolation":"LINEAR"}]}]);
+    let actor = Actor::from_glb(&f.bytes()).unwrap();
+    let rest = actor.sample(&["Body"], Pose::Rest).unwrap();
+    let half = actor
+        .sample(
+            &["Body"],
+            Pose::Clip {
+                name: "Bend",
+                time: 0.5,
+            },
+        )
+        .unwrap();
+    assert!((half.vertices[0][0] - rest.vertices[0][0] - 0.5).abs() < 1e-12);
+    assert_eq!(rest.vertices[1..], half.vertices[1..]);
+    assert_eq!(rest.triangles, half.triangles);
+}
+
+#[test]
 fn custom_vertex_identity_does_not_change_sampling_or_admit_invalid_semantics() {
     let baseline = Actor::from_glb(&Fixture::triangle().bytes())
         .unwrap()
@@ -339,8 +370,18 @@ fn unselected_cloth_weight_channels_do_not_block_solids() {
             .vertices[0],
         [1.5, 0., 0.],
     );
+    near(
+        actor.sample(&["Cloth"], Pose::Rest).unwrap().vertices[0],
+        [1., 0., 0.],
+    );
     assert!(matches!(
-        actor.sample(&["Cloth"], Pose::Rest),
+        actor.sample(
+            &["Cloth"],
+            Pose::Clip {
+                name: "Run",
+                time: 0.5,
+            }
+        ),
         Err(ActorError::Unsupported { .. })
     ));
 }

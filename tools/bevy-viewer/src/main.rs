@@ -2356,7 +2356,7 @@ fn select_clip(
     keys: Res<ButtonInput<KeyCode>>,
     graph: Option<Res<PlayerGraph>>,
     mut selection: ResMut<ClipSelection>,
-    mut players: Query<&mut AnimationPlayer>,
+    mut players: Query<(&mut AnimationPlayer, &AnimationGraphHandle)>,
     bank: Option<Res<bank::Bank>>,
 ) {
     if !config.interactive || bank.is_some() {
@@ -2745,17 +2745,33 @@ fn place_camera(
 
 /// Start the chosen actor clip on every player while the cloth clip keeps
 /// running. Shared by the keyboard path and the control socket.
-fn start_actor_clip(graph: &PlayerGraph, index: usize, players: &mut Query<&mut AnimationPlayer>) {
+fn start_actor_clip(
+    graph: &PlayerGraph,
+    index: usize,
+    players: &mut Query<(&mut AnimationPlayer, &AnimationGraphHandle)>,
+) {
     let Some(node) = graph.nodes.get(index).copied() else {
         return;
     };
-    for mut player in players.iter_mut() {
+    for (mut player, _) in players
+        .iter_mut()
+        .filter(|(_, bound)| bound.0 == graph.handle)
+    {
         player.stop_all();
         player.play(node).repeat();
         if let Some(cloth) = graph.cloth {
             player.play(cloth).repeat();
         }
     }
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct ControlScene<'w, 's> {
+    joints: Res<'w, SkelJointsInfo>,
+    materials: Res<'w, ActorMaterials>,
+    graphs: Res<'w, Assets<AnimationGraph>>,
+    clips: Res<'w, Assets<AnimationClip>>,
+    morphs: Query<'w, 's, (&'static Name, &'static MorphWeights)>,
 }
 
 /// The agent control socket: drain the queued requests and answer each one in
@@ -2772,10 +2788,9 @@ fn control_service(
     mut selection: ResMut<ClipSelection>,
     mut playback: ResMut<Playback>,
     mut skel: ResMut<SkelMode>,
-    info: Res<SkelJointsInfo>,
-    actor_materials: Res<ActorMaterials>,
+    scene: ControlScene,
     graph: Option<Res<PlayerGraph>>,
-    mut players: Query<&mut AnimationPlayer>,
+    mut players: Query<(&mut AnimationPlayer, &AnimationGraphHandle)>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
     mut bank: Option<ResMut<bank::Bank>>,
     mut watch: Option<ResMut<WatchState>>,
@@ -2792,7 +2807,8 @@ fn control_service(
     // playing a phantom handle.
     let clip_count = profile.clips;
     while let Ok(request) = requests.try_recv() {
-        let joints: Vec<(String, [f32; 3])> = info
+        let joints: Vec<(String, [f32; 3])> = scene
+            .joints
             .0
             .iter()
             .map(|(name, position)| (name.clone(), [position.x, position.y, position.z]))
@@ -2810,6 +2826,23 @@ fn control_service(
                     meshes: profile.meshes,
                     scale: profile.scale,
                     status: config.status.clone(),
+                    clip_seconds: graph
+                        .as_ref()
+                        .filter(|_| profile.loaded && !profile.pending)
+                        .and_then(|g| {
+                            let node = *g.nodes.get(selection.0)?;
+                            players
+                                .iter()
+                                .filter(|(_, bound)| bound.0 == g.handle)
+                                .find_map(|(player, _)| {
+                                    player.animation(node).map(|a| a.seek_time())
+                                })
+                        }),
+                    morph_weights: scene
+                        .morphs
+                        .iter()
+                        .map(|(name, w)| (name.to_string(), w.weights().to_vec()))
+                        .collect(),
                     clip_index: graph
                         .as_ref()
                         .and_then(|graph| graph.nodes.get(selection.0).map(|_| selection.0)),
@@ -2833,7 +2866,7 @@ fn control_service(
                         .next()
                         .map_or([0.0; 3], |transform| transform.translation.to_array()),
                     joints: joints.clone(),
-                    materials: actor_materials.0.clone(),
+                    materials: scene.materials.0.clone(),
                 };
                 snapshot.to_json()
             }
@@ -2959,6 +2992,41 @@ fn control_service(
                     control::ok_json(serde_json::json!({ "clip": index }))
                 }
             },
+            control::Command::Seek { seconds } => {
+                use bevy::animation::graph::AnimationNodeType;
+                let clip = graph
+                    .as_ref()
+                    .filter(|_| profile.loaded && !profile.pending)
+                    .and_then(|g| {
+                        let node = *g.nodes.get(selection.0)?;
+                        let entry = scene.graphs.get(&g.handle)?.get(node)?;
+                        let AnimationNodeType::Clip(handle) = &entry.node_type else {
+                            return None;
+                        };
+                        Some((node, scene.clips.get(handle)?.duration(), &g.handle))
+                    });
+                match clip {
+                    Some((_, duration, _)) if seconds > duration => {
+                        control::error_json(&format!("time exceeds clip duration {duration}"))
+                    }
+                    Some((node, _, handle))
+                        if players.iter().any(|(p, bound)| {
+                            bound.0 == *handle && p.animation(node).is_some()
+                        }) =>
+                    {
+                        for (mut player, _) in
+                            players.iter_mut().filter(|(_, bound)| bound.0 == *handle)
+                        {
+                            if let Some(a) = player.animation_mut(node) {
+                                a.pause().set_seek_time(seconds);
+                            }
+                        }
+                        playback.paused = true;
+                        control::ok_json(serde_json::json!({"seconds":seconds,"paused":true}))
+                    }
+                    _ => control::error_json("seek requires a loaded, selected clip"),
+                }
+            }
             control::Command::Playback { paused, speed } => {
                 if let Some(paused) = paused {
                     playback.paused = paused;

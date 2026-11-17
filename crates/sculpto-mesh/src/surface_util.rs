@@ -7,6 +7,100 @@
 
 use std::collections::HashMap;
 
+/// Horn rotation from the source-by-destination covariance in scalar-first quaternion order. @req DECL0013
+pub(crate) fn alignment_quaternion(covariance: [[f64; 3]; 3]) -> [f64; 4] {
+    let matrix = [
+        [
+            covariance[0][0] + covariance[1][1] + covariance[2][2],
+            covariance[1][2] - covariance[2][1],
+            covariance[2][0] - covariance[0][2],
+            covariance[0][1] - covariance[1][0],
+        ],
+        [
+            covariance[1][2] - covariance[2][1],
+            covariance[0][0] - covariance[1][1] - covariance[2][2],
+            covariance[0][1] + covariance[1][0],
+            covariance[2][0] + covariance[0][2],
+        ],
+        [
+            covariance[2][0] - covariance[0][2],
+            covariance[0][1] + covariance[1][0],
+            -covariance[0][0] + covariance[1][1] - covariance[2][2],
+            covariance[1][2] + covariance[2][1],
+        ],
+        [
+            covariance[0][1] - covariance[1][0],
+            covariance[2][0] + covariance[0][2],
+            covariance[1][2] + covariance[2][1],
+            -covariance[0][0] - covariance[1][1] + covariance[2][2],
+        ],
+    ];
+    largest_eigenvector(matrix)
+}
+
+/// Eigenvector of the largest eigenvalue of a symmetric 4x4 matrix, by Jacobi
+/// rotations (`LargestEigenvector`, `MeshAnalysis.cpp:445-497`).
+fn largest_eigenvector(mut matrix: [[f64; 4]; 4]) -> [f64; 4] {
+    let mut vectors = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    for _ in 0..50 {
+        let mut off_diagonal = 0.0;
+        let mut diagonal = 0.0;
+        for (p, row) in matrix.iter().enumerate() {
+            diagonal += row[p] * row[p];
+            for value in row.iter().skip(p + 1) {
+                off_diagonal += value * value;
+            }
+        }
+        if off_diagonal <= 1e-24 * diagonal || off_diagonal < 1e-300 {
+            break;
+        }
+        for p in 0..4 {
+            for q in (p + 1)..4 {
+                if matrix[p][q] == 0.0 {
+                    continue;
+                }
+                let theta = (matrix[q][q] - matrix[p][p]) / (2.0 * matrix[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for row in &mut matrix {
+                    let (akp, akq) = (row[p], row[q]);
+                    row[p] = c * akp - s * akq;
+                    row[q] = s * akp + c * akq;
+                }
+                let (before_q, from_q) = matrix.split_at_mut(q);
+                for (apk, aqk) in before_q[p].iter_mut().zip(from_q[0].iter_mut()) {
+                    let (old_p, old_q) = (*apk, *aqk);
+                    *apk = c * old_p - s * old_q;
+                    *aqk = s * old_p + c * old_q;
+                }
+                for row in &mut vectors {
+                    let (vkp, vkq) = (row[p], row[q]);
+                    row[p] = c * vkp - s * vkq;
+                    row[q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    let mut largest = 0;
+    for index in 1..4 {
+        if matrix[index][index] > matrix[largest][largest] {
+            largest = index;
+        }
+    }
+    [
+        vectors[0][largest],
+        vectors[1][largest],
+        vectors[2][largest],
+        vectors[3][largest],
+    ]
+}
+
 /// Groups of points closer than `tolerance` around each first ungrouped point,
 /// on a spatial hash (`CoincidentGroups`, `MeshAnalysis.cpp:244-288`). @req DECL0013
 pub(crate) fn coincident_groups(points: &[[f32; 3]], tolerance: f32) -> Vec<Vec<usize>> {

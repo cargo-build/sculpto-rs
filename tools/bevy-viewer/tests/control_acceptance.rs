@@ -226,6 +226,10 @@ fn control_socket_answers_identity_errors_capture_and_quit() {
     // playing a phantom graph node.
     let clip = ask(&viewer.socket, r#"{"cmd":"clip","index":1}"#);
     assert_eq!(clip["ok"], false);
+    assert_eq!(
+        ask(&viewer.socket, r#"{"cmd":"seek","seconds":0.1}"#)["ok"],
+        false
+    );
     assert!(
         clip["error"]
             .as_str()
@@ -469,6 +473,24 @@ fn supplied_bank_switches_all_slots_and_returns_to_exact_rest() {
                     .clone()
             };
             assert_eq!(hips(&state), hips(&later), "slot {index} root travelled");
+            if index == 4 {
+                assert_eq!(
+                    ask(&viewer.socket, r#"{"cmd":"seek","seconds":0.2}"#)["ok"],
+                    true
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                let paused = ask(&viewer.socket, r#"{"cmd":"state"}"#);
+                assert_eq!(paused["clip"]["paused"], true);
+                assert!((paused["clip"]["seconds"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+                assert_eq!(
+                    ask(&viewer.socket, r#"{"cmd":"seek","seconds":10000}"#)["ok"],
+                    false
+                );
+                assert_eq!(
+                    ask(&viewer.socket, r#"{"cmd":"playback","paused":false}"#)["ok"],
+                    true
+                );
+            }
         }
         evidence.push(serde_json::json!({"slot": index, "clip": state["clip"],
             "asset": state["asset"], "materials": state["materials"]}));

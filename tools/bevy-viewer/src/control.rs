@@ -69,6 +69,9 @@ pub enum Command {
     Slot {
         index: usize,
     },
+    Seek {
+        seconds: f32,
+    },
     Playback {
         paused: Option<bool>,
         speed: Option<f32>,
@@ -340,6 +343,13 @@ pub fn parse_request(line: &str) -> Result<Command, String> {
                 _ => Ok(Command::Clip { index }),
             }
         }
+        "seek" => {
+            let seconds = optional_number(object, "seconds")?.ok_or("seek requires seconds")?;
+            if seconds < 0.0 {
+                return Err("seek time must be nonnegative".to_owned());
+            }
+            Ok(Command::Seek { seconds })
+        }
         "playback" => {
             let paused = match object.get("paused") {
                 None | Some(Value::Null) => None,
@@ -568,6 +578,8 @@ pub struct Snapshot {
     pub scale: f32,
     pub status: String,
     pub clip_index: Option<usize>,
+    pub clip_seconds: Option<f32>,
+    pub morph_weights: Vec<(String, Vec<f32>)>,
     pub clip_name: Option<String>,
     pub bank: Option<Value>,
     pub clip_count: Option<usize>,
@@ -612,12 +624,14 @@ impl Snapshot {
             "status": self.status,
             "clip": {
                 "index": self.clip_index,
+                "seconds": self.clip_seconds,
                 "name": self.clip_name,
                 "count": self.clip_count,
                 "paused": self.paused,
                 "speed": self.speed,
             },
             "bank": self.bank,
+            "morph_weights": self.morph_weights,
             "skeleton": self.skeleton,
             "camera": {
                 "mode": self.camera_mode,
@@ -680,6 +694,7 @@ pub fn help_json() -> String {
             "target": {"joint": "name", "point": "[x, y, z]"},
             "clip": {"index": "actor clip index; see clip.count in state"},
             "slot": {"index": "bank entry 0..9; see bank.slots in state; requires --bank"},
+            "seek": {"seconds": "pause the selected actor clip at an exact time within its duration"},
             "playback": {"paused": "true|false", "speed": format!("{MIN_SPEED}..{MAX_SPEED}")},
             "skeleton": {"level": "0 off, 1 primary chain, 2 every driven joint"},
             "capture": {"path": "absolute .png path; written asynchronously, poll the file"},
@@ -846,6 +861,8 @@ mod tests {
             scale: 1.0,
             status: "InProgress".to_string(),
             clip_index: Some(1),
+            clip_seconds: Some(0.5),
+            morph_weights: vec![],
             clip_name: Some("Walk".into()),
             bank: None,
             clip_count: Some(2),

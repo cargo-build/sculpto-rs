@@ -1,6 +1,7 @@
 //! A display-only mesh variant for inspecting skinned triangle boundaries.
 
 use bevy::mesh::PrimitiveTopology;
+use bevy::mesh::{morph::MorphAttributes, VertexAttributeValues};
 use bevy::prelude::*;
 
 use crate::{SceneMeshFilter, ViewerConfig};
@@ -15,17 +16,50 @@ pub(super) struct FaceMesh {
 }
 
 fn face_mesh(mesh: &Mesh) -> Option<Mesh> {
-    // All vertex attributes, including joint indices and weights, duplicate with the face.
-    // Morph targets are indexed separately and need a different remap.
-    if mesh.primitive_topology() != PrimitiveTopology::TriangleList
-        || mesh.try_has_morph_targets().ok()?
-    {
+    if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
         return None;
     }
-    let mut mesh = mesh.clone();
-    mesh.try_duplicate_vertices().ok()?;
-    mesh.try_compute_flat_normals().ok()?;
-    Some(mesh)
+    let mut flat = mesh.clone();
+    flat.try_duplicate_vertices().ok()?;
+    flat.try_compute_flat_normals().ok()?;
+    if mesh.try_has_morph_targets().ok()? {
+        let count = mesh.count_vertices();
+        let source: Vec<_> = match mesh.indices() {
+            Some(indices) => indices.iter().collect(),
+            None => (0..count).collect(),
+        };
+        let VertexAttributeValues::Float32x3(positions) =
+            flat.attribute(Mesh::ATTRIBUTE_POSITION)?
+        else {
+            return None;
+        };
+        let VertexAttributeValues::Float32x3(normals) = flat.attribute(Mesh::ATTRIBUTE_NORMAL)?
+        else {
+            return None;
+        };
+        let original = mesh.try_morph_targets().ok()?;
+        if count == 0 || !original.len().is_multiple_of(count) {
+            return None;
+        }
+        let mut remapped = Vec::with_capacity(source.len().checked_mul(original.len() / count)?);
+        for shape in original.chunks_exact(count) {
+            for (i, corners) in source.as_chunks::<3>().0.iter().enumerate() {
+                let tri = [0, 1, 2]
+                    .map(|k| Vec3::from_array(positions[3 * i + k]) + shape[corners[k]].position);
+                let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero()
+                    - Vec3::from_array(normals[3 * i]);
+                for &v in corners {
+                    remapped.push(MorphAttributes::new(
+                        shape[v].position,
+                        normal,
+                        shape[v].tangent,
+                    ));
+                }
+            }
+        }
+        flat.set_morph_targets(remapped);
+    }
+    Some(flat)
 }
 
 pub(super) fn update(
@@ -95,6 +129,12 @@ mod tests {
         ];
         mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, weights.to_vec());
         mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 3, 1]));
+        mesh.set_morph_targets(vec![
+            MorphAttributes::default(),
+            MorphAttributes::default(),
+            MorphAttributes::new(Vec3::Z, Vec3::ZERO, Vec3::ZERO),
+            MorphAttributes::default(),
+        ]);
 
         let faceted = face_mesh(&mesh).expect("faceted skinned mesh");
         assert_eq!(mesh.count_vertices(), 4);
@@ -105,6 +145,11 @@ mod tests {
             panic!("triangle normals are missing");
         };
         assert_ne!(normals[0], normals[3]);
+        let morph = faceted.try_morph_targets().expect("faceted target");
+        assert_eq!(morph.len(), 6);
+        assert_eq!(morph[2].position, Vec3::Z);
+        assert_eq!(morph[3].position, Vec3::ZERO);
+        assert!(morph[0].normal.length() > 0.5);
         assert_eq!(
             faceted.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT),
             Some(&VertexAttributeValues::Float32x4(

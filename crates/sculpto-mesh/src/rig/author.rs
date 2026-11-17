@@ -61,6 +61,7 @@ use glam::DVec3;
 use crate::garment::Influences;
 use crate::weight_norm::{WeightError, pack_influences};
 
+pub mod knee;
 mod seams;
 
 /// Which body side a bone drives, from its authored name.
@@ -837,32 +838,7 @@ fn geodesic_fields(surface: &Surface, seeds: &[Vec<u32>], bones: usize) -> Geode
         }
         let base = bone * count;
         let row = &mut squared[base..base + count];
-        let mut heap = BinaryHeap::with_capacity(bone_seeds.len() * 4);
-        for seed in bone_seeds {
-            row[*seed as usize] = 0.0;
-            heap.push(Candidate {
-                distance: 0.0,
-                vertex: *seed,
-            });
-        }
-        while let Some(Candidate { distance, vertex }) = heap.pop() {
-            let vertex = vertex as usize;
-            let known = row[vertex];
-            if distance > known {
-                continue;
-            }
-            for slot in surface.neighbours(vertex) {
-                let next = surface.neighbours[slot] as usize;
-                let total = known + surface.lengths[slot];
-                if total < row[next] {
-                    row[next] = total;
-                    heap.push(Candidate {
-                        distance: total,
-                        vertex: next as u32,
-                    });
-                }
-            }
-        }
+        surface_distances(surface, bone_seeds, row, |_| true);
         for value in row.iter_mut() {
             match value.is_finite() {
                 true => *value *= *value,
@@ -871,6 +847,40 @@ fn geodesic_fields(surface: &Surface, seeds: &[Vec<u32>], bones: usize) -> Geode
         }
     }
     GeodesicFields { squared, unreached }
+}
+
+/// Multi-source surface distances within a connected anatomical region. @req DECL0013
+fn surface_distances(
+    surface: &Surface,
+    seeds: &[u32],
+    row: &mut [f64],
+    allowed: impl Fn(usize) -> bool,
+) {
+    let mut heap = BinaryHeap::with_capacity(seeds.len());
+    for &seed in seeds {
+        row[seed as usize] = 0.0;
+        heap.push(Candidate {
+            distance: 0.0,
+            vertex: seed,
+        });
+    }
+    while let Some(Candidate { distance, vertex }) = heap.pop() {
+        let vertex = vertex as usize;
+        if distance > row[vertex] {
+            continue;
+        }
+        for slot in surface.neighbours(vertex) {
+            let next = surface.neighbours[slot] as usize;
+            let total = distance + surface.lengths[slot];
+            if allowed(next) && total < row[next] {
+                row[next] = total;
+                heap.push(Candidate {
+                    distance: total,
+                    vertex: next as u32,
+                });
+            }
+        }
+    }
 }
 
 /// One Dijkstra frontier entry, ordered by distance then vertex for determinism.

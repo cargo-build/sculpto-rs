@@ -265,11 +265,35 @@ impl PackWriter {
         node: usize,
         times: &[f32],
     ) -> Result<(), PackError> {
-        let input = self.floats(times, true)?;
         let weights: Vec<_> = (0..times.len())
             .flat_map(|sample| (0..times.len()).map(move |target| f32::from(sample == target)))
             .collect();
-        let output = self.floats(&weights, false)?;
+        self.write_morph_track(clip, channel, node, times, &weights)
+    }
+
+    /// A sampled morph track is a flat SCALAR output with one row per key. @req DECL0013
+    pub fn write_morph_track(
+        &mut self,
+        clip: usize,
+        channel: Option<usize>,
+        node: usize,
+        times: &[f32],
+        weights: &[f32],
+    ) -> Result<(), PackError> {
+        if times.is_empty()
+            || weights.is_empty()
+            || !weights.len().is_multiple_of(times.len())
+            || times.iter().any(|t| !t.is_finite() || *t < 0.0)
+            || times.windows(2).any(|s| s[0] >= s[1])
+            || weights.iter().any(|w| !w.is_finite())
+        {
+            return Err(PackError::invalid(
+                "morph track",
+                "invalid times or weight rows",
+            ));
+        }
+        let input = self.floats(times, true)?;
+        let output = self.floats(weights, false)?;
         let animation = self
             .json
             .get_mut("animations")
@@ -453,6 +477,71 @@ impl PackWriter {
         object.insert("byteOffset".into(), json!(offset));
         object.insert("byteLength".into(), json!(data.len()));
         self.append("bufferViews", description)
+    }
+
+    /// Attach a validated four-slot skin to all primitives of a shared vertex pool. @req DECL0013
+    pub fn set_shared_skin(
+        &mut self,
+        mesh: usize,
+        parts: usize,
+        rows: &[Vec<(u16, f32)>],
+    ) -> Result<(), PackError> {
+        let mut joints = Vec::with_capacity(rows.len() * 8);
+        let mut weights = Vec::with_capacity(rows.len() * 4);
+        for row in rows {
+            let sum = row.iter().map(|(_, w)| *w).sum::<f32>();
+            if row.is_empty()
+                || row.len() > 4
+                || (sum - 1.0).abs() > 2.0e-6
+                || row.iter().any(|(_, w)| !w.is_finite() || *w < 0.0)
+            {
+                return Err(PackError::invalid(
+                    "skin weights",
+                    "invalid four-slot influence row",
+                ));
+            }
+            for i in 0..4 {
+                let (slot, weight) = row.get(i).copied().unwrap_or((0, 0.0));
+                joints.extend(slot.to_le_bytes());
+                weights.push(weight);
+            }
+        }
+        let view = self.view(&joints, &json!({"target":34962}))?;
+        let js = self.append(
+            "accessors",
+            json!({"bufferView":view,"count":rows.len(),"type":"VEC4","componentType":5123}),
+        )?;
+        let ws = self.vec_floats(&weights, 4, rows.len())?;
+        for part in 0..parts {
+            self.set_attribute(mesh, part, "JOINTS_0", js)?;
+            self.set_attribute(mesh, part, "WEIGHTS_0", ws)?;
+        }
+        Ok(())
+    }
+
+    /// Morph POSITION displacements carry bounds in the same coordinate frame as the base. @req DECL0013
+    pub fn morph_vectors(&mut self, vectors: &[[f32; 3]]) -> Result<usize, PackError> {
+        if vectors.is_empty() || vectors.iter().flatten().any(|x| !x.is_finite()) {
+            return Err(PackError::invalid(
+                "morph vectors",
+                "empty or nonfinite target",
+            ));
+        }
+        let mut low = [f32::INFINITY; 3];
+        let mut high = [f32::NEG_INFINITY; 3];
+        for v in vectors {
+            for k in 0..3 {
+                low[k] = low[k].min(v[k]);
+                high[k] = high[k].max(v[k]);
+            }
+        }
+        let bytes = vectors
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let view = self.view(&bytes, &json!({"target":34962}))?;
+        self.append("accessors",json!({"bufferView":view,"componentType":5126,"type":"VEC3","count":vectors.len(),"min":low,"max":high}))
     }
 
     /// Append one accessor whose values were just written as floats.

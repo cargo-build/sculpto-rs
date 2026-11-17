@@ -131,7 +131,7 @@ fn create(path: &str) -> Result<File, String> {
         .map_err(|error| format!("{path}: {error}"))
 }
 
-fn write_outputs(
+pub(super) fn write_outputs(
     output_path: &str,
     bytes: &[u8],
     report_path: Option<&str>,

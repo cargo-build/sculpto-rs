@@ -1,6 +1,6 @@
 //! LINEAR channels use f64 interpolation and exact trigonometric SLERP.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use glam::{DMat4, DQuat, DVec3};
 use gltf::accessor::{DataType, Dimensions};
@@ -21,7 +21,10 @@ pub(super) struct Channel {
 pub(super) enum Values {
     Vector(Vec<DVec3>),
     Rotation(Vec<DQuat>),
+    Weights { width: usize, values: Vec<f64> },
 }
+
+pub(super) type MorphWeights = BTreeMap<usize, Vec<f64>>;
 
 /// Every validated channel of one clip plus its authored time span.
 pub(super) struct Read {
@@ -35,9 +38,18 @@ pub(super) fn worlds(
     selected: &[usize],
     pose: Pose<'_>,
 ) -> Result<Vec<DMat4>, ActorError> {
+    evaluated(actor, selected, pose).map(|(worlds, _)| worlds)
+}
+
+/// Evaluate transforms and selected morph tracks at the same clip instant. @req DECL0013
+pub(super) fn evaluated(
+    actor: &Actor,
+    selected: &[usize],
+    pose: Pose<'_>,
+) -> Result<(Vec<DMat4>, MorphWeights), ActorError> {
     let mut transforms = actor.transforms.clone();
-    match pose {
-        Pose::Rest => {}
+    let weights = match pose {
+        Pose::Rest => MorphWeights::new(),
         Pose::Clip { name, time } => {
             let clips: Vec<_> = actor
                 .document
@@ -53,10 +65,10 @@ pub(super) fn worlds(
                     });
                 }
             };
-            apply(actor, clip, selected, time, &mut transforms)?;
+            apply(actor, clip, selected, time, &mut transforms)?
         }
-    }
-    compose_worlds(actor, &transforms)
+    };
+    Ok((compose_worlds(actor, &transforms)?, weights))
 }
 
 /// One pose's own local rotations, per node, without composing the hierarchy.
@@ -190,7 +202,7 @@ fn apply(
     selected: &[usize],
     time: f64,
     transforms: &mut [Transform],
-) -> Result<(), ActorError> {
+) -> Result<MorphWeights, ActorError> {
     let Read {
         channels,
         start,
@@ -200,9 +212,11 @@ fn apply(
         true => {}
         false => return Err(ActorError::Time { time, start, end }),
     }
+    let mut morphs = MorphWeights::new();
     channels
-        .into_iter()
-        .try_for_each(|channel| evaluate(channel, time, transforms))
+        .iter()
+        .try_for_each(|channel| evaluate(channel, time, transforms, &mut morphs))?;
+    Ok(morphs)
 }
 
 /// Decode and validate one clip's channels without applying them.
@@ -251,9 +265,6 @@ pub(super) fn read(
             end = end.max(times[times.len() - 1]);
             match property {
                 Property::MorphTargetWeights if !selected.contains(&node) => return Ok(None),
-                Property::MorphTargetWeights => {
-                    return Err(unsupported(&context, "selected morph weight animation"));
-                }
                 _ => {}
             }
             let step = match channel.sampler().interpolation() {
@@ -261,13 +272,64 @@ pub(super) fn read(
                 Interpolation::Step => true,
                 value => return Err(unsupported(&context, format!("{value:?} interpolation"))),
             };
+            let output = channel.sampler().output();
+            if property == Property::MorphTargetWeights {
+                let mesh = channel
+                    .target()
+                    .node()
+                    .mesh()
+                    .ok_or_else(|| invalid(&context, "morph track without a mesh"))?;
+                let width = mesh
+                    .primitives()
+                    .next()
+                    .map(|p| p.morph_targets().len())
+                    .unwrap_or(0);
+                if width == 0
+                    || mesh.primitives().any(|p| p.morph_targets().len() != width)
+                    || times.len().checked_mul(width) != Some(output.count())
+                {
+                    return Err(invalid(&context, "morph track width disagrees with mesh"));
+                }
+                decode::accessor(
+                    &output,
+                    Dimensions::Scalar,
+                    &[
+                        DataType::F32,
+                        DataType::U8,
+                        DataType::U16,
+                        DataType::I8,
+                        DataType::I16,
+                    ],
+                    &context,
+                )?;
+                if input.normalized()
+                    || (output.data_type() != DataType::F32) != output.normalized()
+                {
+                    return Err(invalid(&context, "invalid morph weight normalization"));
+                }
+                let Some(gltf::animation::util::ReadOutputs::MorphTargetWeights(weights)) =
+                    channel.reader(|buffer| actor.buffer(buffer)).read_outputs()
+                else {
+                    return Err(invalid(&context, "unreadable morph weights"));
+                };
+                let values: Vec<_> = weights.into_f32().map(f64::from).collect();
+                if values.iter().any(|x| !x.is_finite()) {
+                    return Err(invalid(&context, "nonfinite morph weight"));
+                }
+                return Ok(Some(Channel {
+                    node,
+                    property,
+                    times,
+                    values: Values::Weights { width, values },
+                    step,
+                }));
+            }
             match actor.transforms[node] {
                 Transform::Matrix(_) => {
                     return Err(invalid(&context, "animation targets a static matrix node"));
                 }
                 Transform::Trs { .. } => {}
             }
-            let output = channel.sampler().output();
             let dimensions = match property {
                 Property::Rotation => Dimensions::Vec4,
                 _ => Dimensions::Vec3,
@@ -321,7 +383,12 @@ pub(super) fn read(
     })
 }
 
-fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result<(), ActorError> {
+fn evaluate(
+    channel: &Channel,
+    time: f64,
+    transforms: &mut [Transform],
+    morphs: &mut MorphWeights,
+) -> Result<(), ActorError> {
     let last = channel.times.len() - 1;
     let (lower, upper, alpha) = match channel.step {
         true => {
@@ -347,6 +414,20 @@ fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result
             (lower, upper, alpha)
         }
     };
+    if let Values::Weights { width, values } = &channel.values {
+        let width = *width;
+        let start = &values[lower * width..(lower + 1) * width];
+        let end = &values[upper * width..(upper + 1) * width];
+        morphs.insert(
+            channel.node,
+            start
+                .iter()
+                .zip(end)
+                .map(|(&a, &b)| a + (b - a) * alpha)
+                .collect(),
+        );
+        return Ok(());
+    }
     let Transform::Trs {
         translation,
         rotation,
@@ -358,7 +439,7 @@ fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result
             "animation targets static matrix",
         ));
     };
-    match (channel.property, channel.values) {
+    match (channel.property, &channel.values) {
         (Property::Translation, Values::Vector(values)) => {
             *translation = values[lower].lerp(values[upper], alpha)
         }
@@ -376,6 +457,63 @@ fn evaluate(channel: Channel, time: f64, transforms: &mut [Transform]) -> Result
         }
     }
     Ok(())
+}
+
+impl Actor {
+    /// Joint centres at the union of skeletal keys and their midpoints for an angle-driven LINEAR morph track. @req DECL0013
+    pub fn joint_position_keys(
+        &self,
+        clip: usize,
+        nodes: &[usize],
+    ) -> Result<Vec<(f32, Vec<DVec3>)>, ActorError> {
+        let animation = self
+            .document
+            .animations()
+            .nth(clip)
+            .ok_or_else(|| invalid("joint keys", "missing clip"))?;
+        if nodes.iter().any(|&id| id >= self.transforms.len()) {
+            return Err(invalid("joint keys", "missing node"));
+        }
+        let read = read(self, &animation, &[])?;
+        if read.channels.iter().any(|c| c.step) {
+            return Err(unsupported(
+                "joint keys",
+                "STEP skeletal track for a LINEAR corrective",
+            ));
+        }
+        let mut times: Vec<_> = read
+            .channels
+            .iter()
+            .flat_map(|c| c.times.iter().map(|&t| t as f32))
+            .collect();
+        times.sort_by(f32::total_cmp);
+        times.dedup();
+        let mids: Vec<_> = times
+            .windows(2)
+            .map(|t| t[0] + 0.5 * (t[1] - t[0]))
+            .collect();
+        times.extend(mids);
+        times.sort_by(f32::total_cmp);
+        times.dedup();
+        times
+            .into_iter()
+            .map(|t| {
+                let mut transforms = self.transforms.clone();
+                let mut morphs = MorphWeights::new();
+                for c in &read.channels {
+                    evaluate(c, f64::from(t), &mut transforms, &mut morphs)?;
+                }
+                let world = compose_worlds(self, &transforms)?;
+                Ok((
+                    t,
+                    nodes
+                        .iter()
+                        .map(|&id| world[id].w_axis.truncate())
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Shortest-path interpolation between two authored samples, exposed to the

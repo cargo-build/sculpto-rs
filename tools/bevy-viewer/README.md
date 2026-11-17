@@ -214,6 +214,7 @@ printf '{"cmd":"state"}\n' | socat - UNIX-CONNECT:/tmp/opencode/task/viewer.sock
 | `{"cmd":"clip","index":1}` | restart the chosen actor clip; the cloth clip keeps running |
 | `{"cmd":"slot","index":3}` | select a posed asset or named clip in `--bank` mode |
 | `{"cmd":"playback","paused":true,"speed":0.25}` | pause and slow the clip (`0.05..4`) |
+| `{"cmd":"seek","seconds":0.7}` | pause the loaded actor clip at the requested time within its duration |
 | `{"cmd":"skeleton","level":2}` | `0` off, `1` primary chain, `2` every driven joint |
 | `{"cmd":"capture","path":"/abs/shot.png"}` | screenshot of the window (interactive) or the render target (headless); absolute `.png`/`.jpg` path, parent directories created — the file lands a frame later, poll it |
 | `{"cmd":"quit"}` | answer, then close the process |
@@ -270,8 +271,10 @@ checked instead of judged from a still.
 The review camera uses depth-sorted transparency on supported GPUs.
 `SCULPTO_VIEWER_SORT_TRANSPARENCY=0` selects the ordinary blend path for comparison.
 `N` switches between smooth normals and per-triangle normals on body and clothing.
-`SCULPTO_VIEWER_FACE_NORMALS=1` starts in the faceted view. The toggle retains vertex
-positions and skin influences. Meshes with morph targets keep their original rendering.
+`SCULPTO_VIEWER_FACE_NORMALS=1` starts in the faceted view. The faceted mesh copies
+skin influences and morph offsets onto each triangle corner and computes the face
+normal for each target. The control socket exposes the active clip time in
+`state.clip.seconds` and the current mesh weights in `state.morph_weights`.
 
 ## Review lighting
 

@@ -315,8 +315,8 @@ impl Actor {
     /// Preserve selection/primitive order without welding or axis conversion. @req DECL0013
     pub fn sample(&self, parts: &[&str], pose: Pose<'_>) -> Result<Sample, ActorError> {
         let nodes = geometry::select(&self.document, parts)?;
-        let worlds = animation::worlds(self, &nodes, pose)?;
-        geometry::sample(self, &nodes, &worlds)
+        let (worlds, morphs) = animation::evaluated(self, &nodes, pose)?;
+        geometry::sample_with_morphs(self, &nodes, &worlds, Some(&morphs))
     }
 
     /// Authored time span of one uniquely named clip. @req DECL0013
@@ -340,6 +340,63 @@ impl Actor {
     /// sampled time outside the clip's authored span.
     pub fn skeleton_worlds(&self, pose: Pose<'_>) -> Result<Vec<DMat4>, ActorError> {
         animation::worlds(self, &[], pose)
+    }
+
+    /// Reweighting a shared mesh preserves its bind shape when the palette maps it into one rest frame. @req DECL0013
+    pub fn shared_skin_frame(&self, node: usize) -> Result<DMat4, ActorError> {
+        let part = self
+            .document
+            .nodes()
+            .nth(node)
+            .ok_or_else(|| invalid("skin frame", "missing mesh node"))?;
+        let mesh = part
+            .mesh()
+            .ok_or_else(|| invalid("skin frame", "missing mesh"))?;
+        let skin = part
+            .skin()
+            .ok_or_else(|| invalid("skin frame", "missing skin"))?;
+        if self.document.skins().len() != 1
+            || self
+                .document
+                .nodes()
+                .filter_map(|n| n.mesh())
+                .filter(|m| m.index() == mesh.index())
+                .count()
+                != 1
+        {
+            return Err(unsupported(
+                "skin frame",
+                "instanced mesh or multiple skins",
+            ));
+        }
+        if mesh.primitives().any(|p| {
+            p.attributes().any(|(s, _)| {
+                matches!(s,
+            gltf::Semantic::Weights(i)|gltf::Semantic::Joints(i) if i>0)
+            })
+        }) {
+            return Err(unsupported(
+                "skin frame",
+                "more than one skin attribute set",
+            ));
+        }
+        if self.document.images().any(
+            |i| matches!(i.source(),gltf::image::Source::Uri{uri,..} if !uri.starts_with("data:")),
+        ) {
+            return Err(unsupported(
+                "skin frame",
+                "external image URI in relocated actor",
+            ));
+        }
+        let matrices = geometry::joint_matrices(self, skin, &self.skeleton_worlds(Pose::Rest)?)?;
+        let frame = matrices[0];
+        if !frame.inverse().is_finite() || matrices.iter().any(|m| !m.abs_diff_eq(frame, 2e-5)) {
+            return Err(unsupported(
+                "skin frame",
+                "palette has no common invertible bind transform",
+            ));
+        }
+        Ok(frame)
     }
 
     /// Every node's local rotation at one pose, without composing the hierarchy.

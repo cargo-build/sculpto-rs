@@ -43,8 +43,8 @@ pub(super) fn sample(
     let selected = geometry::select(&actor.document, parts)?;
     let electorate = skin_electorate(actor, &selected);
     let (requested, disambiguated) = resolve_with(actor, joints, &electorate)?;
-    let worlds = animation::worlds(actor, &selected, pose)?;
-    let sample = geometry::sample(actor, &selected, &worlds)?;
+    let (worlds, morphs) = animation::evaluated(actor, &selected, pose)?;
+    let sample = geometry::sample_with_morphs(actor, &selected, &worlds, Some(&morphs))?;
     let (rig, index) = graph(actor, &requested, &worlds)?;
     let requested = requested
         .into_iter()

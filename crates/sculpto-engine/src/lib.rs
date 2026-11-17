@@ -24,6 +24,7 @@ mod handlers;
 pub mod havok;
 mod humanoid;
 pub mod joints;
+pub mod knee_fold;
 pub mod measures;
 pub mod medial;
 pub mod obj;
