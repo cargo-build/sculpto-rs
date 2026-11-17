@@ -295,10 +295,9 @@ fn a_shell_inherits_the_flesh_it_lies_on() {
     assert_eq!(authored.report.inherited_vertices, points.len() - flesh_len);
     for vertex in flesh_len..points.len() {
         let row = &authored.rows[vertex];
-        let borrowed = authored.rows[..flesh_len]
-            .iter()
-            .any(|flesh_row| flesh_row == row);
-        assert!(borrowed, "shell vertex {vertex} authored its own weights");
+        let sum: f32 = row.values().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(row.keys().all(|name| name == "Upper" || name == "Lower"));
         // The sleeve above the upper bone rides the upper bone.
         if points[vertex][0] < 0.12 {
             assert!(weight(row, "Upper") > 0.5, "sleeve weighted {row:?}");

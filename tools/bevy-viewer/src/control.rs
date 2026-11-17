@@ -66,6 +66,9 @@ pub enum Command {
     Clip {
         index: usize,
     },
+    Slot {
+        index: usize,
+    },
     Playback {
         paused: Option<bool>,
         speed: Option<f32>,
@@ -325,15 +328,17 @@ pub fn parse_request(line: &str) -> Result<Command, String> {
                 _ => Ok(Command::Target { joint, point }),
             }
         }
-        "clip" => {
+        "clip" | "slot" => {
             let index = object
                 .get("index")
                 .ok_or("clip needs \"index\"")?
                 .as_u64()
                 .ok_or("\"index\" must be a non-negative integer")?;
-            Ok(Command::Clip {
-                index: index as usize,
-            })
+            let index = usize::try_from(index).map_err(|_| "index exceeds platform size")?;
+            match cmd {
+                "slot" => Ok(Command::Slot { index }),
+                _ => Ok(Command::Clip { index }),
+            }
         }
         "playback" => {
             let paused = match object.get("paused") {
@@ -562,7 +567,9 @@ pub struct Snapshot {
     pub meshes: usize,
     pub scale: f32,
     pub status: String,
-    pub clip_index: usize,
+    pub clip_index: Option<usize>,
+    pub clip_name: Option<String>,
+    pub bank: Option<Value>,
     pub clip_count: Option<usize>,
     pub paused: bool,
     pub speed: f32,
@@ -605,10 +612,12 @@ impl Snapshot {
             "status": self.status,
             "clip": {
                 "index": self.clip_index,
+                "name": self.clip_name,
                 "count": self.clip_count,
                 "paused": self.paused,
                 "speed": self.speed,
             },
+            "bank": self.bank,
             "skeleton": self.skeleton,
             "camera": {
                 "mode": self.camera_mode,
@@ -670,6 +679,7 @@ pub fn help_json() -> String {
             },
             "target": {"joint": "name", "point": "[x, y, z]"},
             "clip": {"index": "actor clip index; see clip.count in state"},
+            "slot": {"index": "bank entry 0..9; see bank.slots in state; requires --bank"},
             "playback": {"paused": "true|false", "speed": format!("{MIN_SPEED}..{MAX_SPEED}")},
             "skeleton": {"level": "0 off, 1 primary chain, 2 every driven joint"},
             "capture": {"path": "absolute .png path; written asynchronously, poll the file"},
@@ -835,7 +845,9 @@ mod tests {
             meshes: 3,
             scale: 1.0,
             status: "InProgress".to_string(),
-            clip_index: 1,
+            clip_index: Some(1),
+            clip_name: Some("Walk".into()),
+            bank: None,
             clip_count: Some(2),
             paused: true,
             speed: 0.5,

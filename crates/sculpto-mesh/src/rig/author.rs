@@ -61,6 +61,8 @@ use glam::DVec3;
 use crate::garment::Influences;
 use crate::weight_norm::{WeightError, pack_influences};
 
+mod seams;
+
 /// Which body side a bone drives, from its authored name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodySide {
@@ -115,8 +117,7 @@ pub struct AuthorSettings {
     pub prune_ratio: f64,
     /// Surface smoothing passes over the weight field.
     pub smoothing: usize,
-    /// Half-width of the midline band that may carry both sides. A vertex inside
-    /// the band has no side worth isolating; a vertex outside it belongs to one.
+    /// Half-width in metres over which opposite-side influence fades to zero.
     pub midline_dead_zone: f64,
 }
 
@@ -170,6 +171,8 @@ pub struct AuthorReport {
     pub flesh_vertices: usize,
     /// Shell vertices that inherited the flesh they lie on.
     pub inherited_vertices: usize,
+    /// Coincident boundary endpoint groups that share one body influence row.
+    pub seam_weight_groups: usize,
     /// Vertices whose opposite-side mass the isolation mask removed.
     pub side_masked_vertices: usize,
     /// Mass the isolation mask removed, in raw pre-pack units.
@@ -325,7 +328,8 @@ pub fn author_weights(
         .collect::<Result<_, _>>()?;
 
     let count = points.len();
-    let surface = Surface::build(&points, triangles);
+    let seams = seams::SeamWeights::find(positions, triangles, flesh);
+    let surface = Surface::build(&points, triangles, seams.links());
     let euclidean = euclidean_fields(&points, bones);
     // The bone's own flesh section, measured from the surface. Ownership uses it
     // as a capsule; the falloff and the reach bound use it as their unit.
@@ -344,7 +348,7 @@ pub fn author_weights(
         settings,
     );
     let (axis, origin) = lateral_frame(bones);
-    let mask = side_mask(&points, &axis, &origin, settings.midline_dead_zone);
+    let mut mask = side_mask(&points, &axis, &origin, settings.midline_dead_zone);
     let mut neighbours = Neighbours::from_surface(&surface);
     for _ in 0..settings.smoothing {
         neighbours.smooth(&mut weights, bones.len(), count);
@@ -355,10 +359,12 @@ pub fn author_weights(
     let reach = reach_bounds(&section, settings);
     let (envelope_cut_vertices, envelope_cut_mass, envelope_restored) =
         apply_envelope_bound(&mut weights, &geodesic.squared, &reach, bones.len(), count);
+    seams.share(&mut weights, count, &mut mask);
+    let inherited = inherit_from_flesh(&points, flesh, &mut weights, bones.len(), count);
+    resolve_bilateral_overlap(&mut weights, bones, count);
     // The mask runs last: a smoothing pass would carry masked mass back across
     // the midline from the dead-zone band, and side isolation is a product gate
     // on the encoded rows, not an aspiration.
-    let inherited = inherit_from_flesh(&points, flesh, &mut weights, bones.len(), count);
     let (masked_vertices, masked_mass, mask_restored) =
         apply_side_mask(&mut weights, &mask, bones, count);
 
@@ -373,6 +379,7 @@ pub fn author_weights(
             unreached_pairs: geodesic.unreached,
             flesh_vertices: flesh.iter().filter(|flag| **flag).count(),
             inherited_vertices: inherited,
+            seam_weight_groups: seams.len(),
             side_masked_vertices: masked_vertices,
             side_masked_mass: masked_mass,
             side_mask_restored: mask_restored,
@@ -398,7 +405,11 @@ struct Surface {
 }
 
 impl Surface {
-    fn build(points: &[DVec3], triangles: &[[u32; 3]]) -> Self {
+    fn build(
+        points: &[DVec3],
+        triangles: &[[u32; 3]],
+        seams: impl Iterator<Item = (u32, u32)>,
+    ) -> Self {
         let mut edges = BTreeSet::new();
         for triangle in triangles {
             for (left, right) in [
@@ -416,6 +427,7 @@ impl Surface {
                 edges.insert(key);
             }
         }
+        edges.extend(seams);
         let mut degree = vec![0_u32; points.len()];
         for (left, right) in &edges {
             degree[*left as usize] += 1;
@@ -670,7 +682,7 @@ fn apply_envelope_bound(
     (vertices, mass, restored)
 }
 
-/// Give every shell vertex the weights of the nearest flesh vertex.
+/// Interpolate the flesh field through a compact distance kernel.
 ///
 /// A garment primitive, a detached toe or a nail is its own surface: its bones
 /// are the ones it lies on, never the ones its isolated geodesic graph would
@@ -692,17 +704,16 @@ fn inherit_from_flesh(
         return 0;
     }
     let grid = Grid::build(points, &sources);
-    let mut borrowed = 0;
-    for vertex in inherited {
-        let Some(source) = grid.nearest(points, vertex) else {
-            continue;
-        };
-        for bone in 0..bones {
-            weights[bone * count + vertex] = weights[bone * count + source];
-        }
-        borrowed += 1;
-    }
-    borrowed
+    inherited.iter().for_each(|&vertex| {
+        let neighbours = grid.blend(points, points[vertex]);
+        (0..bones).for_each(|bone| {
+            weights[bone * count + vertex] = neighbours
+                .iter()
+                .map(|(source, fraction)| weights[bone * count + source] * fraction)
+                .sum();
+        });
+    });
+    inherited.len()
 }
 
 /// A uniform grid over the flesh vertices, for nearest-source queries.
@@ -739,14 +750,35 @@ impl Grid {
         )
     }
 
-    /// The nearest source vertex, searching outward one grid shell at a time.
-    ///
-    /// The search stops as soon as the best candidate found is closer than the
-    /// inner boundary of the next shell, so a loose layer standing off the body
-    /// (a boxer short at 110 mm) is still resolved exactly.
-    fn nearest(&self, points: &[DVec3], vertex: usize) -> Option<usize> {
-        self.search(points, points[vertex])
-            .map(|(_, source)| source)
+    /// The support follows nearest distance continuously; its boundary has zero mass.
+    /// A nearest-vertex switch across an opening must not tear a spanning garment.
+    fn blend(&self, points: &[DVec3], point: DVec3) -> Vec<(usize, f64)> {
+        let Some((distance, source)) = self.search(points, point) else {
+            return Vec::new();
+        };
+        if distance < 1e-9 {
+            return vec![(source, 1.0)];
+        }
+        let radius = distance + self.cell;
+        let low = Self::key(point - DVec3::splat(radius), self.cell);
+        let high = Self::key(point + DVec3::splat(radius), self.cell);
+        let mut blend: Vec<(usize, f64)> = (low.0..=high.0)
+            .flat_map(|x| (low.1..=high.1).map(move |y| (x, y)))
+            .flat_map(|(x, y)| (low.2..=high.2).map(move |z| (x, y, z)))
+            .filter_map(|key| self.buckets.get(&key))
+            .flatten()
+            .filter_map(|&source| {
+                let squared = points[source].distance_squared(point);
+                let taper = 1.0 - squared / radius.powi(2);
+                match taper > 0.0 {
+                    true => Some((source, taper.powi(2) / squared)),
+                    false => None,
+                }
+            })
+            .collect();
+        let total: f64 = blend.iter().map(|(_, weight)| weight).sum();
+        blend.iter_mut().for_each(|(_, weight)| *weight /= total);
+        blend
     }
 
     /// Distance from an arbitrary point to the nearest source vertex.
@@ -943,52 +975,87 @@ fn lateral_frame(bones: &[DeformBone]) -> (DVec3, DVec3) {
     };
     match (mean(BodySide::Left), mean(BodySide::Right)) {
         (Some(left), Some(right)) if left.distance(right) > f64::EPSILON => {
-            (left - right, (left + right) * 0.5)
+            ((left - right).normalize(), (left + right) * 0.5)
         }
         _ => (DVec3::ZERO, DVec3::ZERO),
     }
 }
 
-/// Vertices that must not carry the opposite side: clear of the midline band.
-fn side_mask(
-    points: &[DVec3],
-    axis: &DVec3,
-    origin: &DVec3,
-    dead_zone: f64,
-) -> Vec<Option<BodySide>> {
+/// Signed progress through the metre-wide isolation band, clamped at its ends.
+fn side_mask(points: &[DVec3], axis: &DVec3, origin: &DVec3, dead_zone: f64) -> Vec<f64> {
     match axis.length_squared() > f64::EPSILON {
         true => points
             .iter()
             .map(|point| {
                 let lateral = (*point - *origin).dot(*axis);
-                match lateral {
-                    value if value > dead_zone => Some(BodySide::Left),
-                    value if value < -dead_zone => Some(BodySide::Right),
-                    _ => None,
+                match dead_zone > 0.0 {
+                    true => (lateral / dead_zone).clamp(-1.0, 1.0),
+                    false if lateral != 0.0 => lateral.signum(),
+                    false => 0.0,
                 }
             })
             .collect(),
-        false => vec![None; points.len()],
+        false => vec![0.0; points.len()],
     }
 }
 
-/// Remove every opposite-side influence from a clearly one-sided vertex.
+/// Give shared branch influence to the unsided bone that already reaches the vertex. @req DECL0013
+fn resolve_bilateral_overlap(weights: &mut [f64], bones: &[DeformBone], count: usize) {
+    for (hub, bone) in bones
+        .iter()
+        .enumerate()
+        .filter(|(_, bone)| bone.side.is_none())
+    {
+        let mut branches = bones.iter().enumerate().filter_map(|(index, branch)| {
+            let side = branch.side?;
+            let head = branch.segments.first()?.0;
+            bone.segments
+                .iter()
+                .any(|&(_, tail)| tail == head)
+                .then_some((index, side))
+        });
+        let (Some((a, side)), Some((b, other)), None) =
+            (branches.next(), branches.next(), branches.next())
+        else {
+            continue;
+        };
+        if side == other {
+            continue;
+        }
+        for vertex in 0..count {
+            let (centre, first, second) =
+                (hub * count + vertex, a * count + vertex, b * count + vertex);
+            let shared = weights[centre].min(weights[first]).min(weights[second]);
+            weights[first] -= shared;
+            weights[second] -= shared;
+            weights[centre] += 2.0 * shared;
+        }
+    }
+}
+
+/// Fade opposite-side mass smoothly inside the band, remove it beyond the band.
 ///
 /// A vertex whose only influence was the opposite side keeps its heaviest such
 /// bone: the isolation rule must not empty a row, and the number of those
 /// vertices is reported so the exception is never silent.
 fn apply_side_mask(
     weights: &mut [f64],
-    mask: &[Option<BodySide>],
+    mask: &[f64],
     bones: &[DeformBone],
     count: usize,
 ) -> (usize, f64, usize) {
     let mut vertices = 0;
     let mut mass = 0.0;
     let mut restored = 0;
-    for (vertex, side) in mask.iter().enumerate() {
-        let Some(side) = side else { continue };
+    for (vertex, progress) in mask.iter().copied().enumerate() {
+        let side = match progress {
+            value if value > 0.0 => BodySide::Left,
+            value if value < 0.0 => BodySide::Right,
+            _ => continue,
+        };
         let opposite = side.opposite();
+        let t = progress.abs();
+        let removed_fraction = t * t * (3.0 - 2.0 * t);
         let mut removed = 0.0;
         let mut heaviest = None::<(f64, usize)>;
         for (bone, spec) in bones.iter().enumerate() {
@@ -999,7 +1066,7 @@ fn apply_side_mask(
             if weight <= 0.0 {
                 continue;
             }
-            removed += weight;
+            removed += weight * removed_fraction;
             if heaviest.is_none_or(|(known, _)| weight > known) {
                 heaviest = Some((weight, bone));
             }
@@ -1009,7 +1076,7 @@ fn apply_side_mask(
         }
         for (bone, spec) in bones.iter().enumerate() {
             if spec.side == Some(opposite) {
-                weights[bone * count + vertex] = 0.0;
+                weights[bone * count + vertex] *= 1.0 - removed_fraction;
             }
         }
         vertices += 1;
@@ -1182,4 +1249,75 @@ fn footprints(
             mass: mass[slot],
         })
         .collect()
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+
+    fn sides(span: f64) -> Vec<DeformBone> {
+        [(BodySide::Left, span), (BodySide::Right, -span)]
+            .into_iter()
+            .map(|(side, x)| DeformBone {
+                name: format!("{side:?}"),
+                side: Some(side),
+                segments: vec![(DVec3::new(x, 0.0, 0.0), DVec3::new(x, 1.0, 0.0))],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn isolation_band_is_measured_in_metres_at_different_body_widths() {
+        [0.1, 0.5, 2.0].into_iter().for_each(|span| {
+            let (axis, origin) = lateral_frame(&sides(span));
+            assert!((axis.length() - 1.0).abs() < 1e-12);
+            let mask = side_mask(&[DVec3::X * 0.005], &axis, &origin, 0.010);
+            assert!((mask[0] - 0.5).abs() < 1e-12);
+        });
+    }
+
+    #[test]
+    fn opposite_mass_reaches_zero_without_a_step_at_band_boundary() {
+        let points = [0.009999, 0.010, 0.010001].map(|x| DVec3::X * x);
+        let bones = sides(0.3);
+        let (axis, origin) = lateral_frame(&bones);
+        let mask = side_mask(&points, &axis, &origin, 0.010);
+        let mut weights = vec![0.5; 6];
+        apply_side_mask(&mut weights, &mask, &bones, 3);
+        assert!(weights[3] < 2e-8, "boundary jump: {}", weights[3]);
+        assert_eq!(&weights[4..], &[0.0, 0.0]);
+        assert_eq!(&weights[..3], &[0.5; 3]);
+    }
+
+    #[test]
+    fn opposite_branches_move_only_shared_mass_to_their_common_bone() {
+        let mut bones = sides(0.3);
+        bones.push(DeformBone {
+            name: "Centre".to_owned(),
+            side: None,
+            segments: vec![
+                (DVec3::Y, bones[0].segments[0].0),
+                (DVec3::Y, bones[1].segments[0].0),
+            ],
+        });
+        let mut weights = [0.5, 0.5, 0.25, 0.5, 0.25, 0.0];
+        resolve_bilateral_overlap(&mut weights, &bones, 2);
+        assert_eq!(weights, [0.25, 0.5, 0.0, 0.5, 0.75, 0.0]);
+    }
+
+    #[test]
+    fn shell_crossing_a_nearest_source_bisector_has_a_continuous_field() {
+        let points = [DVec3::X * -0.02, DVec3::X * 0.02];
+        let grid = Grid::build(&points, &[0, 1]);
+        let mass = |x| {
+            grid.blend(&points, DVec3::new(x, 0.01, 0.0))
+                .iter()
+                .filter(|(source, _)| *source == 0)
+                .map(|(_, weight)| weight)
+                .sum::<f64>()
+        };
+        assert!((mass(0.0) - 0.5).abs() < 1e-12);
+        assert!((mass(-1e-7) - mass(1e-7)).abs() < 0.001);
+        assert_eq!(grid.blend(&points, points[0]), vec![(0, 1.0)]);
+    }
 }

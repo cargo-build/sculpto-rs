@@ -131,6 +131,11 @@ impl Viewer {
     // every path, including a panic in a test assertion.
     #[allow(clippy::zombie_processes)]
     fn start(fixture: &Path, tag: &str) -> Option<Viewer> {
+        Self::start_mode(fixture, tag, "--glb")
+    }
+
+    #[allow(clippy::zombie_processes)]
+    fn start_mode(fixture: &Path, tag: &str, mode: &str) -> Option<Viewer> {
         let bin = viewer_binary();
         if !bin.exists() {
             eprintln!("SKIP: cloth-viewer binary not found at {}", bin.display());
@@ -142,7 +147,7 @@ impl Viewer {
         std::fs::create_dir_all(&dir).expect("work dir");
         let socket = dir.join("viewer.sock");
         let mut cmd = Command::new(&bin);
-        cmd.args(["--headless", "--glb"])
+        cmd.args(["--headless", mode])
             .arg(fixture)
             .arg("--control")
             .arg(&socket)
@@ -388,4 +393,112 @@ fn control_is_refused_with_report() {
         !Path::new("/tmp/cloth-viewer-control-report.sock").exists(),
         "no socket is left behind"
     );
+}
+
+fn await_bank_slot(viewer: &Viewer, slot: usize) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = ask(&viewer.socket, r#"{"cmd":"state"}"#);
+        if state["asset"]["loaded"] == true
+            && state["bank"]["current"] == slot
+            && state["bank"]["requested"].is_null()
+            && state["joint_count"] == 65
+        {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "slot {slot} did not load: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Private Mixamo bank: every slot, actual motion, opacity, camera and exact rest return.
+#[test]
+fn supplied_bank_switches_all_slots_and_returns_to_exact_rest() {
+    let Some(path) = std::env::var_os("SCULPTO_VIEWER_BANK_FIXTURE") else {
+        eprintln!("SKIP: SCULPTO_VIEWER_BANK_FIXTURE is not supplied");
+        return;
+    };
+    let Some(viewer) = Viewer::start_mode(Path::new(&path), "bank", "--bank") else {
+        return;
+    };
+    let first = await_bank_slot(&viewer, 0);
+    let slots = first["bank"]["slots"].as_array().expect("bank slots");
+    assert_eq!(slots.len(), 10);
+    assert!(first["clip"]["index"].is_null());
+    assert_eq!(
+        ask(&viewer.socket, r#"{"cmd":"slot","index":10}"#)["ok"],
+        false
+    );
+    assert_eq!(
+        ask(&viewer.socket, r#"{"cmd":"clip","index":0}"#)["ok"],
+        false
+    );
+    let camera = first["camera"].clone();
+    let mut evidence = Vec::new();
+    for index in 0..10 {
+        assert_eq!(
+            ask(
+                &viewer.socket,
+                &format!(r#"{{"cmd":"slot","index":{index}}}"#)
+            )["ok"],
+            true
+        );
+        let state = await_bank_slot(&viewer, index);
+        assert_eq!(state["camera"], camera, "camera changed at slot {index}");
+        assert_eq!(state["clip"]["index"].is_null(), index < 2);
+        let materials = state["materials"].as_array().expect("actor materials");
+        assert_eq!(materials.len(), 3, "complete dressed actor at slot {index}");
+        for material in materials {
+            let alpha = material["alpha"].as_f64().expect("alpha");
+            assert!((alpha - 0.85).abs() < 1e-6, "slot{index}: {material}");
+        }
+        if index >= 2 {
+            std::thread::sleep(Duration::from_millis(300));
+            let later = ask(&viewer.socket, r#"{"cmd":"state"}"#);
+            assert_ne!(state["joints"], later["joints"], "slot {index} is frozen");
+            let hips = |state: &serde_json::Value| {
+                state["joints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|joint| joint["name"] == "mixamorig:Hips")
+                    .unwrap()["position"]
+                    .clone()
+            };
+            assert_eq!(hips(&state), hips(&later), "slot {index} root travelled");
+        }
+        evidence.push(serde_json::json!({"slot": index, "clip": state["clip"],
+            "asset": state["asset"], "materials": state["materials"]}));
+    }
+    assert_eq!(
+        ask(&viewer.socket, r#"{"cmd":"slot","index":0}"#)["ok"],
+        true
+    );
+    let returned = await_bank_slot(&viewer, 0);
+    assert_eq!(returned["asset"]["sha256"], first["asset"]["sha256"]);
+    let by_name =
+        |state: &serde_json::Value| -> std::collections::BTreeMap<String, serde_json::Value> {
+            state["joints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|joint| {
+                    (
+                        joint["name"].as_str().unwrap().to_owned(),
+                        joint["position"].clone(),
+                    )
+                })
+                .collect()
+        };
+    assert_eq!(
+        by_name(&returned),
+        by_name(&first),
+        "A-rest transforms changed after motion"
+    );
+    if let Some(path) = std::env::var_os("SCULPTO_VIEWER_BANK_EVIDENCE") {
+        std::fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap()).expect("bank evidence");
+    }
 }

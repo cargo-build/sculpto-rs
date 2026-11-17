@@ -2,14 +2,18 @@
 //! (morph animation), render an offscreen frame, save it as PNG, exit.
 //! Also provides `--headless --report --glb <path>` count reporting for consumer acceptance.
 //! `--control <socket>` publishes the agent control socket (see `control.rs`).
+mod bank;
 mod control;
+mod facets;
 
 use bevy::asset::RenderAssetUsages;
+use bevy::core_pipeline::oit::{resolve::is_oit_supported, OrderIndependentTransparencySettings};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::mesh::morph::{MorphWeights, MAX_MORPH_WEIGHTS};
 use bevy::mesh::skinning::SkinnedMesh;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::renderer::{RenderAdapter, RenderDevice};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use serde::{Deserialize, Serialize};
 
@@ -100,7 +104,7 @@ struct KeyLight;
 #[derive(Component)]
 struct ReviewGround;
 
-/// Review rig: one key light by default; `3` adds the fill/rim pair.
+/// Review rig: one key light by default; `F3` adds the fill/rim pair.
 #[derive(Resource, Clone, Copy)]
 struct RigMode {
     three_point: bool,
@@ -111,13 +115,13 @@ struct RigMode {
 struct FlatFlipped(Vec<AssetId<StandardMaterial>>);
 
 /// Opacity for **every** actor material while the skeleton overlay is on — body,
-/// bra and panty alike. The operator's default is 65 % (2026-11-17, was 16 %),
+/// bra and panty alike. The operator's default is 85 % (2026-11-17),
 /// so the figure stays readable as flesh with the bones visible through it.
 ///
 /// The value is one number for one figure: parts are distinguished by their
 /// own compositing, not by different alpha. `state.materials` reports what each
 /// material actually carries.
-const ACTOR_OPACITY: f32 = 0.65;
+const ACTOR_OPACITY: f32 = 0.85;
 
 /// `B` cycles the skeleton overlay: off -> primary chain -> every driven joint.
 /// Enabled at start by `SCULPTO_VIEWER_SKELETON=1` so a headless capture can
@@ -216,8 +220,7 @@ struct ModelHome(Vec3);
 #[derive(Component)]
 struct HelpOverlay;
 
-/// Selected actor clip: `0` idle, `1` walk, `2` the actor-extra clip when
-/// `SCULPTO_VIEWER_ACTOR_ANIMATION` names one. Cloth keeps its own clip.
+/// Actual glTF clip index; usize::MAX selects the asset's unanimated rest.
 #[derive(Resource, Clone, Copy)]
 struct ClipSelection(usize);
 
@@ -292,14 +295,6 @@ fn hold_roots_in_place(
     for (root, mut transform) in &mut roots {
         transform.translation = root.translation;
     }
-}
-
-/// Whether `SCULPTO_VIEWER_ACTOR_ANIMATION` names an extra actor clip (index ≥ 2).
-fn has_actor_extra() -> bool {
-    std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|index| index >= 2)
 }
 
 // --- Live reload (`--watch <dir> --stage <name>`) -------------------------
@@ -511,6 +506,7 @@ struct PendingScene {
     world: Handle<bevy::world_serialization::WorldAsset>,
     sha: String,
     note: SidecarNote,
+    bank_slot: Option<usize>,
 }
 
 /// Live reload state; present only when `--watch` is given, so every system
@@ -585,6 +581,7 @@ struct CliOptions {
     stage: Option<String>,
     /// `--control <socket>`: publish the agent control socket at this path.
     control: Option<std::path::PathBuf>,
+    bank: Option<std::path::PathBuf>,
 }
 
 /// The asset the viewer is showing: identity for the control socket.
@@ -636,6 +633,7 @@ fn parse_args() -> CliOptions {
         control: std::env::var("SCULPTO_VIEWER_CONTROL")
             .ok()
             .map(std::path::PathBuf::from),
+        bank: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -663,6 +661,17 @@ fn parse_args() -> CliOptions {
                 if let Some(val) = args.next().filter(|value| !value.starts_with('-')) {
                     options.control = Some(std::path::PathBuf::from(val));
                 }
+            }
+            "--bank" => {
+                options.bank = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with('-'))
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            eprintln!("viewer: --bank requires a manifest path");
+                            std::process::exit(2);
+                        }),
+                );
             }
             "--glb" => {
                 if let Some(val) = args.next() {
@@ -697,6 +706,10 @@ fn glb_animation_count(path: &std::path::Path) -> Option<usize> {
 /// The animation count of already-read GLB bytes, so a startup hash and a
 /// clip count cost one file read, not two.
 fn glb_animation_count_bytes(bytes: &[u8]) -> Option<usize> {
+    glb_animation_names_bytes(bytes).map(|names| names.len())
+}
+
+fn glb_animation_names_bytes(bytes: &[u8]) -> Option<Vec<String>> {
     if bytes.len() < 20 || &bytes[0..4] != b"glTF" {
         return None;
     }
@@ -710,14 +723,42 @@ fn glb_animation_count_bytes(bytes: &[u8]) -> Option<usize> {
     // there would read as "unknown" to an agent.
     Some(
         json.get("animations")
-            .and_then(|animations| animations.as_array())
-            .map_or(0, |animations| animations.len()),
+            .and_then(|value| value.as_array())
+            .map(|animations| {
+                animations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, animation)| {
+                        animation
+                            .get("name")
+                            .and_then(|name| name.as_str())
+                            .map_or_else(|| format!("Animation{index}"), str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     )
 }
 
 fn main() {
     let mut options = parse_args();
-    let (asset_dir, mut asset_file) = if let Some(ref glb) = options.glb_path {
+    let bank = options.bank.as_ref().map(|path| {
+        if options.watch.is_some()
+            || options.glb_path.is_some()
+            || options.report
+            || options.units != 1
+        {
+            eprintln!(
+                "viewer: --bank requires a single live actor, without --watch/--glb/--report"
+            );
+            std::process::exit(2);
+        }
+        bank::Bank::load(path).unwrap_or_else(|error| {
+            eprintln!("viewer: bank: {error}");
+            std::process::exit(2);
+        })
+    });
+    let (mut asset_dir, mut asset_file) = if let Some(ref glb) = options.glb_path {
         let p = std::path::Path::new(glb);
         let abs = if p.is_absolute() {
             p.to_path_buf()
@@ -739,6 +780,17 @@ fn main() {
             env_or("SCULPTO_VIEWER_ASSET", "combined.glb"),
         )
     };
+    let bank_staging = bank.as_ref().map(|bank| {
+        let initial = &bank.slots[0];
+        options.watch = initial.asset.parent().map(std::path::Path::to_path_buf);
+        options.stage = initial
+            .asset
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned());
+        let dir = std::env::temp_dir().join(format!("sculpto-viewer-bank-{}", std::process::id()));
+        asset_dir = dir.display().to_string();
+        dir
+    });
 
     // The ordinary proof runs at 60 Hz so captures land on stable ticks. The
     // units benchmark and report modes must not be capped: a 16.7 ms sleep would
@@ -866,12 +918,18 @@ fn main() {
     // A clip index the file does not carry is a caller error, not a broken clip.
     // Say it in the status line and fall back to the last clip that exists.
     let asset_path = std::path::Path::new(&asset_dir).join(&asset_file);
-    let requested_clip = std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+    let mut requested_clip = bank
+        .as_ref()
+        .map(|bank| bank.slots[0].clip.unwrap_or(usize::MAX))
+        .or_else(|| {
+            std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        });
     let clip_note = match (requested_clip, glb_animation_count(&asset_path)) {
-        (Some(index), Some(count)) if count > 0 && index >= count => {
+        (Some(index), Some(count)) if bank.is_none() && count > 0 && index >= count => {
             let fallback = count - 1;
+            requested_clip = Some(fallback);
             std::env::set_var("SCULPTO_VIEWER_ACTOR_ANIMATION", fallback.to_string());
             eprintln!(
                 "viewer: requested actor clip {index}, file carries {count} — showing {fallback}"
@@ -979,10 +1037,10 @@ fn main() {
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
-                        title: format!(
-                            "{} — Sculpto cloth review — drag orbit (Ctrl+drag figure), Shift+drag light, RMB pan, wheel zoom, R reset, L lit/flat, 3 rig, B bones, Space pause, Ctrl+,/. speed, H help",
-                            headline
-                        ),
+                        title: match options.bank.is_some() {
+                            true => format!("Sculpto cloth review — {headline}"),
+                            false => format!("{headline} — Sculpto cloth review"),
+                        },
                         resolution: (1280, 900).into(),
                         ..default()
                     }),
@@ -1012,15 +1070,13 @@ fn main() {
     if let Some(server) = control_server {
         app.insert_resource(ControlHandle(server));
     }
+    if let Some(bank) = bank {
+        app.insert_resource(bank);
+    }
     app.insert_resource(asset_profile)
         .insert_resource(ActorMaterials::default())
         .insert_resource(FlatFlipped::default())
-        .insert_resource(ClipSelection(
-            std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
-        ))
+        .insert_resource(ClipSelection(requested_clip.unwrap_or(0)))
         .insert_resource(InPlaceEnabled(
             std::env::var("SCULPTO_VIEWER_IN_PLACE").map_or(true, |value| value != "0"),
         ))
@@ -1031,6 +1087,9 @@ fn main() {
             offset: Vec3::ZERO,
         })
         .insert_resource(FlatMode(config.flat))
+        .insert_resource(facets::FaceNormals(
+            std::env::var_os("SCULPTO_VIEWER_FACE_NORMALS").is_some_and(|value| value != "0"),
+        ))
         .insert_resource(RigMode {
             three_point: std::env::var("SCULPTO_VIEWER_THREE_POINT").is_ok(),
         })
@@ -1115,7 +1174,10 @@ fn main() {
         )
         // Separate call: the tuple above is already at Bevy's arity limit.
         .add_systems(Update, (watch_tick, watch_card))
+        .add_systems(Update, bank_keyboard.before(watch_tick))
+        .add_systems(Update, clip_label.after(watch_tick))
         .add_systems(Update, hover_joint_name)
+        .add_systems(Update, facets::update)
         .add_systems(Update, track_asset_loaded)
         .add_systems(Update, collect_actor_materials.after(apply_skeleton_mode))
         // The socket reads joints after the overlay refreshed them and writes
@@ -1139,6 +1201,9 @@ fn main() {
                 .before(bevy::transform::TransformSystems::Propagate),
         )
         .run();
+    if let Some(dir) = bank_staging {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Ctrl+LMB turns the figure and Ctrl+RMB moves it sideways; the default mouse
@@ -1212,7 +1277,7 @@ fn toggle_rig(
     keys: Res<ButtonInput<KeyCode>>,
     mut rig: ResMut<RigMode>,
 ) {
-    if config.interactive && keys.just_pressed(KeyCode::Digit3) {
+    if config.interactive && keys.just_pressed(KeyCode::F3) {
         rig.three_point = !rig.three_point;
     }
 }
@@ -1293,15 +1358,18 @@ fn apply_skeleton_mode(
     if skel.on() {
         for handle in &actors {
             let id = handle.id();
-            if restore.0.contains(&id) {
-                continue;
-            }
             if let Some(mut material) = materials.get_mut(id) {
-                // 65 % opacity is the operator's default (2026-11-17): the body
+                // The default opacity is shared so the body
                 // reads as a body while the bones still show through it.
-                material.base_color = material.base_color.with_alpha(ACTOR_OPACITY);
-                material.alpha_mode = AlphaMode::Blend;
-                restore.0.push(id);
+                if material.base_color.alpha() != ACTOR_OPACITY
+                    || material.alpha_mode != AlphaMode::Blend
+                {
+                    material.base_color = material.base_color.with_alpha(ACTOR_OPACITY);
+                    material.alpha_mode = AlphaMode::Blend;
+                }
+                if !restore.0.contains(&id) {
+                    restore.0.push(id);
+                }
             }
         }
     } else if !restore.0.is_empty() {
@@ -1557,39 +1625,26 @@ struct GltfRoot(Handle<bevy::gltf::Gltf>);
 struct PlayerGraph {
     handle: Handle<AnimationGraph>,
     nodes: Vec<AnimationNodeIndex>,
+    names: Vec<String>,
     /// The cloth clip, when `SCULPTO_VIEWER_CLOTH_ANIMATION` names one. It plays
     /// alongside whatever actor clip is selected, on its own node.
     cloth: Option<AnimationNodeIndex>,
 }
 
-/// The actor idle/walk clips (plus the optional extra and cloth clips) as one
-/// graph. Shared by startup and every live swap, so a reloaded file plays its
-/// own clips under the same `0`/`1` keys the operator already set.
+/// Every actual clip gets its own node; a clipless rest asset gets an empty graph.
 fn build_player_graph(
     asset_server: &AssetServer,
     graphs: &mut Assets<AnimationGraph>,
     asset_file: &str,
+    names: Vec<String>,
 ) -> PlayerGraph {
-    let actor_idle = asset_server.load(format!("{asset_file}#Animation0"));
-    let actor_walk = asset_server.load(format!("{asset_file}#Animation1"));
-    let (mut graph, actor_idle_node) = AnimationGraph::from_clip(actor_idle);
-    let actor_walk_node = graph.add_clip(actor_walk, 1.0, graph.root);
+    let clips =
+        (0..names.len()).map(|index| asset_server.load(format!("{asset_file}#Animation{index}")));
+    let (mut graph, nodes) = AnimationGraph::from_clips(clips);
     // A separate cloth clip exists only when the file carries one and the
     // caller names it. Defaulting it to `Animation0` played the actor's own
     // idle clip a second time at full weight, blending two clips on the same
     // skeleton — the figure trembled and the walk was diluted by half.
-    let mut nodes = vec![actor_idle_node, actor_walk_node];
-    // `SCULPTO_VIEWER_ACTOR_ANIMATION=N` with N ≥ 2 adds the named actor clip
-    // (for example an adapted Havok spike) as node 2. `select_clip` reaches it
-    // with the `2` key; cloth keeps its own slot behind it.
-    if has_actor_extra() {
-        let extra_index = std::env::var("SCULPTO_VIEWER_ACTOR_ANIMATION")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2);
-        let extra_clip = asset_server.load(format!("{asset_file}#Animation{extra_index}"));
-        nodes.push(graph.add_clip(extra_clip, 1.0, graph.root));
-    }
     let cloth = std::env::var("SCULPTO_VIEWER_CLOTH_ANIMATION")
         .ok()
         .map(|index| {
@@ -1599,6 +1654,7 @@ fn build_player_graph(
     PlayerGraph {
         handle: graphs.add(graph),
         nodes,
+        names,
         cloth,
     }
 }
@@ -1613,7 +1669,11 @@ fn setup(
     mut graphs: ResMut<Assets<AnimationGraph>>,
     units: Res<Units>,
     config: Res<ViewerConfig>,
+    profile: Res<AssetProfile>,
+    bank: Option<Res<bank::Bank>>,
     mut watch: Option<ResMut<WatchState>>,
+    render_adapter: Option<Res<RenderAdapter>>,
+    render_device: Option<Res<RenderDevice>>,
 ) {
     // A live watch with no file yet spawns nothing until the first poll
     // stages one; everything else behaves exactly as before.
@@ -1671,6 +1731,14 @@ fn setup(
         bevy::core_pipeline::tonemapping::Tonemapping::None,
         Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
+    if !config.report_mode
+        && std::env::var_os("SCULPTO_VIEWER_SORT_TRANSPARENCY").is_none_or(|value| value != "0")
+        && render_adapter
+            .zip(render_device)
+            .is_some_and(|(adapter, device)| is_oit_supported(&adapter, &device, false))
+    {
+        camera.insert((Msaa::Off, OrderIndependentTransparencySettings::default()));
+    }
     if let Some(handle) = target_handle {
         camera.insert(bevy::camera::RenderTarget::Image(handle.into()));
     }
@@ -1730,6 +1798,10 @@ fn setup(
             &asset_server,
             &mut graphs,
             &config.asset_file,
+            std::fs::read(&profile.path)
+                .ok()
+                .and_then(|bytes| glb_animation_names_bytes(&bytes))
+                .unwrap_or_default(),
         ));
     }
 
@@ -1788,17 +1860,14 @@ fn setup(
                     "Drag LMB orbit · RMB pan · wheel zoom",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB move key light",
-                    if has_actor_extra() {
-                        "0 idle · 1 walk · 2 attack"
+                    if bank.is_some() {
+                        "0 A-pose · 1 T-pose · 2–9 animations"
                     } else {
-                        "0 idle · 1 walk"
+                        "0–9 select clip"
                     },
-                    if has_actor_extra() {
-                        "0 idle · 1 walk · 2 attack · Space pause · Ctrl+, slower · Ctrl+. faster"
-                    } else {
-                        "0 idle · 1 walk · Space pause · Ctrl+, slower · Ctrl+. faster"
-                    },
-                    "R reset · L lit/flat · 3 rig · B bones · H help · hover node = name",
+                    "Space pause · Ctrl+, slower · Ctrl+. faster",
+                    "R reset · L lit/flat · N face normals · F3 rig · B bones · H help",
+                    "Hover node = name",
                 ] {
                     card.spawn((
                         Text::new(line),
@@ -1809,6 +1878,15 @@ fn setup(
                         TextColor(Color::WHITE),
                     ));
                 }
+                card.spawn((
+                    Text::new("Loading…"),
+                    TextFont {
+                        font_size: bevy::text::FontSize::Px(14.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.77, 0.20)),
+                    ClipLine,
+                ));
                 if let Some(watch) = watch.as_mut() {
                     let line = watch.line(&config.status);
                     watch.last_line = line.clone();
@@ -1995,10 +2073,7 @@ fn fit_camera_to_scene(
     config: Res<ViewerConfig>,
     mut fitted: Local<bool>,
     orbit: Option<ResMut<OrbitCamera>>,
-    meshes: Query<
-        (&bevy::camera::primitives::Aabb, &GlobalTransform),
-        (With<Mesh3d>, Without<ReviewGround>),
-    >,
+    meshes: Query<(&bevy::camera::primitives::Aabb, &GlobalTransform), SceneMeshFilter>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
     mut grounds: Query<&mut Transform, (With<ReviewGround>, Without<Camera3d>)>,
 ) {
@@ -2258,10 +2333,12 @@ fn advance_animation(
     // The glTF scene spawns its players asynchronously; attach our graph and
     // start both clips the moment each player appears.
     let Some(graph) = graph else { return };
-    let selection = selection.0.min(graph.nodes.len().saturating_sub(1));
+    let selected = graph.nodes.get(selection.0).copied();
     let cloth = graph.cloth;
     for (entity, mut player) in &mut players {
-        player.play(graph.nodes[selection]).repeat();
+        if let Some(node) = selected {
+            player.play(node).repeat();
+        }
         if let Some(cloth) = cloth {
             player.play(cloth).repeat();
         }
@@ -2280,21 +2357,16 @@ fn select_clip(
     graph: Option<Res<PlayerGraph>>,
     mut selection: ResMut<ClipSelection>,
     mut players: Query<&mut AnimationPlayer>,
+    bank: Option<Res<bank::Bank>>,
 ) {
-    if !config.interactive {
+    if !config.interactive || bank.is_some() {
         return;
     }
-    let wanted = if keys.just_pressed(KeyCode::Digit0) {
-        Some(0)
-    } else if keys.just_pressed(KeyCode::Digit1) {
-        Some(1)
-    } else if keys.just_pressed(KeyCode::Digit2)
-        && graph.as_ref().is_some_and(|g| g.nodes.len() > 2)
-    {
-        Some(2)
-    } else {
-        None
-    };
+    let wanted = pressed_digit(&keys).filter(|index| {
+        graph
+            .as_ref()
+            .is_some_and(|graph| *index < graph.nodes.len())
+    });
     let Some(wanted) = wanted else {
         return;
     };
@@ -2304,6 +2376,111 @@ fn select_clip(
     selection.0 = wanted;
     let Some(graph) = graph else { return };
     start_actor_clip(&graph, wanted, &mut players);
+}
+
+fn pressed_digit(keys: &ButtonInput<KeyCode>) -> Option<usize> {
+    [
+        KeyCode::Digit0,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .into_iter()
+    .position(|key| keys.just_pressed(key))
+}
+
+/// Keyboard and socket requests stage a fresh scene, including for a return to rest.
+fn request_slot(bank: &mut bank::Bank, watch: &mut WatchState, index: usize) -> Result<(), String> {
+    let slot = bank
+        .slots
+        .get(index)
+        .ok_or_else(|| format!("bank has no slot {index}"))?;
+    let bytes =
+        std::fs::read(&slot.asset).map_err(|error| format!("{}: {error}", slot.asset.display()))?;
+    let names = glb_animation_names_bytes(&bytes).ok_or("bank asset is not a valid GLB")?;
+    if slot
+        .clip
+        .is_some_and(|clip| names.get(clip) != slot.clip_name.as_ref())
+    {
+        return Err(format!(
+            "slot {index}: expected clip is absent from the asset"
+        ));
+    }
+    watch.files.dir = slot
+        .asset
+        .parent()
+        .ok_or("bank asset has no parent")?
+        .to_path_buf();
+    watch.files.stage = slot
+        .asset
+        .file_stem()
+        .ok_or("bank asset has no stem")?
+        .to_string_lossy()
+        .into_owned();
+    watch.files.seen = None;
+    watch.next_poll = 0.0;
+    bank.requested = Some(index);
+    bank.error = None;
+    Ok(())
+}
+
+fn bank_keyboard(
+    config: Res<ViewerConfig>,
+    keys: Res<ButtonInput<KeyCode>>,
+    bank: Option<ResMut<bank::Bank>>,
+    watch: Option<ResMut<WatchState>>,
+) {
+    if !config.interactive {
+        return;
+    }
+    let (Some(mut bank), Some(mut watch), Some(index)) = (bank, watch, pressed_digit(&keys)) else {
+        return;
+    };
+    if let Err(error) = request_slot(&mut bank, &mut watch, index) {
+        bank.error = Some(error);
+    }
+}
+
+#[derive(Component)]
+struct ClipLine;
+
+fn clip_label(
+    bank: Option<Res<bank::Bank>>,
+    selection: Res<ClipSelection>,
+    graph: Option<Res<PlayerGraph>>,
+    profile: Res<AssetProfile>,
+    mut lines: Query<&mut Text, With<ClipLine>>,
+) {
+    let line = match bank {
+        Some(bank) => match (&bank.error, bank.requested) {
+            (Some(error), _) => error.clone(),
+            (_, Some(index)) => format!("Loading {} · {}", index, bank.slots[index].name),
+            _ => format!("{} · {}", bank.current, bank.slots[bank.current].name),
+        },
+        None => graph
+            .as_ref()
+            .and_then(|graph| graph.names.get(selection.0))
+            .map_or_else(
+                || "Rest pose".into(),
+                |name| format!("{} · {name}", selection.0),
+            ),
+    };
+    let line = if profile.loaded {
+        line
+    } else {
+        format!("{line} · loading")
+    };
+    lines.iter_mut().for_each(|mut text| {
+        if text.0 != line {
+            text.0.clone_from(&line);
+        }
+    });
 }
 
 /// Camera positions for the review views; the glTF actor faces +Z, so the
@@ -2600,6 +2777,8 @@ fn control_service(
     graph: Option<Res<PlayerGraph>>,
     mut players: Query<&mut AnimationPlayer>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
+    mut bank: Option<ResMut<bank::Bank>>,
+    mut watch: Option<ResMut<WatchState>>,
 ) {
     let Some(server) = server else {
         return;
@@ -2631,7 +2810,13 @@ fn control_service(
                     meshes: profile.meshes,
                     scale: profile.scale,
                     status: config.status.clone(),
-                    clip_index: selection.0,
+                    clip_index: graph
+                        .as_ref()
+                        .and_then(|graph| graph.nodes.get(selection.0).map(|_| selection.0)),
+                    clip_name: graph
+                        .as_ref()
+                        .and_then(|graph| graph.names.get(selection.0).cloned()),
+                    bank: bank.as_ref().map(|bank| bank.state()),
                     clip_count,
                     paused: playback.paused,
                     speed: playback.speed,
@@ -2738,6 +2923,16 @@ fn control_service(
                         }))
                     }
                 }
+            }
+            control::Command::Slot { index } => match (bank.as_mut(), watch.as_mut()) {
+                (Some(bank), Some(watch)) => match request_slot(bank, watch, index) {
+                    Ok(()) => control::ok_json(serde_json::json!({"requested_slot": index})),
+                    Err(error) => control::error_json(&error),
+                },
+                _ => control::error_json("slot requires --bank"),
+            },
+            control::Command::Clip { .. } if bank.is_some() => {
+                control::error_json("use slot to select an entry in --bank mode")
             }
             control::Command::Clip { index } => match (clip_count, graph.as_ref()) {
                 (None, _) | (Some(0), _) => {
@@ -2975,6 +3170,7 @@ fn benchmark(
 /// the camera, orbit, zoom, light rig, bones level and playback state all
 /// survive untouched. A failed load (a half-written GLB) keeps the previous
 /// scene alive and reports `load failed` until the next change.
+#[allow(clippy::too_many_arguments)]
 fn watch_tick(
     mut commands: Commands,
     time: Res<Time>,
@@ -2983,6 +3179,8 @@ fn watch_tick(
     worlds: Res<Assets<bevy::world_serialization::WorldAsset>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut exit: MessageWriter<AppExit>,
+    mut selection: ResMut<ClipSelection>,
+    mut bank: Option<ResMut<bank::Bank>>,
 ) {
     let Some(watch) = watch.as_mut() else {
         return;
@@ -3001,6 +3199,9 @@ fn watch_tick(
     watch.next_poll = watch.elapsed + POLL_INTERVAL_SECS;
 
     if let Some(staged) = watch.files.poll() {
+        if let Some(old) = watch.pending.take() {
+            watch.files.remove_staged(old.seq);
+        }
         let world = asset_server.load(format!("{}#Scene0", staged.asset_name));
         info!(
             "viewer: live staged {} sha {} sidecar {}",
@@ -3014,6 +3215,7 @@ fn watch_tick(
             world,
             sha: staged.sha,
             note: staged.note,
+            bank_slot: bank.as_ref().and_then(|bank| bank.requested),
         });
     }
 
@@ -3045,7 +3247,17 @@ fn watch_tick(
             &asset_server,
             &mut graphs,
             &pending.asset_name,
+            std::fs::read(watch.files.staged_path(pending.seq))
+                .ok()
+                .and_then(|bytes| glb_animation_names_bytes(&bytes))
+                .unwrap_or_default(),
         ));
+        if let (Some(bank), Some(index)) = (bank.as_mut(), pending.bank_slot) {
+            selection.0 = bank.slots[index].clip.unwrap_or(usize::MAX);
+            bank.current = index;
+            bank.requested = None;
+            bank.error = None;
+        }
         watch.sha = pending.sha.clone();
         watch.note = pending.note.display().to_string();
         watch.failed = false;
@@ -3063,6 +3275,10 @@ fn watch_tick(
         let pending = watch.pending.take().expect("checked failed above");
         watch.files.remove_staged(pending.seq);
         watch.failed = true;
+        if let Some(bank) = bank.as_mut() {
+            bank.requested = None;
+            bank.error = Some("Load failed; previous slot kept".into());
+        }
         eprintln!(
             "viewer: live load failed for {} — keeping the previous scene",
             pending.asset_name
@@ -3078,11 +3294,18 @@ fn watch_card(
     mut watch: Option<ResMut<WatchState>>,
     mut lines: Query<&mut Text, With<WatchLine>>,
     mut windows: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
+    bank: Option<Res<bank::Bank>>,
 ) {
     let Some(watch) = watch.as_mut() else {
         return;
     };
-    let line = watch.line(&config.status);
+    let line = match bank.as_ref() {
+        Some(bank) => format!(
+            "{} · {} · {}",
+            config.status, bank.current, bank.slots[bank.current].name
+        ),
+        None => watch.line(&config.status),
+    };
     if watch.last_line == line {
         return;
     }
@@ -3090,7 +3313,10 @@ fn watch_card(
         text.0 = line.clone();
     }
     if let Ok(mut window) = windows.single_mut() {
-        window.title = format!("{line} — Sculpto live review");
+        window.title = match bank.is_some() {
+            true => format!("Sculpto cloth review — {line}"),
+            false => format!("{line} — Sculpto live review"),
+        };
     }
     watch.last_line = line;
 }
@@ -3259,7 +3485,7 @@ mod tests {
     }
 
     #[test]
-    fn key_three_toggles_the_rig() {
+    fn f3_toggles_the_rig_without_consuming_slot_three() {
         let mut app = App::new();
         app.insert_resource(viewer_config(true, false))
             .init_resource::<ButtonInput<KeyCode>>()
@@ -3267,6 +3493,9 @@ mod tests {
             .add_systems(Update, toggle_rig);
 
         press(&mut app, KeyCode::Digit3);
+        app.update();
+        assert!(!app.world().resource::<RigMode>().three_point);
+        press(&mut app, KeyCode::F3);
         app.update();
         assert!(app.world().resource::<RigMode>().three_point);
     }
@@ -3341,6 +3570,60 @@ mod tests {
         assert!(orbit.min_distance > 0.0);
         orbit.reset();
         assert_eq!(orbit.distance, 400.0, "R restores the fitted frame");
+    }
+
+    #[test]
+    fn a_reloaded_material_keeps_the_current_overlay_opacity() {
+        let mut app = App::new();
+        app.insert_resource(SkelMode { level: 2 })
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<GlassRestore>()
+            .add_systems(Update, apply_skeleton_mode);
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        app.world_mut().spawn(MeshMaterial3d(handle.clone()));
+        app.update();
+        *app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&handle)
+            .unwrap() = StandardMaterial::default();
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(material.base_color.alpha(), ACTOR_OPACITY);
+        assert_eq!(material.alpha_mode, AlphaMode::Blend);
+        assert_eq!(app.world().resource::<GlassRestore>().0.len(), 1);
+    }
+
+    #[test]
+    fn camera_waits_for_actor_bounds_instead_of_fitting_the_overlay() {
+        let mut app = App::new();
+        app.insert_resource(viewer_config(true, false))
+            .insert_resource(OrbitCamera::looking_at(Vec3::new(0.0, 1.0, 3.0), Vec3::Y))
+            .add_systems(Update, fit_camera_to_scene);
+        app.world_mut().spawn((
+            Mesh3d::default(),
+            SkelJoint,
+            bevy::camera::primitives::Aabb::from_min_max(Vec3::splat(-10.0), Vec3::splat(10.0)),
+            GlobalTransform::default(),
+        ));
+        app.update();
+        assert_eq!(app.world().resource::<OrbitCamera>().target, Vec3::Y);
+        app.world_mut().spawn((
+            Mesh3d::default(),
+            bevy::camera::primitives::Aabb::from_min_max(
+                Vec3::new(-0.3, 0.0, -0.1),
+                Vec3::new(0.3, 1.8, 0.1),
+            ),
+            GlobalTransform::default(),
+        ));
+        app.update();
+        assert!((app.world().resource::<OrbitCamera>().target.y - 0.9).abs() < 1e-5);
     }
 
     fn temp_watch_dir(name: &str) -> std::path::PathBuf {

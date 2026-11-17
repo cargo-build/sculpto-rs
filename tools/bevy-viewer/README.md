@@ -181,7 +181,7 @@ printf '{"cmd":"state"}\n' | socat - UNIX-CONNECT:/tmp/opencode/task/viewer.sock
            "distance":3.58,"position":[2.2,1.3,2.8]},
  "joint_count":65,"joints":[{"name":"mixamorig:Hips","position":[0,1.02,0]}],
  "material_count":3,
- "materials":[{"mesh":"3BA","material":"bra","asset":1,"alpha":0.65,
+ "materials":[{"mesh":"3BA","material":"bra","asset":1,"alpha":0.85,
                "blend":"Blend","color":[0.18,0.8,0.44],"unlit":false}]}
 ```
 
@@ -212,6 +212,7 @@ printf '{"cmd":"state"}\n' | socat - UNIX-CONNECT:/tmp/opencode/task/viewer.sock
 | `{"cmd":"view","yaw":0.8,"pitch":0.1,"distance":1.5,"target":"Head"}` | explicit angles around the current or a named target |
 | `{"cmd":"target","joint":"Pelvis"}` / `{"cmd":"target","point":[0,0.9,0]}` | move the orbit target |
 | `{"cmd":"clip","index":1}` | restart the chosen actor clip; the cloth clip keeps running |
+| `{"cmd":"slot","index":3}` | select a posed asset or named clip in `--bank` mode |
 | `{"cmd":"playback","paused":true,"speed":0.25}` | pause and slow the clip (`0.05..4`) |
 | `{"cmd":"skeleton","level":2}` | `0` off, `1` primary chain, `2` every driven joint |
 | `{"cmd":"capture","path":"/abs/shot.png"}` | screenshot of the window (interactive) or the render target (headless); absolute `.png`/`.jpg` path, parent directories created — the file lands a frame later, poll it |
@@ -252,7 +253,7 @@ unaffected.
 
 The overlay is on at level 2 by default (`B` cycles off → primary chain → every
 driven joint; `SCULPTO_VIEWER_SKELETON=0` is the only opt-out). While it is on,
-**every actor material** — body, bra and panty alike — renders at **65 %
+**every actor material** — body, bra and panty alike — renders at **85 %
 opacity** (`ACTOR_OPACITY` in `src/main.rs`, the operator's default from
 2026-11-17, previously 16 %): flesh stays readable and the bones show through
 it. Turning the overlay off restores full opacity. There is no opacity control
@@ -266,6 +267,12 @@ alpha. That is transparency compositing, not a different setting — `state`'s
 material-store index of every drawn actor material, which is how the equality is
 checked instead of judged from a still.
 
+The review camera uses depth-sorted transparency on supported GPUs.
+`SCULPTO_VIEWER_SORT_TRANSPARENCY=0` selects the ordinary blend path for comparison.
+`N` switches between smooth normals and per-triangle normals on body and clothing.
+`SCULPTO_VIEWER_FACE_NORMALS=1` starts in the faceted view. The toggle retains vertex
+positions and skin influences. Meshes with morph targets keep their original rendering.
+
 ## Review lighting
 
 Lighting is runtime PBR, not baked into the exported GLB (`viewer export` writes
@@ -274,7 +281,7 @@ albedo and normals only). The interactive viewer defaults to **one key light** w
 default mouse keeps the camera controls (LMB orbit, RMB pan). **Ctrl+LMB turns the
 figure**, **Ctrl+RMB moves it sideways** under the fixed light, and **Shift+LMB
 moves the key light**; every one of those changes the shading and the cast shadow.
-`3` toggles the optional three-point rig (fill and rim) when the far side is too dark
+`F3` toggles the optional three-point rig (fill and rim) when the far side is too dark
 to read; `SCULPTO_VIEWER_THREE_POINT` seeds it. `L` toggles lit/flat; flat hides the
 whole rig and ground and renders every material unlit, so a review shows the
 silhouette, the seams and the layer palette without a shadow that can be mistaken
@@ -282,7 +289,10 @@ for a defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds and st
 on the black backdrop (no ground); `SCULPTO_VIEWER_GROUND=1` adds the ground and
 `SCULPTO_VIEWER_TURNTABLE_YAW` seeds the figure pose for a shadow comparison.
 `0` selects the idle clip and `1` the walk clip of a rigged GLB (the actor graph
-loads `Animation0` and `Animation1`; the cloth clip keeps running). A top-left
-controls card lists the keys and `H` hides or shows it. Keyboard events need the
-window focused — agent-opened preview windows start unfocused by design, so click
-the figure once.
+loads `Animation0` and `Animation1`; the cloth clip keeps running).
+`--interactive --bank <manifest.json>` assigns the number keys to a review bank with
+up to ten entries. Each JSON entry names the asset, a display name and either a clip
+name or `null` for the asset's rest pose. For the Emily bank, `0` opens A-pose,
+`1` opens T-pose and `2`–`9` play the named animations. The top-left controls card
+lists the keys and `H` hides or shows it. Click the figure to give the review window
+keyboard focus.

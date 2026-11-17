@@ -598,6 +598,7 @@ fn build_report(input: ReportInputs<'_>) -> Value {
             "unreached_pairs": input.authored.report.unreached_pairs,
             "flesh_vertices": input.authored.report.flesh_vertices,
             "inherited_vertices": input.authored.report.inherited_vertices,
+            "seam_weight_groups": input.authored.report.seam_weight_groups,
             "side_masked_vertices": input.authored.report.side_masked_vertices,
             "side_masked_mass": input.authored.report.side_masked_mass,
             "side_mask_restored": input.authored.report.side_mask_restored,
