@@ -889,10 +889,20 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
     let humanoid = crate::humanoid::supports(&target_palette);
     let (seated_rig, seat_report) = match humanoid {
         true => {
-            let body_triangles: Vec<[u32; 3]> = pool.triangles.iter().zip(&pool.partitions)
+            let body_triangles: Vec<[u32; 3]> = pool
+                .triangles
+                .iter()
+                .zip(&pool.partitions)
                 .filter(|(_, partition)| partition.0 == 0)
-                .map(|(triangle, _)| *triangle).collect();
-            crate::humanoid::place(&pool.vertices, &body_triangles, &skeleton, &target_rig, &target_palette)?
+                .map(|(triangle, _)| *triangle)
+                .collect();
+            crate::humanoid::place(
+                &pool.vertices,
+                &body_triangles,
+                &skeleton,
+                &target_rig,
+                &target_palette,
+            )?
         }
         false => generic_seat(&pool, &target_rig, &target_palette, &native_pos)?,
     };
@@ -1018,7 +1028,7 @@ pub fn run(params: &RebindParams) -> Result<Value, CommandError> {
     let skin = complete_palette(&remapped.skin, &seated_rig, &target_palette)?;
     let validation = validate_skin(&skin, positions.len())?;
     if humanoid {
-        crate::humanoid::validate_marker_weights(&target_palette,&validation.per_bone)?;
+        crate::humanoid::validate_marker_weights(&target_palette, &validation.per_bone)?;
     }
 
     let normals = smooth_normals(&positions, &pool.triangles);

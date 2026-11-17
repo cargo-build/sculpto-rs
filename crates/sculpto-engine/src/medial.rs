@@ -630,10 +630,13 @@ pub(crate) fn first_surface_hit(
     direction: DVec3,
 ) -> Option<f64> {
     let direction = direction.try_normalize()?;
-    triangles.iter().filter_map(|triangle| {
-        let [a, b, c] = triangle.map(|i| DVec3::from_array(vertices[i as usize]));
-        ray_triangle(origin, direction, a, b, c)
-    }).min_by(f64::total_cmp)
+    triangles
+        .iter()
+        .filter_map(|triangle| {
+            let [a, b, c] = triangle.map(|i| DVec3::from_array(vertices[i as usize]));
+            ray_triangle(origin, direction, a, b, c)
+        })
+        .min_by(f64::total_cmp)
 }
 
 /// The closest point on the flesh surface to `point` (nearest triangle projection,
@@ -2086,16 +2089,31 @@ mod tests {
     #[test]
     fn first_surface_hit_is_nearest_forward_distance_independent_of_winding() {
         let vertices = [
-            [-1.0, 2.0, -1.0], [1.0, 2.0, -1.0], [0.0, 2.0, 1.0],
-            [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0], [0.0, 1.0, 1.0],
-            [-1.0, -0.5, -1.0], [1.0, -0.5, -1.0], [0.0, -0.5, 1.0],
+            [-1.0, 2.0, -1.0],
+            [1.0, 2.0, -1.0],
+            [0.0, 2.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [1.0, 1.0, -1.0],
+            [0.0, 1.0, 1.0],
+            [-1.0, -0.5, -1.0],
+            [1.0, -0.5, -1.0],
+            [0.0, -0.5, 1.0],
         ];
         let triangles = [[0, 1, 2], [5, 4, 3], [6, 7, 8]];
         let hit = first_surface_hit(&vertices, &triangles, DVec3::ZERO, DVec3::Y * 3.0);
         assert_eq!(hit, Some(1.0));
-        assert_eq!(first_surface_hit(&vertices, &triangles, DVec3::ZERO, -DVec3::Y), Some(0.5));
-        assert_eq!(first_surface_hit(&vertices, &triangles, DVec3::ZERO, DVec3::X), None);
-        assert_eq!(first_surface_hit(&vertices, &triangles, DVec3::ZERO, DVec3::ZERO), None);
+        assert_eq!(
+            first_surface_hit(&vertices, &triangles, DVec3::ZERO, -DVec3::Y),
+            Some(0.5)
+        );
+        assert_eq!(
+            first_surface_hit(&vertices, &triangles, DVec3::ZERO, DVec3::X),
+            None
+        );
+        assert_eq!(
+            first_surface_hit(&vertices, &triangles, DVec3::ZERO, DVec3::ZERO),
+            None
+        );
     }
 
     /// Measure the field on a real body fixture (set SCULPTO_MEDIAL_FIXTURE to a

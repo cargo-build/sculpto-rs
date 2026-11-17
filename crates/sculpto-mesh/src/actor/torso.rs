@@ -310,7 +310,10 @@ pub fn horizontal_sections(
     if positions.iter().flatten().any(|value| !value.is_finite())
         || heights.iter().any(|value| !value.is_finite())
     {
-        return Err(invalid("surface sections", "geometry or cut height is not finite"));
+        return Err(invalid(
+            "surface sections",
+            "geometry or cut height is not finite",
+        ));
     }
     let triangles = triangles
         .iter()
@@ -320,7 +323,10 @@ pub fn horizontal_sections(
             match converted.iter().any(|vertex| *vertex >= positions.len()) {
                 true => Err(invalid(
                     "surface sections",
-                    format!("triangle {index} leaves the {}-vertex surface", positions.len()),
+                    format!(
+                        "triangle {index} leaves the {}-vertex surface",
+                        positions.len()
+                    ),
                 )),
                 false => Ok(converted),
             }
@@ -961,10 +967,15 @@ struct CutPoints {
 impl CutPoints {
     fn identity(&mut self, point: DVec3, frame: &Frame) -> usize {
         let point = DVec2::new(point.dot(frame.lateral), point.dot(frame.anterior));
-        let cell = ((point.x / POINT_KEY).floor() as i64, (point.y / POINT_KEY).floor() as i64);
-        let existing = (-1..=1).flat_map(|x| (-1..=1).map(move |y| (x, y)))
+        let cell = (
+            (point.x / POINT_KEY).floor() as i64,
+            (point.y / POINT_KEY).floor() as i64,
+        );
+        let existing = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |y| (x, y)))
             .filter_map(|(x, y)| self.bins.get(&(cell.0 + x, cell.1 + y)))
-            .flatten().copied()
+            .flatten()
+            .copied()
             .filter(|index| self.points[*index].distance(point) <= POINT_KEY)
             .min();
         match existing {

@@ -5,15 +5,28 @@ use sculpto_mesh::actor::horizontal_sections;
 fn box_surface() -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
     (
         vec![
-            [-1.0, 0.0, -2.0], [1.0, 0.0, -2.0],
-            [1.0, 0.0, 2.0], [-1.0, 0.0, 2.0],
-            [-1.0, 3.0, -2.0], [1.0, 3.0, -2.0],
-            [1.0, 3.0, 2.0], [-1.0, 3.0, 2.0],
+            [-1.0, 0.0, -2.0],
+            [1.0, 0.0, -2.0],
+            [1.0, 0.0, 2.0],
+            [-1.0, 0.0, 2.0],
+            [-1.0, 3.0, -2.0],
+            [1.0, 3.0, -2.0],
+            [1.0, 3.0, 2.0],
+            [-1.0, 3.0, 2.0],
         ],
         vec![
-            [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
-            [0, 4, 5], [0, 5, 1], [3, 2, 6], [3, 6, 7],
-            [1, 5, 6], [1, 6, 2], [0, 3, 7], [0, 7, 4],
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 4, 5],
+            [0, 5, 1],
+            [3, 2, 6],
+            [3, 6, 7],
+            [1, 5, 6],
+            [1, 6, 2],
+            [0, 3, 7],
+            [0, 7, 4],
         ],
     )
 }
@@ -26,7 +39,9 @@ fn closed_sections_measure_area_independently_of_triangle_density() {
     let middle = triangle
         .iter()
         .map(|index| vertices[*index as usize])
-        .fold([0.0; 3], |sum, point| std::array::from_fn(|k| sum[k] + point[k] / 3.0));
+        .fold([0.0; 3], |sum, point| {
+            std::array::from_fn(|k| sum[k] + point[k] / 3.0)
+        });
     let added = vertices.len() as u32;
     vertices.push(middle);
     triangles.extend([
@@ -39,7 +54,13 @@ fn closed_sections_measure_area_independently_of_triangle_density() {
     assert_eq!(after[0].open_chains, 0);
     assert!((after[0].area() - 8.0).abs() < 1e-10);
     assert!((before[0].area() - after[0].area()).abs() < 1e-10);
-    assert!(after[0].centroid().unwrap().iter().all(|value| value.abs() < 1e-10));
+    assert!(
+        after[0]
+            .centroid()
+            .unwrap()
+            .iter()
+            .all(|value| value.abs() < 1e-10)
+    );
 }
 
 #[test]
@@ -58,15 +79,24 @@ fn an_open_section_cannot_claim_selected_area() {
 #[test]
 fn roundoff_at_render_seams_keeps_contour_direction_and_closure() {
     let (vertices, triangles) = box_surface();
-    let duplicated: Vec<[f64; 3]> = triangles.iter().enumerate().flat_map(|(i, t)| {
-        let vertices = &vertices;
-        t.iter().map(move |j| {
-            let p = vertices[*j as usize];
-            [p[0] + (i % 3) as f64 * 2e-8, p[1], p[2] - (i % 2) as f64 * 2e-8]
+    let duplicated: Vec<[f64; 3]> = triangles
+        .iter()
+        .enumerate()
+        .flat_map(|(i, t)| {
+            let vertices = &vertices;
+            t.iter().map(move |j| {
+                let p = vertices[*j as usize];
+                [
+                    p[0] + (i % 3) as f64 * 2e-8,
+                    p[1],
+                    p[2] - (i % 2) as f64 * 2e-8,
+                ]
+            })
         })
-    }).collect();
+        .collect();
     let faces: Vec<[u32; 3]> = (0..triangles.len() as u32)
-        .map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect();
+        .map(|i| [i * 3, i * 3 + 1, i * 3 + 2])
+        .collect();
     let cut = horizontal_sections(&duplicated, &faces, &[1.0000004]).unwrap();
     assert_eq!(cut[0].open_chains, 0);
     assert!(cut[0].unresolved.is_none());
