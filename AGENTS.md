@@ -1,46 +1,29 @@
 # Sculpto implementation
 
-The product direction is agent-first authoring: prioritize discoverable
-headless commands and structured results for agents through the same Rust engine.
-Keep remaining command/workflow gaps explicit; direction is not acceptance.
-
-This independent repository contains the GPL-3.0-only implementation. Use
-Rust 2024 and the declared toolchain; keep core behavior in Rust and optional
-host adapters thin. Private mod/model payloads stay outside VCS. Generated PNG
-geometry review renders may be published as explicitly labelled review evidence
-(operator,2026-11-08).
+Public GPL-3.0-only Rust 2024 engine. Agents author through discoverable headless
+commands and structured results. Use the declared toolchain,
+own shared behavior in Rust and keep host adapters thin. Keep mod/model payloads
+private. Label generated PNGs when publishing geometry review evidence.
 
 ## Supplied assets — required first stop
 
-For any asset task, especially clothing, start at **`~/src/oss/gamedev/assets/`**.
-This is the canonical supplied-asset root (operator, 2026-11-12). Read its
-applicable instructions plus `from-skyrim-community/README.md` before
-downloads or absence claims. Pass resolved pack paths to every asset delegate.
-These are private optional host fixtures, never build/runtime dependencies of
-the standalone engine. Bijin and HIMBO Mike remain the primary fitting targets.
-
-Use jj for mutations and readable git diff. Confirm the task feature before
-editing/building; after jj describe immediately jj new. This implementation
-is published publicly; its managed wrapper stays private. Land on main and
-push after the required checks. Use at most two Cargo jobs;
-on the shared host, heavy work uses the operator's owned-unit/QUEUE procedure.
-
-`just gate` checks formatting, Clippy with -D warnings and workspace tests.
-Parsing changes also run `just test-real /path/to/BodySlide` with the explicit
-host fixture. Build with cargo build, not only cargo check.
-
-In the managed `sculpto-rs-wrapper/repos/sculpto-rs` checkout, the wrapper's
-AGENTS.md, issue journal, rules and source map govern coordinated work. Keep
-their affected bindings/metrics current and run the wrapper's full `just gate`
-before integration. Each independent source writer uses the wrapper's ignored
-`repos/jj-workspaces/sculpto-rs-<task>` container; the private management wrapper
-uses its primary copy and main, with serialized writes and no wrapper task
-workspaces. A source workspace name equals its directory basename. Standalone
-build/test does not require the wrapper.
+- Start at `~/src/oss/gamedev/assets/`. Read its instructions and
+  `from-skyrim-community/README.md` before download or absence claims. Pass resolved
+  pack paths to every asset delegate. Bijin and HIMBO Mike are primary fitting targets.
+- Supply private host fixtures explicitly. The standalone engine builds and tests
+  without the private wrapper or asset payloads.
+- Use jj for mutations and `git diff` for reads. Confirm the task bookmark before
+  edits/builds. `jj describe` → `jj new`. Land on public `main` after checks.
+- `cargo build`, at most two jobs. `just gate` runs fmt, Clippy `-D warnings` and tests.
+  Parsing changes also run `just test-real /path/to/BodySlide` on the explicit fixture.
+- In `sculpto-rs-wrapper/repos/sculpto-rs`, follow wrapper AGENTS,
+  issue, rules and map. Update affected bindings and metrics. Run wrapper `just gate`
+  before integration. Concurrent source writers use
+  `repos/jj-workspaces/sculpto-rs-<task>` in the wrapper. Workspace name = directory
+  basename. Keep the stable build path when possible. Wrapper writes use its primary
+  copy and `main`.
 
 ## Start here — engine help
-
-Run from this checkout, using the freshly built binary:
 
 ```sh
 cargo build -p sculpto-cli -j 2
@@ -51,100 +34,81 @@ cargo build -p boethos-cli -j 2
 target/debug/boethos --help
 ```
 
-`--help` covers argv families. `commands --json` covers the closed engine
-registry, including input schemas, `implemented` and `mutates`; `run --cmd ID
---input JSON` and stdio `mcp` use that registry. Actor sampling, control-surface
-and UV commands also exist on argv and are not all registered for JSON/MCP.
-Inspect the actual [argv dispatcher](crates/sculpto-cli/src/main.rs) and
-[registry](crates/sculpto-engine/src/lib.rs) before claiming transport parity.
-Subcommand help is uneven; missing subcommand help does not prove absence.
-`boethos` is a separate binary for the supplied-asset catalogue; the `sculpto`
-registry does not expose it. Query the catalogue before walking asset roots.
+`--help` → argv. `commands --json` → closed registry, schemas, `implemented` and
+`mutates`. `run --cmd ID --input JSON` and stdio `mcp` use the registry. For actor,
+control and UV coverage inspect [argv](crates/sculpto-cli/src/main.rs) and
+[registry](crates/sculpto-engine/src/lib.rs) directly. `boethos` owns the supplied-asset
+catalogue. Query it before walking archives.
 
-| Goal | Existing entry / source | Boundary |
-|---|---|---|
-| Inspect BodySlide data | `inspect PATH`, `presets`, `sliders`; [core](crates/sculpto-core/src/lib.rs) | OSP, presets, OSD/BSD; family and ordered vertex identity matter |
-| Write the review GLB for the interactive viewer | registry `viewer.export` / `sculpto viewer export`; [review writer](crates/sculpto-gltf/src/review.rs) | Metres (71.4286 units/m), one palette-coloured mesh per part; a review artifact, never a fit result |
-| Bake shapes | `bake`, `batch`; [bake](crates/sculpto-bake/src/lib.rs) | Explicit set, preset and weight endpoint; a body bake is not a finished outfit |
-| Import/export assets | `export-obj`, `export-nif`, registry `export.nif` / `export.bundle` / `export.pair`; [NIF](crates/sculpto-nif/src/lib.rs), [GLB writer](crates/sculpto-gltf/src/lib.rs) | Supported subsets; do not infer every native format feature |
-| Fit and classify garments | `garment fit`, `follow`, `aura`, `classify`, `intake`; [mesh](crates/sculpto-mesh/src/lib.rs) | Authored topology/rest frame and declared preparation route |
-| Densify a mesh as a neutral diagnostic | `mesh densify` / `mesh.densify`; [densify](crates/sculpto-mesh/src/densify.rs) | Midpoint subdivision plus optional boundary-locked smoothing; boundaries and parts stay, counts and drift are measured; a diagnostic surface, never a fit result |
-| Dress a raw garment onto a body | `garment dress` / `outfit.dress`; [dress](crates/sculpto-mesh/src/dress.rs) | Authored seam merge, registration, subdivision, contact band and body-poke repair; a placement rule, not an authored-ease-preserving fit |
-| Fit a component seam | registry `component.seam_fit`; [mesh seam](crates/sculpto-mesh/src/seam.rs) | Explicit original vertex targets and same-frame lengths; preserves render order, not automatic anatomy or skin transfer |
-| Measure geometric defects | `garment check`, `depth`, `cover`, `proxies`, `stack`; [checks](crates/sculpto-mesh/src/check.rs), [layer stack](crates/sculpto-mesh/src/layer_stack.rs) | Intersection counts, depth, and sampled coverage mean different things; depth is a local normal-side approximation split by garment facing and, separately, by the DECL0015 contact-point cover test; neither is containment or a camera render. `stack` classifies a declared outfit by contact type: layer-layer contacts come from a declared `pairs` list, and the fallback order rule refuses a pair whose bounding boxes are disjoint, so a far-apart pair is a manifest error rather than a penetration |
-| Construct a control | `garment control-exterior`, `control-repair`, `control-cuts`, `control-separate`, `control-check`; [control](crates/sculpto-mesh/src/control.rs) | Strict profile, source lineage, explicit bounded repairs; refusal retains diagnostics |
-| Qualify UVs and retain appearance | `garment uv-check`; [UV](crates/sculpto-mesh/src/uv.rs), [native baking guide](README.md#bake-original-garment-materials-onto-a-control) | A valid atlas does not establish source-ray coverage or appearance |
-| Author a skin from the flesh | `actor skin`; [author](crates/sculpto-mesh/src/rig/author.rs), [verb](crates/sculpto-engine/src/skin.rs) | Ownership by surface distance, shells inherit the body, leaf bones carry nothing; `actor rebind` stays the transfer route |
-| Sample actor geometry/rig/motion | `actor sample`, `actor rig`; [actor CLI](crates/sculpto-cli/src/actor.rs), [actor reader](crates/sculpto-mesh/src/actor/mod.rs) | Explicit parts and REST or clip/time; finite samples do not prove continuous clearance |
-| Validate joint articulation (type, axis, range) on an actor or clip | `actor joints`; [joints](crates/sculpto-engine/src/joints.rs), schema [joints.toml](crates/sculpto-engine/src/joints.toml) | Cited anatomical ranges plus marked envelopes; digit axes on non-Mixamo palettes are advisory until measured per body |
-| Export a dressed animation | `actor pack-cloth`; [packing](crates/sculpto-gltf/src/pack.rs) | Preserves the actor; does not qualify cloth motion, collisions or loop closure |
-| Choose ordinary rigging / Blender Cloth | `outfit inspect --nif FILE --manifest FILE`; [outfit](crates/sculpto-mesh/src/outfit.rs) | Named parts/regions; selection is distinct from simulation |
-| Index supplied assets and archive members | `boethos index`, `list`, `get`, `stats`, `export`; [catalogue](crates/boethos-catalogue/src/lib.rs), [CLI](crates/boethos-cli/src/main.rs) | Host `7z` listing; RAR unsupported; database and export stay outside VCS |
+| Task | Exact entry and boundary |
+|---|---|
+| BodySlide | `inspect PATH`, `presets`, `sliders`. OSP, presets, OSD/BSD, family and ordered vertex IDs. [Core](crates/sculpto-core/src/lib.rs) |
+| Review GLB | `viewer.export` / `sculpto viewer export`. Metres (71.4286 units/m), palette mesh per part. Review only. [Writer](crates/sculpto-gltf/src/review.rs) |
+| Shapes | `bake`, `batch`. Set, preset and weight endpoint. [Bake](crates/sculpto-bake/src/lib.rs) |
+| Native I/O | `export-obj`, `export-nif`, `export.nif`, `export.bundle`, `export.pair`. Supported subsets. [NIF](crates/sculpto-nif/src/lib.rs) · [GLB](crates/sculpto-gltf/src/lib.rs) |
+| Garment intake | `garment fit`, `follow`, `aura`, `classify`, `intake`. Authored topology, rest frame and declared prep. [Mesh](crates/sculpto-mesh/src/lib.rs) |
+| Densify | `mesh densify` / `mesh.densify`. Midpoint subdivision, optional boundary-locked smoothing. Preserve parts/boundaries. Measure counts and drift. Diagnostic only. [Source](crates/sculpto-mesh/src/densify.rs) |
+| Dress raw garment | `garment dress` / `outfit.dress`. Seam merge → registration → subdivision → contact band → poke repair. Placement can change authored ease. [Source](crates/sculpto-mesh/src/dress.rs) |
+| Component seam | `component.seam_fit`. Original vertex targets and same-frame lengths. Preserve render order. Qualify anatomy and skin transfer separately. [Source](crates/sculpto-mesh/src/seam.rs) |
+| Geometry checks | `garment check`, `depth`, `cover`, `proxies`, `stack`. Distinguish intersections, local normal-side depth by facing and DECL0015 contact-point cover. Verify containment and render evidence separately. `stack` uses declared `pairs`; disjoint bounds under fallback order require a manifest correction. [Checks](crates/sculpto-mesh/src/check.rs) · [Stack](crates/sculpto-mesh/src/layer_stack.rs) |
+| Control | `garment control-exterior`, `control-repair`, `control-cuts`, `control-separate`, `control-check`. Strict profile, lineage, bounded repairs and refusal diagnostics. [Source](crates/sculpto-mesh/src/control.rs) |
+| UV/material | `garment uv-check`. Check atlas, source-ray coverage and appearance. [UV](crates/sculpto-mesh/src/uv.rs) · [Native bake](README.md#bake-original-garment-materials-onto-a-control) |
+| Skin | `actor skin` uses surface distance. Shells inherit body. Leaf bones carry no weights. `actor rebind` transfers. [Author](crates/sculpto-mesh/src/rig/author.rs) · [Verb](crates/sculpto-engine/src/skin.rs) |
+| Actor samples | `actor sample`, `actor rig`. Explicit parts, REST or clip/time. Report finite sampled clearance. [CLI](crates/sculpto-cli/src/actor.rs) · [Reader](crates/sculpto-mesh/src/actor/mod.rs) |
+| Joint checks | `actor joints` checks type/axis/range with cited values and labelled envelopes. Non-Mixamo digit axes advisory until measured per body. [Code](crates/sculpto-engine/src/joints.rs) · [Schema](crates/sculpto-engine/src/joints.toml) |
+| Dressed motion | `actor pack-cloth`. Preserve actor. Qualify cloth motion, collisions and loop closure separately. [Source](crates/sculpto-gltf/src/pack.rs) |
+| Outfit selection | `outfit inspect --nif FILE --manifest FILE`. Named parts/regions for rigging or Blender Cloth. [Source](crates/sculpto-mesh/src/outfit.rs) |
+| Asset catalogue | `boethos index`, `list`, `get`, `stats`, `export`. Host `7z`, supported archives exclude RAR, DB and exports outside VCS. [Catalogue](crates/boethos-catalogue/src/lib.rs) · [CLI](crates/boethos-cli/src/main.rs) |
 
-`garment trim` / `strip` are destructive geometry operations on derived output;
-triangle deletion is not successful construction-preserving fitting.
+`garment trim` / `strip` delete triangles in derived output. Qualify a construction-preserving
+fit on geometry with intact topology.
 
 ## Architecture and change ownership
 
-| Owner | Responsibility | Direct consumers / verification |
-|---|---|---|
-| [sculpto-core](crates/sculpto-core/src/lib.rs) | Neutral mesh/rig/skin model; BodySlide documents, morph data and format validation | bake, mesh, NIF, GLB; `crates/sculpto-core/tests` |
-| [sculpto-bake](crates/sculpto-bake/src/lib.rs) | Deterministic preset-to-offset application | engine bake/build; `crates/sculpto-bake/tests` |
-| [sculpto-mesh](crates/sculpto-mesh/src/lib.rs) | Fitting, control topology, weight transfer/remap, contacts, actor evaluation | engine and thin host adapters; `crates/sculpto-mesh/tests` |
-| [sculpto-nif](crates/sculpto-nif/src/lib.rs) | Native import/write, skin-space projection; vendored byroredux boundary | engine exports; `crates/sculpto-nif/tests` |
-| [sculpto-gltf](crates/sculpto-gltf/src/lib.rs) | GLB writing and append-only cloth packing | engine/actor exports; `crates/sculpto-gltf/tests` |
-| [sculpto-engine](crates/sculpto-engine/src/lib.rs) | Closed command catalogue, schemas, classified errors and operations | CLI/run/MCP; `crates/sculpto-engine/tests` |
-| [sculpto-cli](crates/sculpto-cli/src/main.rs) | argv and stdio transports | users/adapters; `crates/sculpto-cli/tests` |
-| [tools](tools/) | Optional Blender adapters, native reduction, viewers and diagnostics; `tripo-split` writes one GLB per generated figure plus a catalogue manifest | [recipes and restrictions](README.md); `tools/tests` |
+| Owner | Scope and verification |
+|---|---|
+| [sculpto-core](crates/sculpto-core/src/lib.rs) | Neutral mesh/rig/skin, BodySlide, morphs and validation. `crates/sculpto-core/tests` |
+| [sculpto-bake](crates/sculpto-bake/src/lib.rs) | Deterministic preset offsets. `crates/sculpto-bake/tests` |
+| [sculpto-mesh](crates/sculpto-mesh/src/lib.rs) | Fit, control, remap, contacts and actor evaluation. `crates/sculpto-mesh/tests` |
+| [sculpto-nif](crates/sculpto-nif/src/lib.rs) | Native I/O, skin-space projection and byroredux boundary. `crates/sculpto-nif/tests` |
+| [sculpto-gltf](crates/sculpto-gltf/src/lib.rs) | GLB, append-only cloth packing. `crates/sculpto-gltf/tests` |
+| [sculpto-engine](crates/sculpto-engine/src/lib.rs) | Registry, schemas, operations and classified errors. `crates/sculpto-engine/tests` |
+| [sculpto-cli](crates/sculpto-cli/src/main.rs) | Argv and stdio. `crates/sculpto-cli/tests` |
+| [tools](tools/) | Optional Blender/reduction/viewer adapters. `tripo-split`: one GLB per figure + catalogue manifest. [Recipes](README.md), `tools/tests` |
 
-Put shared rules in the owning Rust crate; keep adapters thin. This is a
-package/command navigator, not an exhaustive function map. In managed work,
-the wrapper's `doc/map/README.md` owns entity bindings and measured functions.
+Share rules in the owning Rust crate. For managed work, wrapper `doc/map/README.md` owns
+entity bindings and function metrics.
 
 ## Investigate 3D work by coordinates
 
-Before comparing meshes, record artifact digest, selected objects/parts,
-coordinate frame, units/scale, object matrix, REST or clip/time and ordered
-topology identity. [Material-frame definitions](README.md#bake-original-garment-materials-onto-a-control)
-distinguish source-local and world coordinates: applying a source matrix twice
-can produce a false clearance pass. Do not infer axes from screen orientation.
-
-Start with object bounds/counts, then named regions and failing triangle/vertex
-IDs. Keep numeric witnesses in the same frame as the visual crop. Blender's
-evaluated mesh gives modifier/pose output; its indices are not automatically
-source IDs after topology changes. Preserve the adapter's lineage maps.
-Use the managed garment-authoring skill's spatial-inspection reference for
-region queries and Blender MCP. Standalone adapters remain usable without it.
+1. Record digest, selected parts, coordinate frame, units/scale, matrix, REST or clip/time
+   and ordered topology IDs.
+2. Check [source-local/world frames](README.md#bake-original-garment-materials-onto-a-control).
+   Apply the source matrix once. Infer axes from data.
+3. Inspect bounds/counts → named regions → failed triangle/vertex IDs → matched crop.
+   Keep numeric/visual evidence in one frame. Retain evaluated-to-source lineage after
+   topology changes. Managed Blender queries use garment-authoring's spatial-inspection reference.
 
 ## Worker verification
 
-Implementers build, run focused tests and repair their own changes. Cargo is
-allowed for delegates. On the shared operator host, follow QUEUE.md for heavy
-commands inside task-owned units; small checks need no heavy slot. Never nest
-the shared lock. Name workspace, target directory, tests and fixtures in each
-assignment; preserve the tested source snapshot and exact command/result.
-The coordinator integrates and runs destination gates, reusing worker evidence
-where integration does not invalidate it. A waiting check remains pending.
+Implementer → build → focused tests → repair. INPUT names workspace, target dir, commands,
+fixtures and acceptance gates. Heavy work follows QUEUE.md inside a task-owned unit and
+acquires the shared lock once. Record pending handles, source snapshot and exact result.
+Coordinator composes evidence and runs destination gates.
 
 ## Remaining work — not a shipped guarantee
 
-The raw-garment-to-accepted-outfit workflow is experimental. The managed
-wrapper's roadmap and engine-parity task ledger own priorities/status; update
-this summary when those contracts materially change:
+Raw garment → accepted outfit remains experimental. Managed roadmap and parity ledger
+own priorities, BAS/CLS residuals and acceptance.
 
-- FIT-08: real Apachii/Sentinel garment pose, fit and clearance acceptance.
-- BLD-01–06/09/10: integrated zap/clamp/UV builds, clipping repair, batch,
-  partitions/material/morph fidelity and the `export.tri` command surface.
-- RIG-04/05: complete posed NIF/GLB round trips and supported-family binding
-  acceptance. Existing rig/remap code is a foundation, not that acceptance.
-- SHP-06: native Outfit Studio multi-shape acceptance; the bundle writers and
-  the `export.bundle` / `export-nif --all-shapes` surface have landed.
-- MOD-02–04/06: material/texture completeness and native end-to-end outfit load.
+- FIT-08: real Apachii/Sentinel pose, fit and clearance.
+- BLD-01–06/09/10: zap/clamp/UV, clipping repair, batch, partitions/material/morph fidelity,
+  `export.tri`.
+- RIG-04/05: posed NIF/GLB round trips and supported-family binding acceptance.
+- SHP-06: native Outfit Studio multi-shape acceptance. Shipped:
+  `export.bundle` / `export-nif --all-shapes`.
+- MOD-02–04/06: material/texture completeness and native outfit load.
 - ARC-01/02/04–06: archetypes, attachments and qualified one-button adaptation.
-- Authoring surfaces, engine session/undo/invalidation and hairstyle workflow
-  remain future work; existing Blender prototypes do not establish acceptance.
+- Future: authoring surfaces, engine session/undo/invalidation, hairstyle workflow.
 
-This is a capability summary, not the complete open task set. BAS and CLS
-residuals also remain in the managed ledger; consult it before planning work.
-
-Gameplay, animation authoring and world building are outside this toolkit.
+Toolkit scope excludes gameplay, animation authoring and world building.
