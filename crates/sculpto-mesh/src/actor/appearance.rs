@@ -10,22 +10,35 @@ pub struct SurfaceAttribute {
 }
 
 impl Actor {
+    fn surface_primitive(
+        &self,
+        node: usize,
+        part: usize,
+    ) -> Result<gltf::Primitive<'_>, ActorError> {
+        self.document
+            .nodes()
+            .nth(node)
+            .and_then(|n| n.mesh())
+            .and_then(|m| m.primitives().nth(part))
+            .ok_or_else(|| invalid("surface attributes", "missing mesh or primitive"))
+    }
+
+    /// Read encoded bind positions so a partial repair can copy untouched rows exactly. @req DECL0013
+    pub fn bind_positions(&self, node: usize, part: usize) -> Result<Vec<[f32; 3]>, ActorError> {
+        let p = self.surface_primitive(node, part)?;
+        Ok(p.reader(|b| self.buffer(b))
+            .read_positions()
+            .ok_or_else(|| invalid("bind positions", "unreadable"))?
+            .collect())
+    }
+
     /// Return normals, tangents, UV sets and vertex colors of a selected primitive. @req DECL0013
     pub fn surface_attributes(
         &self,
         node: usize,
         part: usize,
     ) -> Result<Vec<SurfaceAttribute>, ActorError> {
-        let mesh = self
-            .document
-            .nodes()
-            .nth(node)
-            .and_then(|n| n.mesh())
-            .ok_or_else(|| invalid("surface attributes", "missing mesh"))?;
-        let p = mesh
-            .primitives()
-            .nth(part)
-            .ok_or_else(|| invalid("surface attributes", "missing primitive"))?;
+        let p = self.surface_primitive(node, part)?;
         let reader = p.reader(|b| self.buffer(b));
         let count = p
             .get(&Semantic::Positions)

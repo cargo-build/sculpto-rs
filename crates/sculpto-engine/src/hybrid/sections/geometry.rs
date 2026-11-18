@@ -26,21 +26,7 @@ fn interpolate(attr: &SurfaceAttribute, site: &Site) -> [f64; 4] {
     out
 }
 fn appearance(attr: &SurfaceAttribute, site: &Site, map: DMat4) -> [f64; 4] {
-    let mut v = interpolate(attr, site);
-    if attr.semantic == "NORMAL" || attr.semantic == "TANGENT" {
-        let d = DVec3::new(v[0], v[1], v[2]);
-        let q = if attr.semantic == "NORMAL" {
-            map.inverse().transpose().transform_vector3(d)
-        } else {
-            map.transform_vector3(d)
-        };
-        let n = q.normalize_or_zero();
-        v[..3].copy_from_slice(&n.to_array());
-        if attr.semantic == "TANGENT" {
-            v[3] = v[3].signum() * map.determinant().signum();
-        }
-    }
-    v
+    super::super::map_attribute(interpolate(attr, site), &attr.semantic, map)
 }
 
 fn row(s: &Site, target: &SkinAsset, parts: &[Part]) -> Vec<(u16, f32)> {

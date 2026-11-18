@@ -24,6 +24,35 @@ pub struct CutGeometry {
 }
 
 impl PackWriter {
+    /// Replace just one directional attribute of a partially rebound underlayer. @req DECL0013
+    pub fn set_bind_directions(
+        &mut self,
+        mesh: usize,
+        part: usize,
+        semantic: &str,
+        values: &[[f32; 4]],
+    ) -> Result<(), PackError> {
+        let width = match semantic {
+            "NORMAL" => 3,
+            "TANGENT" => 4,
+            _ => {
+                return Err(PackError::invalid(
+                    "bind directions",
+                    "expected NORMAL or TANGENT",
+                ));
+            }
+        };
+        let flat: Vec<_> = values
+            .iter()
+            .flat_map(|row| row[..width].iter().copied())
+            .collect();
+        if flat.iter().any(|n| !n.is_finite()) {
+            return Err(PackError::invalid("bind directions", "nonfinite value"));
+        }
+        let accessor = self.vec_floats(&flat, width, values.len())?;
+        self.set_attribute(mesh, part, semantic, accessor)
+    }
+
     fn child(&mut self, parent: usize, node: Value) -> Result<usize, PackError> {
         let nodes = self
             .json

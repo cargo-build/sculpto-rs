@@ -1,13 +1,14 @@
 //! Preserve an A-reference material cuff between rigid limb sections and transplant registered soft helpers.
 mod pelvis;
 mod sections;
+mod trunk_bind;
 
 use crate::{
     CommandError,
     actor_io::{Pool, read_pool},
     export_glb::{actor_error, hex, refused},
 };
-use glam::DMat4;
+use glam::{DMat4, DVec3};
 use sculpto_gltf::pack::PackWriter;
 use sculpto_mesh::actor::{Actor, Pose};
 use serde_json::{Value, json};
@@ -123,7 +124,13 @@ fn matrix32(m: DMat4) -> Result<[f32; 16], CommandError> {
 }
 
 /// The remaining body and underlayers follow the trunk. Only explicit joint bridges may regain arm mass. @req DECL0013
-fn isolate_trunk(target: &mut SkinAsset) -> Result<(Vec<bool>, usize), CommandError> {
+struct ArmIsolation {
+    slots: Vec<bool>,
+    redirected: Vec<bool>,
+    spine: u16,
+}
+
+fn isolate_trunk(target: &mut SkinAsset) -> Result<ArmIsolation, CommandError> {
     let parents = target.actor.node_parents();
     let roots = [
         target.slots[target.mix_slot("LeftShoulder")?],
@@ -137,13 +144,33 @@ fn isolate_trunk(target: &mut SkinAsset) -> Result<(Vec<bool>, usize), CommandEr
             std::iter::successors(Some(joint), |&n| parents[n]).any(|n| roots.contains(&n))
         })
         .collect();
-    let changed = target
+    let redirected = target
         .pool
         .rows
         .iter_mut()
-        .map(|row| usize::from(redirect_arm_mass(row, &arm, spine)))
-        .sum();
-    Ok((arm, changed))
+        .map(|row| redirect_arm_mass(row, &arm, spine))
+        .collect();
+    Ok(ArmIsolation {
+        slots: arm,
+        redirected,
+        spine,
+    })
+}
+
+fn map_attribute(mut v: [f64; 4], semantic: &str, map: DMat4) -> [f64; 4] {
+    if matches!(semantic, "NORMAL" | "TANGENT") {
+        let direction = DVec3::new(v[0], v[1], v[2]);
+        let q = if semantic == "NORMAL" {
+            map.inverse().transpose().transform_vector3(direction)
+        } else {
+            map.transform_vector3(direction)
+        };
+        v[..3].copy_from_slice(&q.normalize_or_zero().to_array());
+        if semantic == "TANGENT" {
+            v[3] = v[3].signum() * map.determinant().signum();
+        }
+    }
+    v
 }
 
 /// Donor helpers follow the original palette and retain their share. @req DECL0013
@@ -197,11 +224,26 @@ pub fn prepare(
         .as_ref()
         .map(|d| pelvis::transplant(&mut target, &reference, d, &mut writer))
         .transpose()?;
-    let (arm, isolated) = isolate_trunk(&mut target)?;
+    let isolation = isolate_trunk(&mut target)?;
+    let isolated = isolation.redirected.iter().filter(|v| **v).count();
+    let body_shading = trunk_bind::restore(
+        &reference,
+        &mut target,
+        &isolation,
+        bytes == a_reference,
+        &mut writer,
+    )?;
     writer
         .set_shared_skin(target.mesh, target.parts, &target.pool.rows)
         .map_err(fail)?;
-    let section = sections::apply(&reference, &target, &mut writer, mark_transitions, &arm)?;
+    let section = sections::apply(
+        &reference,
+        &target,
+        &mut writer,
+        mark_transitions,
+        &isolation.slots,
+        body_shading,
+    )?;
     let encoded = writer.finish().map_err(fail)?;
     let written = Actor::from_glb(&encoded).map_err(actor_error)?;
     let final_joints = written.skin_joints().map_err(actor_error)?.len();

@@ -5,6 +5,7 @@ use super::{SkinAsset, fail, matrix32};
 use crate::CommandError;
 use glam::{DMat4, DVec3};
 use sculpto_gltf::pack::PackWriter;
+use sculpto_mesh::actor::SurfaceAttribute;
 use sculpto_mesh::rig::author::parted;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,6 +16,7 @@ pub(super) fn apply(
     writer: &mut PackWriter,
     mark: bool,
     arm: &[bool],
+    target_attrs: Vec<SurfaceAttribute>,
 ) -> Result<Value, CommandError> {
     let body = &a.pool.triangles[..a.pool.parts[0].triangles];
     let layout = anatomy::Layout::new(a, body)?;
@@ -31,7 +33,7 @@ pub(super) fn apply(
         target: t,
         parts: &layout.parts,
         source_attrs: attributes(a)?,
-        target_attrs: attributes(t)?,
+        target_attrs,
     };
     let skin = source.materialize(&template.skin, None)?;
     if skin.outer.iter().flatten().any(|&v| {
