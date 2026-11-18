@@ -23,6 +23,7 @@ pub mod export_glb;
 mod handlers;
 pub mod havok;
 mod humanoid;
+pub mod hybrid;
 pub mod joints;
 pub mod knee_fold;
 pub mod measures;

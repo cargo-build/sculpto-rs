@@ -15,6 +15,8 @@
 //! is re-serialized with the digits it arrived with.
 
 use std::borrow::Cow;
+mod articulation;
+pub use articulation::{CutGeometry, HelperJoint};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -486,6 +488,15 @@ impl PackWriter {
         parts: usize,
         rows: &[Vec<(u16, f32)>],
     ) -> Result<(), PackError> {
+        let (js, ws) = self.skin_accessors(rows)?;
+        for part in 0..parts {
+            self.set_attribute(mesh, part, "JOINTS_0", js)?;
+            self.set_attribute(mesh, part, "WEIGHTS_0", ws)?;
+        }
+        Ok(())
+    }
+
+    fn skin_accessors(&mut self, rows: &[Vec<(u16, f32)>]) -> Result<(usize, usize), PackError> {
         let mut joints = Vec::with_capacity(rows.len() * 8);
         let mut weights = Vec::with_capacity(rows.len() * 4);
         for row in rows {
@@ -512,11 +523,7 @@ impl PackWriter {
             json!({"bufferView":view,"count":rows.len(),"type":"VEC4","componentType":5123}),
         )?;
         let ws = self.vec_floats(&weights, 4, rows.len())?;
-        for part in 0..parts {
-            self.set_attribute(mesh, part, "JOINTS_0", js)?;
-            self.set_attribute(mesh, part, "WEIGHTS_0", ws)?;
-        }
-        Ok(())
+        Ok((js, ws))
     }
 
     /// Morph POSITION displacements carry bounds in the same coordinate frame as the base. @req DECL0013
@@ -575,12 +582,13 @@ impl PackWriter {
             .collect();
         let view = self.view(&bytes, &json!({}))?;
         let kind = match components {
+            2 => "VEC2",
             3 => "VEC3",
             4 => "VEC4",
             _ => {
                 return Err(PackError::invalid(
                     "animation output",
-                    "expected VEC3 or VEC4",
+                    "expected VEC2, VEC3 or VEC4",
                 ));
             }
         };

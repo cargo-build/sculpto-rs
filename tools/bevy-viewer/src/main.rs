@@ -5,6 +5,7 @@
 mod bank;
 mod control;
 mod facets;
+mod number_entry;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::oit::{resolve::is_oit_supported, OrderIndependentTransparencySettings};
@@ -506,7 +507,7 @@ struct PendingScene {
     world: Handle<bevy::world_serialization::WorldAsset>,
     sha: String,
     note: SidecarNote,
-    bank_slot: Option<usize>,
+    bank_slot: Option<bank::Selection>,
 }
 
 /// Live reload state; present only when `--watch` is given, so every system
@@ -1087,6 +1088,7 @@ fn main() {
             offset: Vec3::ZERO,
         })
         .insert_resource(FlatMode(config.flat))
+        .init_resource::<number_entry::NumberEntry>()
         .insert_resource(facets::FaceNormals(
             std::env::var_os("SCULPTO_VIEWER_FACE_NORMALS").is_some_and(|value| value != "0"),
         ))
@@ -1174,6 +1176,13 @@ fn main() {
         )
         // Separate call: the tuple above is already at Bevy's arity limit.
         .add_systems(Update, (watch_tick, watch_card))
+        .add_systems(
+            Update,
+            number_entry::read
+                .before(bank_keyboard)
+                .before(select_clip)
+                .before(hover_joint_name),
+        )
         .add_systems(Update, bank_keyboard.before(watch_tick))
         .add_systems(Update, clip_label.after(watch_tick))
         .add_systems(Update, hover_joint_name)
@@ -1860,10 +1869,12 @@ fn setup(
                     "Drag LMB orbit · RMB pan · wheel zoom",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB move key light",
-                    if bank.is_some() {
-                        "0 A-pose · 1 T-pose · 2–9 animations"
+                    if bank.as_ref().is_some_and(|bank| bank.inspection.is_some()) {
+                        "0 A-pose · 1 T-pose · Ctrl+0 disassembled · Ctrl+number 1.35s"
+                    } else if bank.is_some() {
+                        "0 A-pose · 1 T-pose · 2–9 animations · Ctrl+number 1.35s"
                     } else {
-                        "0–9 select clip"
+                        "0–9 select clip · Ctrl+number 1.35s"
                     },
                     "Space pause · Ctrl+, slower · Ctrl+. faster",
                     "R reset · L lit/flat · N face normals · F3 rig · B bones · H help",
@@ -1940,6 +1951,7 @@ fn setup(
 /// small radius, so the operator can identify nodes while placing them.
 fn hover_joint_name(
     config: Res<ViewerConfig>,
+    number: Res<number_entry::NumberEntry>,
     skel: Res<SkelMode>,
     info: Res<SkelJointsInfo>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
@@ -1949,6 +1961,11 @@ fn hover_joint_name(
     let Ok((mut text, mut vis)) = labels.single_mut() else {
         return;
     };
+    if !number.digits().is_empty() {
+        text.0 = format!("Ctrl · {}", number.digits());
+        *vis = Visibility::Inherited;
+        return;
+    }
     if !config.interactive || !skel.on() || info.0.is_empty() {
         *vis = Visibility::Hidden;
         return;
@@ -2353,7 +2370,7 @@ fn advance_animation(
 /// the cloth clip keeps running.
 fn select_clip(
     config: Res<ViewerConfig>,
-    keys: Res<ButtonInput<KeyCode>>,
+    number: Res<number_entry::NumberEntry>,
     graph: Option<Res<PlayerGraph>>,
     mut selection: ResMut<ClipSelection>,
     mut players: Query<(&mut AnimationPlayer, &AnimationGraphHandle)>,
@@ -2362,45 +2379,29 @@ fn select_clip(
     if !config.interactive || bank.is_some() {
         return;
     }
-    let wanted = pressed_digit(&keys).filter(|index| {
-        graph
-            .as_ref()
-            .is_some_and(|graph| *index < graph.nodes.len())
-    });
-    let Some(wanted) = wanted else {
+    let Some(graph) = graph else { return };
+    let Some(bank::Selection::Slot(wanted)) = number
+        .pick
+        .and_then(|p| p.resolve(graph.nodes.len(), false))
+    else {
         return;
     };
     if selection.0 == wanted {
         return;
     }
     selection.0 = wanted;
-    let Some(graph) = graph else { return };
     start_actor_clip(&graph, wanted, &mut players);
 }
 
-fn pressed_digit(keys: &ButtonInput<KeyCode>) -> Option<usize> {
-    [
-        KeyCode::Digit0,
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-        KeyCode::Digit9,
-    ]
-    .into_iter()
-    .position(|key| keys.just_pressed(key))
-}
-
 /// Keyboard and socket requests stage a fresh scene, including for a return to rest.
-fn request_slot(bank: &mut bank::Bank, watch: &mut WatchState, index: usize) -> Result<(), String> {
+fn request_slot(
+    bank: &mut bank::Bank,
+    watch: &mut WatchState,
+    index: bank::Selection,
+) -> Result<(), String> {
     let slot = bank
-        .slots
-        .get(index)
-        .ok_or_else(|| format!("bank has no slot {index}"))?;
+        .slot(index)
+        .ok_or_else(|| format!("bank has no selection {}", index.value()))?;
     let bytes =
         std::fs::read(&slot.asset).map_err(|error| format!("{}: {error}", slot.asset.display()))?;
     let names = glb_animation_names_bytes(&bytes).ok_or("bank asset is not a valid GLB")?;
@@ -2409,7 +2410,7 @@ fn request_slot(bank: &mut bank::Bank, watch: &mut WatchState, index: usize) -> 
         .is_some_and(|clip| names.get(clip) != slot.clip_name.as_ref())
     {
         return Err(format!(
-            "slot {index}: expected clip is absent from the asset"
+            "selection {index:?}: expected clip is absent from the asset"
         ));
     }
     watch.files.dir = slot
@@ -2432,17 +2433,23 @@ fn request_slot(bank: &mut bank::Bank, watch: &mut WatchState, index: usize) -> 
 
 fn bank_keyboard(
     config: Res<ViewerConfig>,
-    keys: Res<ButtonInput<KeyCode>>,
+    number: Res<number_entry::NumberEntry>,
     bank: Option<ResMut<bank::Bank>>,
     watch: Option<ResMut<WatchState>>,
 ) {
     if !config.interactive {
         return;
     }
-    let (Some(mut bank), Some(mut watch), Some(index)) = (bank, watch, pressed_digit(&keys)) else {
+    let (Some(mut bank), Some(mut watch)) = (bank, watch) else {
         return;
     };
-    if let Err(error) = request_slot(&mut bank, &mut watch, index) {
+    let Some(selected) = number
+        .pick
+        .and_then(|p| p.resolve(bank.slots.len(), bank.inspection.is_some()))
+    else {
+        return;
+    };
+    if let Err(error) = request_slot(&mut bank, &mut watch, selected) {
         bank.error = Some(error);
     }
 }
@@ -2460,8 +2467,8 @@ fn clip_label(
     let line = match bank {
         Some(bank) => match (&bank.error, bank.requested) {
             (Some(error), _) => error.clone(),
-            (_, Some(index)) => format!("Loading {} · {}", index, bank.slots[index].name),
-            _ => format!("{} · {}", bank.current, bank.slots[bank.current].name),
+            (_, Some(index)) => format!("Loading {}", bank.caption(index)),
+            _ => bank.caption(bank.current),
         },
         None => graph
             .as_ref()
@@ -2958,11 +2965,22 @@ fn control_service(
                 }
             }
             control::Command::Slot { index } => match (bank.as_mut(), watch.as_mut()) {
-                (Some(bank), Some(watch)) => match request_slot(bank, watch, index) {
-                    Ok(()) => control::ok_json(serde_json::json!({"requested_slot": index})),
-                    Err(error) => control::error_json(&error),
-                },
+                (Some(bank), Some(watch)) => {
+                    match request_slot(bank, watch, bank::Selection::Slot(index)) {
+                        Ok(()) => control::ok_json(serde_json::json!({"requested_slot": index})),
+                        Err(error) => control::error_json(&error),
+                    }
+                }
                 _ => control::error_json("slot requires --bank"),
+            },
+            control::Command::Inspection => match (bank.as_mut(), watch.as_mut()) {
+                (Some(bank), Some(watch)) => {
+                    match request_slot(bank, watch, bank::Selection::Inspection) {
+                        Ok(()) => control::ok_json(serde_json::json!({"requested":"inspection"})),
+                        Err(e) => control::error_json(&e),
+                    }
+                }
+                _ => control::error_json("inspection requires --bank"),
             },
             control::Command::Clip { .. } if bank.is_some() => {
                 control::error_json("use slot to select an entry in --bank mode")
@@ -3321,7 +3339,11 @@ fn watch_tick(
                 .unwrap_or_default(),
         ));
         if let (Some(bank), Some(index)) = (bank.as_mut(), pending.bank_slot) {
-            selection.0 = bank.slots[index].clip.unwrap_or(usize::MAX);
+            selection.0 = bank
+                .slot(index)
+                .expect("staged bank slot")
+                .clip
+                .unwrap_or(usize::MAX);
             bank.current = index;
             bank.requested = None;
             bank.error = None;
@@ -3368,10 +3390,7 @@ fn watch_card(
         return;
     };
     let line = match bank.as_ref() {
-        Some(bank) => format!(
-            "{} · {} · {}",
-            config.status, bank.current, bank.slots[bank.current].name
-        ),
+        Some(bank) => format!("{} · {}", config.status, bank.caption(bank.current)),
         None => watch.line(&config.status),
     };
     if watch.last_line == line {

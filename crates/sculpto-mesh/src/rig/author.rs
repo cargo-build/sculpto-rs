@@ -62,6 +62,7 @@ use crate::garment::Influences;
 use crate::weight_norm::{WeightError, pack_influences};
 
 pub mod knee;
+pub mod parted;
 mod seams;
 
 /// Which body side a bone drives, from its authored name.

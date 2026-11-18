@@ -66,6 +66,7 @@ pub enum Command {
     Clip {
         index: usize,
     },
+    Inspection,
     Slot {
         index: usize,
     },
@@ -331,6 +332,7 @@ pub fn parse_request(line: &str) -> Result<Command, String> {
                 _ => Ok(Command::Target { joint, point }),
             }
         }
+        "inspection" => Ok(Command::Inspection),
         "clip" | "slot" => {
             let index = object
                 .get("index")
@@ -693,7 +695,8 @@ pub fn help_json() -> String {
             },
             "target": {"joint": "name", "point": "[x, y, z]"},
             "clip": {"index": "actor clip index; see clip.count in state"},
-            "slot": {"index": "bank entry 0..9; see bank.slots in state; requires --bank"},
+            "slot": {"index": "zero-based bank entry; see state.bank.slots"},
+            "inspection": "open the optional disassembled rest asset (Ctrl+0)",
             "seek": {"seconds": "pause the selected actor clip at an exact time within its duration"},
             "playback": {"paused": "true|false", "speed": format!("{MIN_SPEED}..{MAX_SPEED}")},
             "skeleton": {"level": "0 off, 1 primary chain, 2 every driven joint"},

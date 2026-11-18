@@ -1,6 +1,8 @@
 //! Explicit actor selection and f64 world-space glTF motion. @req DECL0013
 
 mod animation;
+mod appearance;
+pub use appearance::SurfaceAttribute;
 mod clips;
 mod decode;
 mod fit;
@@ -526,6 +528,18 @@ impl Actor {
             }
         }
         Ok(primitives.len())
+    }
+
+    /// Return the encoded inverse binds, including implicit identities, in skin palette order. @req DECL0013
+    pub fn skin_inverse_binds(&self, node: usize) -> Result<Vec<DMat4>, ActorError> {
+        let skin = self
+            .document
+            .nodes()
+            .nth(node)
+            .and_then(|n| n.skin())
+            .ok_or_else(|| invalid("inverse binds", "missing skin"))?;
+        let identity = vec![DMat4::IDENTITY; self.document.nodes().len()];
+        geometry::joint_matrices(self, skin, &identity)
     }
 
     /// One part colour per primitive of a mesh node. @req DECL0013

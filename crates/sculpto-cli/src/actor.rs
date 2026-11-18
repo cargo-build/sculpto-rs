@@ -4,6 +4,7 @@ mod adapt;
 mod fit;
 mod gait;
 mod havok;
+mod hybrid;
 mod joints;
 mod knee_fold;
 mod pack;
@@ -52,6 +53,9 @@ struct Arguments<'arg> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|command| command == "hybrid") {
+        return hybrid::run(&args[1..]);
+    }
     if args.first().is_some_and(|command| command == "knee-fold") {
         return knee_fold::run(&args[1..]);
     }

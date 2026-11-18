@@ -213,6 +213,7 @@ printf '{"cmd":"state"}\n' | socat - UNIX-CONNECT:/tmp/opencode/task/viewer.sock
 | `{"cmd":"target","joint":"Pelvis"}` / `{"cmd":"target","point":[0,0.9,0]}` | move the orbit target |
 | `{"cmd":"clip","index":1}` | restart the chosen actor clip; the cloth clip keeps running |
 | `{"cmd":"slot","index":3}` | select a posed asset or named clip in `--bank` mode |
+| `{"cmd":"inspection"}` | select the optional disassembled rest asset in a bank |
 | `{"cmd":"playback","paused":true,"speed":0.25}` | pause and slow the clip (`0.05..4`) |
 | `{"cmd":"seek","seconds":0.7}` | pause the loaded actor clip at the requested time within its duration |
 | `{"cmd":"skeleton","level":2}` | `0` off, `1` primary chain, `2` every driven joint |
@@ -293,9 +294,14 @@ on the black backdrop (no ground); `SCULPTO_VIEWER_GROUND=1` adds the ground and
 `SCULPTO_VIEWER_TURNTABLE_YAW` seeds the figure pose for a shadow comparison.
 `0` selects the idle clip and `1` the walk clip of a rigged GLB (the actor graph
 loads `Animation0` and `Animation1`; the cloth clip keeps running).
-`--interactive --bank <manifest.json>` assigns the number keys to a review bank with
-up to ten entries. Each JSON entry names the asset, a display name and either a clip
-name or `null` for the asset's rest pose. For the Emily bank, `0` opens A-pose,
-`1` opens T-pose and `2`–`9` play the named animations. The top-left controls card
-lists the keys and `H` hides or shows it. Click the figure to give the review window
-keyboard focus.
+`--interactive --bank <manifest.json>` accepts a version-1 manifest with a nonempty
+`slots` array. Each entry names a GLB asset, a display name and either a clip name or
+`null` for rest. Plain digits select slots 0–9 immediately. Hold Ctrl while typing a
+slot number. The viewer shows the digits and selects the slot 1.35 seconds after the
+last digit, including after Ctrl is released. Numbers beyond the bank select the last
+slot. An optional top-level `inspection` entry has the same fields and a null clip.
+Ctrl+0 opens this asset and reports `bank.current = "inspection"`. Plain 0 opens slot 0.
+The socket's numeric slot command requires a valid index.
+
+In the Emily bank, 0 opens A-pose, 1 opens T-pose and 2–9 play named Mixamo clips.
+Click the figure for keyboard focus. H toggles the controls card.
