@@ -18,7 +18,6 @@ pub struct CutGeometry {
     pub attributes: Vec<(String, usize, Vec<f32>)>,
     pub rows: Vec<Vec<(u16, f32)>>,
     pub outer: Vec<[u32; 3]>,
-    pub transitions: Vec<[u32; 3]>,
     pub band_uv: Vec<f32>,
     pub caps: Vec<[u32; 3]>,
 }
@@ -195,6 +194,7 @@ impl PackWriter {
         mesh: usize,
         part: usize,
         data: &CutGeometry,
+        membrane: &CutGeometry,
         mark: bool,
     ) -> Result<(), PackError> {
         let material = self
@@ -203,15 +203,24 @@ impl PackWriter {
             .and_then(Value::as_u64)
             .map(|i| i as usize);
         let pr = self.cut_primitive(data, &data.outer, material)?;
-        let mut transition = pr.clone();
-        transition["indices"] = json!(self.triangle_indices(&data.transitions)?);
+        let mut lining = match material {
+            Some(i) => self.element("materials", i)?.clone(),
+            None => json!({}),
+        };
+        lining["name"] = json!("Seam membrane");
+        lining["doubleSided"] = json!(false);
+        let film_material = if mark {
+            self.stripe_material()?
+        } else {
+            self.append("materials", lining)?
+        };
+        let mut transition = self.cut_primitive(membrane, &membrane.outer, Some(film_material))?;
         if mark {
-            if data.band_uv.len() != data.positions.len() * 2 {
+            if membrane.band_uv.len() != membrane.positions.len() * 2 {
                 return Err(PackError::invalid("transition stripes", "invalid UV count"));
             }
-            let uv = self.vec_floats(&data.band_uv, 2, data.positions.len())?;
+            let uv = self.vec_floats(&membrane.band_uv, 2, membrane.positions.len())?;
             transition["attributes"]["TEXCOORD_0"] = json!(uv);
-            transition["material"] = json!(self.stripe_material()?);
         }
         *self.primitive(mesh, part)? = pr;
         self.mesh(mesh)?["primitives"]

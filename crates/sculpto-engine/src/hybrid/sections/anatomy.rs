@@ -141,30 +141,20 @@ impl Layout {
         })
     }
 
-    pub fn fields(&self, a: &SkinAsset) -> (Vec<Option<usize>>, Vec<f64>) {
-        let mut owners = Vec::new();
-        let mut widths = Vec::new();
-        let stations: Vec<_> = self
-            .parts
+    pub fn owners(&self, a: &SkinAsset) -> Vec<Option<usize>> {
+        a.pool
+            .vertices
             .iter()
-            .map(|p| (p.root, (0.54 * p.depth).min(0.18 * p.root.distance(p.tip))))
-            .chain(self.ankles.iter().map(|(_, p, d)| (*p, 0.54 * d)))
-            .collect();
-        for (&point, row) in a.pool.vertices.iter().zip(&a.pool.rows) {
-            let p = DVec3::from_array(point);
-            let dom = row
-                .iter()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .and_then(|v| a.names[usize::from(v.0)].rsplit(':').next());
-            let owner = dom.and_then(|n| self.sides.iter().find_map(|s| self.owner(s, p, n, row)));
-            let nearest = stations
-                .iter()
-                .min_by(|(a, _), (b, _)| a.distance_squared(p).total_cmp(&b.distance_squared(p)))
-                .expect("limb stations");
-            owners.push(owner);
-            widths.push(nearest.1);
-        }
-        (owners, widths)
+            .zip(&a.pool.rows)
+            .map(|(&point, row)| {
+                let p = DVec3::from_array(point);
+                let dom = row
+                    .iter()
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .and_then(|v| a.names[usize::from(v.0)].rsplit(':').next());
+                dom.and_then(|n| self.sides.iter().find_map(|s| self.owner(s, p, n, row)))
+            })
+            .collect()
     }
 
     fn owner(&self, s: &Side, p: DVec3, dominant: &str, row: &[(u16, f32)]) -> Option<usize> {

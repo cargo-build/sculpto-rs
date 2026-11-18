@@ -30,17 +30,13 @@ fn appearance(attr: &SurfaceAttribute, site: &Site, map: DMat4) -> [f64; 4] {
 }
 
 fn row(s: &Site, target: &SkinAsset, parts: &[Part]) -> Vec<(u16, f32)> {
+    if let Some(i) = s.owner {
+        return vec![(parts[i].slot as u16, 1.)];
+    }
     let mut result = BTreeMap::<u16, f64>::new();
-    for &(owner, weight) in &s.shares {
-        match owner {
-            Some(i) => *result.entry(parts[i].slot as u16).or_default() += weight,
-            None => {
-                for (v, b) in s.face.into_iter().zip(s.bary) {
-                    for &(j, w) in &target.pool.rows[v as usize] {
-                        *result.entry(j).or_default() += weight * b * f64::from(w);
-                    }
-                }
-            }
+    for (v, b) in s.face.into_iter().zip(s.bary) {
+        for &(j, w) in &target.pool.rows[v as usize] {
+            *result.entry(j).or_default() += b * f64::from(w);
         }
     }
     let mut packed: Vec<_> = result.into_iter().filter(|p| p.1 > 0.).collect();
@@ -70,7 +66,6 @@ impl Sources<'_> {
         }
         let mut data = CutGeometry {
             outer: piece.faces.clone(),
-            transitions: piece.transitions.clone(),
             attributes: self
                 .source_attrs
                 .iter()
@@ -96,16 +91,13 @@ impl Sources<'_> {
             let position = match rigid {
                 Some(i) => frames[i].transform_point3(material),
                 None => site
-                    .shares
-                    .iter()
-                    .map(|&(i, w)| {
-                        w * i.map_or(accepted, |i| anchors[i].transform_point3(material))
-                    })
-                    .sum(),
+                    .owner
+                    .map_or(accepted, |i| anchors[i].transform_point3(material)),
             };
             data.positions.push(position.as_vec3().to_array());
             if rigid.is_none() {
-                data.band_uv.extend([0.125 + 2.5 * site.band_distance, 0.5]);
+                data.band_uv
+                    .extend([0.125 + 2.5 * f32::from(site.band_side), 0.5]);
                 data.rows.push(row(site, self.target, self.parts));
             }
             for ((dst, base), current) in data
@@ -116,19 +108,10 @@ impl Sources<'_> {
             {
                 let mut value = match rigid {
                     Some(i) => appearance(base, site, frames[i] * self.a.frame),
-                    None => {
-                        let mut sum = [0.; 4];
-                        for &(owner, weight) in &site.shares {
-                            let v = match owner {
-                                Some(i) => appearance(base, site, anchors[i] * self.a.frame),
-                                None => interpolate(current, site),
-                            };
-                            for (dst, comp) in sum.iter_mut().zip(v) {
-                                *dst += weight * comp;
-                            }
-                        }
-                        sum
-                    }
+                    None => match site.owner {
+                        Some(i) => appearance(base, site, anchors[i] * self.a.frame),
+                        None => interpolate(current, site),
+                    },
                 };
                 if base.semantic == "NORMAL" || base.semantic == "TANGENT" {
                     let n = DVec3::new(value[0], value[1], value[2]).normalize_or_zero();

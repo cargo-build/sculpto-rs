@@ -1,16 +1,16 @@
-//! Clip a named material partition once on a rest surface, keeping a flexible strip between rigid pieces.
-use super::{Candidate, Surface, seams::SeamWeights};
+//! Partition the entire A surface at shared seams and attach zero-width membranes to both rims.
+use super::seams::SeamWeights;
 use crate::surface_util::coincident_groups;
 use glam::DVec3;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// A location on one original material triangle. A cuff approaches one rigid owner at its cut rim.
+/// A material point in one original triangle. Each side of a seam has its own attachment.
 #[derive(Clone)]
 pub struct Site {
     pub face: [u32; 3],
     pub bary: [f64; 3],
-    pub shares: Vec<(Option<usize>, f64)>,
-    pub band_distance: f32,
+    pub owner: Option<usize>,
+    pub band_side: u8,
 }
 impl Site {
     pub fn point(&self, points: &[[f64; 3]]) -> DVec3 {
@@ -21,123 +21,94 @@ impl Site {
             .sum()
     }
 }
-/// Indexed outer material and newly cut, ordered loops. Caps are inside the joint sleeve.
+
 #[derive(Default)]
 pub struct Piece {
     pub sites: Vec<Site>,
     pub faces: Vec<[u32; 3]>,
-    pub transitions: Vec<[u32; 3]>,
     pub rims: Vec<Vec<u32>>,
 }
 pub struct Partition {
     pub skin: Piece,
+    pub membrane: Piece,
     pub pieces: Vec<Piece>,
 }
 
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+struct MaterialPoint {
+    vertices: [u32; 3],
+    owner: Option<usize>,
+    side: u8,
+}
 #[derive(Default)]
 struct Build {
     part: Piece,
-    index: BTreeMap<[(u32, i64); 3], u32>,
+    index: BTreeMap<MaterialPoint, u32>,
     cut: Vec<(u32, u32)>,
 }
-struct FaceField<'a> {
-    regions: &'a [(usize, DVec3)],
-    tissue: DVec3,
-    neighbours: [(Option<usize>, Option<usize>); 3],
-}
-impl FaceField<'_> {
-    fn shares(&self, b: DVec3) -> (Vec<(Option<usize>, f64)>, f32) {
-        let (owner, distance) = self
-            .regions
-            .iter()
-            .map(|(r, f)| (Some(*r), 1. + b.dot(*f)))
-            .fold((None, 1. + b.dot(self.tissue)), |a, c| {
-                if c.1 > a.1 { c } else { a }
-            });
-        let t = distance.clamp(0., 1.);
-        if t >= 1. - 1e-9 {
-            return (vec![(owner, 1.)], 1.);
-        }
-        let gain = t * t * (3. - 2. * t);
-        let mut weights = BTreeMap::new();
-        for ((left, right), v) in self.neighbours.iter().zip(b.to_array()) {
-            for which in [*left, *right] {
-                *weights.entry(which).or_insert(0.) += 0.5 * v * (1. - gain);
-            }
-        }
-        *weights.entry(owner).or_insert(0.) += gain;
-        (
-            weights.into_iter().filter(|(_, w)| *w > 0.).collect(),
-            t as f32,
-        )
-    }
-}
 impl Build {
-    fn site(&mut self, s: Site) -> Result<u32, String> {
-        let mut key = [(u32::MAX, 0); 3];
-        for (i, (&v, w)) in s.face.iter().zip(s.bary).enumerate() {
-            let units = (w * 1e9).round() as i64;
-            if units > 0 {
-                key[i] = (v, units);
-            }
-        }
-        key.sort_unstable();
+    fn site(
+        &mut self,
+        face: [u32; 3],
+        b: DVec3,
+        owner: Option<usize>,
+        side: u8,
+    ) -> Result<u32, String> {
+        // Categorical barycentric cells meet exactly at corners, edge midpoints and the centroid.
+        // Reconstruct those points identically on either side, including a triple junction.
+        let support = b.to_array().map(|w| w > 1e-12);
+        let count = support.iter().filter(|&&v| v).count() as f64;
+        let bary = support.map(|yes| if yes { 1. / count } else { 0. });
+        let mut vertices = std::array::from_fn(|i| if support[i] { face[i] } else { u32::MAX });
+        vertices.sort_unstable();
+        let key = MaterialPoint {
+            vertices,
+            owner,
+            side,
+        };
         if let Some(&i) = self.index.get(&key) {
             return Ok(i);
         }
         let i = u32::try_from(self.part.sites.len()).map_err(|_| "too many cut vertices")?;
         self.index.insert(key, i);
-        self.part.sites.push(s);
+        self.part.sites.push(Site {
+            face,
+            bary,
+            owner,
+            band_side: side,
+        });
         Ok(i)
     }
+
     fn polygon(
         &mut self,
         face: [u32; 3],
         poly: &[DVec3],
-        field: &FaceField<'_>,
-        rigid: Option<usize>,
-        marked: bool,
+        owner: Option<usize>,
+    ) -> Result<Vec<u32>, String> {
+        let ids = poly
+            .iter()
+            .map(|&p| self.site(face, p, owner, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        for side in ids[1..].windows(2) {
+            self.part.faces.push([ids[0], side[0], side[1]]);
+        }
+        Ok(ids)
+    }
+
+    /// Follow each exterior half-edge with a reversed attachment edge. The paired points coincide in A. @req DECL0013
+    fn bridge(
+        &mut self,
+        face: [u32; 3],
+        edge: [DVec3; 2],
+        owners: [Option<usize>; 2],
     ) -> Result<(), String> {
-        if poly.len() < 3 {
-            return Ok(());
-        }
-        let mut ids = Vec::with_capacity(poly.len());
-        for &b in poly {
-            let (shares, band_distance) = field.shares(b);
-            let i = self.site(Site {
-                face,
-                bary: b.to_array(),
-                shares,
-                band_distance,
-            })?;
-            ids.push(i);
-        }
-        if let Some(r) = rigid {
-            let field = field
-                .regions
-                .iter()
-                .find(|f| f.0 == r)
-                .ok_or("missing cut field")?
-                .1;
-            for (i, j) in (0..ids.len()).map(|i| (i, (i + 1) % ids.len())) {
-                if ids[i] != ids[j]
-                    && poly[i].dot(field).abs() < 1e-8
-                    && poly[j].dot(field).abs() < 1e-8
-                {
-                    self.cut.push((ids[j], ids[i]));
-                }
-            }
-        }
-        for i in 1..ids.len() - 1 {
-            let tri = [ids[0], ids[i], ids[i + 1]];
-            if tri[0] != tri[1] && tri[0] != tri[2] && tri[1] != tri[2] {
-                if marked {
-                    self.part.transitions.push(tri);
-                } else {
-                    self.part.faces.push(tri);
-                }
-            }
-        }
+        let [p, q] = edge;
+        let a = self.site(face, p, owners[0], 0)?;
+        let b = self.site(face, q, owners[0], 0)?;
+        let c = self.site(face, p, owners[1], 1)?;
+        let d = self.site(face, q, owners[1], 1)?;
+        self.part.faces.extend([[b, a, c], [b, c, d]]);
         Ok(())
     }
     fn finish(mut self, p: &[[f64; 3]]) -> Result<Piece, String> {
@@ -223,135 +194,184 @@ fn clip(poly: &[DVec3], field: DVec3) -> Vec<DVec3> {
     out
 }
 
-/// Use surface distance to the anatomical interfaces to allocate a finite-width connecting skin. @req DECL0013
+/// Allocate every source triangle to its adjacent materials; the membrane owns no A-pose area. @req DECL0013
 pub fn cut(
     positions: &[[f64; 3]],
     triangles: &[[u32; 3]],
     mut labels: Vec<Option<usize>>,
-    widths: &[f64],
     count: usize,
 ) -> Result<Partition, String> {
-    let n = positions.len();
-    if n == 0
-        || labels.len() != n
-        || widths.len() != n
-        || widths.iter().any(|v| !v.is_finite() || *v <= 0.)
+    if positions.is_empty()
+        || labels.len() != positions.len()
         || labels.iter().flatten().any(|&i| i >= count)
-        || triangles.iter().flatten().any(|&v| v as usize >= n)
+        || triangles
+            .iter()
+            .flatten()
+            .any(|&v| v as usize >= positions.len())
     {
         return Err("invalid material segmentation inputs".into());
     }
-    let p: Vec<_> = positions.iter().map(|&v| DVec3::from_array(v)).collect();
-    let mut used = vec![false; n];
-    for &i in triangles.iter().flatten() {
-        used[i as usize] = true;
+    let mut used = vec![false; positions.len()];
+    for &v in triangles.iter().flatten() {
+        used[v as usize] = true;
     }
     let seams = SeamWeights::find(positions, triangles, &used);
     for (a, b) in seams.links() {
         labels[b as usize] = labels[a as usize];
     }
-    let surface = Surface::build(&p, triangles, seams.links());
-    let mut across = labels.clone();
-    let mut d = vec![4_f64; n];
-    let mut heap = BinaryHeap::new();
-    for a in 0..n {
-        for k in surface.neighbours(a) {
-            let b = surface.neighbours[k] as usize;
-            if labels[a] != labels[b] {
-                let len = surface.lengths[k] / (widths[a] + widths[b]);
-                if len < d[a] {
-                    d[a] = len;
-                    across[a] = labels[b];
-                    heap.push(Candidate {
-                        distance: len,
-                        vertex: a as u32,
-                    });
-                }
-            }
-        }
-    }
-    while let Some(Candidate { distance, vertex }) = heap.pop() {
-        let a = vertex as usize;
-        if distance > d[a] {
-            continue;
-        }
-        for k in surface.neighbours(a) {
-            let b = surface.neighbours[k] as usize;
-            let v = distance + 2. * surface.lengths[k] / (widths[a] + widths[b]);
-            if labels[a] == labels[b] && v < d[b] {
-                d[b] = v;
-                across[b] = across[a];
-                heap.push(Candidate {
-                    distance: v,
-                    vertex: b as u32,
-                });
-            }
-        }
-    }
-    let mut builders: Vec<Build> = (0..count).map(|_| Build::default()).collect();
+    let mut rigid: Vec<_> = (0..count).map(|_| Build::default()).collect();
     let mut skin = Build::default();
-    let original = [DVec3::X, DVec3::Y, DVec3::Z];
+    let mut membrane = Build::default();
     for &face in triangles {
-        let owners = face.map(|v| labels[v as usize]);
-        let mut unique = Vec::new();
-        for r in owners.into_iter().flatten() {
-            if !unique.contains(&r) {
-                unique.push(r);
-            }
-        }
-        let fields: Vec<_> = unique
-            .iter()
-            .map(|&r| {
-                (
-                    r,
-                    DVec3::from_array(face.map(|v| {
-                        let v = v as usize;
-                        let s = if labels[v] == Some(r) { d[v] } else { -d[v] };
-                        s - 1.
-                    })),
-                )
-            })
-            .collect();
-        let tissue = DVec3::from_array(face.map(|v| {
-            let i = v as usize;
-            let x = if labels[i].is_none() { d[i] } else { -d[i] };
-            x - 1.
-        }));
-        let field = FaceField {
-            regions: &fields,
-            tissue,
-            neighbours: face.map(|v| (labels[v as usize], across[v as usize])),
-        };
-        let mut leftover = original.to_vec();
-        for &(r, f) in &fields {
-            builders[r].polygon(face, &clip(&original, f), &field, Some(r), false)?;
-            leftover = clip(&leftover, -f);
-        }
-        skin.polygon(face, &clip(&leftover, tissue), &field, None, false)?;
-        let band = clip(&leftover, -tissue);
-        let mut centre = band.clone();
-        // Split at zero signed distance so the stripe coordinate stays linear on each flank.
-        for f in fields.iter().map(|p| p.1).chain([tissue]) {
-            let side = f + DVec3::ONE;
-            skin.polygon(face, &clip(&band, side), &field, None, true)?;
-            centre = clip(&centre, -side);
-        }
-        skin.polygon(face, &centre, &field, None, true)?;
+        divide_face(
+            face,
+            face.map(|v| labels[v as usize]),
+            &mut rigid,
+            &mut skin,
+            &mut membrane,
+        )?;
     }
-    let pieces = builders
+    let pieces = rigid
         .into_iter()
         .enumerate()
         .map(|(i, b)| b.finish(positions).map_err(|e| format!("part {i}: {e}")))
         .collect::<Result<_, _>>()?;
     Ok(Partition {
         skin: skin.part,
+        membrane: membrane.part,
         pieces,
     })
+}
+
+fn divide_face(
+    face: [u32; 3],
+    owners: [Option<usize>; 3],
+    rigid: &mut [Build],
+    skin: &mut Build,
+    membrane: &mut Build,
+) -> Result<(), String> {
+    let corners = [DVec3::X, DVec3::Y, DVec3::Z];
+    let mut regions = BTreeMap::<Option<usize>, DVec3>::new();
+    for (owner, point) in owners.into_iter().zip(corners) {
+        *regions.entry(owner).or_default() += point;
+    }
+    for (&owner, score) in &regions {
+        let mut area = corners.to_vec();
+        for (&other, field) in &regions {
+            if other != owner {
+                area = clip(&area, *score - *field);
+            }
+        }
+        area.dedup_by(|x, y| x.abs_diff_eq(*y, 1e-12));
+        if area.len() > 1 && area[0].abs_diff_eq(*area.last().expect("nonempty polygon"), 1e-12) {
+            area.pop();
+        }
+        if area.len() < 3 {
+            return Err("material region has no exterior area".into());
+        }
+        let builder = match owner {
+            Some(i) => &mut rigid[i],
+            None => &mut *skin,
+        };
+        let ids = builder.polygon(face, &area, owner)?;
+        for i in 0..area.len() {
+            let j = (i + 1) % area.len();
+            let (a, b) = (area[i], area[j]);
+            let neighbour = regions.iter().find(|(other, field)| {
+                **other != owner
+                    && a.dot(*score - **field).abs() < 1e-9
+                    && b.dot(*score - **field).abs() < 1e-9
+            });
+            if let Some((&other, _)) = neighbour {
+                if owner.is_some() {
+                    builder.cut.push((ids[j], ids[i]));
+                }
+                if owner < other {
+                    membrane.bridge(face, [a, b], [owner, other])?;
+                }
+            }
+        }
+    }
+    // A junction of three separating materials also opens a triangle between the three ribbon ends.
+    if regions.len() == 3 {
+        let b = DVec3::splat(1. / 3.);
+        let [a, c, d] = owners;
+        let tri = [
+            membrane.site(face, b, a, 0)?,
+            membrane.site(face, b, c, 0)?,
+            membrane.site(face, b, d, 0)?,
+        ];
+        membrane.part.faces.push(tri);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn projected_area(piece: &Piece, p: &[[f64; 3]], separation: f64) -> f64 {
+        piece
+            .faces
+            .iter()
+            .map(|f| {
+                let [a, b, c] = f.map(|v| {
+                    let s = &piece.sites[v as usize];
+                    let xyz = s.point(p);
+                    if s.owner.is_some() {
+                        xyz + separation * DVec3::X
+                    } else {
+                        xyz
+                    }
+                });
+                0.5 * (b - a).cross(c - a).z
+            })
+            .sum()
+    }
+    #[test]
+    fn closed_edges_reserve_no_surface_and_unfold_only_on_the_opening_side() {
+        let p = [[-1., -1., 0.], [1., 0., 0.], [-1., 1., 0.]];
+        let (mut skin, mut rigid, mut film) =
+            (Build::default(), [Build::default()], Build::default());
+        divide_face(
+            [0, 1, 2],
+            [None, Some(0), None],
+            &mut rigid,
+            &mut skin,
+            &mut film,
+        )
+        .unwrap();
+        assert_eq!(
+            projected_area(&skin.part, &p, 0.) + projected_area(&rigid[0].part, &p, 0.),
+            2.
+        );
+        assert_eq!(film.part.faces.len(), 2);
+        for gap in [0., 0.25, 0., -0.25, 0.] {
+            assert_eq!(projected_area(&film.part, &p, gap), gap);
+        }
+    }
+    #[test]
+    fn three_materials_share_the_central_point_until_separated() {
+        let p = [[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]];
+        let (mut skin, mut film) = (Build::default(), Build::default());
+        let mut rigid = [Build::default(), Build::default()];
+        divide_face(
+            [0, 1, 2],
+            [None, Some(0), Some(1)],
+            &mut rigid,
+            &mut skin,
+            &mut film,
+        )
+        .unwrap();
+        assert_eq!(film.part.faces.len(), 7);
+        assert_eq!(projected_area(&film.part, &p, 0.), 0.);
+        let total = projected_area(&skin.part, &p, 0.)
+            + rigid
+                .iter()
+                .map(|r| projected_area(&r.part, &p, 0.))
+                .sum::<f64>();
+        assert!((total - 0.5).abs() < 1e-12);
+    }
     #[test]
     fn clipping_preserves_barycentric_area_without_overlapping_tissue() {
         let tri = [DVec3::X, DVec3::Y, DVec3::Z];

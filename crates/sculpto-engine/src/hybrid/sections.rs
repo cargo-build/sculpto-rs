@@ -20,9 +20,8 @@ pub(super) fn apply(
 ) -> Result<Value, CommandError> {
     let body = &a.pool.triangles[..a.pool.parts[0].triangles];
     let layout = anatomy::Layout::new(a, body)?;
-    let (labels, widths) = layout.fields(a);
     let template =
-        parted::cut(&a.pool.vertices, body, labels, &widths, layout.parts.len()).map_err(fail)?;
+        parted::cut(&a.pool.vertices, body, layout.owners(a), layout.parts.len()).map_err(fail)?;
     let attributes = |s: &SkinAsset| {
         s.actor
             .surface_attributes(s.mesh_node, 0)
@@ -36,6 +35,7 @@ pub(super) fn apply(
         target_attrs,
     };
     let skin = source.materialize(&template.skin, None)?;
+    let membrane = source.materialize(&template.membrane, None)?;
     if skin.outer.iter().flatten().any(|&v| {
         skin.rows[v as usize]
             .iter()
@@ -51,7 +51,7 @@ pub(super) fn apply(
         .and_then(|m| m.primitives().next())
         .and_then(|p| p.material().index());
     writer
-        .flexible_surface(t.mesh, 0, &skin, mark)
+        .flexible_surface(t.mesh, 0, &skin, &membrane, mark)
         .map_err(fail)?;
     let interior = writer.core_material().map_err(fail)?;
     let sphere = writer.joint_core_mesh(interior).map_err(fail)?;
@@ -117,6 +117,9 @@ pub(super) fn apply(
     }
     Ok(
         json!({"source_A_faces":body.len(),"remaining_skin_faces":skin.outer.len(),"remaining_skin_vertices":skin.positions.len(),
-        "transition_faces":skin.transitions.len(),"marked_transitions":mark,"segments":report,"cores":cores}),
+        "transition_faces":membrane.outer.len(),"membrane_rest_area_A_m2":template.membrane.faces.iter().map(|f| {
+            let [p,q,r]=f.map(|v|template.membrane.sites[v as usize].point(&a.pool.vertices));
+            0.5*(q-p).cross(r-p).length()
+        }).sum::<f64>(),"marked_transitions":mark,"segments":report,"cores":cores}),
     )
 }

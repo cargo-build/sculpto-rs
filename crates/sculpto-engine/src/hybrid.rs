@@ -1,4 +1,4 @@
-//! Preserve an A-reference material cuff between rigid limb sections and transplant registered soft helpers.
+//! Recut the A-reference surface at shared rims, attach opening membranes and transplant registered helpers.
 mod pelvis;
 mod sections;
 mod trunk_bind;

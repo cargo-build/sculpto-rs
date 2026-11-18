@@ -21,7 +21,18 @@ fn face_mesh(mesh: &Mesh) -> Option<Mesh> {
     }
     let mut flat = mesh.clone();
     flat.try_duplicate_vertices().ok()?;
+    let folded = folded_normals(&flat);
     flat.try_compute_flat_normals().ok()?;
+    if !folded.is_empty() {
+        let VertexAttributeValues::Float32x3(normals) =
+            flat.attribute_mut(Mesh::ATTRIBUTE_NORMAL)?
+        else {
+            return None;
+        };
+        for (index, original) in folded {
+            normals[index..index + 3].copy_from_slice(&original);
+        }
+    }
     if mesh.try_has_morph_targets().ok()? {
         let count = mesh.count_vertices();
         let source: Vec<_> = match mesh.indices() {
@@ -60,6 +71,35 @@ fn face_mesh(mesh: &Mesh) -> Option<Mesh> {
         flat.set_morph_targets(remapped);
     }
     Some(flat)
+}
+
+/// A bound membrane can open after posing. Its collapsed rest triangle has no geometric normal.
+fn folded_normals(flat: &Mesh) -> Vec<(usize, [[f32; 3]; 3])> {
+    let (
+        Some(_),
+        Some(VertexAttributeValues::Float32x3(p)),
+        Some(VertexAttributeValues::Float32x3(n)),
+    ) = (
+        flat.attribute(Mesh::ATTRIBUTE_JOINT_INDEX),
+        flat.attribute(Mesh::ATTRIBUTE_POSITION),
+        flat.attribute(Mesh::ATTRIBUTE_NORMAL),
+    )
+    else {
+        return Vec::new();
+    };
+    p.as_chunks::<3>()
+        .0
+        .iter()
+        .zip(n.as_chunks::<3>().0)
+        .enumerate()
+        .filter_map(|(i, (tri, normals))| {
+            let [a, b, c] = tri.map(Vec3::from_array);
+            let u = b - a;
+            let v = c - a;
+            let tol = 4. * f32::EPSILON * u.length_squared().max(v.length_squared());
+            (u.cross(v).length_squared() <= tol * tol).then_some((i * 3, *normals))
+        })
+        .collect()
 }
 
 pub(super) fn update(
@@ -104,6 +144,25 @@ mod tests {
     use bevy::mesh::{Indices, VertexAttributeValues};
 
     use super::*;
+
+    #[test]
+    fn closed_skinned_seam_keeps_authored_normals_for_its_animated_opening() {
+        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all());
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[0., 0., 0.], [1., 0., 0.], [0., 0., 0.]],
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0., 0., 1.]; 3]);
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_JOINT_INDEX,
+            VertexAttributeValues::Uint16x4(vec![[0; 4], [0; 4], [1, 0, 0, 0]]),
+        );
+        let fixed = face_mesh(&mesh).expect("skinned seam");
+        assert_eq!(
+            fixed.attribute(Mesh::ATTRIBUTE_NORMAL),
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        );
+    }
 
     #[test]
     fn splits_normals_at_a_crease_without_changing_vertex_skinning() {

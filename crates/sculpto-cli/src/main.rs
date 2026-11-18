@@ -38,7 +38,7 @@ commands:
   actor pack-cloth [options] pack baked cloth into an unchanged GLB actor
   actor pose [options]  probe named joints at explicit angles; posed GLB + report
   actor knee-fold [options] distribute knee weights and bake angle-driven crease shapes
-  actor hybrid [options] fit rigid limb sections under the A-pose skin and graft native pelvic helpers
+  actor hybrid [options] cut A-pose parts along shared rims, seal opening gaps and graft pelvic helpers
   actor gait [options]  generate a symmetric walk cycle from parameters; GLB + report
   actor adapt [options] adapt a clip authored on ANY skeleton onto the actor's palette
   actor rig-regression --config FILE [--report FILE]
