@@ -422,6 +422,10 @@ pub(crate) fn display_to_source([x, y, z]: [f32; 3]) -> [f32; 3] {
     [x, -z, y]
 }
 
+pub(crate) fn source_to_display([x, y, z]: [f32; 3]) -> [f32; 3] {
+    [x, z, -y]
+}
+
 pub fn pick_shape<'a>(
     shapes: &'a [NifShape],
     name: Option<&str>,
@@ -471,8 +475,8 @@ pub fn write_obj_uv(
         out,
         "# sculpto: Y-up display frame from source Z-up (x, z, -y)"
     )?;
-    for [x, y, z] in positions {
-        writeln!(out, "v {x} {z} {}", -y)?;
+    for [x, y, z] in positions.iter().copied().map(source_to_display) {
+        writeln!(out, "v {x} {y} {z}")?;
     }
     let with_uv = !uvs.is_empty() && uvs.len() == positions.len();
     if with_uv {

@@ -693,12 +693,14 @@ version = "0.3.1"
 dependencies = [
  "glam 0.34.3",
  "gltf",
+ "nalgebra",
  "robust",
  "sculpto-core",
  "sculpto-gltf",
  "sculpto-nif",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -28,6 +28,7 @@ pub mod joints;
 pub mod knee_fold;
 pub mod measures;
 pub mod medial;
+mod neutralize;
 pub mod obj;
 pub mod ops;
 mod parts;
@@ -66,6 +67,8 @@ pub enum CommandId {
     BodyAssemble,
     /// Audit attached body parts against their sockets; read-only.
     BodyAuditParts,
+    /// Neutralize local chest relief on compatible baked bodies.
+    BodyNeutralize,
     /// Seal open joint rims (neck, wrists, ankles) into one watertight, smoothed
     /// seam.
     BodySealJoints,
@@ -132,6 +135,7 @@ impl CommandId {
             CommandId::BlenderClothCheck => "blender.cloth_check",
             CommandId::BodyAssemble => "body.assemble",
             CommandId::BodyAuditParts => "body.audit_parts",
+            CommandId::BodyNeutralize => "body.neutralize",
             CommandId::BodySealJoints => "body.seal_joints",
             CommandId::OutfitFit => "outfit.fit",
             CommandId::OutfitStackFit => "outfit.stack_fit",
@@ -372,6 +376,14 @@ const COMMANDS: &[Spec] = &[
         stub: false,
         schema: parts::schema,
         handler: parts::audit,
+    },
+    Spec {
+        id: CommandId::BodyNeutralize,
+        summary: "Bake BodySlide presets, neutralize the local chest relief on compatible topology and write one static GLB per endpoint.",
+        mutates: true,
+        stub: false,
+        schema: neutralize::schema,
+        handler: neutralize::run,
     },
     Spec {
         id: CommandId::BodySealJoints,

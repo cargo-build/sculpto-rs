@@ -44,6 +44,7 @@ pub mod intake_gltf;
 pub mod joint_seal;
 pub mod layer_stack;
 pub mod mask;
+pub mod neutralize;
 pub mod outfit;
 pub mod parts;
 mod point_query;

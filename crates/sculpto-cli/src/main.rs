@@ -6,6 +6,7 @@
 
 mod actor;
 mod blender;
+mod body_neutralize;
 mod garment_control;
 mod garment_uv;
 mod mcp;
@@ -60,6 +61,8 @@ commands:
                         place and concatenate the declared parts, then seal the joints
   body audit-parts [options]
                         audit attached body parts against their sockets (read-only)
+  body neutralize [options]
+                        bake a list of presets and write neutral static GLBs
   body seal-joints --body <obj> --out <obj> --joint <part>:<socket>[:seat]
                         seal open joint rims (neck, wrists); report boundary counts
   outfit inspect --nif <path> [--manifest <json>] report shape roles and cloth selection
@@ -385,6 +388,9 @@ fn main() -> ExitCode {
         }
         [command, action, rest @ ..] if command == "body" && action == "audit-parts" => {
             body_audit_parts(rest)
+        }
+        [command, action, rest @ ..] if command == "body" && action == "neutralize" => {
+            body_neutralize::run(rest)
         }
         [command, action, rest @ ..] if command == "body" && action == "seal-joints" => {
             body_seal_joints(rest)
@@ -3320,28 +3326,14 @@ fn batch_inner(args: &[String]) -> Result<(), String> {
         "small" => SliderSize::Small,
         other => return Err(format!("`--endpoint` must be big or small, got `{other}`")),
     };
-    let project = match Document::parse_file(&project_path).map_err(|e| e.to_string())? {
-        Document::Project(project) => project,
-        Document::Presets(_) => return Err(format!("{} is not a project", project_path.display())),
-    };
-    let presets = match Document::parse_file(&presets_path).map_err(|e| e.to_string())? {
-        Document::Presets(presets) => presets,
-        Document::Project(_) => {
-            return Err(format!("{} is not a presets file", presets_path.display()));
-        }
-    };
+    let project = ops::read_bake_project(&project_path).map_err(|error| error.to_string())?;
+    let presets = ops::read_bake_presets(&presets_path).map_err(|error| error.to_string())?;
     let preset = presets
         .iter()
         .find(|preset| preset.name == preset_name)
         .ok_or_else(|| format!("preset `{preset_name}` not found"))?;
-    let home = match flags.get("home") {
-        Some(home) => PathBuf::from(home),
-        None => project_path
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| "cannot derive the BodySlide home; pass `--home`".to_string())?
-            .to_path_buf(),
-    };
+    let home = ops::bake_home(&project_path, flags.get("home").map(Path::new))
+        .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
 
     let mut built = 0usize;
@@ -3367,20 +3359,8 @@ fn batch_inner(args: &[String]) -> Result<(), String> {
                 continue;
             }
         };
-        let source = home
-            .join("ShapeData")
-            .join(set.data_folder.replace('\\', "/"))
-            .join(&set.source_file);
-        let bytes = match std::fs::read(&source) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                println!("FAIL {}: {}: {error}", set.name, source.display());
-                failed += 1;
-                continue;
-            }
-        };
-        let document = match sculpto_nif::read(&bytes) {
-            Ok(document) => document,
+        let document = match ops::read_bake_source(&home, set, None) {
+            Ok((_, document)) => document,
             Err(error) => {
                 println!("FAIL {}: {error}", set.name);
                 failed += 1;
@@ -3389,7 +3369,7 @@ fn batch_inner(args: &[String]) -> Result<(), String> {
         };
         let mut shapes_written = 0usize;
         for shape in &document.shapes {
-            let baked = match plan.apply(&shape.name, &shape.positions) {
+            let baked = match ops::BakedShape::apply(&plan, shape, &shape.name) {
                 Ok(baked) => baked,
                 Err(error) => {
                     println!("FAIL {} / {}: {error}", set.name, shape.name);
@@ -3401,8 +3381,8 @@ fn batch_inner(args: &[String]) -> Result<(), String> {
                 sanitize(&set.name),
                 sanitize(&shape.name)
             ));
-            if let Err(error) = write_obj(&file, &baked, &shape.triangles) {
-                println!("FAIL {}: {}: {error}", set.name, file.display());
+            if let Err(error) = baked.write_obj(&file) {
+                println!("FAIL {}: {error}", set.name);
                 continue;
             }
             shapes_written += 1;

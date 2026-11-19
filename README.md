@@ -90,6 +90,32 @@ Real-data tests are optional and read an explicitly supplied private fixture:
 SCULPTO_BODYSLIDE_HOME=/path/to/BodySlide cargo test -p sculpto-core --test real_data
 ```
 
+### Neutralize body presets
+
+```sh
+target/debug/sculpto body neutralize --project "$BS_HOME/SliderSets/SE 3BBB Amazing.osp" \
+  --presets "$BS_HOME/SliderPresets/MyBodies.xml" \
+  --preset "Body A" --preset "Body B" --out neutral-bodies
+```
+
+Repeat `--project` and `--presets` to supply multiple files. Omit `--preset`
+to select all entries. Each preset's authored set is used by default. `--set`
+and `--shape` can select an explicit set and body shape. The default shape
+selection follows `bake`.
+
+The command applies the preset's position sliders, reconstructs two local
+chest patches and writes untextured static GLBs in metres. The first profile
+matches the ordered vertex topology of `CBBE 3BBB Body Amazing` v2. It keeps
+the rim, volume, indices and the bake's UVs. The report names any deferred bake
+sliders. `--endpoint both` is the default. A weighted set writes `_0` and `_1`;
+use `small` or `big` for one endpoint.
+
+The JSON envelope lists `processed` and `skipped` rows. An unmatched topology,
+an active body zap or a failed geometric check skips that endpoint and the
+batch continues. Output filenames include the preset's selection order and
+existing files are preserved. `sculpto commands --json` exposes the same
+operation as `body.neutralize`.
+
 ## Layout
 
 | Path | Responsibility |

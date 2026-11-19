@@ -46,11 +46,15 @@ use crate::obj::{
     pick_shape, pick_shape_index, read_obj_positions, read_obj_surface, write_obj, write_obj_uv,
 };
 
+mod body_bake;
 mod dress;
 mod head;
 mod mesh_densify;
 mod slider;
 mod stack_fit;
+pub use body_bake::{
+    BakedShape, bake_home, read_bake_presets, read_bake_project, read_bake_source,
+};
 pub use dress::{DressMeasurements, DressOutcome, DressParams, dress_garment};
 pub use head::{
     AssignedShape, BodiesConfig, BodyDescriptor, CheckStatus, CompatibilityCheck,
@@ -364,37 +368,13 @@ pub struct BakeOutcome {
 /// Resolve a preset and write the morphed shape as an OBJ.
 pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
     let size = endpoint("endpoint", &params.endpoint)?;
-    let project = match Document::parse_file(&params.project).map_err(errors::document)? {
-        Document::Project(project) => project,
-        Document::Presets(_) => {
-            return Err(errors::invalid(
-                "project",
-                format!("{} is not a project", params.project.display()),
-            ));
-        }
-    };
-    let presets = match Document::parse_file(&params.presets).map_err(errors::document)? {
-        Document::Presets(presets) => presets,
-        Document::Project(_) => {
-            return Err(errors::invalid(
-                "presets",
-                format!("{} is not a presets file", params.presets.display()),
-            ));
-        }
-    };
+    let project = read_bake_project(&params.project)?;
+    let presets = read_bake_presets(&params.presets)?;
     let preset = presets
         .iter()
         .find(|preset| preset.name == params.preset)
         .ok_or_else(|| errors::not_found("preset", &params.preset))?;
-    let home = match &params.home {
-        Some(home) => home.clone(),
-        None => params
-            .project
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| errors::invalid("home", "cannot derive the BodySlide home; pass it"))?
-            .to_path_buf(),
-    };
+    let home = bake_home(&params.project, params.home.as_deref())?;
     let set = project
         .sets
         .iter()
@@ -443,27 +423,18 @@ pub fn bake(params: &BakeParams) -> Result<BakeOutcome, CommandError> {
             detail: detail.to_string(),
         }));
     }
-    let source = match &params.source {
-        Some(source) => source.clone(),
-        None => home
-            .join("ShapeData")
-            .join(set.data_folder.replace('\\', "/"))
-            .join(&set.source_file),
-    };
-    let bytes = std::fs::read(&source).map_err(|error| errors::io(&source, error))?;
-    let document = sculpto_nif::read(&bytes).map_err(errors::nif)?;
+    let (_, document) = read_bake_source(&home, set, params.source.as_deref())?;
     let shape = pick_shape(&document.shapes, params.shape.as_deref())?;
     let target = set.target_for_shape(&shape.name).unwrap_or(&shape.name);
-    let baked = plan.apply(target, &shape.positions).map_err(errors::bake)?;
-    write_obj(&params.out, &baked, &shape.triangles)
-        .map_err(|error| errors::io(&params.out, error))?;
+    let baked = BakedShape::apply(&plan, shape, target)?;
+    baked.write_obj(&params.out)?;
     Ok(BakeOutcome {
         out: params.out.clone(),
         endpoint: match size {
             SliderSize::Big => "big",
             SliderSize::Small => "small",
         },
-        vertices: baked.len(),
+        vertices: baked.positions.len(),
         triangles: shape.triangles.len(),
         sliders: plan.sliders.len(),
         unresolved: plan.unresolved.len(),

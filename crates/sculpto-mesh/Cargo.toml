@@ -8,12 +8,14 @@ license.workspace = true
 
 [dependencies]
 glam.workspace = true
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 robust = "1"
 gltf = { version = "1", default-features = false, features = ["utils", "names", "extras"] }
 sculpto-core.workspace = true
 sculpto-gltf.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 sculpto-nif.workspace = true

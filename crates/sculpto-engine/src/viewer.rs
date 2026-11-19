@@ -26,7 +26,7 @@ use crate::obj::{ObjMesh, read_error, read_obj_mesh};
 use crate::{CommandError, ErrorKind, errors};
 
 /// BodySlide units per metre: the source OBJ frame is centimetre-like.
-const UNITS_PER_METRE: f32 = 71.4286;
+pub(crate) const UNITS_PER_METRE: f32 = 71.4286;
 
 /// The command input. `layers` and `outfit` are alternative routes to the same
 /// layer list; giving both is a refusal, not an undefined merge.
