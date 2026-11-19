@@ -5,6 +5,8 @@ use std::fmt;
 use boethos::{Kind, Put, Ref, Store, StoreError, StoreResult};
 use serde::{Deserialize, Serialize};
 
+use crate::face_labels::retain_face_labels;
+
 const FAVORITE: &str = "favorite";
 const PREVIEW: &str = "preview";
 
@@ -270,15 +272,18 @@ pub fn change_favorite(store: &Store, id: &str, change: FavoriteChange) -> Store
     Ok(outcome.is_some())
 }
 
-/// Refresh an indexed asset while retaining its operator-selected favorite tag.
+/// Refresh an indexed asset while retaining operator labels.
 pub fn refresh_asset(store: &Store, asset: &Asset) -> StoreResult<Put> {
     let outcome = store.update::<Assets>(&asset.id, |previous| {
         if previous.as_ref() == Some(asset) {
             return None;
         }
         let mut refreshed = asset.clone();
-        if previous.as_ref().is_some_and(is_favorite) {
-            mark_favorite(&mut refreshed);
+        if let Some(previous) = previous.as_ref() {
+            if is_favorite(previous) {
+                mark_favorite(&mut refreshed);
+            }
+            retain_face_labels(previous, &mut refreshed);
         }
         (previous.as_ref() != Some(&refreshed)).then_some(refreshed)
     })?;

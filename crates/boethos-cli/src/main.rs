@@ -13,9 +13,9 @@ use std::process::ExitCode;
 
 use boethos::Store;
 use boethos_catalogue::{
-    Asset, Assets, BodyPartInput, Category, FavoriteChange, IndexOptions, RawPartInput, Sex,
-    attach_preview, body_part_asset, change_favorite, index_file, index_root, preset_previews,
-    raw_part_asset, read_clips, refresh_asset,
+    Asset, Assets, BodyPartInput, Category, FaceClassification, FavoriteChange, IndexOptions,
+    RawPartInput, Sex, attach_preview, body_part_asset, change_favorite, classify_faces,
+    index_file, index_root, preset_previews, raw_part_asset, read_clips, refresh_asset,
 };
 
 fn main() -> ExitCode {
@@ -139,13 +139,7 @@ fn spec(command: &str) -> Option<Spec> {
             repeat: &[],
             max_positionals: 0,
         },
-        "import-parts" => Spec {
-            values: &["--manifest"],
-            switches: &["--json"],
-            repeat: &[],
-            max_positionals: 0,
-        },
-        "import-raw-parts" => Spec {
+        "import-parts" | "import-raw-parts" | "classify-faces" => Spec {
             values: &["--manifest"],
             switches: &["--json"],
             repeat: &[],
@@ -327,6 +321,8 @@ commands:
         import measured body-part shapes from JSONL
   import-raw-parts --manifest PATH [--json]
         import split raw-model parts from JSONL
+  classify-faces --manifest PATH [--json]
+        apply race, sex, hair color, style and source tags to indexed faces
   export PATH
         write one JSON object per record, in identity order
   help, --help, --version
@@ -361,6 +357,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         "stats" => command_stats(cli),
         "import-parts" => command_import_parts(cli),
         "import-raw-parts" => command_import_raw_parts(cli),
+        "classify-faces" => command_classify_faces(cli),
         "export" => command_export(cli),
         other => Err(format!("unknown command {other:?}; run `boethos help`")),
     }
@@ -797,13 +794,34 @@ fn command_import_raw_parts(cli: &Cli) -> Result<(), String> {
     import_manifest::<RawPartInput, _>(cli, manifest, "raw part", raw_part_asset)
 }
 
-fn import_manifest<T, F>(cli: &Cli, manifest: &str, noun: &str, build: F) -> Result<(), String>
-where
-    T: serde::de::DeserializeOwned,
-    F: Fn(&T) -> Result<Asset, String>,
-{
+fn command_classify_faces(cli: &Cli) -> Result<(), String> {
+    let manifest = cli
+        .value("--manifest")
+        .ok_or_else(|| "classify-faces requires --manifest PATH".to_string())?;
+    let labels = read_manifest::<FaceClassification, _>(manifest, "face classification", Ok)?;
+    let store = open_write_existing(cli)?;
+    let updated =
+        classify_faces(&store, &labels).map_err(|error| format!("{manifest}: {error}"))?;
+    let records = labels.len();
+    let unchanged = records - updated;
+    if cli.has("--json") {
+        println!(
+            "{}",
+            serde_json::json!({"records": records, "updated": updated, "unchanged": unchanged})
+        );
+    } else {
+        println!("classified {records} faces: updated {updated}, unchanged {unchanged}");
+    }
+    Ok(())
+}
+
+fn read_manifest<T: serde::de::DeserializeOwned, R>(
+    manifest: &str,
+    noun: &str,
+    build: impl Fn(T) -> Result<R, String>,
+) -> Result<Vec<R>, String> {
     let text = fs::read_to_string(manifest).map_err(|error| format!("{manifest}: {error}"))?;
-    let mut assets = Vec::new();
+    let mut records = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -811,12 +829,21 @@ where
         }
         let input: T = serde_json::from_str(line)
             .map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
-        let asset = build(&input).map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
-        assets.push(asset);
+        let row = build(input).map_err(|error| format!("{manifest}:{}: {error}", index + 1))?;
+        records.push(row);
     }
-    if assets.is_empty() {
+    if records.is_empty() {
         return Err(format!("{manifest}: no {noun} records"));
     }
+    Ok(records)
+}
+
+fn import_manifest<T, F>(cli: &Cli, manifest: &str, noun: &str, build: F) -> Result<(), String>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> Result<Asset, String>,
+{
+    let assets = read_manifest(manifest, noun, |input| build(&input))?;
     let total = assets.len();
     let store = open_write_existing(cli)?;
     let mut inserted = 0usize;

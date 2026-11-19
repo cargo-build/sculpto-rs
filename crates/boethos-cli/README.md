@@ -20,6 +20,7 @@ boethos list [--category C] [--sex S] [--family F] [--source S] [--tag T]
 boethos get ID [--json]
 boethos favorite ID [--remove]
 boethos preview PRESET_ID [IMAGE_ID] [--json]
+boethos classify-faces --manifest PATH [--json]
 boethos clips --glb PATH [--json]
 boethos delete ID
 boethos stats [--json]
@@ -41,6 +42,12 @@ asset identity preserves the tag.
 After indexing a preset and a review image, link them with
 `boethos preview PRESET_ID IMAGE_ID`. Running `boethos preview PRESET_ID`
 lists the linked image paths.
+
+Classify an indexed `face` or `face_preset` with a JSONL manifest of full
+asset IDs and the fields `sex`, `race`, `hair_color`, `hairstyle`,
+`hair_source` and optional `hairdo`. Use `dark`, `light`, `colored`, `none`
+or `unknown` for hair color. Other labels use lowercase English tokens such
+as `dark-elf` or `ks-hairdos`. Re-indexing preserves the applied tags.
 
 Exit `0` on success and `2` on a classified refusal. Errors name the path and
 the failing capability.

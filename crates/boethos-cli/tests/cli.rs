@@ -32,6 +32,102 @@ fn run(db: &Path, arguments: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn face_classification_validates_targets_and_survives_reindex() {
+    let root = temp_dir("face-classification");
+    fs::write(root.join("character.jslot"), "{}").expect("preset");
+    fs::write(root.join("reference.png"), []).expect("image");
+    let db = root.with_extension("redb");
+    let index = ["index", "--root", root.to_str().expect("root")];
+    let (code, _, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, records, stderr) = run(&db, &["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let records: Vec<serde_json::Value> = serde_json::from_str(&records).expect("assets");
+    let asset_id = |category| {
+        records
+            .iter()
+            .find(|asset| asset["category"] == category)
+            .expect("category")["id"]
+            .as_str()
+            .expect("id")
+    };
+    let id = asset_id("face_preset");
+    let (code, _, stderr) = run(&db, &["favorite", id]);
+    assert_eq!(code, 0, "{stderr}");
+    let face = |asset_id, hair_color| {
+        serde_json::json!({
+            "id": asset_id,
+            "sex": "female",
+            "race": "nord",
+            "hair_color": hair_color,
+            "hairstyle": "braid",
+            "hair_source": "ks-hairdos",
+            "hairdo": "sample-braid",
+        })
+    };
+    let manifest = root.with_extension("jsonl");
+    let classify = [
+        "classify-faces",
+        "--manifest",
+        manifest.to_str().expect("manifest"),
+        "--json",
+    ];
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n{}\n",
+            face(id, "dark"),
+            face(asset_id("image"), "dark")
+        ),
+    )
+    .expect("bad manifest");
+    let (code, _, stderr) = run(&db, &classify);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("expected face or face_preset"), "{stderr}");
+    let (code, initial, stderr) = run(&db, &["get", id, "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!initial.contains("race:nord"));
+
+    fs::write(&manifest, format!("{}\n", face(id, "dark"))).expect("manifest");
+    let (code, _, stderr) = run(&db, &classify);
+    assert_eq!(code, 0, "{stderr}");
+    fs::write(&manifest, format!("{}\n", face(id, "light"))).expect("new labels");
+    let (code, _, stderr) = run(&db, &classify);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, _, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, classified, stderr) = run(
+        &db,
+        &[
+            "list",
+            "--sex",
+            "female",
+            "--tag",
+            "race:nord",
+            "--tag",
+            "favorite",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let classified: Vec<serde_json::Value> = serde_json::from_str(&classified).expect("assets");
+    assert_eq!(classified.len(), 1);
+    assert_eq!(classified[0]["id"], id);
+    let tags = classified[0]["tags"].as_array().expect("tags");
+    assert!(tags.iter().any(|tag| tag == "hair-color:light"));
+    assert!(tags.iter().any(|tag| tag == "hairstyle:braid"));
+    assert!(tags.iter().any(|tag| tag == "hair-source:ks-hairdos"));
+    assert!(!tags.iter().any(|tag| tag == "hair-color:dark"));
+    let (code, report, stderr) = run(&db, &classify);
+    assert_eq!(code, 0, "{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&report).expect("report");
+    assert_eq!(report["unchanged"], 1);
+    let _ = fs::remove_file(manifest);
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn index_list_get_stats_export() {
     let root = temp_dir("root");
     fs::create_dir_all(root.join("SliderPresets")).expect("dirs");
