@@ -19,6 +19,7 @@ boethos list [--category C] [--sex S] [--family F] [--source S] [--tag T]
              [--name TEXT] [--offset N] [--limit N] [--json]
 boethos get ID [--json]
 boethos favorite ID [--remove]
+boethos preview PRESET_ID [IMAGE_ID] [--json]
 boethos clips --glb PATH [--json]
 boethos delete ID
 boethos stats [--json]
@@ -36,6 +37,10 @@ database. `--json` prints one document; text `list` prints `id`, `category`,
 Mark an asset with `boethos favorite ID` and find it with `boethos list --tag favorite`.
 Use `boethos favorite ID --remove` to clear the tag. A refresh of the same
 asset identity preserves the tag.
+
+After indexing a preset and a review image, link them with
+`boethos preview PRESET_ID IMAGE_ID`. Running `boethos preview PRESET_ID`
+lists the linked image paths.
 
 Exit `0` on success and `2` on a classified refusal. Errors name the path and
 the failing capability.

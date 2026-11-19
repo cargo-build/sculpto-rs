@@ -128,6 +128,54 @@ fn favorite_survives_reindex_and_can_be_removed() {
 }
 
 #[test]
+fn preview_links_only_the_selected_preset_across_reindex() {
+    let root = temp_dir("preset-previews");
+    let presets = root.join("SliderPresets");
+    fs::create_dir_all(&presets).expect("preset directory");
+    fs::write(presets.join("First.xml"), "<SliderPresets/>").expect("first");
+    fs::write(presets.join("Second.xml"), "<SliderPresets/>").expect("second");
+    fs::write(root.join("Review.png"), b"image").expect("image fixture");
+    let db = root.with_extension("redb");
+    let index = ["index", "--root", root.to_str().expect("root")];
+    let (code, _, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+
+    let (code, output, stderr) = run(&db, &["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&output).expect("assets");
+    let id = |name| {
+        rows.iter()
+            .find(|asset| asset["name"] == name)
+            .expect("asset")["id"]
+            .as_str()
+            .expect("id")
+    };
+    let first = id("First.xml");
+    let second = id("Second.xml");
+    let image = id("Review.png");
+    let (code, _, stderr) = run(&db, &["preview", first, second]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("expected image"), "{stderr}");
+    for _ in 0..2 {
+        let (code, output, stderr) = run(&db, &["preview", &first[..8], image, "--json"]);
+        assert_eq!(code, 0, "{stderr}");
+        let previews: Vec<serde_json::Value> = serde_json::from_str(&output).expect("previews");
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["id"], image);
+    }
+    let (code, _, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, output, stderr) = run(&db, &["preview", first]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(output.contains(image));
+    let (code, output, stderr) = run(&db, &["preview", second, "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(output.trim(), "[]");
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn missing_db_value_is_refused() {
     let root = temp_dir("db-missing");
     let output = Command::new(env!("CARGO_BIN_EXE_boethos"))

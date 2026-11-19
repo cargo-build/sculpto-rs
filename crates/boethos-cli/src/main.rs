@@ -14,8 +14,8 @@ use std::process::ExitCode;
 use boethos::Store;
 use boethos_catalogue::{
     Asset, Assets, BodyPartInput, Category, FavoriteChange, IndexOptions, RawPartInput, Sex,
-    body_part_asset, change_favorite, index_file, index_root, raw_part_asset, read_clips,
-    refresh_asset,
+    attach_preview, body_part_asset, change_favorite, index_file, index_root, preset_previews,
+    raw_part_asset, read_clips, refresh_asset,
 };
 
 fn main() -> ExitCode {
@@ -114,6 +114,12 @@ fn spec(command: &str) -> Option<Spec> {
             switches: &["--remove"],
             repeat: &[],
             max_positionals: 1,
+        },
+        "preview" => Spec {
+            values: &[],
+            switches: &["--json"],
+            repeat: &[],
+            max_positionals: 2,
         },
         "clips" => Spec {
             values: &["--glb"],
@@ -308,6 +314,8 @@ commands:
         print one asset; accepts an unambiguous 8+ character id prefix
   favorite ID [--remove]
         add or remove the favorite tag; query with list --tag favorite
+  preview PRESET_ID [IMAGE_ID] [--json]
+        list a preset's preview images, or attach an indexed image and list them
   clips --glb PATH [--json]
         read the animations embedded in a glb/gltf actor: name, channels,
         keyframes, duration, driven nodes and palette coverage
@@ -347,6 +355,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         "list" => command_list(cli),
         "get" => command_get(cli),
         "favorite" => command_favorite(cli),
+        "preview" => command_preview(cli),
         "clips" => command_clips(cli),
         "delete" => command_delete(cli),
         "stats" => command_stats(cli),
@@ -682,6 +691,36 @@ fn command_favorite(cli: &Cli) -> Result<(), String> {
         }
         false => Err(format!("asset {requested} not found")),
     }
+}
+
+fn command_preview(cli: &Cli) -> Result<(), String> {
+    let requested = cli
+        .positionals
+        .first()
+        .ok_or_else(|| "preview requires a preset id".to_string())?;
+    let image_id = cli.positionals.get(1);
+    let store = match image_id {
+        Some(_) => open_write_existing(cli)?,
+        None => open_read(cli)?,
+    };
+    let preset = find_asset(&store, requested)?;
+    if let Some(image_id) = image_id {
+        let image = find_asset(&store, image_id)?;
+        attach_preview(&store, &preset, &image).map_err(|error| error.to_string())?;
+    }
+    let previews = preset_previews(&store, &preset).map_err(|error| error.to_string())?;
+    if cli.has("--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&previews).map_err(|error| error.to_string())?
+        );
+    } else {
+        for image in &previews {
+            println!("{}\t{}", image.id, escape_field(&image.path));
+        }
+        println!("{} previews", previews.len());
+    }
+    Ok(())
 }
 
 fn command_delete(cli: &Cli) -> Result<(), String> {

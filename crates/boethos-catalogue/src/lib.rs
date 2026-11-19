@@ -18,8 +18,8 @@ pub use bsa::{BsaError, BsaIndex, TextureSource, index_bsa, resolve_texture};
 pub use clip::{ClipDocument, ClipInfo, clip_asset, read_clips};
 pub use index::{IndexOptions, IndexReport, index_file, index_root};
 pub use model::{
-    Asset, Assets, Category, ClipDetails, FavoriteChange, Sex, Status, change_favorite,
-    refresh_asset,
+    Asset, Assets, Category, ClipDetails, FavoriteChange, Sex, Status, attach_preview,
+    change_favorite, preset_previews, refresh_asset,
 };
 pub use raw_part::{RawPartInput, raw_part_asset};
 

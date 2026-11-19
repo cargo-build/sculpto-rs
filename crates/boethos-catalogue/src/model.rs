@@ -2,10 +2,11 @@
 
 use std::fmt;
 
-use boethos::{Kind, Put, Store, StoreResult};
+use boethos::{Kind, Put, Ref, Store, StoreError, StoreResult};
 use serde::{Deserialize, Serialize};
 
 const FAVORITE: &str = "favorite";
+const PREVIEW: &str = "preview";
 
 /// What an indexed file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -292,4 +293,46 @@ fn mark_favorite(asset: &mut Asset) {
     if !is_favorite(asset) {
         asset.tags.push(FAVORITE.to_string());
     }
+}
+
+/// Link an indexed image to a body preset. Repeated attachments are idempotent.
+pub fn attach_preview(store: &Store, preset: &Asset, image: &Asset) -> StoreResult<bool> {
+    require_category(preset, Category::Preset)?;
+    require_category(image, Category::Image)?;
+    store.link(asset_ref(preset), PREVIEW, asset_ref(image))
+}
+
+/// Resolve a body preset's preview links to currently indexed images.
+pub fn preset_previews(store: &Store, preset: &Asset) -> StoreResult<Vec<Asset>> {
+    require_category(preset, Category::Preset)?;
+    store
+        .links_from(asset_ref(preset))?
+        .into_iter()
+        .filter(|link| link.relation == PREVIEW && link.to_kind == Assets::NAME)
+        .filter_map(|link| match store.get::<Assets>(&link.to_id) {
+            Ok(Some(image)) if image.category == Category::Image => Some(Ok(image)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn asset_ref(asset: &Asset) -> Ref<'_> {
+    Ref {
+        kind: Assets::NAME,
+        id: &asset.id,
+    }
+}
+
+fn require_category(asset: &Asset, expected: Category) -> StoreResult<()> {
+    if asset.category == expected {
+        return Ok(());
+    }
+    Err(StoreError::Validation {
+        kind: Assets::NAME,
+        detail: format!(
+            "{} has category {}, expected {expected}",
+            asset.id, asset.category
+        ),
+    })
 }
