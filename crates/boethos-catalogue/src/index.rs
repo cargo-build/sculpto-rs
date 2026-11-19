@@ -9,7 +9,7 @@ use boethos::{Put, Store};
 use sha2::{Digest, Sha256};
 
 use crate::archive::archive_members;
-use crate::model::{Asset, Assets, Category, Sex, Status};
+use crate::model::{Asset, Assets, Category, Sex, Status, refresh_asset};
 
 const ARCHIVE_EXTENSIONS: [&str; 4] = ["7z", "zip", "rar", "bsa"];
 const IGNORED_DIRS: [&str; 5] = [".git", ".jj", "__pycache__", "node_modules", "target"];
@@ -465,18 +465,7 @@ fn index_archive(
 
 fn write(store: &Store, asset: &Asset, seen: &mut HashSet<String>, report: &mut IndexReport) {
     seen.insert(asset.id.clone());
-    match store.get::<Assets>(&asset.id) {
-        Ok(Some(existing)) if &existing == asset => {
-            report.unchanged += 1;
-            return;
-        }
-        Ok(_) => {}
-        Err(error) => {
-            report.errors.push(format!("{}: {error}", asset.path));
-            return;
-        }
-    }
-    match store.upsert::<Assets>(&asset.id, asset) {
+    match refresh_asset(store, asset) {
         Ok(Put::Inserted) => report.inserted += 1,
         Ok(Put::Replaced) => report.updated += 1,
         Ok(Put::Exists) => report.unchanged += 1,

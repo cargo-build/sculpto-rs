@@ -80,6 +80,54 @@ fn index_list_get_stats_export() {
 }
 
 #[test]
+fn favorite_survives_reindex_and_can_be_removed() {
+    let root = temp_dir("favorite");
+    let preset = root.join("SliderPresets/Emily.xml");
+    fs::create_dir_all(root.join("SliderPresets")).expect("preset directory");
+    fs::write(&preset, "<SliderPresets/>").expect("preset");
+    let db = root.with_extension("redb");
+    let index = ["index", "--root", root.to_str().expect("root"), "--json"];
+    let (code, _, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+
+    let (code, output, stderr) = run(&db, &["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let assets: serde_json::Value = serde_json::from_str(&output).expect("assets");
+    let id = assets[0]["id"].as_str().expect("id");
+    for requested in [&id[..8], id] {
+        let (code, _, stderr) = run(&db, &["favorite", requested]);
+        assert_eq!(code, 0, "{stderr}");
+    }
+
+    fs::write(
+        &preset,
+        "<SliderPresets><Preset name=\"Emily\"/></SliderPresets>",
+    )
+    .expect("updated preset");
+    let (code, output, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&output).expect("index report");
+    assert_eq!(report["updated"], 1);
+
+    let favorites = ["list", "--tag", "favorite", "--json"];
+    let (code, output, stderr) = run(&db, &favorites);
+    assert_eq!(code, 0, "{stderr}");
+    let assets: serde_json::Value = serde_json::from_str(&output).expect("favorites");
+    assert_eq!(assets[0]["id"], id);
+    assert_eq!(assets[0]["tags"], serde_json::json!(["favorite"]));
+
+    for _ in 0..2 {
+        let (code, _, stderr) = run(&db, &["favorite", id, "--remove"]);
+        assert_eq!(code, 0, "{stderr}");
+    }
+    let (code, output, stderr) = run(&db, &favorites);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(output.trim(), "[]");
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn missing_db_value_is_refused() {
     let root = temp_dir("db-missing");
     let output = Command::new(env!("CARGO_BIN_EXE_boethos"))

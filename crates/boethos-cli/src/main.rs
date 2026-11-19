@@ -13,8 +13,9 @@ use std::process::ExitCode;
 
 use boethos::Store;
 use boethos_catalogue::{
-    Asset, Assets, BodyPartInput, Category, IndexOptions, RawPartInput, Sex, body_part_asset,
-    index_file, index_root, raw_part_asset, read_clips,
+    Asset, Assets, BodyPartInput, Category, FavoriteChange, IndexOptions, RawPartInput, Sex,
+    body_part_asset, change_favorite, index_file, index_root, raw_part_asset, read_clips,
+    refresh_asset,
 };
 
 fn main() -> ExitCode {
@@ -105,6 +106,12 @@ fn spec(command: &str) -> Option<Spec> {
         "get" => Spec {
             values: &[],
             switches: &["--json"],
+            repeat: &[],
+            max_positionals: 1,
+        },
+        "favorite" => Spec {
+            values: &[],
+            switches: &["--remove"],
             repeat: &[],
             max_positionals: 1,
         },
@@ -299,6 +306,8 @@ commands:
         list indexed assets; --name is a case-insensitive substring
   get ID [--json]
         print one asset; accepts an unambiguous 8+ character id prefix
+  favorite ID [--remove]
+        add or remove the favorite tag; query with list --tag favorite
   clips --glb PATH [--json]
         read the animations embedded in a glb/gltf actor: name, channels,
         keyframes, duration, driven nodes and palette coverage
@@ -337,6 +346,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         "index" => command_index(cli),
         "list" => command_list(cli),
         "get" => command_get(cli),
+        "favorite" => command_favorite(cli),
         "clips" => command_clips(cli),
         "delete" => command_delete(cli),
         "stats" => command_stats(cli),
@@ -654,6 +664,26 @@ fn command_clips(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+fn command_favorite(cli: &Cli) -> Result<(), String> {
+    let requested = cli
+        .positionals
+        .first()
+        .ok_or_else(|| "favorite requires an asset id".to_string())?;
+    let store = open_write_existing(cli)?;
+    let asset = find_asset(&store, requested)?;
+    let (change, action) = match cli.has("--remove") {
+        true => (FavoriteChange::Remove, "cleared favorite"),
+        false => (FavoriteChange::Add, "set favorite"),
+    };
+    match change_favorite(&store, &asset.id, change).map_err(|error| error.to_string())? {
+        true => {
+            println!("{action}: {}", asset.id);
+            Ok(())
+        }
+        false => Err(format!("asset {requested} not found")),
+    }
+}
+
 fn command_delete(cli: &Cli) -> Result<(), String> {
     let requested = cli
         .positionals
@@ -755,18 +785,7 @@ where
     let mut unchanged = 0usize;
     let mut errors = Vec::new();
     for asset in assets {
-        match store.get::<Assets>(&asset.id) {
-            Ok(Some(existing)) if existing == asset => {
-                unchanged += 1;
-                continue;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                errors.push(format!("{}: {error}", asset.path));
-                continue;
-            }
-        }
-        match store.upsert::<Assets>(&asset.id, &asset) {
+        match refresh_asset(&store, &asset) {
             Ok(boethos::Put::Inserted) => inserted += 1,
             Ok(boethos::Put::Replaced) => updated += 1,
             Ok(boethos::Put::Exists) => unchanged += 1,

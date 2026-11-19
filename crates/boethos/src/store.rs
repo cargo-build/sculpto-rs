@@ -15,14 +15,14 @@ const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("records");
 const LINKS: TableDefinition<&str, ()> = TableDefinition::new("links");
 const SEPARATOR: char = '\u{1f}';
 
-/// Outcome of a write that refuses to overwrite.
+/// Outcome of writing a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Put {
     /// The identity was free and the record was written.
     Inserted,
     /// The identity existed and the record was replaced by an upsert.
     Replaced,
-    /// The identity existed and the insert was refused.
+    /// The identity existed and its record was kept.
     Exists,
 }
 
@@ -102,6 +102,41 @@ impl Store {
     /// Write a record, replacing an existing identity.
     pub fn upsert<K: Kind>(&self, id: &str, record: &K::Record) -> StoreResult<Put> {
         self.write::<K>(id, record, true)
+    }
+
+    /// Edit the latest record inside one write transaction.
+    /// Returning `None` skips the write. The callback runs while the writer
+    /// is held and must not start another write on the store.
+    pub fn update<K: Kind>(
+        &self,
+        id: &str,
+        edit: impl FnOnce(Option<K::Record>) -> Option<K::Record>,
+    ) -> StoreResult<Option<Put>> {
+        let key = record_key(K::NAME, id)?;
+        let transaction = self.begin_write()?;
+        let outcome = {
+            let mut table = transaction.open_table(RECORDS)?;
+            let stored = table.get(key.as_str())?;
+            let previous = stored
+                .as_ref()
+                .map(|value| decode::<K>(value.value()))
+                .transpose()?;
+            let Some(record) = edit(previous) else {
+                return Ok(None);
+            };
+            validate_record::<K>(&record)?;
+            let bytes = encode::<K>(id, &record)?;
+            let outcome = match &stored {
+                Some(value) if value.value() == bytes.as_slice() => return Ok(Some(Put::Exists)),
+                Some(_) => Put::Replaced,
+                None => Put::Inserted,
+            };
+            drop(stored);
+            table.insert(key.as_str(), bytes.as_slice())?;
+            outcome
+        };
+        transaction.commit()?;
+        Ok(Some(outcome))
     }
 
     /// Read one record.
@@ -249,10 +284,7 @@ impl Store {
     }
 
     fn write<K: Kind>(&self, id: &str, record: &K::Record, replace: bool) -> StoreResult<Put> {
-        K::validate(record).map_err(|detail| StoreError::Validation {
-            kind: K::NAME,
-            detail,
-        })?;
+        validate_record::<K>(record)?;
         let key = record_key(K::NAME, id)?;
         let bytes = encode::<K>(id, record)?;
         let transaction = self.begin_write()?;
@@ -279,6 +311,13 @@ fn decode<K: Kind>(bytes: &[u8]) -> StoreResult<K::Record> {
     let envelope: RecordEnvelope<serde_json::Value> = serde_json::from_slice(bytes)?;
     check_version::<K>(envelope.version)?;
     Ok(serde_json::from_value(envelope.record)?)
+}
+
+fn validate_record<K: Kind>(record: &K::Record) -> StoreResult<()> {
+    K::validate(record).map_err(|detail| StoreError::Validation {
+        kind: K::NAME,
+        detail,
+    })
 }
 
 fn encode<K: Kind>(id: &str, record: &K::Record) -> StoreResult<Vec<u8>> {

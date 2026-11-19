@@ -213,6 +213,48 @@ fn concurrent_inserts_admit_exactly_one_writer() {
 }
 
 #[test]
+fn updates_to_the_same_record_see_each_others_writes() {
+    let path = temp_path("concurrent-updates");
+    let store = Store::open(&path).expect("open");
+    store
+        .insert::<Characters>("hero", &character("Hero"))
+        .expect("insert");
+    let ready = Barrier::new(2);
+    thread::scope(|threads| {
+        threads.spawn(|| {
+            ready.wait();
+            store
+                .update::<Characters>("hero", |record| {
+                    record.map(|mut record| {
+                        record.name = "Emily".to_string();
+                        record
+                    })
+                })
+                .expect("rename");
+        });
+        threads.spawn(|| {
+            ready.wait();
+            store
+                .update::<Characters>("hero", |record| {
+                    record.map(|mut record| {
+                        record.stage = "accepted".to_string();
+                        record
+                    })
+                })
+                .expect("update stage");
+        });
+    });
+    let result = store
+        .get::<Characters>("hero")
+        .expect("read")
+        .expect("hero");
+    assert_eq!(result.name, "Emily");
+    assert_eq!(result.stage, "accepted");
+    drop(store);
+    std::fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
 fn empty_identity_and_reserved_separator_are_refused() {
     let path = temp_path("keys");
     let store = Store::open(&path).expect("open");

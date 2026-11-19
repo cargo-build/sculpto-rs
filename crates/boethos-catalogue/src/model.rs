@@ -2,8 +2,10 @@
 
 use std::fmt;
 
-use boethos::Kind;
+use boethos::{Kind, Put, Store, StoreResult};
 use serde::{Deserialize, Serialize};
+
+const FAVORITE: &str = "favorite";
 
 /// What an indexed file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -241,5 +243,53 @@ impl Kind for Assets {
             return Err("path must not be empty".to_string());
         }
         Ok(())
+    }
+}
+
+/// Change to a user's favorite tag.
+#[derive(Debug, Clone, Copy)]
+pub enum FavoriteChange {
+    /// Add the tag if absent.
+    Add,
+    /// Remove the tag if present.
+    Remove,
+}
+
+/// Set or clear the tag. Returns false when the asset does not exist.
+pub fn change_favorite(store: &Store, id: &str, change: FavoriteChange) -> StoreResult<bool> {
+    let outcome = store.update::<Assets>(id, |asset| {
+        asset.map(|mut asset| {
+            match change {
+                FavoriteChange::Add => mark_favorite(&mut asset),
+                FavoriteChange::Remove => asset.tags.retain(|tag| tag != FAVORITE),
+            }
+            asset
+        })
+    })?;
+    Ok(outcome.is_some())
+}
+
+/// Refresh an indexed asset while retaining its operator-selected favorite tag.
+pub fn refresh_asset(store: &Store, asset: &Asset) -> StoreResult<Put> {
+    let outcome = store.update::<Assets>(&asset.id, |previous| {
+        if previous.as_ref() == Some(asset) {
+            return None;
+        }
+        let mut refreshed = asset.clone();
+        if previous.as_ref().is_some_and(is_favorite) {
+            mark_favorite(&mut refreshed);
+        }
+        (previous.as_ref() != Some(&refreshed)).then_some(refreshed)
+    })?;
+    Ok(outcome.unwrap_or(Put::Exists))
+}
+
+fn is_favorite(asset: &Asset) -> bool {
+    asset.tags.iter().any(|tag| tag == FAVORITE)
+}
+
+fn mark_favorite(asset: &mut Asset) {
+    if !is_favorite(asset) {
+        asset.tags.push(FAVORITE.to_string());
     }
 }

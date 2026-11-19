@@ -18,6 +18,7 @@ boethos index --root DIR [--root DIR ...] [--file PATH ...] [--source LABEL] [--
 boethos list [--category C] [--sex S] [--family F] [--source S] [--tag T]
              [--name TEXT] [--offset N] [--limit N] [--json]
 boethos get ID [--json]
+boethos favorite ID [--remove]
 boethos clips --glb PATH [--json]
 boethos delete ID
 boethos stats [--json]
@@ -31,6 +32,10 @@ existing database read-only; a missing database is a refusal, not an empty
 catalogue. `clips --glb PATH` reads an actor document directly and needs no
 database. `--json` prints one document; text `list` prints `id`, `category`,
 `sex`, `name` and `path`. `boethos --version` prints the binary version.
+
+Mark an asset with `boethos favorite ID` and find it with `boethos list --tag favorite`.
+Use `boethos favorite ID --remove` to clear the tag. A refresh of the same
+asset identity preserves the tag.
 
 Exit `0` on success and `2` on a classified refusal. Errors name the path and
 the failing capability.
