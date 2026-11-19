@@ -224,13 +224,17 @@ fn favorite_survives_reindex_and_can_be_removed() {
 }
 
 #[test]
-fn preview_links_only_the_selected_preset_across_reindex() {
+fn preview_links_the_selected_preset_and_outfit_across_reindex() {
     let root = temp_dir("preset-previews");
     let presets = root.join("SliderPresets");
     fs::create_dir_all(&presets).expect("preset directory");
     fs::write(presets.join("First.xml"), "<SliderPresets/>").expect("first");
     fs::write(presets.join("Second.xml"), "<SliderPresets/>").expect("second");
+    let outfits = root.join("outfits");
+    fs::create_dir_all(&outfits).expect("outfit directory");
+    fs::write(outfits.join("Cuirass.nif"), b"NIF").expect("outfit fixture");
     fs::write(root.join("Review.png"), b"image").expect("image fixture");
+    fs::write(root.join("Cuirass.png"), b"outfit image").expect("outfit image fixture");
     let db = root.with_extension("redb");
     let index = ["index", "--root", root.to_str().expect("root")];
     let (code, _, stderr) = run(&db, &index);
@@ -249,21 +253,33 @@ fn preview_links_only_the_selected_preset_across_reindex() {
     let first = id("First.xml");
     let second = id("Second.xml");
     let image = id("Review.png");
+    let cuirass = id("Cuirass.nif");
+    let cuirass_image = id("Cuirass.png");
     let (code, _, stderr) = run(&db, &["preview", first, second]);
     assert_eq!(code, 2);
     assert!(stderr.contains("expected image"), "{stderr}");
-    for _ in 0..2 {
-        let (code, output, stderr) = run(&db, &["preview", &first[..8], image, "--json"]);
+    let (code, _, stderr) = run(&db, &["preview", image, cuirass_image]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("expected preset or outfit"), "{stderr}");
+    let links = [(first, image), (cuirass, cuirass_image)];
+    for (subject, image) in links {
+        for _ in 0..2 {
+            let (code, output, stderr) = run(&db, &["preview", &subject[..8], image, "--json"]);
+            assert_eq!(code, 0, "{stderr}");
+            let previews: Vec<serde_json::Value> = serde_json::from_str(&output).expect("previews");
+            assert_eq!(previews.len(), 1);
+            assert_eq!(previews[0]["id"], image);
+        }
+    }
+    let (code, _, stderr) = run(&db, &index);
+    assert_eq!(code, 0, "{stderr}");
+    for (subject, image) in links {
+        let (code, output, stderr) = run(&db, &["preview", subject, "--json"]);
         assert_eq!(code, 0, "{stderr}");
         let previews: Vec<serde_json::Value> = serde_json::from_str(&output).expect("previews");
         assert_eq!(previews.len(), 1);
         assert_eq!(previews[0]["id"], image);
     }
-    let (code, _, stderr) = run(&db, &index);
-    assert_eq!(code, 0, "{stderr}");
-    let (code, output, stderr) = run(&db, &["preview", first]);
-    assert_eq!(code, 0, "{stderr}");
-    assert!(output.contains(image));
     let (code, output, stderr) = run(&db, &["preview", second, "--json"]);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(output.trim(), "[]");

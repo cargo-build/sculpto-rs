@@ -20,8 +20,8 @@ pub use clip::{ClipDocument, ClipInfo, clip_asset, read_clips};
 pub use face_labels::{FaceClassification, HairColor, classify_faces};
 pub use index::{IndexOptions, IndexReport, index_file, index_root};
 pub use model::{
-    Asset, Assets, Category, ClipDetails, FavoriteChange, Sex, Status, attach_preview,
-    change_favorite, preset_previews, refresh_asset,
+    Asset, Assets, Category, ClipDetails, FavoriteChange, Sex, Status, asset_previews,
+    attach_preview, change_favorite, refresh_asset,
 };
 pub use raw_part::{RawPartInput, raw_part_asset};
 

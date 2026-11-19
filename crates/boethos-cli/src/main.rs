@@ -14,8 +14,8 @@ use std::process::ExitCode;
 use boethos::Store;
 use boethos_catalogue::{
     Asset, Assets, BodyPartInput, Category, FaceClassification, FavoriteChange, IndexOptions,
-    RawPartInput, Sex, attach_preview, body_part_asset, change_favorite, classify_faces,
-    index_file, index_root, preset_previews, raw_part_asset, read_clips, refresh_asset,
+    RawPartInput, Sex, asset_previews, attach_preview, body_part_asset, change_favorite,
+    classify_faces, index_file, index_root, raw_part_asset, read_clips, refresh_asset,
 };
 
 fn main() -> ExitCode {
@@ -308,8 +308,8 @@ commands:
         print one asset; accepts an unambiguous 8+ character id prefix
   favorite ID [--remove]
         add or remove the favorite tag; query with list --tag favorite
-  preview PRESET_ID [IMAGE_ID] [--json]
-        list a preset's preview images, or attach an indexed image and list them
+  preview ASSET_ID [IMAGE_ID] [--json]
+        list or attach preview images for a body preset or outfit
   clips --glb PATH [--json]
         read the animations embedded in a glb/gltf actor: name, channels,
         keyframes, duration, driven nodes and palette coverage
@@ -694,18 +694,18 @@ fn command_preview(cli: &Cli) -> Result<(), String> {
     let requested = cli
         .positionals
         .first()
-        .ok_or_else(|| "preview requires a preset id".to_string())?;
+        .ok_or_else(|| "preview requires an asset id".to_string())?;
     let image_id = cli.positionals.get(1);
     let store = match image_id {
         Some(_) => open_write_existing(cli)?,
         None => open_read(cli)?,
     };
-    let preset = find_asset(&store, requested)?;
+    let subject = find_asset(&store, requested)?;
     if let Some(image_id) = image_id {
         let image = find_asset(&store, image_id)?;
-        attach_preview(&store, &preset, &image).map_err(|error| error.to_string())?;
+        attach_preview(&store, &subject, &image).map_err(|error| error.to_string())?;
     }
-    let previews = preset_previews(&store, &preset).map_err(|error| error.to_string())?;
+    let previews = asset_previews(&store, &subject).map_err(|error| error.to_string())?;
     if cli.has("--json") {
         println!(
             "{}",

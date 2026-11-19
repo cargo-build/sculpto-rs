@@ -300,18 +300,18 @@ fn mark_favorite(asset: &mut Asset) {
     }
 }
 
-/// Link an indexed image to a body preset. Repeated attachments are idempotent.
-pub fn attach_preview(store: &Store, preset: &Asset, image: &Asset) -> StoreResult<bool> {
-    require_category(preset, Category::Preset)?;
+/// Link an indexed image to a preset or outfit. Repeated attachments are idempotent.
+pub fn attach_preview(store: &Store, subject: &Asset, image: &Asset) -> StoreResult<bool> {
+    require_preview_subject(subject)?;
     require_category(image, Category::Image)?;
-    store.link(asset_ref(preset), PREVIEW, asset_ref(image))
+    store.link(asset_ref(subject), PREVIEW, asset_ref(image))
 }
 
-/// Resolve a body preset's preview links to currently indexed images.
-pub fn preset_previews(store: &Store, preset: &Asset) -> StoreResult<Vec<Asset>> {
-    require_category(preset, Category::Preset)?;
+/// Resolve a preset or outfit's preview links to currently indexed images.
+pub fn asset_previews(store: &Store, subject: &Asset) -> StoreResult<Vec<Asset>> {
+    require_preview_subject(subject)?;
     store
-        .links_from(asset_ref(preset))?
+        .links_from(asset_ref(subject))?
         .into_iter()
         .filter(|link| link.relation == PREVIEW && link.to_kind == Assets::NAME)
         .filter_map(|link| match store.get::<Assets>(&link.to_id) {
@@ -327,6 +327,19 @@ fn asset_ref(asset: &Asset) -> Ref<'_> {
         kind: Assets::NAME,
         id: &asset.id,
     }
+}
+
+fn require_preview_subject(asset: &Asset) -> StoreResult<()> {
+    if matches!(asset.category, Category::Preset | Category::Outfit) {
+        return Ok(());
+    }
+    Err(StoreError::Validation {
+        kind: Assets::NAME,
+        detail: format!(
+            "{} has category {}, expected preset or outfit",
+            asset.id, asset.category
+        ),
+    })
 }
 
 fn require_category(asset: &Asset, expected: Category) -> StoreResult<()> {
