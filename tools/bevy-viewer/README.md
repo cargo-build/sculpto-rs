@@ -281,19 +281,21 @@ normal for each target. The control socket exposes the active clip time in
 
 ## Review lighting
 
-Lighting is runtime PBR, not baked into the exported GLB (`viewer export` writes
-albedo and normals only). The interactive viewer defaults to **one key light** with
-`shadow_maps_enabled`, and spawns a matte ground so the cast shadow is visible. The
-default mouse keeps the camera controls (LMB orbit, RMB pan). **Ctrl+LMB turns the
-figure**, **Ctrl+RMB moves it sideways** under the fixed light, and **Shift+LMB
-moves the key light**; every one of those changes the shading and the cast shadow.
-`F3` toggles the optional three-point rig (fill and rim) when the far side is too dark
-to read; `SCULPTO_VIEWER_THREE_POINT` seeds it. `L` toggles lit/flat; flat hides the
-whole rig and ground and renders every material unlit, so a review shows the
-silhouette, the seams and the layer palette without a shadow that can be mistaken
-for a defect. The capture path keeps whatever `SCULPTO_VIEWER_FLAT` seeds and stays
-on the black backdrop (no ground); `SCULPTO_VIEWER_GROUND=1` adds the ground and
-`SCULPTO_VIEWER_TURNTABLE_YAW` seeds the figure pose for a shadow comparison.
+The viewer supplies a directional sun and subtle cool skylight for every
+lit review. The sun starts at 55° with white light. **Shift+LMB** aims it.
+Lower it toward the horizon for warmer, dimmer light and longer shadows.
+The matte ground receives the shadow in an interactive review. **Ctrl+LMB**
+turns the figure and **Ctrl+RMB** moves it sideways under the same sun.
+
+`F3` adds the optional fill and rim and `SCULPTO_VIEWER_THREE_POINT` seeds
+that rig. `L` switches to unlit materials against a black background for
+seam, silhouette and palette checks. `SCULPTO_VIEWER_FLAT` seeds that view.
+
+Headless captures use the same sunlight. Set
+`SCULPTO_VIEWER_SUN_ELEVATION_DEG` within 2–83 for a repeatable starting
+angle. `SCULPTO_VIEWER_AMBIENT` sets the ambient brightness.
+`SCULPTO_VIEWER_GROUND=1` adds the matte ground and
+`SCULPTO_VIEWER_TURNTABLE_YAW` sets the opening figure angle.
 `0` selects the idle clip and `1` the walk clip of a rigged GLB (the actor graph
 loads `Animation0` and `Animation1`; the cloth clip keeps running).
 `--interactive --bank <manifest.json>` accepts a version-1 manifest with a nonempty

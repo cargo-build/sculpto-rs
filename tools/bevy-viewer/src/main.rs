@@ -90,12 +90,11 @@ struct FlatMode(bool);
 #[derive(Component)]
 struct ReviewLight;
 
-/// Fill and rim lights: visible only in the optional three-point rig, so the
-/// default is one key light and its honest runtime shadow.
+/// Fill and rim lights for the optional three-point rig.
 #[derive(Component)]
 struct FillLight;
 
-/// The key light is the only default source; it casts the shadow.
+/// The directional sun casts the scene's shadow.
 #[derive(Component)]
 struct KeyLight;
 
@@ -175,32 +174,45 @@ struct GlassRestore(Vec<AssetId<StandardMaterial>>);
 #[derive(Component)]
 struct ReviewModel;
 
-/// Key-light orbit: Shift+LMB moves the light around the figure while the
-/// character stays put, so the shading and cast shadow follow the light.
+/// Direction and elevation of the review sun.
 #[derive(Resource, Clone, Copy)]
-struct LightOrbit {
+struct SunOrbit {
     azimuth: f32,
     elevation: f32,
-    radius: f32,
 }
 
-impl LightOrbit {
-    fn from_position(position: Vec3) -> Self {
-        let radius = position.length().max(0.2);
+impl SunOrbit {
+    const DEFAULT_ELEVATION_DEG: f32 = 55.0;
+    const MIN_ELEVATION: f32 = 2.0_f32.to_radians();
+    const MAX_ELEVATION: f32 = 83.0_f32.to_radians();
+
+    fn new(elevation_degrees: f32) -> Self {
+        let degrees = if elevation_degrees.is_finite() {
+            elevation_degrees
+        } else {
+            Self::DEFAULT_ELEVATION_DEG
+        };
         Self {
-            azimuth: position.x.atan2(position.z),
-            elevation: (position.y / radius).asin(),
-            radius,
+            azimuth: 3.0_f32.atan2(2.0),
+            elevation: degrees
+                .to_radians()
+                .clamp(Self::MIN_ELEVATION, Self::MAX_ELEVATION),
         }
     }
 
-    fn position(self) -> Vec3 {
-        let horizontal = self.radius * self.elevation.cos();
-        Vec3::new(
-            horizontal * self.azimuth.sin(),
-            self.radius * self.elevation.sin(),
-            horizontal * self.azimuth.cos(),
-        )
+    fn transform(self) -> Transform {
+        let (height, horizontal) = self.elevation.sin_cos();
+        let (east, north) = self.azimuth.sin_cos();
+        let toward_sun = Vec3::new(horizontal * east, height, horizontal * north);
+        Transform::IDENTITY.looking_to(-toward_sun, Vec3::Y)
+    }
+
+    fn lighting(self) -> (Color, f32) {
+        let height = (self.elevation.to_degrees() / 45.0).clamp(0.0, 1.0);
+        let daylight = height * height * (3.0 - 2.0 * height);
+        let color = Color::linear_rgb(1.0, 0.40 + 0.60 * daylight, 0.18 + 0.82 * daylight);
+        let illuminance = 3_500.0 + 3_000.0 * daylight;
+        (color, illuminance)
     }
 }
 
@@ -1081,7 +1093,10 @@ fn main() {
         .insert_resource(InPlaceEnabled(
             std::env::var("SCULPTO_VIEWER_IN_PLACE").map_or(true, |value| value != "0"),
         ))
-        .insert_resource(LightOrbit::from_position(Vec3::new(3.0, 5.0, 2.0)))
+        .insert_resource(SunOrbit::new(env_f32(
+            "SCULPTO_VIEWER_SUN_ELEVATION_DEG",
+            SunOrbit::DEFAULT_ELEVATION_DEG,
+        )))
         .insert_resource(CharacterPose {
             yaw: env_f32("SCULPTO_VIEWER_TURNTABLE_YAW", 0.0),
             pitch: 0.0,
@@ -1141,10 +1156,8 @@ fn main() {
         .register_type::<ViewVisibility>()
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(GlobalAmbientLight {
-            brightness: env_f32(
-                "SCULPTO_VIEWER_AMBIENT",
-                if options.interactive { 60.0 } else { 0.0 },
-            ),
+            color: Color::srgb(0.88, 0.93, 1.0),
+            brightness: env_f32("SCULPTO_VIEWER_AMBIENT", 125.0),
             ..default()
         })
         .init_resource::<SkelJointsInfo>()
@@ -1679,6 +1692,7 @@ fn setup(
     units: Res<Units>,
     config: Res<ViewerConfig>,
     profile: Res<AssetProfile>,
+    sun: Res<SunOrbit>,
     bank: Option<Res<bank::Bank>>,
     mut watch: Option<ResMut<WatchState>>,
     render_adapter: Option<Res<RenderAdapter>>,
@@ -1755,29 +1769,31 @@ fn setup(
     // the mouse, the headless capture leaves it at the fixed review view, and
     // the control socket can move either one through the same resource.
     commands.insert_resource(OrbitCamera::looking_at(camera_eye, camera_target));
-    // One key light by default: the shading and the cast shadow are computed
-    // at runtime, so turning the figure under it changes both. `3` adds the
-    // fill/rim pair when the far side is too dark to read.
-    let rig = [
-        (10_000.0_f32, Vec3::new(3.0, 5.0, 2.0), true),
-        (3_500.0, Vec3::new(-3.0, 2.0, -2.5), false),
-        (6_000.0, Vec3::new(0.0, 3.0, -4.0), false),
-    ];
-    for (index, (illuminance, position, key)) in rig.into_iter().enumerate() {
-        let mut entity = commands.spawn((
+    let (color, illuminance) = sun.lighting();
+    commands.spawn((
+        DirectionalLight {
+            color,
+            illuminance,
+            shadow_maps_enabled: std::env::var("SCULPTO_VIEWER_NO_SHADOWS").is_err(),
+            ..default()
+        },
+        sun.transform(),
+        ReviewLight,
+        KeyLight,
+    ));
+    for (illuminance, position) in [
+        (3_500.0, Vec3::new(-3.0, 2.0, -2.5)),
+        (6_000.0, Vec3::new(0.0, 3.0, -4.0)),
+    ] {
+        commands.spawn((
             DirectionalLight {
                 illuminance,
-                shadow_maps_enabled: key && std::env::var("SCULPTO_VIEWER_NO_SHADOWS").is_err(),
                 ..default()
             },
             Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y),
             ReviewLight,
+            FillLight,
         ));
-        match index {
-            0 => entity.insert(KeyLight),
-            1 | 2 => entity.insert(FillLight),
-            _ => unreachable!(),
-        };
     }
     if config.interactive || std::env::var("SCULPTO_VIEWER_GROUND").is_ok() {
         // A matte ground receives the key's shadow. It is off in the archived
@@ -1869,11 +1885,11 @@ fn setup(
                     "Drag LMB orbit · RMB pan · wheel zoom",
                     "W/S approach or retreat · A/D move sideways",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
-                    "Shift+LMB move key light",
+                    "Shift+LMB aim sun · lower is warmer",
                     if bank.as_ref().is_some_and(|bank| bank.inspection.is_some()) {
                         "0 A-pose · 1 T-pose · Ctrl+0 disassembled · Ctrl+number 1.35s"
                     } else if bank.is_some() {
-                        "0 A-pose · 1 T-pose · 2–9 animations · Ctrl+number 1.35s"
+                        "0–9 select bank slot · Ctrl+number 1.35s"
                     } else {
                         "0–9 select clip · Ctrl+number 1.35s"
                     },
@@ -2213,37 +2229,33 @@ fn orbit_controls(
     transform.look_at(orbit.target, Vec3::Y);
 }
 
-/// Shift+LMB moves the key light around the figure; the character stays put so
-/// a shadow comparison is a light change, not a pose change.
+/// Shift+LMB aims the sun and grades its light by elevation.
 fn light_controls(
     config: Res<ViewerConfig>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut motion: MessageReader<MouseMotion>,
-    orbit: Option<ResMut<LightOrbit>>,
-    mut lights: Query<&mut Transform, With<KeyLight>>,
+    mut sun: ResMut<SunOrbit>,
+    mut lights: Query<(&mut Transform, &mut DirectionalLight), With<KeyLight>>,
 ) {
     if !config.interactive {
         return;
     }
-    let Some(mut orbit) = orbit else {
-        return;
-    };
-    let mut delta = Vec2::ZERO;
-    for event in motion.read() {
-        delta += event.delta;
-    }
-    if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
-        && buttons.pressed(MouseButton::Left)
+    let delta: Vec2 = motion.read().map(|event| event.delta).sum();
+    if delta == Vec2::ZERO
+        || !keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+        || !buttons.pressed(MouseButton::Left)
     {
-        orbit.azimuth -= delta.x * 0.005;
-        orbit.elevation = (orbit.elevation - delta.y * 0.005).clamp(-0.2, 1.45);
+        return;
     }
-    let Ok(mut transform) = lights.single_mut() else {
+    let Ok((mut transform, mut light)) = lights.single_mut() else {
         return;
     };
-    transform.translation = orbit.position();
-    transform.look_at(Vec3::ZERO, Vec3::Y);
+    sun.azimuth -= delta.x * 0.005;
+    sun.elevation =
+        (sun.elevation - delta.y * 0.005).clamp(SunOrbit::MIN_ELEVATION, SunOrbit::MAX_ELEVATION);
+    *transform = sun.transform();
+    (light.color, light.illuminance) = sun.lighting();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3628,6 +3640,51 @@ mod tests {
             *app.world().get::<Visibility>(card).expect("card"),
             Visibility::Inherited
         );
+    }
+
+    #[test]
+    fn sunlight_is_white_high_up_and_warmer_and_dimmer_near_the_horizon() {
+        let (high, high_lux) = SunOrbit::new(55.0).lighting();
+        let (middle, middle_lux) = SunOrbit::new(25.0).lighting();
+        let (low, low_lux) = SunOrbit::new(6.0).lighting();
+        let [high, middle, low] = [high, middle, low].map(|color| color.to_linear());
+
+        assert_eq!([high.red, high.green, high.blue], [1.0; 3]);
+        assert!(low.blue < low.green && low.green < low.red);
+        assert!(low.blue < middle.blue && middle.blue < high.blue);
+        assert!(low_lux < middle_lux && middle_lux < high_lux);
+        assert_eq!(SunOrbit::new(-10.0).elevation, SunOrbit::MIN_ELEVATION);
+        assert_eq!(SunOrbit::new(90.0).elevation, SunOrbit::MAX_ELEVATION);
+    }
+
+    #[test]
+    fn shift_drag_updates_sun_direction_and_lighting_in_the_same_frame() {
+        let mut app = App::new();
+        let high = SunOrbit::new(55.0);
+        app.insert_resource(viewer_config(true, false))
+            .insert_resource(high)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_message::<MouseMotion>()
+            .add_systems(Update, light_controls);
+        let sun = app
+            .world_mut()
+            .spawn((KeyLight, DirectionalLight::default(), high.transform()))
+            .id();
+        press(&mut app, KeyCode::ShiftLeft);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut().write_message(MouseMotion {
+            delta: Vec2::new(0.0, (55.0_f32 - 6.0).to_radians() / 0.005),
+        });
+        app.update();
+
+        let light = app.world().get::<DirectionalLight>(sun).unwrap();
+        let direction = app.world().get::<Transform>(sun).unwrap().rotation * Vec3::NEG_Z;
+        assert!((direction.y + 6.0_f32.to_radians().sin()).abs() < 1e-5);
+        assert!(light.color.to_linear().blue < 0.25);
+        assert!(light.illuminance < 4_000.0);
     }
 
     #[test]
