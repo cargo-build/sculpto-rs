@@ -4,10 +4,12 @@ Headless Bevy proof harness for the baked cloth GLB. Loads the actor GLB and
 the `export_cloth_glb.py` output, renders one offscreen frame and writes
 `/tmp/sculpto-classify/cloth/bevy_cloth.png`.
 
-`--interactive` opens the same scene in a window so a baked result can be
-orbited and inspected instead of captured from one fixed view: drag **LMB** to
-orbit, **RMB** to pan, wheel to zoom, **R** to reset. The review window is the
-fast inspection loop; the 13-view contact sheet remains the fit evidence.
+`--interactive` opens the same scene in a review window. Drag **LMB** to
+orbit or **RMB** to pan. Scroll to zoom, or press **R** to reset. Hold **W/S**
+to move toward/away from the orbit target. The **LMB** orbit radius shrinks
+as you approach. Hold **A/D** to move the view left/right. The keys work
+during a drag, and movement slows near the target for close inspection.
+The 13-view contact sheet remains the fit evidence.
 
 The interactive camera frames the loaded scene from its world bounds: once
 geometry exists it measures the AABB, puts the orbit target at its centre and

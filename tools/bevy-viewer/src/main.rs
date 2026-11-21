@@ -1867,6 +1867,7 @@ fn setup(
                 ));
                 for line in [
                     "Drag LMB orbit · RMB pan · wheel zoom",
+                    "W/S approach or retreat · A/D move sideways",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB move key light",
                     if bank.as_ref().is_some_and(|bank| bank.inspection.is_some()) {
@@ -2140,15 +2141,14 @@ fn fit_camera_to_scene(
     info!("viewer: auto-fit target={target:?} radius={radius:.3} distance={distance:.3}");
 }
 
-/// Interactive-only orbit camera: LMB drag orbits, RMB drag pans, wheel zooms,
-/// R resets. It never runs in the headless capture path.
+/// Combines orbit, pan and zoom with view-relative WASD travel.
 fn orbit_controls(
     config: Res<ViewerConfig>,
     orbit: Option<ResMut<OrbitCamera>>,
+    time: Res<Time>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut motion: MessageReader<MouseMotion>,
-    mut wheel: MessageReader<MouseWheel>,
+    (mut motion, mut wheel): (MessageReader<MouseMotion>, MessageReader<MouseWheel>),
     mut cameras: Query<&mut Transform, With<Camera3d>>,
 ) {
     if !config.interactive {
@@ -2178,8 +2178,8 @@ fn orbit_controls(
         orbit.yaw -= delta.x * 0.005;
         orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
     }
+    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     if buttons.pressed(MouseButton::Right) && !moving_character {
-        let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
         let right = rotation * Vec3::X;
         let up = rotation * Vec3::Y;
         let pan_scale = orbit.distance * 0.0015;
@@ -2190,10 +2190,25 @@ fn orbit_controls(
             (orbit.distance * (1.0 - zoom * 0.12)).clamp(orbit.min_distance, orbit.max_distance);
     }
 
+    let axis = |positive, negative| {
+        f32::from(i8::from(keys.pressed(positive)) - i8::from(keys.pressed(negative)))
+    };
+    let direction = Vec2::new(
+        axis(KeyCode::KeyD, KeyCode::KeyA),
+        axis(KeyCode::KeyS, KeyCode::KeyW),
+    );
+    let travel = direction.normalize_or_zero() * (0.5 * time.delta_secs());
+    let radius = orbit.distance;
+    if travel.x != 0.0 {
+        orbit.target += rotation * Vec3::X * (radius * travel.x);
+    }
+    if travel.y != 0.0 {
+        orbit.distance = (radius * travel.y.exp()).clamp(orbit.min_distance, orbit.max_distance);
+    }
+
     let Ok(mut transform) = cameras.single_mut() else {
         return;
     };
-    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     transform.translation = orbit.target + rotation * Vec3::Z * orbit.distance;
     transform.look_at(orbit.target, Vec3::Y);
 }
@@ -3410,6 +3425,8 @@ fn watch_card(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn viewer_config(interactive: bool, flat: bool) -> ViewerConfig {
@@ -3642,6 +3659,107 @@ mod tests {
             Vec3::new(1.1, 0.2, 2.0),
             "Ctrl+RMB offsets the figure from its home"
         );
+    }
+
+    fn orbit_test_app(interactive: bool) -> (App, Entity) {
+        let mut app = App::new();
+        let eye = Vec3::new(0.0, 1.0, 3.0);
+        app.insert_resource(viewer_config(interactive, false))
+            .insert_resource(OrbitCamera::looking_at(eye, Vec3::Y))
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_message::<MouseMotion>()
+            .add_message::<MouseWheel>()
+            .add_systems(Update, orbit_controls);
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Transform::from_translation(eye)))
+            .id();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(100));
+        (app, camera)
+    }
+
+    #[test]
+    fn wasd_moves_toward_or_sideways_from_the_orbit_target() {
+        for (key, target_offset, radius) in [
+            (KeyCode::KeyW, Vec3::ZERO, 3.0 * (-0.05_f32).exp()),
+            (KeyCode::KeyA, Vec3::NEG_X * 0.15, 3.0),
+            (KeyCode::KeyS, Vec3::ZERO, 3.0 * 0.05_f32.exp()),
+            (KeyCode::KeyD, Vec3::X * 0.15, 3.0),
+        ] {
+            let (mut app, camera) = orbit_test_app(true);
+            press(&mut app, key);
+            app.update();
+
+            let target = Vec3::Y + target_offset;
+            let orbit = app.world().resource::<OrbitCamera>();
+            assert!(orbit.target.abs_diff_eq(target, 1e-5));
+            assert!((orbit.distance - radius).abs() < 1e-5);
+            let eye = app.world().get::<Transform>(camera).unwrap().translation;
+            assert!(eye.abs_diff_eq(target + radius * Vec3::Z, 1e-5));
+
+            press(&mut app, KeyCode::KeyR);
+            app.update();
+            let orbit = app.world().resource::<OrbitCamera>();
+            assert_eq!(orbit.target, Vec3::Y);
+            assert_eq!(orbit.distance, 3.0);
+        }
+    }
+
+    #[test]
+    fn mouse_orbit_uses_the_smaller_radius_while_wasd_moves_diagonally() {
+        let (mut app, camera) = orbit_test_app(true);
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::KeyW);
+            keys.press(KeyCode::KeyD);
+        }
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut().write_message(MouseMotion {
+            delta: Vec2::new(-std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_6) / 0.005,
+        });
+        app.update();
+
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+        let target = Vec3::Y - Vec3::Z * (0.15 * diagonal);
+        let radius = 3.0 * (-0.05 * diagonal).exp();
+        let orbit = app.world().resource::<OrbitCamera>();
+        assert!(orbit.target.abs_diff_eq(target, 1e-5));
+        assert!((orbit.distance - radius).abs() < 1e-5);
+        let eye_offset = Vec3::new(3.0_f32.sqrt() / 2.0, -0.5, 0.0) * radius;
+        let eye = app.world().get::<Transform>(camera).unwrap().translation;
+        assert!(eye.abs_diff_eq(target + eye_offset, 1e-5));
+    }
+
+    #[test]
+    fn wasd_approach_depends_on_elapsed_time_and_respects_zoom_limits() {
+        let approach = (-0.05_f32).exp();
+        for (interactive, key, steps, delta_ms, radius, expected) in [
+            (true, KeyCode::KeyW, 1, 100, 3.0, 3.0 * approach),
+            (true, KeyCode::KeyW, 4, 25, 3.0, 3.0 * approach),
+            (true, KeyCode::KeyW, 1, 100, 0.3, 0.3 * approach),
+            (true, KeyCode::KeyW, 1, 100, 0.201, 0.2),
+            (true, KeyCode::KeyS, 1, 100, 29.9, 30.0),
+            (false, KeyCode::KeyW, 1, 100, 3.0, 3.0),
+        ] {
+            let (mut app, _) = orbit_test_app(interactive);
+            app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(Duration::from_millis(delta_ms));
+            press(&mut app, key);
+            for _ in 0..steps {
+                app.update();
+            }
+            let orbit = app.world().resource::<OrbitCamera>();
+            assert_eq!(orbit.target, Vec3::Y);
+            assert!((orbit.distance - expected).abs() < 1e-5);
+        }
     }
 
     #[test]
