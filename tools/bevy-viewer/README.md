@@ -9,6 +9,8 @@ orbit or **RMB** to pan. Scroll to zoom, or press **R** to reset. Hold **W/S**
 to move toward/away from the orbit target. The **LMB** orbit radius shrinks
 as you approach. Hold **A/D** to move the view left/right. The keys work
 during a drag, and movement slows near the target for close inspection.
+LMB orbit turns further per pixel as you approach the target, up to three
+times the sensitivity of the opening view.
 The 13-view contact sheet remains the fit evidence.
 
 The interactive camera frames the loaded scene from its world bounds: once

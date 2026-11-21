@@ -2157,7 +2157,7 @@ fn fit_camera_to_scene(
     info!("viewer: auto-fit target={target:?} radius={radius:.3} distance={distance:.3}");
 }
 
-/// Combines orbit, pan and zoom with view-relative WASD travel.
+/// Interactive orbit, pan and zoom with view-relative WASD travel.
 fn orbit_controls(
     config: Res<ViewerConfig>,
     orbit: Option<ResMut<OrbitCamera>>,
@@ -2191,8 +2191,10 @@ fn orbit_controls(
     let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
-        orbit.yaw -= delta.x * 0.005;
-        orbit.pitch = (orbit.pitch - delta.y * 0.005).clamp(-1.45, 1.45);
+        let gain = (orbit.home.3 / orbit.distance).clamp(1.0, 3.0);
+        let sensitivity = 0.005 * gain;
+        orbit.yaw -= delta.x * sensitivity;
+        orbit.pitch = (orbit.pitch - delta.y * sensitivity).clamp(-1.45, 1.45);
     }
     let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     if buttons.pressed(MouseButton::Right) && !moving_character {
@@ -3791,6 +3793,26 @@ mod tests {
         let eye_offset = Vec3::new(3.0_f32.sqrt() / 2.0, -0.5, 0.0) * radius;
         let eye = app.world().get::<Transform>(camera).unwrap().translation;
         assert!(eye.abs_diff_eq(target + eye_offset, 1e-5));
+    }
+
+    #[test]
+    fn close_mouse_orbit_turns_further_per_pixel_with_a_capped_gain() {
+        for (radius, gain) in [(6.0, 1.0), (3.0, 1.0), (1.5, 2.0), (0.75, 3.0)] {
+            let (mut app, _) = orbit_test_app(true);
+            app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .press(MouseButton::Left);
+            app.world_mut().write_message(MouseMotion {
+                delta: Vec2::new(40.0, -20.0),
+            });
+            app.update();
+
+            let orbit = app.world().resource::<OrbitCamera>();
+            assert!((orbit.yaw + 0.2 * gain).abs() < 1e-5);
+            assert!((orbit.pitch - 0.1 * gain).abs() < 1e-5);
+            assert_eq!(orbit.distance, radius);
+        }
     }
 
     #[test]
