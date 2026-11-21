@@ -2739,8 +2739,17 @@ pub fn plan_clip_with(
                             };
                             match ours.length_squared() > 0.5 && target.length_squared() > 0.5 {
                                 true => {
-                                    DQuat::from_rotation_arc(rest_axis.normalize(), target)
-                                        * rest_rotations[position]
+                                    // A spine's child direction specifies its bend. Start
+                                    // from the full pose to retain its axial rotation.
+                                    let orientation =
+                                        match track_roles[position].map(|role| role.part) {
+                                            Some(crate::retarget::Part::Spine(_)) => fallback(),
+                                            _ => rest_rotations[position],
+                                        };
+                                    DQuat::from_rotation_arc(
+                                        (orientation * ours).normalize(),
+                                        target,
+                                    ) * orientation
                                 }
                                 false => fallback(),
                             }
