@@ -30,9 +30,24 @@ fn vector(v: Vec3) -> rp::Vector {
 pub(super) struct Solver {
     world: rp::PhysicsWorld,
     cloth: rp::SoftBodyHandle,
-    obstacles: Vec<rp::RigidBodyHandle>,
+    obstacles: Vec<MovingCapsule>,
     pins: Vec<u32>,
     pub steps: u64,
+}
+
+struct MovingCapsule {
+    body: rp::RigidBodyHandle,
+    collider: rp::ColliderHandle,
+    half_height: f32,
+    radius: f32,
+}
+
+fn capsule_shape(half_height: f32, radius: f32) -> rp::SharedShape {
+    if half_height < 1e-6 {
+        rp::SharedShape::ball(radius)
+    } else {
+        rp::SharedShape::capsule_y(half_height, radius)
+    }
 }
 
 impl Solver {
@@ -71,16 +86,16 @@ impl Solver {
         let mut bodies = Vec::with_capacity(obstacles.len());
         for &(shape, radius) in obstacles {
             let h = (shape.b - shape.a).length() * 0.5;
-            let collider = if h < 1e-6 {
-                rp::ColliderBuilder::ball(radius)
-            } else {
-                rp::ColliderBuilder::capsule_y(h, radius)
-            };
-            let (body, _) = world.insert(
+            let (body, collider) = world.insert(
                 rp::RigidBodyBuilder::kinematic_position_based().pose(shape.pose()),
-                collider.friction(0.65),
+                rp::ColliderBuilder::new(capsule_shape(h, radius)).friction(0.65),
             );
-            bodies.push(body);
+            bodies.push(MovingCapsule {
+                body,
+                collider,
+                half_height: h,
+                radius,
+            });
         }
         let mut result = Self {
             world,
@@ -104,8 +119,15 @@ impl Solver {
             self.world.soft_bodies[self.cloth]
                 .set_particle_kinematic_target(idx as usize, vector(point));
         }
-        for (&handle, &pose) in self.obstacles.iter().zip(capsules) {
-            self.world.bodies[handle].set_next_kinematic_position(pose.pose());
+        for (obstacle, &pose) in self.obstacles.iter_mut().zip(capsules) {
+            let half_height = pose.a.distance(pose.b) * 0.5;
+            // Length scales on animated props change even when their collision radius stays fixed.
+            if (obstacle.half_height - half_height).abs() > obstacle.radius * 0.001 {
+                self.world.colliders[obstacle.collider]
+                    .set_shape(capsule_shape(half_height, obstacle.radius));
+                obstacle.half_height = half_height;
+            }
+            self.world.bodies[obstacle.body].set_next_kinematic_position(pose.pose());
         }
         self.world.step();
         self.steps += 1;
@@ -144,13 +166,34 @@ mod tests {
             particle_mass: 0.003,
             thickness: 0.003,
         };
-        let mut sim = Solver::new(&rest, &[[0, 2, 1], [1, 2, 3]], &[0, 1], m, &[], &rest).unwrap();
+        let obstacle = CapsulePose {
+            a: Vec3::X,
+            b: Vec3::X,
+        };
+        let extended = CapsulePose {
+            a: Vec3::X,
+            b: Vec3::X + 0.5 * Vec3::Y,
+        };
+        let mut sim = Solver::new(
+            &rest,
+            &[[0, 2, 1], [1, 2, 3]],
+            &[0, 1],
+            m,
+            &[(obstacle, 0.01)],
+            &rest,
+        )
+        .unwrap();
         for _ in 0..18 {
-            sim.step(&rest[..2], &[]);
+            sim.step(&rest[..2], &[extended]);
         }
         let points = sim.positions();
         assert_eq!(sim.steps, 18);
         assert!(points[0].distance(rest[0]) < 1e-4 && points[1].distance(rest[1]) < 1e-4);
         assert!(points[2].y < -0.025 && points[3].is_finite());
+        let actual = sim.world.colliders[sim.obstacles[0].collider]
+            .shape()
+            .as_capsule()
+            .unwrap();
+        assert!((actual.segment.a.distance(actual.segment.b) - 0.5).abs() < 1e-5);
     }
 }
