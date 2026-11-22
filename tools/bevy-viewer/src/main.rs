@@ -2215,7 +2215,7 @@ fn orbit_controls(
         axis(KeyCode::KeyD, KeyCode::KeyA),
         axis(KeyCode::KeyS, KeyCode::KeyW),
     );
-    let travel = direction.normalize_or_zero() * (0.5 * time.delta_secs());
+    let travel = direction.normalize_or_zero() * (0.825 * time.delta_secs());
     let radius = orbit.distance;
     if travel.x != 0.0 {
         orbit.target += rotation * Vec3::X * (radius * travel.x);
@@ -3744,10 +3744,10 @@ mod tests {
     #[test]
     fn wasd_moves_toward_or_sideways_from_the_orbit_target() {
         for (key, target_offset, radius) in [
-            (KeyCode::KeyW, Vec3::ZERO, 3.0 * (-0.05_f32).exp()),
-            (KeyCode::KeyA, Vec3::NEG_X * 0.15, 3.0),
-            (KeyCode::KeyS, Vec3::ZERO, 3.0 * 0.05_f32.exp()),
-            (KeyCode::KeyD, Vec3::X * 0.15, 3.0),
+            (KeyCode::KeyW, Vec3::ZERO, 3.0 * (-0.0825_f32).exp()),
+            (KeyCode::KeyA, Vec3::NEG_X * 0.2475, 3.0),
+            (KeyCode::KeyS, Vec3::ZERO, 3.0 * 0.0825_f32.exp()),
+            (KeyCode::KeyD, Vec3::X * 0.2475, 3.0),
         ] {
             let (mut app, camera) = orbit_test_app(true);
             press(&mut app, key);
@@ -3785,8 +3785,8 @@ mod tests {
         app.update();
 
         let diagonal = std::f32::consts::FRAC_1_SQRT_2;
-        let target = Vec3::Y - Vec3::Z * (0.15 * diagonal);
-        let radius = 3.0 * (-0.05 * diagonal).exp();
+        let target = Vec3::Y - Vec3::Z * (0.2475 * diagonal);
+        let radius = 3.0 * (-0.0825 * diagonal).exp();
         let orbit = app.world().resource::<OrbitCamera>();
         assert!(orbit.target.abs_diff_eq(target, 1e-5));
         assert!((orbit.distance - radius).abs() < 1e-5);
@@ -3817,7 +3817,7 @@ mod tests {
 
     #[test]
     fn wasd_approach_depends_on_elapsed_time_and_respects_zoom_limits() {
-        let approach = (-0.05_f32).exp();
+        let approach = (-0.0825_f32).exp();
         for (interactive, key, steps, delta_ms, radius, expected) in [
             (true, KeyCode::KeyW, 1, 100, 3.0, 3.0 * approach),
             (true, KeyCode::KeyW, 4, 25, 3.0, 3.0 * approach),
