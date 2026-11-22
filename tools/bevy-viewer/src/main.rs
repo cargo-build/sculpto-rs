@@ -3,6 +3,7 @@
 //! Also provides `--headless --report --glb <path>` count reporting for consumer acceptance.
 //! `--control <socket>` publishes the agent control socket (see `control.rs`).
 mod bank;
+mod cloth;
 mod control;
 mod facets;
 mod number_entry;
@@ -1219,6 +1220,7 @@ fn main() {
         .add_systems(Update, clip_label.after(watch_tick))
         .add_systems(Update, hover_joint_name)
         .add_systems(Update, facets::update)
+        .add_plugins(cloth::LiveClothPlugin)
         .add_systems(Update, track_asset_loaded)
         .add_systems(Update, collect_actor_materials.after(apply_skeleton_mode))
         // The socket reads joints after the overlay refreshed them and writes
@@ -2839,6 +2841,7 @@ fn start_actor_clip(
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct ControlScene<'w, 's> {
+    cloth: Res<'w, cloth::ClothStatus>,
     joints: Res<'w, SkelJointsInfo>,
     materials: Res<'w, ActorMaterials>,
     graphs: Res<'w, Assets<AnimationGraph>>,
@@ -2910,6 +2913,7 @@ fn control_service(
                                     player.animation(node).map(|a| a.seek_time())
                                 })
                         }),
+                    cloth: scene.cloth.0.clone(),
                     morph_weights: scene
                         .morphs
                         .iter()

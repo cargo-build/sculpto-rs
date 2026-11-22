@@ -283,6 +283,23 @@ skin influences and morph offsets onto each triangle corner and computes the fac
 normal for each target. The control socket exposes the active clip time in
 `state.clip.seconds` and the current mesh weights in `state.morph_weights`.
 
+## Live garments
+
+The interactive viewer simulates a garment that carries a `sculpto_cloth`
+version-1 descriptor in its glTF primitive extras. Rapier steps its free
+surface at a fixed 1/60-second timestep on a dedicated worker. The source primitive supplies animated shoulder positions
+and the scene supplies the moving collision capsules. The actor may pause
+while the cloth settles. Camera controls and asset-bank navigation remain
+available throughout the simulation.
+
+The free primitive shares the skinned source's bind coordinate system. Its
+descriptor supplies source vertex indices for the proxy, triangle indices,
+pinned particle indices, dense render-to-triangle bindings and exact seam
+vertex pairs. Capsules follow a source joint or a named prop. The cloth
+retains both faces, UVs and the original material. The socket reports the
+solver step count, solve time, active contact pairs, pin error and count of
+unit-length render normals under `state.cloth`.
+
 ## Review lighting
 
 The viewer supplies a directional sun and subtle cool skylight for every

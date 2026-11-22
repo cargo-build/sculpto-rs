@@ -582,6 +582,7 @@ pub struct Snapshot {
     pub clip_index: Option<usize>,
     pub clip_seconds: Option<f32>,
     pub morph_weights: Vec<(String, Vec<f32>)>,
+    pub cloth: Vec<Value>,
     pub clip_name: Option<String>,
     pub bank: Option<Value>,
     pub clip_count: Option<usize>,
@@ -634,6 +635,7 @@ impl Snapshot {
             },
             "bank": self.bank,
             "morph_weights": self.morph_weights,
+            "cloth": self.cloth,
             "skeleton": self.skeleton,
             "camera": {
                 "mode": self.camera_mode,
@@ -866,6 +868,7 @@ mod tests {
             clip_index: Some(1),
             clip_seconds: Some(0.5),
             morph_weights: vec![],
+            cloth: vec![],
             clip_name: Some("Walk".into()),
             bank: None,
             clip_count: Some(2),

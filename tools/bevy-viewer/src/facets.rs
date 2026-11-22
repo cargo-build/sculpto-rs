@@ -102,13 +102,15 @@ fn folded_normals(flat: &Mesh) -> Vec<(usize, [[f32; 3]; 3])> {
         .collect()
 }
 
+type InspectableMesh = (SceneMeshFilter, Without<crate::cloth::LiveSurface>);
+
 pub(super) fn update(
     mut commands: Commands,
     config: Res<ViewerConfig>,
     keys: Res<ButtonInput<KeyCode>>,
     mut mode: ResMut<FaceNormals>,
     mut assets: ResMut<Assets<Mesh>>,
-    mut models: Query<(Entity, &mut Mesh3d, Option<&FaceMesh>), SceneMeshFilter>,
+    mut models: Query<(Entity, &mut Mesh3d, Option<&FaceMesh>), InspectableMesh>,
 ) {
     if config.interactive && keys.just_pressed(KeyCode::KeyN) {
         mode.0 = !mode.0;
