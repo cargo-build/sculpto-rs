@@ -1754,6 +1754,12 @@ fn setup(
         bevy::core_pipeline::tonemapping::Tonemapping::None,
         Transform::from_translation(camera_eye).looking_at(camera_target, Vec3::Y),
     ));
+    if config.interactive {
+        camera.insert(Projection::Perspective(PerspectiveProjection {
+            near: INSPECTION_NEAR_PLANE,
+            ..default()
+        }));
+    }
     if !config.report_mode
         && std::env::var_os("SCULPTO_VIEWER_SORT_TRANSPARENCY").is_none_or(|value| value != "0")
         && render_adapter
@@ -2046,6 +2052,10 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+const INSPECTION_NEAR_PLANE: f32 = 0.001;
+/// Retain a well-defined look direction as keyboard travel carries the pivot forward.
+const MIN_ORBIT_RADIUS: f32 = 5.0 * INSPECTION_NEAR_PLANE;
+
 /// Orbit state for the interactive review window.
 ///
 /// `looking_at` seeds the state from the same eye/target the headless camera
@@ -2064,7 +2074,7 @@ struct OrbitCamera {
 impl OrbitCamera {
     fn looking_at(eye: Vec3, target: Vec3) -> Self {
         let offset = eye - target;
-        let distance = offset.length().max(0.2);
+        let distance = offset.length().max(MIN_ORBIT_RADIUS);
         let yaw = offset.x.atan2(offset.z);
         let pitch = (offset.y / distance).asin();
         Self {
@@ -2072,7 +2082,7 @@ impl OrbitCamera {
             yaw,
             pitch,
             distance,
-            min_distance: 0.2,
+            min_distance: MIN_ORBIT_RADIUS,
             max_distance: 30.0,
             home: (target, yaw, pitch, distance),
         }
@@ -2084,7 +2094,6 @@ impl OrbitCamera {
     fn fit(&mut self, target: Vec3, distance: f32) {
         self.target = target;
         self.distance = distance;
-        self.min_distance = (distance * 0.05).max(0.01);
         self.max_distance = (distance * 20.0).max(30.0);
         self.home = (target, self.yaw, self.pitch, distance);
     }
@@ -2157,6 +2166,9 @@ fn fit_camera_to_scene(
     info!("viewer: auto-fit target={target:?} radius={radius:.3} distance={distance:.3}");
 }
 
+/// Scale pan and keyboard travel by the fitted opening distance.
+const CAMERA_TRANSLATION_GAIN: f32 = 3.4225;
+
 /// Interactive orbit, pan and zoom with view-relative WASD travel.
 fn orbit_controls(
     config: Res<ViewerConfig>,
@@ -2191,16 +2203,16 @@ fn orbit_controls(
     let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
-        let gain = (orbit.home.3 / orbit.distance).clamp(1.0, 3.0);
-        let sensitivity = 0.005 * gain;
+        let sensitivity = 0.005;
         orbit.yaw -= delta.x * sensitivity;
         orbit.pitch = (orbit.pitch - delta.y * sensitivity).clamp(-1.45, 1.45);
     }
     let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+    let travel_scale = orbit.home.3 * CAMERA_TRANSLATION_GAIN;
     if buttons.pressed(MouseButton::Right) && !moving_character {
         let right = rotation * Vec3::X;
         let up = rotation * Vec3::Y;
-        let pan_scale = orbit.distance * 0.0015;
+        let pan_scale = travel_scale * 0.0015;
         orbit.target += (-right * delta.x + up * delta.y) * pan_scale;
     }
     if zoom.abs() > f32::EPSILON {
@@ -2215,13 +2227,16 @@ fn orbit_controls(
         axis(KeyCode::KeyD, KeyCode::KeyA),
         axis(KeyCode::KeyS, KeyCode::KeyW),
     );
-    let travel = direction.normalize_or_zero() * (0.825 * time.delta_secs());
+    let travel = direction.normalize_or_zero() * (0.5 * travel_scale * time.delta_secs());
     let radius = orbit.distance;
     if travel.x != 0.0 {
-        orbit.target += rotation * Vec3::X * (radius * travel.x);
+        orbit.target += rotation * Vec3::X * travel.x;
     }
     if travel.y != 0.0 {
-        orbit.distance = (radius * travel.y.exp()).clamp(orbit.min_distance, orbit.max_distance);
+        let requested = radius + travel.y;
+        let next = requested.clamp(orbit.min_distance, orbit.max_distance);
+        orbit.target += rotation * Vec3::Z * (requested - next);
+        orbit.distance = next;
     }
 
     let Ok(mut transform) = cameras.single_mut() else {
@@ -3744,10 +3759,10 @@ mod tests {
     #[test]
     fn wasd_moves_toward_or_sideways_from_the_orbit_target() {
         for (key, target_offset, radius) in [
-            (KeyCode::KeyW, Vec3::ZERO, 3.0 * (-0.0825_f32).exp()),
-            (KeyCode::KeyA, Vec3::NEG_X * 0.2475, 3.0),
-            (KeyCode::KeyS, Vec3::ZERO, 3.0 * 0.0825_f32.exp()),
-            (KeyCode::KeyD, Vec3::X * 0.2475, 3.0),
+            (KeyCode::KeyW, Vec3::ZERO, 3.0 - 0.513375),
+            (KeyCode::KeyA, Vec3::NEG_X * 0.513375, 3.0),
+            (KeyCode::KeyS, Vec3::ZERO, 3.0 + 0.513375),
+            (KeyCode::KeyD, Vec3::X * 0.513375, 3.0),
         ] {
             let (mut app, camera) = orbit_test_app(true);
             press(&mut app, key);
@@ -3785,8 +3800,8 @@ mod tests {
         app.update();
 
         let diagonal = std::f32::consts::FRAC_1_SQRT_2;
-        let target = Vec3::Y - Vec3::Z * (0.2475 * diagonal);
-        let radius = 3.0 * (-0.0825 * diagonal).exp();
+        let target = Vec3::Y - Vec3::Z * (0.513375 * diagonal);
+        let radius = 3.0 - 0.513375 * diagonal;
         let orbit = app.world().resource::<OrbitCamera>();
         assert!(orbit.target.abs_diff_eq(target, 1e-5));
         assert!((orbit.distance - radius).abs() < 1e-5);
@@ -3796,8 +3811,8 @@ mod tests {
     }
 
     #[test]
-    fn close_mouse_orbit_turns_further_per_pixel_with_a_capped_gain() {
-        for (radius, gain) in [(6.0, 1.0), (3.0, 1.0), (1.5, 2.0), (0.75, 3.0)] {
+    fn mouse_orbit_keeps_the_same_angular_sensitivity_at_every_radius() {
+        for radius in [6.0, 3.0, 1.5, 0.75] {
             let (mut app, _) = orbit_test_app(true);
             app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
             app.world_mut()
@@ -3809,22 +3824,41 @@ mod tests {
             app.update();
 
             let orbit = app.world().resource::<OrbitCamera>();
-            assert!((orbit.yaw + 0.2 * gain).abs() < 1e-5);
-            assert!((orbit.pitch - 0.1 * gain).abs() < 1e-5);
+            assert!((orbit.yaw + 0.2).abs() < 1e-5);
+            assert!((orbit.pitch - 0.1).abs() < 1e-5);
             assert_eq!(orbit.distance, radius);
         }
     }
 
     #[test]
-    fn wasd_approach_depends_on_elapsed_time_and_respects_zoom_limits() {
-        let approach = (-0.0825_f32).exp();
-        for (interactive, key, steps, delta_ms, radius, expected) in [
-            (true, KeyCode::KeyW, 1, 100, 3.0, 3.0 * approach),
-            (true, KeyCode::KeyW, 4, 25, 3.0, 3.0 * approach),
-            (true, KeyCode::KeyW, 1, 100, 0.3, 0.3 * approach),
-            (true, KeyCode::KeyW, 1, 100, 0.201, 0.2),
-            (true, KeyCode::KeyS, 1, 100, 29.9, 30.0),
-            (false, KeyCode::KeyW, 1, 100, 3.0, 3.0),
+    fn right_button_pan_uses_the_translation_gain_at_each_radius() {
+        for radius in [0.75, 3.0] {
+            let (mut app, _) = orbit_test_app(true);
+            app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .press(MouseButton::Right);
+            app.world_mut().write_message(MouseMotion {
+                delta: Vec2::new(40.0, -20.0),
+            });
+            app.update();
+
+            let orbit = app.world().resource::<OrbitCamera>();
+            let target = Vec3::Y + Vec3::new(-0.61605, -0.308025, 0.0);
+            assert!(orbit.target.abs_diff_eq(target, 1e-5));
+            assert_eq!((orbit.yaw, orbit.pitch, orbit.distance), (0.0, 0.0, radius));
+        }
+    }
+
+    #[test]
+    fn wasd_travels_the_full_world_distance_across_both_orbit_limits() {
+        for (interactive, key, steps, delta_ms, radius, displacement) in [
+            (true, KeyCode::KeyW, 1, 100, 3.0, -0.513375),
+            (true, KeyCode::KeyW, 4, 25, 0.09572126, -0.513375),
+            (true, KeyCode::KeyW, 1, 100, 0.09572126, -0.513375),
+            (true, KeyCode::KeyW, 1, 100, MIN_ORBIT_RADIUS, -0.513375),
+            (true, KeyCode::KeyS, 1, 100, 29.9, 0.513375),
+            (false, KeyCode::KeyW, 1, 100, 3.0, 0.0),
         ] {
             let (mut app, _) = orbit_test_app(interactive);
             app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
@@ -3836,8 +3870,11 @@ mod tests {
                 app.update();
             }
             let orbit = app.world().resource::<OrbitCamera>();
-            assert_eq!(orbit.target, Vec3::Y);
-            assert!((orbit.distance - expected).abs() < 1e-5);
+            let expected_eye_z: f32 = radius + displacement;
+            let expected_radius = expected_eye_z.clamp(MIN_ORBIT_RADIUS, 30.0);
+            assert!((orbit.distance - expected_radius).abs() < 1e-5);
+            let eye = orbit.target + Vec3::Z * orbit.distance;
+            assert!(eye.abs_diff_eq(Vec3::Y + Vec3::Z * expected_eye_z, 1e-5));
         }
     }
 
@@ -3854,6 +3891,33 @@ mod tests {
         assert!(orbit.min_distance > 0.0);
         orbit.reset();
         assert_eq!(orbit.distance, 400.0, "R restores the fitted frame");
+    }
+
+    #[test]
+    fn holding_w_walks_through_an_offset_focus_in_the_reported_archer_view() {
+        let (mut app, camera) = orbit_test_app(true);
+        let target = Vec3::new(-0.35721472, 0.7243093, 0.96193457);
+        let yaw = -19.45375;
+        let pitch = -0.16969746;
+        let forward = Quat::from_euler(bevy::math::EulerRot::YXZ, yaw, pitch, 0.0) * Vec3::NEG_Z;
+        let opening = 1.9144252;
+        let former_wall = 0.09572126;
+        {
+            let mut orbit = app.world_mut().resource_mut::<OrbitCamera>();
+            orbit.fit(target, opening);
+            orbit.yaw = yaw;
+            orbit.pitch = pitch;
+            orbit.distance = former_wall;
+        }
+        let mut previous_eye = target - former_wall * forward;
+        press(&mut app, KeyCode::KeyW);
+        for _ in 0..3 {
+            app.update();
+            let eye = app.world().get::<Transform>(camera).unwrap().translation;
+            assert!((eye - previous_eye).abs_diff_eq(forward * (opening * 0.171125), 1e-5));
+            assert!((eye - target).dot(forward) > 0.0);
+            previous_eye = eye;
+        }
     }
 
     #[test]

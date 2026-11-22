@@ -6,12 +6,13 @@ the `export_cloth_glb.py` output, renders one offscreen frame and writes
 
 `--interactive` opens the same scene in a review window. Drag **LMB** to
 orbit or **RMB** to pan. Scroll to zoom, or press **R** to reset. Hold **W/S**
-to move toward/away from the orbit target. The **LMB** orbit radius shrinks
-as you approach. Hold **A/D** to move the view left/right. The keys work
-during a drag. The instantaneous travel speed is 0.825 times the current
-orbit radius per second, allowing smaller movements near the target.
-LMB orbit turns further per pixel as you approach the target, up to three
-times the sensitivity of the opening view.
+to travel forward/back along the view. The **LMB** orbit radius shrinks on
+approach. Hold W to continue past the old pivot. Hold **A/D** to move the
+view left/right. The keys work during a drag. WASD and RMB use the fitted
+opening distance as their speed reference at every zoom level. Keyboard
+travel covers 1.71125 opening distances per second and RMB panning covers
+0.00513375 per pixel. The interactive near clipping plane is 1 mm.
+LMB rotation is 0.005 radians per pixel at every distance.
 The 13-view contact sheet remains the fit evidence.
 
 The interactive camera frames the loaded scene from its world bounds: once
