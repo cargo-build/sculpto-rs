@@ -463,6 +463,19 @@ struct StagedFile {
     note: SidecarNote,
 }
 
+impl StagedFile {
+    /// Identical bank entries can respawn the scene using the resident GPU assets.
+    fn reuse_loaded(&mut self, files: &WatchFiles, current: Option<u64>, sha: &str) {
+        if let Some(seq) =
+            current.filter(|&seq| self.sha == sha && files.staged_path(seq).is_file())
+        {
+            files.remove_staged(self.seq);
+            self.seq = seq;
+            self.asset_name = format!("live-{seq}.glb");
+        }
+    }
+}
+
 impl WatchFiles {
     fn watched_path(&self) -> std::path::PathBuf {
         self.dir.join(format!("{}.glb", self.stage))
@@ -554,6 +567,12 @@ struct WatchState {
 }
 
 impl WatchState {
+    fn discard_inactive(&self, seq: u64) {
+        if self.current_seq != Some(seq) {
+            self.files.remove_staged(seq);
+        }
+    }
+
     /// The truth line: status first (the niri focus rules match
     /// `^diagnostic · ` titles), then stage, the sha of what is on screen
     /// and the sidecar note.
@@ -2166,8 +2185,10 @@ fn fit_camera_to_scene(
     info!("viewer: auto-fit target={target:?} radius={radius:.3} distance={distance:.3}");
 }
 
-/// Scale pan and keyboard travel by the fitted opening distance.
-const CAMERA_TRANSLATION_GAIN: f32 = 3.4225;
+/// Keyboard and pan rates use the fitted opening distance as their unit.
+const TRAVEL_PER_SECOND: f32 = 0.5;
+const PAN_PER_PIXEL: f32 = 0.0015;
+const ORBIT_RADIANS_PER_PIXEL: f32 = 0.005;
 
 /// Interactive orbit, pan and zoom with view-relative WASD travel.
 fn orbit_controls(
@@ -2203,16 +2224,15 @@ fn orbit_controls(
     let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
-        let sensitivity = 0.005;
-        orbit.yaw -= delta.x * sensitivity;
-        orbit.pitch = (orbit.pitch - delta.y * sensitivity).clamp(-1.45, 1.45);
+        orbit.yaw -= delta.x * ORBIT_RADIANS_PER_PIXEL;
+        orbit.pitch = (orbit.pitch - delta.y * ORBIT_RADIANS_PER_PIXEL).clamp(-1.45, 1.45);
     }
     let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
-    let travel_scale = orbit.home.3 * CAMERA_TRANSLATION_GAIN;
+    let opening_distance = orbit.home.3;
     if buttons.pressed(MouseButton::Right) && !moving_character {
         let right = rotation * Vec3::X;
         let up = rotation * Vec3::Y;
-        let pan_scale = travel_scale * 0.0015;
+        let pan_scale = opening_distance * PAN_PER_PIXEL;
         orbit.target += (-right * delta.x + up * delta.y) * pan_scale;
     }
     if zoom.abs() > f32::EPSILON {
@@ -2227,7 +2247,8 @@ fn orbit_controls(
         axis(KeyCode::KeyD, KeyCode::KeyA),
         axis(KeyCode::KeyS, KeyCode::KeyW),
     );
-    let travel = direction.normalize_or_zero() * (0.5 * travel_scale * time.delta_secs());
+    let travel =
+        direction.normalize_or_zero() * (TRAVEL_PER_SECOND * opening_distance * time.delta_secs());
     let radius = orbit.distance;
     if travel.x != 0.0 {
         orbit.target += rotation * Vec3::X * travel.x;
@@ -3328,9 +3349,13 @@ fn watch_tick(
     }
     watch.next_poll = watch.elapsed + POLL_INTERVAL_SECS;
 
-    if let Some(staged) = watch.files.poll() {
+    if let Some(mut staged) = watch.files.poll() {
         if let Some(old) = watch.pending.take() {
-            watch.files.remove_staged(old.seq);
+            watch.discard_inactive(old.seq);
+        }
+        let bank_slot = bank.as_ref().and_then(|bank| bank.requested);
+        if bank_slot.is_some() {
+            staged.reuse_loaded(&watch.files, watch.current_seq, &watch.sha);
         }
         let world = asset_server.load(format!("{}#Scene0", staged.asset_name));
         info!(
@@ -3345,7 +3370,7 @@ fn watch_tick(
             world,
             sha: staged.sha,
             note: staged.note,
-            bank_slot: bank.as_ref().and_then(|bank| bank.requested),
+            bank_slot,
         });
     }
 
@@ -3398,7 +3423,7 @@ fn watch_tick(
         // Free the replaced generation: its staged copy is gone from disk and
         // its asset unloads once nothing holds a strong handle any more.
         if let Some(old_seq) = watch.current_seq.replace(pending.seq) {
-            watch.files.remove_staged(old_seq);
+            watch.discard_inactive(old_seq);
         }
         info!(
             "viewer: live swap to {} sha {} — camera, orbit, lights, bones and playback state kept",
@@ -3407,7 +3432,7 @@ fn watch_tick(
         );
     } else if failed {
         let pending = watch.pending.take().expect("checked failed above");
-        watch.files.remove_staged(pending.seq);
+        watch.discard_inactive(pending.seq);
         watch.failed = true;
         if let Some(bank) = bank.as_mut() {
             bank.requested = None;
@@ -3759,10 +3784,10 @@ mod tests {
     #[test]
     fn wasd_moves_toward_or_sideways_from_the_orbit_target() {
         for (key, target_offset, radius) in [
-            (KeyCode::KeyW, Vec3::ZERO, 3.0 - 0.513375),
-            (KeyCode::KeyA, Vec3::NEG_X * 0.513375, 3.0),
-            (KeyCode::KeyS, Vec3::ZERO, 3.0 + 0.513375),
-            (KeyCode::KeyD, Vec3::X * 0.513375, 3.0),
+            (KeyCode::KeyW, Vec3::ZERO, 3.0 - 0.15),
+            (KeyCode::KeyA, Vec3::NEG_X * 0.15, 3.0),
+            (KeyCode::KeyS, Vec3::ZERO, 3.0 + 0.15),
+            (KeyCode::KeyD, Vec3::X * 0.15, 3.0),
         ] {
             let (mut app, camera) = orbit_test_app(true);
             press(&mut app, key);
@@ -3800,8 +3825,8 @@ mod tests {
         app.update();
 
         let diagonal = std::f32::consts::FRAC_1_SQRT_2;
-        let target = Vec3::Y - Vec3::Z * (0.513375 * diagonal);
-        let radius = 3.0 - 0.513375 * diagonal;
+        let target = Vec3::Y - Vec3::Z * (0.15 * diagonal);
+        let radius = 3.0 - 0.15 * diagonal;
         let orbit = app.world().resource::<OrbitCamera>();
         assert!(orbit.target.abs_diff_eq(target, 1e-5));
         assert!((orbit.distance - radius).abs() < 1e-5);
@@ -3831,7 +3856,7 @@ mod tests {
     }
 
     #[test]
-    fn right_button_pan_uses_the_translation_gain_at_each_radius() {
+    fn right_button_pan_keeps_the_original_rate_at_each_radius() {
         for radius in [0.75, 3.0] {
             let (mut app, _) = orbit_test_app(true);
             app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
@@ -3844,7 +3869,7 @@ mod tests {
             app.update();
 
             let orbit = app.world().resource::<OrbitCamera>();
-            let target = Vec3::Y + Vec3::new(-0.61605, -0.308025, 0.0);
+            let target = Vec3::Y + Vec3::new(-0.18, -0.09, 0.0);
             assert!(orbit.target.abs_diff_eq(target, 1e-5));
             assert_eq!((orbit.yaw, orbit.pitch, orbit.distance), (0.0, 0.0, radius));
         }
@@ -3853,11 +3878,11 @@ mod tests {
     #[test]
     fn wasd_travels_the_full_world_distance_across_both_orbit_limits() {
         for (interactive, key, steps, delta_ms, radius, displacement) in [
-            (true, KeyCode::KeyW, 1, 100, 3.0, -0.513375),
-            (true, KeyCode::KeyW, 4, 25, 0.09572126, -0.513375),
-            (true, KeyCode::KeyW, 1, 100, 0.09572126, -0.513375),
-            (true, KeyCode::KeyW, 1, 100, MIN_ORBIT_RADIUS, -0.513375),
-            (true, KeyCode::KeyS, 1, 100, 29.9, 0.513375),
+            (true, KeyCode::KeyW, 1, 100, 3.0, -0.15),
+            (true, KeyCode::KeyW, 4, 25, 0.09572126, -0.15),
+            (true, KeyCode::KeyW, 1, 100, 0.09572126, -0.15),
+            (true, KeyCode::KeyW, 1, 100, MIN_ORBIT_RADIUS, -0.15),
+            (true, KeyCode::KeyS, 1, 100, 29.9, 0.15),
             (false, KeyCode::KeyW, 1, 100, 3.0, 0.0),
         ] {
             let (mut app, _) = orbit_test_app(interactive);
@@ -3914,10 +3939,10 @@ mod tests {
         for _ in 0..3 {
             app.update();
             let eye = app.world().get::<Transform>(camera).unwrap().translation;
-            assert!((eye - previous_eye).abs_diff_eq(forward * (opening * 0.171125), 1e-5));
-            assert!((eye - target).dot(forward) > 0.0);
+            assert!((eye - previous_eye).abs_diff_eq(forward * (opening * 0.05), 1e-5));
             previous_eye = eye;
         }
+        assert!((previous_eye - target).dot(forward) > 0.0);
     }
 
     #[test]
@@ -4040,6 +4065,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identical_bank_slots_reuse_asset_paths_while_edits_stage_new_bytes() {
+        let dir = temp_watch_dir("bank-reuse");
+        let mut files = watch_files(&dir);
+        std::fs::create_dir_all(&files.staging_dir).unwrap();
+        std::fs::write(files.watched_path(), b"same model").unwrap();
+        let resident = files.poll().unwrap();
+        files.seen = None;
+        let mut duplicate = files.poll().unwrap();
+        duplicate.reuse_loaded(&files, Some(resident.seq), &resident.sha);
+        assert_eq!(duplicate.asset_name, resident.asset_name);
+        assert!(!files.staged_path(1).exists());
+        std::fs::write(files.watched_path(), b"changed geometry").unwrap();
+        let mut edited = files.poll().unwrap();
+        edited.reuse_loaded(&files, Some(resident.seq), &resident.sha);
+        assert_eq!(edited.asset_name, "live-2.glb");
+        assert_eq!(std::fs::read(files.staged_path(0)).unwrap(), b"same model");
+        assert_eq!(
+            std::fs::read(files.staged_path(2)).unwrap(),
+            b"changed geometry"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

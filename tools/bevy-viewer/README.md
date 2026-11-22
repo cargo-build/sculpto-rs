@@ -10,8 +10,8 @@ to travel forward/back along the view. The **LMB** orbit radius shrinks on
 approach. Hold W to continue past the old pivot. Hold **A/D** to move the
 view left/right. The keys work during a drag. WASD and RMB use the fitted
 opening distance as their speed reference at every zoom level. Keyboard
-travel covers 1.71125 opening distances per second and RMB panning covers
-0.00513375 per pixel. The interactive near clipping plane is 1 mm.
+travel covers 0.5 opening distances per second and RMB panning covers
+0.0015 opening distances per pixel. The interactive near clipping plane is 1 mm.
 LMB rotation is 0.005 radians per pixel at every distance.
 The 13-view contact sheet remains the fit evidence.
 
@@ -310,6 +310,8 @@ last digit, including after Ctrl is released. Numbers beyond the bank select the
 slot. An optional top-level `inspection` entry has the same fields and a null clip.
 Ctrl+0 opens this asset and reports `bank.current = "inspection"`. Plain 0 opens slot 0.
 The socket's numeric slot command requires a valid index.
+Slots with identical GLB bytes restart their pose using the resident meshes and textures.
+Editing the asset stages its new geometry on the next load.
 
 In the Emily bank, 0 opens A-pose, 1 opens T-pose and 2–9 play named Mixamo clips.
 Click the figure for keyboard focus. H toggles the controls card.
