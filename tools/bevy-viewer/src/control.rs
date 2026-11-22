@@ -55,6 +55,7 @@ pub enum Command {
         name: Option<String>,
         yaw: Option<f32>,
         pitch: Option<f32>,
+        look_pitch: Option<f32>,
         distance: Option<f32>,
         target: Option<String>,
     },
@@ -278,10 +279,11 @@ pub fn parse_request(line: &str) -> Result<Command, String> {
             }
             let yaw = optional_number(object, "yaw")?;
             let pitch = optional_number(object, "pitch")?;
+            let look_pitch = optional_number(object, "look_pitch")?;
             let distance = optional_number(object, "distance")?;
-            if let Some(pitch) = pitch {
-                if !(-1.45..=1.45).contains(&pitch) {
-                    return Err(format!("pitch {pitch} outside -1.45..1.45 rad"));
+            for (name, angle) in [("pitch", pitch), ("look_pitch", look_pitch)] {
+                if angle.is_some_and(|a| a.abs() > super::MAX_ORBIT_PITCH) {
+                    return Err(format!("{name} outside -1.45..1.45 rad"));
                 }
             }
             if let Some(distance) = distance {
@@ -290,9 +292,14 @@ pub fn parse_request(line: &str) -> Result<Command, String> {
                 }
             }
             let target = optional_string(object, "target")?;
-            if name.is_none() && yaw.is_none() && pitch.is_none() && distance.is_none() {
+            if name.is_none()
+                && yaw.is_none()
+                && pitch.is_none()
+                && look_pitch.is_none()
+                && distance.is_none()
+            {
                 return Err(format!(
-                    "view needs one of \"name\" ({}), \"yaw\", \"pitch\", \"distance\"",
+                    "view needs one of \"name\" ({}), \"yaw\", \"pitch\", \"look_pitch\", \"distance\"",
                     VIEWS.join(", ")
                 ));
             }
@@ -300,6 +307,7 @@ pub fn parse_request(line: &str) -> Result<Command, String> {
                 name,
                 yaw,
                 pitch,
+                look_pitch,
                 distance,
                 target,
             })
@@ -593,6 +601,7 @@ pub struct Snapshot {
     pub camera_target: [f32; 3],
     pub camera_yaw: f32,
     pub camera_pitch: f32,
+    pub camera_look_pitch: f32,
     pub camera_distance: f32,
     pub camera_position: [f32; 3],
     pub joints: Vec<(String, [f32; 3])>,
@@ -642,6 +651,7 @@ impl Snapshot {
                 "target": self.camera_target,
                 "yaw": self.camera_yaw,
                 "pitch": self.camera_pitch,
+                "look_pitch": self.camera_look_pitch,
                 "distance": self.camera_distance,
                 "position": self.camera_position,
             },
@@ -691,7 +701,8 @@ pub fn help_json() -> String {
             "view": {
                 "name": VIEWS,
                 "yaw": "radians, 0 = camera on +Z",
-                "pitch": "radians, -1.45..1.45, positive = above",
+                "pitch": "eye angle about the pivot in radians, -1.45..1.45",
+                "look_pitch": "view angle at the eye in radians, -1.45..1.45, positive looks up",
                 "distance": "metres from the target",
                 "target": "joint name to orbit around, same lookup as \"joint\""
             },
@@ -770,6 +781,7 @@ mod tests {
                 name: Some("front".to_string()),
                 yaw: None,
                 pitch: None,
+                look_pitch: None,
                 distance: None,
                 target: None
             }
@@ -879,6 +891,7 @@ mod tests {
             camera_target: [0.0, 0.9, 0.0],
             camera_yaw: 0.0,
             camera_pitch: 0.2,
+            camera_look_pitch: 0.2,
             camera_distance: 3.5,
             camera_position: [0.0, 1.6, 3.4],
             joints: joints(),
@@ -975,6 +988,7 @@ mod tests {
                 name: None,
                 yaw: Some(1234.5),
                 pitch: None,
+                look_pitch: None,
                 distance: None,
                 target: None
             }

@@ -183,7 +183,7 @@ printf '{"cmd":"state"}\n' | socat - UNIX-CONNECT:/tmp/opencode/task/viewer.sock
  "status":"InProgress",
  "clip":{"index":0,"count":0,"paused":false,"speed":1.0},
  "skeleton":2,
- "camera":{"mode":"orbit","target":[0,0.9,0],"yaw":0.66,"pitch":0.11,
+ "camera":{"mode":"orbit","target":[0,0.9,0],"yaw":0.66,"pitch":0.11,"look_pitch":0.11,
            "distance":3.58,"position":[2.2,1.3,2.8]},
  "joint_count":65,"joints":[{"name":"mixamorig:Hips","position":[0,1.02,0]}],
  "material_count":3,
@@ -304,6 +304,11 @@ unit-length render normals under `state.cloth`.
 
 The viewer supplies a directional sun and subtle cool skylight for every
 lit review. The sun starts at 55° with white light. **Shift+LMB** aims it.
+Drag **LMB** sideways to circle the horizontal pivot. Drag up or down to
+look from the current eye position. Both use 0.005 radians per pixel.
+W/S follows the new line of sight. **R** restores the fitted camera.
+The socket's `camera.pitch` locates the eye on the orbit and `camera.look_pitch`
+reports its viewing angle. The `view` command can restore both independently.
 Lower it toward the horizon for warmer, dimmer light and longer shadows.
 The matte ground receives the shadow in an interactive review. **Ctrl+LMB**
 turns the figure and **Ctrl+RMB** moves it sideways under the same sun.

@@ -1909,7 +1909,7 @@ fn setup(
                     TextColor(status_colour),
                 ));
                 for line in [
-                    "Drag LMB orbit · RMB pan · wheel zoom",
+                    "LMB sideways orbit · up/down look · RMB pan · wheel zoom",
                     "W/S approach or retreat · A/D move sideways",
                     "Ctrl+LMB turn figure · Ctrl+RMB move sideways",
                     "Shift+LMB aim sun · lower is warmer",
@@ -1921,7 +1921,7 @@ fn setup(
                         "0–9 select clip · Ctrl+number 1.35s"
                     },
                     "Space pause · Ctrl+, slower · Ctrl+. faster",
-                    "R reset · L lit/flat · N face normals · F3 rig · B bones · H help",
+                    "R reset camera · L lit/flat · N face normals · F3 rig · B bones · H help",
                     "Hover node = name",
                 ] {
                     card.spawn((
@@ -2086,6 +2086,7 @@ struct OrbitCamera {
     target: Vec3,
     yaw: f32,
     pitch: f32,
+    look_offset: f32,
     distance: f32,
     min_distance: f32,
     max_distance: f32,
@@ -2102,6 +2103,7 @@ impl OrbitCamera {
             target,
             yaw,
             pitch,
+            look_offset: 0.0,
             distance,
             min_distance: MIN_ORBIT_RADIUS,
             max_distance: 30.0,
@@ -2114,6 +2116,7 @@ impl OrbitCamera {
     /// human-scale 30-unit cap.
     fn fit(&mut self, target: Vec3, distance: f32) {
         self.target = target;
+        self.look_offset = 0.0;
         self.distance = distance;
         self.max_distance = (distance * 20.0).max(30.0);
         self.home = (target, self.yaw, self.pitch, distance);
@@ -2124,7 +2127,35 @@ impl OrbitCamera {
         self.target = target;
         self.yaw = yaw;
         self.pitch = pitch;
+        self.look_offset = 0.0;
         self.distance = distance;
+    }
+
+    /// Yaw circles the pivot. Pitch turns the lens about the eye without moving either point.
+    fn drag(&mut self, delta: Vec2) {
+        self.yaw -= delta.x * ORBIT_RADIANS_PER_PIXEL;
+        if delta.y != 0.0 {
+            self.look_offset = (self.look_pitch() - delta.y * ORBIT_RADIANS_PER_PIXEL)
+                .clamp(-MAX_ORBIT_PITCH, MAX_ORBIT_PITCH)
+                - self.pitch;
+        }
+    }
+
+    fn look_pitch(&self) -> f32 {
+        self.pitch + self.look_offset
+    }
+
+    fn radial(&self) -> Vec3 {
+        Quat::from_euler(bevy::math::EulerRot::YXZ, self.yaw, self.pitch, 0.) * Vec3::Z
+    }
+
+    fn orientation(&self) -> Quat {
+        Quat::from_euler(bevy::math::EulerRot::YXZ, self.yaw, self.look_pitch(), 0.)
+    }
+
+    fn place(&self, camera: &mut Transform) {
+        camera.translation = self.target + self.radial() * self.distance;
+        camera.rotation = self.orientation();
     }
 }
 
@@ -2174,9 +2205,7 @@ fn fit_camera_to_scene(
     let distance = radius / (std::f32::consts::FRAC_PI_8).tan() * 1.15;
     orbit.fit(target, distance);
     if let Ok(mut camera) = cameras.single_mut() {
-        let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
-        camera.translation = target + rotation * Vec3::Z * distance;
-        camera.look_at(target, Vec3::Y);
+        orbit.place(&mut camera);
     }
     let width = (max.x - min.x).max(max.z - min.z).max(radius * 2.0);
     for mut ground in &mut grounds {
@@ -2191,6 +2220,7 @@ fn fit_camera_to_scene(
 const TRAVEL_PER_SECOND: f32 = 0.5;
 const PAN_PER_PIXEL: f32 = 0.0015;
 const ORBIT_RADIANS_PER_PIXEL: f32 = 0.005;
+const MAX_ORBIT_PITCH: f32 = 1.45;
 
 /// Interactive orbit, pan and zoom with view-relative WASD travel.
 fn orbit_controls(
@@ -2226,10 +2256,9 @@ fn orbit_controls(
     let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
-        orbit.yaw -= delta.x * ORBIT_RADIANS_PER_PIXEL;
-        orbit.pitch = (orbit.pitch - delta.y * ORBIT_RADIANS_PER_PIXEL).clamp(-1.45, 1.45);
+        orbit.drag(delta);
     }
-    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+    let rotation = orbit.orientation();
     let opening_distance = orbit.home.3;
     if buttons.pressed(MouseButton::Right) && !moving_character {
         let right = rotation * Vec3::X;
@@ -2258,15 +2287,15 @@ fn orbit_controls(
     if travel.y != 0.0 {
         let requested = radius + travel.y;
         let next = requested.clamp(orbit.min_distance, orbit.max_distance);
-        orbit.target += rotation * Vec3::Z * (requested - next);
+        let pivot_shift = rotation * Vec3::Z * travel.y - orbit.radial() * (next - radius);
+        orbit.target += pivot_shift;
         orbit.distance = next;
     }
 
     let Ok(mut transform) = cameras.single_mut() else {
         return;
     };
-    transform.translation = orbit.target + rotation * Vec3::Z * orbit.distance;
-    transform.look_at(orbit.target, Vec3::Y);
+    orbit.place(&mut transform);
 }
 
 /// Shift+LMB aims the sun and grades its light by elevation.
@@ -2799,24 +2828,6 @@ fn view_angles(name: &str) -> (f32, f32) {
     }
 }
 
-/// Move the camera to the orbit state. In the interactive window
-/// `orbit_controls` writes the same values from the same resource, so the two
-/// paths cannot disagree; the headless capture camera is otherwise untouched,
-/// which keeps a plain capture on its fixed review view.
-fn place_camera(
-    target: Vec3,
-    yaw: f32,
-    pitch: f32,
-    distance: f32,
-    cameras: &mut Query<&mut Transform, With<Camera3d>>,
-) {
-    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, yaw, pitch, 0.0);
-    if let Ok(mut camera) = cameras.single_mut() {
-        camera.translation = target + rotation * Vec3::Z * distance;
-        camera.look_at(target, Vec3::Y);
-    }
-}
-
 /// Start the chosen actor clip on every player while the cloth clip keeps
 /// running. Shared by the keyboard path and the control socket.
 fn start_actor_clip(
@@ -2936,6 +2947,7 @@ fn control_service(
                         .map_or([0.0; 3], |orbit| orbit.target.to_array()),
                     camera_yaw: orbit.as_ref().map_or(0.0, |orbit| orbit.yaw),
                     camera_pitch: orbit.as_ref().map_or(0.0, |orbit| orbit.pitch),
+                    camera_look_pitch: orbit.as_ref().map_or(0.0, |orbit| orbit.look_pitch()),
                     camera_distance: orbit.as_ref().map_or(0.0, |orbit| orbit.distance),
                     camera_position: cameras
                         .iter()
@@ -2956,6 +2968,7 @@ fn control_service(
                 name,
                 yaw,
                 pitch,
+                look_pitch,
                 distance,
                 target,
             } => {
@@ -2980,28 +2993,30 @@ fn control_service(
                             let (view_yaw, view_pitch) = view_angles(name);
                             orbit.yaw = view_yaw;
                             orbit.pitch = view_pitch;
+                            orbit.look_offset = 0.0;
                         }
                         if let Some(yaw) = yaw {
                             orbit.yaw = yaw;
                         }
                         if let Some(pitch) = pitch {
                             orbit.pitch = pitch;
+                            orbit.look_offset = 0.0;
+                        }
+                        if let Some(look_pitch) = look_pitch {
+                            orbit.look_offset = look_pitch - orbit.pitch;
                         }
                         if let Some(distance) = distance {
                             orbit.distance = distance;
                         }
-                        place_camera(
-                            orbit.target,
-                            orbit.yaw,
-                            orbit.pitch,
-                            orbit.distance,
-                            &mut cameras,
-                        );
+                        if let Ok(mut camera) = cameras.single_mut() {
+                            orbit.place(&mut camera);
+                        }
                         control::ok_json(serde_json::json!({
                             "camera": {
                                 "target": orbit.target.to_array(),
                                 "yaw": orbit.yaw,
                                 "pitch": orbit.pitch,
+                                "look_pitch": orbit.look_pitch(),
                                 "distance": orbit.distance,
                             },
                         }))
@@ -3020,13 +3035,9 @@ fn control_service(
                     (Ok(_), None) => control::error_json("no orbit camera in this mode"),
                     (Ok(target), Some(orbit)) => {
                         orbit.target = target;
-                        place_camera(
-                            orbit.target,
-                            orbit.yaw,
-                            orbit.pitch,
-                            orbit.distance,
-                            &mut cameras,
-                        );
+                        if let Ok(mut camera) = cameras.single_mut() {
+                            orbit.place(&mut camera);
+                        }
                         control::ok_json(serde_json::json!({
                             "camera": { "target": target.to_array(), "distance": orbit.distance },
                         }))
@@ -3829,34 +3840,67 @@ mod tests {
         app.update();
 
         let diagonal = std::f32::consts::FRAC_1_SQRT_2;
-        let target = Vec3::Y - Vec3::Z * (0.15 * diagonal);
-        let radius = 3.0 - 0.15 * diagonal;
+        let view_back = Vec3::new(3.0_f32.sqrt() / 2.0, -0.5, 0.0);
+        let eye_before_travel = Vec3::Y + 3.0 * Vec3::X;
+        let expected = eye_before_travel - (Vec3::Z + view_back) * (0.15 * diagonal);
         let orbit = app.world().resource::<OrbitCamera>();
-        assert!(orbit.target.abs_diff_eq(target, 1e-5));
-        assert!((orbit.distance - radius).abs() < 1e-5);
-        let eye_offset = Vec3::new(3.0_f32.sqrt() / 2.0, -0.5, 0.0) * radius;
-        let eye = app.world().get::<Transform>(camera).unwrap().translation;
-        assert!(eye.abs_diff_eq(target + eye_offset, 1e-5));
+        assert!((orbit.distance - (3.0 - 0.15 * diagonal)).abs() < 1e-5);
+        let t = app.world().get::<Transform>(camera).unwrap();
+        assert!(t.translation.abs_diff_eq(expected, 1e-5));
+        assert!((t.rotation * Vec3::Z).abs_diff_eq(view_back, 1e-5));
     }
 
     #[test]
-    fn mouse_orbit_keeps_the_same_angular_sensitivity_at_every_radius() {
-        for radius in [6.0, 3.0, 1.5, 0.75] {
-            let (mut app, _) = orbit_test_app(true);
+    fn vertical_mouse_look_stays_at_the_eye_and_yaw_keeps_the_horizontal_pivot() {
+        for radius in [6.0, 0.75, MIN_ORBIT_RADIUS] {
+            let (mut app, camera) = orbit_test_app(true);
             app.world_mut().resource_mut::<OrbitCamera>().distance = radius;
             app.world_mut()
                 .resource_mut::<ButtonInput<MouseButton>>()
                 .press(MouseButton::Left);
             app.world_mut().write_message(MouseMotion {
-                delta: Vec2::new(40.0, -20.0),
+                delta: Vec2::new(0., -60.),
             });
             app.update();
-
+            let t = app.world().get::<Transform>(camera).unwrap();
+            assert!(t.translation.abs_diff_eq(Vec3::Y + radius * Vec3::Z, 1e-6));
+            assert!((t.rotation * Vec3::NEG_Z).y > 0.29);
+            app.world_mut().write_message(MouseMotion {
+                delta: Vec2::new(40., 0.),
+            });
+            app.update();
             let orbit = app.world().resource::<OrbitCamera>();
-            assert!((orbit.yaw + 0.2).abs() < 1e-5);
-            assert!((orbit.pitch - 0.1).abs() < 1e-5);
-            assert_eq!(orbit.distance, radius);
+            let eye = app.world().get::<Transform>(camera).unwrap().translation;
+            assert_eq!(orbit.target, Vec3::Y);
+            assert!((orbit.yaw + 0.2).abs() < 1e-5 && (orbit.look_pitch() - 0.3).abs() < 1e-5);
+            assert!((eye.y - 1.).abs() < 1e-6 && ((eye - Vec3::Y).length() - radius).abs() < 1e-5);
+            press(&mut app, KeyCode::KeyR);
+            app.update();
+            let orbit = app.world().resource::<OrbitCamera>();
+            assert_eq!(orbit.look_pitch(), orbit.home.2);
+            assert!(app
+                .world()
+                .get::<Transform>(camera)
+                .unwrap()
+                .translation
+                .abs_diff_eq(Vec3::Y + 3. * Vec3::Z, 1e-6));
         }
+    }
+
+    #[test]
+    fn a_tilted_off_center_closeup_can_look_straight_ahead_without_moving() {
+        let mut orbit = OrbitCamera::looking_at(Vec3::new(1.2, 2., 1.5), Vec3::Y);
+        orbit.target = Vec3::new(-0.3, 0.84, 0.25);
+        orbit.distance = MIN_ORBIT_RADIUS;
+        let mut camera = Transform::IDENTITY;
+        orbit.place(&mut camera);
+        let eye = camera.translation;
+        let pivot = orbit.target;
+        orbit.drag(Vec2::new(0., orbit.pitch / ORBIT_RADIANS_PER_PIXEL));
+        orbit.place(&mut camera);
+        assert!(camera.translation.abs_diff_eq(eye, 1e-6));
+        assert_eq!(pivot, orbit.target);
+        assert!((camera.rotation * Vec3::NEG_Z).y.abs() < 1e-6);
     }
 
     #[test]
