@@ -7,6 +7,7 @@ mod cloth;
 mod control;
 mod facets;
 mod number_entry;
+mod timeline;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::oit::{resolve::is_oit_supported, OrderIndependentTransparencySettings};
@@ -742,7 +743,8 @@ fn glb_animation_count_bytes(bytes: &[u8]) -> Option<usize> {
     glb_animation_names_bytes(bytes).map(|names| names.len())
 }
 
-fn glb_animation_names_bytes(bytes: &[u8]) -> Option<Vec<String>> {
+/// The JSON chunk of already-read GLB bytes.
+fn glb_json(bytes: &[u8]) -> Option<serde_json::Value> {
     if bytes.len() < 20 || &bytes[0..4] != b"glTF" {
         return None;
     }
@@ -751,7 +753,11 @@ fn glb_animation_names_bytes(bytes: &[u8]) -> Option<Vec<String>> {
     if chunk_type != 0x4E4F_534A || 20 + chunk_len > bytes.len() {
         return None;
     }
-    let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + chunk_len]).ok()?;
+    serde_json::from_slice(&bytes[20..20 + chunk_len]).ok()
+}
+
+fn glb_animation_names_bytes(bytes: &[u8]) -> Option<Vec<String>> {
+    let json = glb_json(bytes)?;
     // A GLB without an `animations` array carries zero clips; reporting `null`
     // there would read as "unknown" to an agent.
     Some(
@@ -1124,6 +1130,7 @@ fn main() {
         })
         .insert_resource(FlatMode(config.flat))
         .init_resource::<number_entry::NumberEntry>()
+        .init_resource::<timeline::Timeline>()
         .insert_resource(facets::FaceNormals(
             std::env::var_os("SCULPTO_VIEWER_FACE_NORMALS").is_some_and(|value| value != "0"),
         ))
@@ -1234,6 +1241,8 @@ fn main() {
                 .before(orbit_controls),
         )
         .add_systems(Update, (control_playback, apply_playback))
+        .add_systems(Update, timeline::read.before(orbit_controls))
+        .add_systems(Update, timeline::show.after(apply_playback))
         .add_systems(Update, tag_in_place_roots)
         // After the animation pass, before transform propagation, so the held
         // translation is what the skin actually renders this frame.
@@ -1920,8 +1929,9 @@ fn setup(
                     } else {
                         "0–9 select clip · Ctrl+number 1.35s"
                     },
-                    "Space pause · Ctrl+, slower · Ctrl+. faster",
-                    "R reset camera · L lit/flat · N face normals · F3 rig · B bones · H help",
+                    "Space pause · Left/Right one frame · Ctrl+, slower · Ctrl+. faster",
+                    "LMB on the timeline seeks · R reset camera · L lit/flat · N face normals",
+                    "F3 rig · B bones · H help",
                     "Hover node = name",
                 ] {
                     card.spawn((
@@ -1987,6 +1997,7 @@ fn setup(
                     Visibility::Hidden,
                 ));
             });
+        timeline::spawn(&mut commands);
     }
 }
 
@@ -2222,9 +2233,12 @@ const PAN_PER_PIXEL: f32 = 0.0015;
 const ORBIT_RADIANS_PER_PIXEL: f32 = 0.005;
 const MAX_ORBIT_PITCH: f32 = 1.45;
 
-/// Interactive orbit, pan and zoom with view-relative WASD travel.
+/// Interactive orbit, pan and zoom with view-relative WASD travel. A drag that began on the
+/// timeline scrubs the clip and leaves the camera alone.
+#[allow(clippy::too_many_arguments)]
 fn orbit_controls(
     config: Res<ViewerConfig>,
+    timeline: Res<timeline::Timeline>,
     orbit: Option<ResMut<OrbitCamera>>,
     time: Res<Time>,
     buttons: Res<ButtonInput<MouseButton>>,
@@ -2255,7 +2269,11 @@ fn orbit_controls(
     }
     let moving_light = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let moving_character = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
-    if buttons.pressed(MouseButton::Left) && !moving_light && !moving_character {
+    if buttons.pressed(MouseButton::Left)
+        && !moving_light
+        && !moving_character
+        && !timeline.scrubbing
+    {
         orbit.drag(delta);
     }
     let rotation = orbit.orientation();
@@ -3783,6 +3801,7 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<timeline::Timeline>()
             .add_message::<MouseMotion>()
             .add_message::<MouseWheel>()
             .add_systems(Update, orbit_controls);
@@ -3794,6 +3813,63 @@ mod tests {
             .resource_mut::<Time>()
             .advance_by(Duration::from_millis(100));
         (app, camera)
+    }
+
+    fn glb(json: &[u8]) -> Vec<u8> {
+        let padding = (4 - json.len() % 4) % 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"glTF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&((12 + 8 + json.len() + padding) as u32).to_le_bytes());
+        bytes.extend_from_slice(&((json.len() + padding) as u32).to_le_bytes());
+        bytes.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+        bytes.extend_from_slice(json);
+        bytes.extend(std::iter::repeat_n(b' ', padding));
+        bytes
+    }
+
+    #[test]
+    fn a_drag_that_begins_on_the_timeline_leaves_the_camera_alone() {
+        let (mut app, camera) = orbit_test_app(true);
+        let before = app.world().get::<Transform>(camera).unwrap().translation;
+        app.world_mut()
+            .resource_mut::<timeline::Timeline>()
+            .scrubbing = true;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut().write_message(MouseMotion {
+            delta: Vec2::new(200., 100.),
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<Transform>(camera).unwrap().translation,
+            before
+        );
+        assert_eq!(app.world().resource::<OrbitCamera>().yaw, 0.0);
+
+        app.world_mut()
+            .resource_mut::<timeline::Timeline>()
+            .scrubbing = false;
+        app.world_mut().write_message(MouseMotion {
+            delta: Vec2::new(100., 0.),
+        });
+        app.update();
+        assert!((app.world().resource::<OrbitCamera>().yaw.abs() - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn glb_json_reads_the_json_chunk_of_a_glb_and_refuses_anything_else() {
+        let bytes =
+            glb(br#"{"accessors":[{"count":31}],"animations":[{"samplers":[{"input":0}]}]}"#);
+        let json = glb_json(&bytes).expect("the JSON chunk");
+        assert_eq!(timeline::frames_of(&json, 0), Some(31));
+        assert_eq!(
+            glb_animation_names_bytes(&bytes),
+            Some(vec!["Animation0".to_string()])
+        );
+        assert!(glb_json(&bytes[..10]).is_none());
+        assert!(glb_json(b"RIFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").is_none());
     }
 
     #[test]

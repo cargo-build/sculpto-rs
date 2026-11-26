@@ -337,3 +337,13 @@ Editing the asset stages its new geometry on the next load.
 
 In the Emily bank, 0 opens A-pose, 1 opens T-pose and 2–9 play named Mixamo clips.
 Click the figure for keyboard focus. H toggles the controls card.
+
+## Timeline
+
+An interactive window shows a strip at the bottom while a clip is selected:
+`||` or `>` for paused or playing, the rate, `mm:ss.mmm / mm:ss.mmm` for the
+clip's time and its length, and `n/N frames`, the keyframe under the playhead
+and the most any channel of the clip holds. Left and Right step one keyframe
+and pause. A plain LMB on the bar seeks, and the drag holds the orbit off until
+the button is released. The strip reads the time the socket reports in
+`state.clip.seconds`, so a moment named on the strip is reproduced with `seek`.
