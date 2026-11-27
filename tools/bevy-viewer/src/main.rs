@@ -1112,6 +1112,22 @@ fn main() {
     if let Some(bank) = bank {
         app.insert_resource(bank);
     }
+    if options.interactive {
+        // The strip reads a window's input and draws in that window, so a headless or a
+        // fixed-capture run never runs it. It shows the frame's own seek, clip change and time.
+        app.add_systems(
+            Update,
+            (
+                timeline::read.before(orbit_controls),
+                timeline::show
+                    .after(timeline::read)
+                    .after(apply_playback)
+                    .after(advance_animation)
+                    .after(select_clip)
+                    .after(watch_tick),
+            ),
+        );
+    }
     app.insert_resource(asset_profile)
         .insert_resource(ActorMaterials::default())
         .insert_resource(FlatFlipped::default())
@@ -1241,8 +1257,6 @@ fn main() {
                 .before(orbit_controls),
         )
         .add_systems(Update, (control_playback, apply_playback))
-        .add_systems(Update, timeline::read.before(orbit_controls))
-        .add_systems(Update, timeline::show.after(apply_playback))
         .add_systems(Update, tag_in_place_roots)
         // After the animation pass, before transform propagation, so the held
         // translation is what the skin actually renders this frame.

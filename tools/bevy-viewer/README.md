@@ -340,10 +340,15 @@ Click the figure for keyboard focus. H toggles the controls card.
 
 ## Timeline
 
-An interactive window shows a strip at the bottom while a clip is selected:
-`||` or `>` for paused or playing, the rate, `mm:ss.mmm / mm:ss.mmm` for the
-clip's time and its length, and `n/N frames`, the keyframe under the playhead
-and the most any channel of the clip holds. Left and Right step one keyframe
-and pause. A plain LMB on the bar seeks, and the drag holds the orbit off until
-the button is released. The strip reads the time the socket reports in
-`state.clip.seconds`, so a moment named on the strip is reproduced with `seek`.
+An interactive window shows a strip at the bottom while a clip of the loaded
+asset is selected: `||` or `>` for paused or playing, the rate,
+`mm:ss.mmm / mm:ss.mmm` for the clip's time and its length, and `n/N frames`,
+the nearest keyframe and the most any channel of the clip holds. The count
+spreads the clip's time evenly over that many keys, so it is a place to name a
+moment by, not a key index of every channel. Left and Right step one keyframe
+and pause. A plain LMB on the bar seeks and leaves pause and speed as they
+were, where the socket's `seek` pauses; the drag holds the orbit off until the
+button is released, also while the cursor is outside the window. The time on
+the strip is the one the socket reports in `state.clip.seconds`, so a moment
+named on the strip is reproduced with `seek`. A hidden strip, as on a slot
+without a clip, leaves the drag to the camera.

@@ -312,6 +312,7 @@ fn control_session_outlives_the_one_shot_exit() {
 fn one_shot_capture_still_exits_without_control() {
     let bin = viewer_binary();
     if !bin.exists() {
+        eprintln!("SKIP: cloth-viewer binary not found at {}", bin.display());
         return;
     }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic.glb");

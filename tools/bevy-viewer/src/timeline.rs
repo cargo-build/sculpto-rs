@@ -8,7 +8,7 @@ use bevy::animation::graph::AnimationNodeType;
 use bevy::prelude::*;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 
-use crate::{AssetProfile, ClipSelection, Playback, PlayerGraph, ViewerConfig};
+use crate::{AssetProfile, ClipSelection, Playback, PlayerGraph};
 
 /// Keyframes a second for a clip whose file does not say how many it holds.
 const DEFAULT_FPS: f32 = 30.0;
@@ -16,7 +16,7 @@ const BAR_WIDTH_PX: f32 = 440.0;
 const BAR_HEIGHT_PX: f32 = 12.0;
 const AMBER: Color = Color::srgb(1.0, 0.82, 0.15);
 
-/// The strip, shown while a clip is selected.
+/// The strip, shown while a clip of the loaded asset is selected.
 #[derive(Component)]
 pub(crate) struct TimelinePanel;
 
@@ -200,26 +200,34 @@ pub(crate) fn spawn(commands: &mut Commands) {
         });
 }
 
-/// A plain left button on the bar scrubs the clip. The gesture lasts until the button is
+/// A plain left button on a shown bar scrubs the clip. The gesture lasts until the button is
 /// released, wherever the cursor has gone, and holds the orbit off meanwhile.
 pub(crate) fn read(
-    config: Res<ViewerConfig>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
+    panel: Query<&InheritedVisibility, With<TimelinePanel>>,
     bar: Query<(&ComputedNode, &UiGlobalTransform), With<TimelineBar>>,
     mut timeline: ResMut<Timeline>,
 ) {
     let held = timeline.scrubbing;
     timeline.scrubbing = false;
     timeline.place = None;
-    if !config.interactive {
+    let (Ok(visible), Ok((node, transform))) = (panel.single(), bar.single()) else {
+        return;
+    };
+    // A hidden strip is still laid out, and its bar must leave the drag to the orbit.
+    if !visible.get() {
         return;
     }
-    let (Ok((node, transform)), Some(cursor)) = (
-        bar.single(),
-        windows.single().ok().and_then(Window::cursor_position),
-    ) else {
+    // The rect and this cursor are both in physical pixels; the logical one would miss once scaled.
+    let Some(cursor) = windows
+        .single()
+        .ok()
+        .and_then(Window::physical_cursor_position)
+    else {
+        // Out of the window with the button down: the clip holds its time, the orbit stays off.
+        timeline.scrubbing = held && buttons.pressed(MouseButton::Left);
         return;
     };
     let plain = !keys.any_pressed([
@@ -228,14 +236,17 @@ pub(crate) fn read(
         KeyCode::ControlLeft,
         KeyCode::ControlRight,
     ]);
+    let down = buttons.pressed(MouseButton::Left);
     let begun =
-        node.contains_point(*transform, cursor) && plain && buttons.just_pressed(MouseButton::Left);
-    if !(begun || (held && buttons.pressed(MouseButton::Left))) {
+        plain && buttons.just_pressed(MouseButton::Left) && node.contains_point(*transform, cursor);
+    if !(begun || (held && down)) {
         return;
     }
-    let across = transform.inverse().transform_point2(cursor).x / node.size().x;
+    let Some(across) = node.normalize_point(*transform, cursor) else {
+        return;
+    };
     timeline.scrubbing = true;
-    timeline.place = Some(place(across));
+    timeline.place = Some(place(across.x));
 }
 
 /// Show where the clip is, step it a keyframe with Left and Right, and take what the bar asked.
@@ -270,7 +281,8 @@ pub(crate) fn show(
             .iter_mut()
             .for_each(|mut visibility| *visibility = Visibility::Hidden)
     };
-    let Some((node, duration)) = clip else {
+    // While a newer generation loads, the socket answers `null` for the time: the strip hides too.
+    let Some((node, duration)) = clip.filter(|_| profile.loaded && !profile.pending) else {
         hide();
         return;
     };
@@ -291,17 +303,24 @@ pub(crate) fn show(
         return;
     };
     let keyframes = timeline.keyframes(&profile, selection.0);
-    let stepped = [(KeyCode::ArrowLeft, false), (KeyCode::ArrowRight, true)]
+    let arrow = [(KeyCode::ArrowLeft, false), (KeyCode::ArrowRight, true)]
         .into_iter()
         .find(|(key, _)| keys.just_pressed(*key))
-        .map(|(_, forward)| {
-            playback.paused = true;
-            step(now, duration, keyframes, forward)
-        });
-    let to = timeline.place.map(|place| place * duration).or(stepped);
+        .map(|(_, forward)| forward);
+    // The bar owns the clip while it is dragged, so an arrow pressed then neither steps nor pauses.
+    let (to, stepped) = match (timeline.place, arrow) {
+        (Some(place), _) => (Some(place * duration), false),
+        (None, Some(forward)) => (Some(step(now, duration, keyframes, forward)), true),
+        (None, None) => (None, false),
+    };
     if let Some(to) = to {
         for (mut player, _) in players.iter_mut().filter(|(_, bound)| bound.0 == *handle) {
             if let Some(animation) = player.animation_mut(node) {
+                if stepped {
+                    // Paused here, not by `apply_playback` a frame later: the clock names the key.
+                    playback.paused = true;
+                    animation.pause();
+                }
                 animation.set_seek_time(to);
             }
         }
